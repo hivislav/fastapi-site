@@ -3,6 +3,10 @@ venv/
 .venv/
 env/
 
+# Секреты и локальные конфиги
+.env
+*.local
+
 # Кэши Python
 __pycache__/
 *.py[cod]
