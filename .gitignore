@@ -1,0 +1,17 @@
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Кэши Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Инструменты IDE
+.idea/
+.vscode/
+
+# Системные файлы
+.DS_Store
