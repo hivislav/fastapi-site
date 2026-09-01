@@ -1,0 +1,11 @@
+venv/
+.venv/
+env/
+.DS_Store
+__pycache__/
+*.pyc
+
+# НОВЫЕ ИСКЛЮЧЕНИЯ:
+.git/
+.idea/
+.env
