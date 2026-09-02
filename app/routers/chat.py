@@ -13,5 +13,13 @@ def chat(msg: ChatMessage) -> dict:
     """Принимает сообщение пользователя и возвращает ответ бота."""
     if not msg.content.strip():
         return {"user": msg.content, "bot": "Пожалуйста, введите сообщение."}
-    answer = service.generate_response(msg.content, msg.format, msg.max_tokens, msg.stop)
-    return {"user": msg.content, "bot": answer}
+    answer, correct = service.generate_response(
+        msg.content,
+        msg.format,
+        msg.max_tokens,
+        msg.stop,
+        msg.expert_mode,
+        msg.expert_mode_type,
+        msg.expert_roles,
+    )
+    return {"user": msg.content, "bot": answer, "correct": correct}

@@ -36,6 +36,7 @@ def call_llm(
     response_format: str = "free",
     max_tokens: Optional[int] = None,
     stop: Optional[str] = None,
+    system_prompt: Optional[str] = None,
 ) -> str:
     """Отправляет запрос к реальной модели и возвращает текст ответа.
 
@@ -53,18 +54,28 @@ def call_llm(
     Для JSON-режима используется только системная инструкция (без нативного
     response_format=json_object), т.к. он заставляет модель дописывать лишний
     служебный вид и сжирает токены — важно для малых max_tokens.
+
+    system_prompt — необязательная полностью своя системная инструкция
+    (используется экспертными режимами вместо стандартной). Передача своего
+    системного промпта также отключает reasoning, как и задание max_tokens/stop.
     """
     if not config.LLM_API_KEY:
         return ""
 
-    system_prompt = SYSTEM_PROMPT
-    if response_format == "json":
-        system_prompt += SYSTEM_PROMPT_JSON
+    if system_prompt is not None:
+        system_prompt_content = system_prompt
+    else:
+        system_prompt_content = SYSTEM_PROMPT
+        if response_format == "json":
+            system_prompt_content += SYSTEM_PROMPT_JSON
+    # Свой системный промпт считается экспертной инструкцией: reasoning
+    # отключаем, чтобы весь бюджет ушёл на сам ответ.
+    expert_mode = system_prompt is not None
 
     payload = {
         "model": config.LLM_MODEL,
         "messages": [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt_content},
             {"role": "user", "content": user_text},
         ],
         "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
@@ -81,10 +92,10 @@ def call_llm(
     if stop_sequences:
         payload["stop"] = stop_sequences
 
-    # Если задано ЛЮБОЕ управление генерацией (лимит токенов или стоп) —
-    # отключаем reasoning. Иначе reasoning-модель может потратить бюджет на
-    # «размышления» и оставить content пустым.
-    if max_tokens or stop_sequences:
+    # Если задано ЛЮБОЕ управление генерацией (лимит токенов, стоп или
+    # экспертный системный промпт) — отключаем reasoning. Иначе reasoning-модель
+    # может потратить бюджет на «размышления» и оставить content пустым.
+    if max_tokens or stop_sequences or expert_mode:
         payload["thinking"] = {"type": "disabled"}
 
     url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"

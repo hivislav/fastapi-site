@@ -21,6 +21,7 @@
             max-width: 1200px;
             margin: 0 auto;
             padding: 16px;
+            position: relative;
         }
         /* ---------- Боковая панель: история юзера ---------- */
         .sidebar {
@@ -72,9 +73,15 @@
             background: #5b4bb8;
             color: #fff;
             display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .chat-header-top {
+            display: flex;
             align-items: center;
             gap: 16px;
             flex-wrap: wrap;
+            width: 100%;
         }
         .chat-header .title-group {
             display: flex;
@@ -175,9 +182,152 @@
             font-size: 0.85rem;
             padding: 4px 16px 0;
         }
+        /* ---------- Экспертный режим ---------- */
+        .basic-settings {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        [hidden] { display: none !important; }
+        #expert-toggle {
+            padding: 8px 12px;
+            border: 2px solid #fff;
+            border-radius: 8px;
+            background: transparent;
+            color: #fff;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: background 0.2s, color 0.2s, border-color 0.2s;
+        }
+        #expert-toggle:hover { background: rgba(255, 255, 255, 0.2); }
+        #expert-toggle.active {
+            background: #fff;
+            color: #5b4bb8;
+            border-color: #fff;
+        }
+        .expert-panel {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            flex-wrap: wrap;
+            background: rgba(255, 255, 255, 0.16);
+            border-radius: 10px;
+            padding: 8px 14px;
+        }
+        .expert-panel .modes {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px 10px;
+            flex: 1;
+            min-width: 0;
+        }
+        .expert-panel .modes label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .group-settings {
+            margin-left: 2px;
+            padding: 2px 9px;
+            border: none;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.9);
+            color: #5b4bb8;
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+        .group-settings:hover { background: #fff; }
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal-box {
+            background: #fff;
+            border-radius: 14px;
+            padding: 20px;
+            width: 320px;
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+            color: #333;
+        }
+        .modal-box h3 { margin: 0 0 14px; font-size: 1rem; color: #4a3b8f; }
+        .roles-field {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+            outline: none;
+            color: #333;
+        }
+        .roles-field:focus { border-color: #667eea; }
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 6px;
+        }
+        .modal-actions button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+        .modal-actions .accept { background: #667eea; color: #fff; }
+        .modal-actions .accept:hover { background: #5563c1; }
+        .modal-actions .clear { background: #eee; color: #333; }
+        .modal-actions .clear:hover { background: #e0e0e0; }
+        /* ---------- Статистика ответов (экспертный режим) ---------- */
+        /* Третья колонка справа от окна чата. Контейнеру задаём фиксированную
+           ширину, достаточную для всех трёх колонок, и центрируем — чат и
+           история не растягиваются на всю страницу, панель просто возникает
+           справа с тем же отступом 16px, что и между чатом и историей слева. */
+        body.expert-mode .layout {
+            grid-template-columns: 260px 1fr 520px;
+            max-width: 1760px;
+        }
+        .stats {
+            width: 100%;
+            height: 50vh;
+            align-self: start;
+            background: rgba(255, 255, 255, 0.97);
+            border-radius: 16px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+        }
+        .stats h2 { margin: 0 0 12px; font-size: 1rem; color: #4a3b8f; }
+        .stats-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        .stats-table th,
+        .stats-table td {
+            padding: 8px 10px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        .stats-table th { color: #5b4bb8; font-weight: 600; }
+        .stats-table td:nth-child(1) { color: #333; }
+        .stats-table td:nth-child(2),
+        .stats-table td:nth-child(3) { text-align: center; color: #333; }
         @media (max-width: 768px) {
             .layout { grid-template-columns: 1fr; }
             .sidebar { display: none; }
+            body.expert-mode .layout { grid-template-columns: 1fr; max-width: none; }
+            .stats { height: auto; max-height: 50vh; }
         }
     </style>
 </head>
@@ -194,26 +344,66 @@
         <!-- Основное окно чата -->
         <main class="chat">
             <div class="chat-header">
-                <div class="title-group">
-                    <span class="avatar">🤖</span>
-                    <div>
-                        <h1>Чат-бот</h1>
-                        <div class="sub">DeepSeek · Yandex Cloud · демо-режим при сбое</div>
+                <div class="chat-header-top">
+                    <div class="title-group">
+                        <span class="avatar">🤖</span>
+                        <div>
+                            <h1>Чат-бот</h1>
+                            <div class="sub">DeepSeek · Yandex Cloud · демо-режим при сбое</div>
+                        </div>
                     </div>
+                    <button id="expert-toggle" type="button" title="Экспертный режим">Экспертный режим</button>
                 </div>
                 <div class="chat-settings">
-                    <label>Формат ответа
-                        <select id="format">
-                            <option value="free" selected>свободный</option>
-                            <option value="json">json</option>
-                        </select>
-                    </label>
-                    <label>Длина
-                        <input id="max-length" type="text" inputmode="numeric" placeholder="Макс. токенов (целое)" autocomplete="off">
-                    </label>
-                    <label>Завершение
-                        <input id="stop-condition" type="text" placeholder="стоп, напр. 7 / синий (через запятую)" autocomplete="off">
-                    </label>
+                    <div class="basic-settings" id="basic-settings">
+                        <label>Формат ответа
+                            <select id="format">
+                                <option value="free" selected>свободный</option>
+                                <option value="json">json</option>
+                            </select>
+                        </label>
+                        <label>Длина
+                            <input id="max-length" type="text" inputmode="numeric" placeholder="Макс. токенов (целое)" autocomplete="off">
+                        </label>
+                        <label>Завершение
+                            <input id="stop-condition" type="text" placeholder="стоп, напр. 7 / синий (через запятую)" autocomplete="off">
+                        </label>
+                    </div>
+                    <div class="expert-panel" id="expert-panel" hidden>
+                        <div class="modes">
+                            <label><input type="radio" name="expert-mode" value="direct" checked> Прямой ответ</label>
+                            <label><input type="radio" name="expert-mode" value="stepwise"> Пошаговое решение</label>
+                            <label><input type="radio" name="expert-mode" value="prompt"> Решение через промпт</label>
+                            <label><input type="radio" name="expert-mode" value="group"> Экспертная группа
+                                <button type="button" class="group-settings" id="group-settings" title="Настройки ролей">⚙️</button>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-overlay" id="group-modal" hidden>
+                <div class="modal-box">
+                    <h3>Роли экспертов</h3>
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="roles-clear">очистить</button>
+                        <button type="button" class="accept" id="roles-accept">принять</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-overlay" id="error-modal" hidden>
+                <div class="modal-box">
+                    <h3>Ошибка</h3>
+                    <p id="error-text"></p>
+                    <div class="modal-actions">
+                        <button type="button" class="accept" id="error-close">закрыть</button>
+                    </div>
                 </div>
             </div>
             <div id="messages" class="messages">
@@ -227,6 +417,15 @@
                 <button id="send">Отправить</button>
             </div>
         </main>
+        <aside class="stats" id="stats-panel" hidden>
+            <h2>Статистика ответов</h2>
+            <table class="stats-table">
+                <thead>
+                    <tr><th>Способ решения</th><th>Верно</th><th>Неверно</th></tr>
+                </thead>
+                <tbody id="stats-body"></tbody>
+            </table>
+        </aside>
     </div>
 
     <script>
@@ -242,6 +441,116 @@
         // Поле «Длина» принимает только целые числа (не пропускаем не-цифры).
         maxLengthInput.addEventListener('input', () => {
             maxLengthInput.value = maxLengthInput.value.replace(/\D/g, '');
+        });
+
+        // ---------- Экспертный режим ----------
+        const expertToggle = document.getElementById('expert-toggle');
+        const basicSettings = document.getElementById('basic-settings');
+        const expertPanel = document.getElementById('expert-panel');
+        const groupSettingsBtn = document.getElementById('group-settings');
+        const groupModal = document.getElementById('group-modal');
+        const roleInputs = Array.from(document.querySelectorAll('.roles-field'));
+        const expertRadios = Array.from(document.querySelectorAll('input[name="expert-mode"]'));
+
+        // Заполненные роли сохраняются после «принять», пока активна «Экспертная группа».
+        let expertRoles = new Array(roleInputs.length).fill('');
+
+        // ---------- Статистика ответов (экспертный режим) ----------
+        const statsPanel = document.getElementById('stats-panel');
+        const statsBody = document.getElementById('stats-body');
+        const statModes = [
+            { key: 'direct', label: 'Прямой ответ', correct: 0, incorrect: 0 },
+            { key: 'stepwise', label: 'Пошаговое решение', correct: 0, incorrect: 0 },
+            { key: 'prompt', label: 'Решение через промпт', correct: 0, incorrect: 0 },
+            { key: 'group', label: 'Экспертная группа', correct: 0, incorrect: 0 }
+        ];
+        function resetStats() {
+            statModes.forEach(m => { m.correct = 0; m.incorrect = 0; });
+            renderStats();
+        }
+        function renderStats() {
+            statsBody.innerHTML = '';
+            statModes.forEach(m => {
+                const tr = document.createElement('tr');
+                const tdName = document.createElement('td');
+                tdName.textContent = m.label;
+                const tdCorrect = document.createElement('td');
+                tdCorrect.textContent = m.correct;
+                const tdIncorrect = document.createElement('td');
+                tdIncorrect.textContent = m.incorrect;
+                tr.appendChild(tdName);
+                tr.appendChild(tdCorrect);
+                tr.appendChild(tdIncorrect);
+                statsBody.appendChild(tr);
+            });
+        }
+        function updateStats(key, isCorrect) {
+            const m = statModes.find(x => x.key === key);
+            if (!m) return;
+            if (isCorrect) m.correct += 1; else m.incorrect += 1;
+            renderStats();
+        }
+
+        function setExpertMode(on) {
+            expertToggle.classList.toggle('active', !!on);
+            basicSettings.hidden = !!on;   // старые настройки скрываются
+            expertPanel.hidden = !on;      // радио появляются
+            document.body.classList.toggle('expert-mode', !!on);
+            statsPanel.hidden = !on;       // панель статистики — только в эксперте
+            resetStats();                  // и при входе, и при выходе — нули
+            if (!on) {
+                // выключение экспертного режима — роли и выбор радио сбрасываются
+                expertRoles.fill('');
+                expertRadios.forEach(r => { r.checked = (r === expertRadios[0]); });
+            }
+        }
+
+        expertToggle.addEventListener('click', () => {
+            setExpertMode(!expertToggle.classList.contains('active'));
+        });
+
+        expertRadios.forEach(r => {
+            r.addEventListener('change', () => {
+                if (!r.checked) return;
+                if (r.value !== 'group') {
+                    // выбрана другая радио — сохранённые роли сбрасываются
+                    expertRoles.fill('');
+                }
+            });
+        });
+
+        groupSettingsBtn.addEventListener('click', () => {
+            // подставляем сохранённые роли в поля (если есть)
+            roleInputs.forEach((inp, i) => { inp.value = expertRoles[i] || ''; });
+            groupModal.hidden = false;
+        });
+
+        document.getElementById('roles-accept').addEventListener('click', () => {
+            // сохраняем текущие значения полей и закрываем окно
+            expertRoles = roleInputs.map(inp => inp.value);
+            groupModal.hidden = true;
+        });
+
+        document.getElementById('roles-clear').addEventListener('click', () => {
+            roleInputs.forEach(inp => { inp.value = ''; });
+        });
+
+        groupModal.addEventListener('click', (e) => {
+            if (e.target === groupModal) groupModal.hidden = true;
+        });
+
+        // Модалка ошибки (например «список ролей пуст») — можно только закрыть.
+        const errorModal = document.getElementById('error-modal');
+        const errorText = document.getElementById('error-text');
+        function showError(text) {
+            errorText.textContent = text;
+            errorModal.hidden = false;
+        }
+        document.getElementById('error-close').addEventListener('click', () => {
+            errorModal.hidden = true;
+        });
+        errorModal.addEventListener('click', (e) => {
+            if (e.target === errorModal) errorModal.hidden = true;
         });
 
         function addHistory(text) {
@@ -269,17 +578,47 @@
             const content = input.value.trim();
             if (!content) return;
 
-            // Валидация длины: пустое поле — по умолчанию; иначе только целое > 0.
-            let maxTokens = null;
-            const rawLength = maxLengthInput.value.trim();
-            if (rawLength !== '') {
-                const num = Number(rawLength);
-                if (!/^\d+$/.test(rawLength) || num < 1) {
-                    addMessage('bot', '⚠️ Длина ответа должна быть целым числом больше нуля.');
-                    input.focus();
-                    return;
+            const expertOn = expertToggle.classList.contains('active');
+            const expertMode = (expertRadios.find(r => r.checked) || expertRadios[0]).value;
+
+            // Экспертная группа без заполненных ролей — отправку блокируем.
+            if (expertOn && expertMode === 'group' && expertRoles.every(r => !r.trim())) {
+                showError('список ролей пуст');
+                return;
+            }
+
+            let body;
+            if (!expertOn) {
+                // Обычный режим: применяем и валидируем текущие настройки как сейчас.
+                let maxTokens = null;
+                const stopValue = stopInput.value.trim() || null;
+                const rawLength = maxLengthInput.value.trim();
+                if (rawLength !== '') {
+                    const num = Number(rawLength);
+                    if (!/^\d+$/.test(rawLength) || num < 1) {
+                        addMessage('bot', '⚠️ Длина ответа должна быть целым числом больше нуля.');
+                        input.focus();
+                        return;
+                    }
+                    maxTokens = num;
                 }
-                maxTokens = num;
+                body = {
+                    content,
+                    format: formatSelect.value,
+                    max_tokens: maxTokens,
+                    stop: stopValue
+                };
+            } else {
+                // Экспертный режим: старые настройки (format/max_tokens/stop) в
+                // модель не отправляются — только выбранный режим и роли.
+                body = {
+                    content,
+                    expert_mode: true,
+                    expert_mode_type: expertMode
+                };
+                if (expertMode === 'group') {
+                    body.expert_roles = expertRoles.map(r => r.trim());
+                }
             }
 
             input.value = '';
@@ -288,26 +627,20 @@
             addMessage('user', content);
             addHistory(content);
 
-            // Выбранный формат ответа: 'free' (по умолчанию) или 'json'
-            const format = formatSelect.value;
-
-            // Условие завершения: строка, на которой остановить генерацию.
-            const stopValue = stopInput.value.trim() || null;
-
             typingEl.textContent = 'ДемоБот печатает...';
             try {
                 const res = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        content,
-                        format,
-                        max_tokens: maxTokens,
-                        stop: stopValue
-                    })
+                    body: JSON.stringify(body)
                 });
                 const data = await res.json();
                 addMessage('bot', data.bot);
+                // Вердикт о верности выносит сама модель; инкрементируем
+                // счётчик активного в данный момент режима.
+                if (expertOn && (data.correct === true || data.correct === false)) {
+                    updateStats(expertMode, data.correct);
+                }
             } catch (e) {
                 addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.');
             } finally {
