@@ -22,8 +22,20 @@ def chat(msg: ChatMessage) -> dict:
         msg.expert_mode_type,
         msg.expert_roles,
         msg.temperatures,
+        msg.models,
     )
     result = {"user": msg.content, "bot": answer, "correct": correct}
+    # Настройка «Тест моделей»: ответы каждой модели по отдельности.
+    if isinstance(answer, dict) and "model_responses" in answer:
+        model_responses = answer["model_responses"]
+        result["model_responses"] = model_responses
+        result["bot"] = "\n".join(
+            f"Ответ модели {r['model']}: {r['text']}" for r in model_responses
+        ) if model_responses else "Пожалуйста, введите сообщение."
+        # Аналитика судьи-аналитика (время, токены, стоимость) — отдельным полем.
+        if answer.get("analytics"):
+            result["analytics"] = answer["analytics"]
+        return result
     # Настройка «Температура»: несколько независимых ответов + резюме судьи.
     # Фронтенд выводит каждый ответ с пометкой «Ответ при значении temperature …»,
     # а затем — резюме судьи-аналитика.

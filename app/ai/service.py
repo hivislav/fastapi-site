@@ -17,6 +17,35 @@ from app.ai.json_utils import is_valid_json, repair_json, wrap_as_json
 # в обычные запросы LLM — нужна только судье-аналитику для оценки точности.
 CORRECT_ANSWER_RE = re.compile(r"верный\s+ответ\s*:\s*(.+)$", re.IGNORECASE)
 
+# Модели для настройки «Тест моделей»: ключ настройки -> URI модели.
+# deepseek — LLM по умолчанию (config.LLM_MODEL).
+MODEL_URIS = {
+    "deepseek": None,  # подставляется config.LLM_MODEL
+    "alice": "gpt://b1gkm5u908if6dc0focb/aliceai-llm/latest",
+    "alice-flash": "gpt://b1gkm5u908if6dc0focb/aliceai-llm-flash/latest",
+}
+# Человекочитаемые названия моделей (для вывода в ответах).
+MODEL_NAMES = {
+    "deepseek": "DeepSeek 4 Flash",
+    "alice": "Alice AI LLM",
+    "alice-flash": "Alice AI LLM Flash",
+}
+# Цена за 1000 токенов (вход/выход), руб., по тарифам Yandex AI Studio.
+# Используется для расчёта стоимости в аналитике судьи.
+MODEL_PRICING = {
+    "deepseek": {"input": 0.3, "output": 0.5},
+    "alice": {"input": 0.5, "output": 1.2},
+    "alice-flash": {"input": 0.1, "output": 0.2},
+}
+# Какие модели поддерживают поле thinking (отключение reasoning).
+# DeepSeek — reasoning-модель, поддерживает "thinking": {"type": "disabled"}.
+# Alice-модели это поле НЕ принимают (HTTP 400), потому им его не отправляем.
+MODEL_SUPPORTS_THINKING = {
+    "deepseek": True,
+    "alice": False,
+    "alice-flash": False,
+}
+
 
 def generate_response(
     user_text: str,
@@ -27,6 +56,7 @@ def generate_response(
     expert_mode_type: str = "direct",
     expert_roles: Optional[list] = None,
     temperatures: Optional[list] = None,
+    models: Optional[list] = None,
 ) -> tuple:
     """Возвращает кортеж (ответ, вердикт).
 
@@ -69,6 +99,13 @@ def generate_response(
         )
         judge = _judge_analyst(user_text, correct_answer, responses) if responses else None
         return {"responses": responses, "judge": judge}, None
+
+    # Настройка «Тест моделей»: запрос отправляется в каждую выбранную модель.
+    # Возвращается словарь {"model_responses": [...]} как первый элемент кортежа.
+    if models:
+        return _model_responses(
+            user_text, models, response_format, max_tokens, stop
+        ), None
 
     answer = client.call_llm(
         user_text,
@@ -216,6 +253,133 @@ def _parse_judge_json(text: str):
         ratings["summary"] = str(item.get("summary") or "").strip()
         rows.append(ratings)
     return rows or None
+
+
+def _judge_model_test(answers: list, analytics: list) -> list:
+    """Краткое резюме судьи по каждой модели настройки «Тест моделей».
+
+    По ответу и метрикам каждой модели (время, вход/выход токены, стоимость)
+    модель формирует резюме: скорость, стоимость/ресурсоёмкость и качество
+    ответа. Возвращает список [{"model", "summary"}, …]; пустой список, если
+    резюме получить не удалось.
+    """
+    system = (
+        "Ты — строгий судья-аналитик. Перед тобой ответы нескольких моделей на "
+        "один вопрос и их метрики: время обработки (секунды), входные и выходные "
+        "токены, стоимость в рублях. Для КАЖДОЙ модели дай КРАТКОЕ резюме "
+        "(2–3 предложения), оценив скорость, стоимость/ресурсоёмкость и качество "
+        "ответа. Верни строго один валидный JSON — массив объектов, по одному на "
+        'каждую модель, в формате: [{"model": "<название>", "summary": "…"}]. '
+        "Без пояснений и без markdown-обёрток ```json."
+    )
+    blocks = []
+    for answer, row in zip(answers, analytics):
+        blocks.append(
+            f"Модель {row['model']} ({row['seconds']:.2f}с, вход {row['input_tokens']} / "
+            f"выход {row['output_tokens']} токенов, стоимость {row['cost_rub']:.2f} руб.):\n"
+            f"{answer['text']}"
+        )
+    verdict = client.call_llm(
+        "Ответы и метрики моделей:\n\n" + "\n\n".join(blocks), system_prompt=system
+    )
+    if not verdict:
+        return []
+    return _parse_model_summaries(verdict)
+
+
+def _parse_model_summaries(text: str) -> list:
+    """Разбирает JSON-ответ судьи по «Тесту моделей» в [{"model", "summary"}, …].
+
+    Толерантен к markdown-обёрткам; невалидные/пустые записи отбрасываются.
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z\s]*\n?|\n?```$", "", cleaned).strip()
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get("model") or "").strip()
+        summary = str(item.get("summary") or "").strip()
+        if model and summary:
+            out.append({"model": model, "summary": summary})
+    return out
+
+
+def _model_responses(
+    user_text: str,
+    models: list,
+    response_format: str,
+    max_tokens: Optional[int],
+    stop: Optional[str],
+) -> dict:
+    """Отправляет запрос в каждую выбранную модель («Тест моделей»).
+
+    Возвращает
+    {"model_responses": [{"model", "text"}, …],
+     "analytics": [{"model", "seconds", "input_tokens", "output_tokens",
+                    "cost_rub"}, …]}.
+    Каждая модель обрабатывается независимо; заодно собираются метрики
+    (время, входной/выходной токены) и считается стоимость по тарифам
+    MODEL_PRICING — это аналитика судьи-аналитика для вывода таблицей.
+    """
+    answers = []
+    analytics = []
+    for key in models:
+        uri = MODEL_URIS.get(key)
+        if uri is None:
+            uri = config.LLM_MODEL
+        name = MODEL_NAMES.get(key, key)
+        text, metrics = client.call_llm_with_metrics(
+            user_text,
+            response_format=response_format,
+            max_tokens=max_tokens,
+            stop=stop,
+            model=uri,
+            # Отключаем reasoning только у моделей, которые это поддерживают
+            # (deepseek) — остальные (alice) отклоняют поле thinking (HTTP 400).
+            disable_thinking=MODEL_SUPPORTS_THINKING.get(key, False),
+        )
+        answers.append({"model": name, "text": _normalize_answer(user_text, text, response_format)})
+
+        if metrics:
+            in_tokens = metrics["prompt_tokens"]
+            out_tokens = metrics["completion_tokens"]
+            price = MODEL_PRICING.get(key) or {"input": 0, "output": 0}
+            cost = (in_tokens / 1000) * price["input"] + (out_tokens / 1000) * price["output"]
+            analytics.append(
+                {
+                    "model": name,
+                    "seconds": metrics["elapsed_seconds"],
+                    "input_tokens": in_tokens,
+                    "output_tokens": out_tokens,
+                    "cost_rub": round(cost, 2),
+                }
+            )
+        else:
+            analytics.append(
+                {
+                    "model": name,
+                    "seconds": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_rub": 0,
+                }
+            )
+    # Резюме судьи-аналитика: краткий разбор каждой модели (скорость, стоимость,
+    # ресурсоёмкость, качество). Прикрепляем summary к строкам таблицы.
+    if answers:
+        summaries = _judge_model_test(answers, analytics)
+        by_model = {s["model"]: s["summary"] for s in summaries}
+        for row in analytics:
+            row["summary"] = by_model.get(row["model"], "")
+    return {"model_responses": answers, "analytics": analytics}
 
 
 def _normalize_answer(user_text: str, answer: str, response_format: str) -> str:

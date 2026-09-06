@@ -5,6 +5,7 @@
 """
 
 import json
+import time
 import urllib.request
 from typing import Optional
 
@@ -38,6 +39,8 @@ def call_llm(
     stop: Optional[str] = None,
     system_prompt: Optional[str] = None,
     temperature: Optional[float] = None,
+    model: Optional[str] = None,
+    disable_thinking: bool = False,
 ) -> str:
     """Отправляет запрос к реальной модели и возвращает текст ответа.
 
@@ -54,6 +57,10 @@ def call_llm(
     temperature — необязательное значение «температуры» модели (0..n), уходит
     провайдеру как есть. Его задание также отключает reasoning.
 
+    model — необязательный идентификатор модели (URI). По умолчанию
+    config.LLM_MODEL; поддержка выбора модели используется настройкой
+    «Тест моделей».
+
     Для JSON-режима используется только системная инструкция (без нативного
     response_format=json_object), т.к. он заставляет модель дописывать лишний
     служебный вид и сжирает токены — важно для малых max_tokens.
@@ -62,8 +69,67 @@ def call_llm(
     (используется экспертными режимами вместо стандартной). Передача своего
     системного промпта также отключает reasoning, как и задание max_tokens/stop.
     """
+    content, _ = _perform_call(
+        user_text,
+        response_format=response_format,
+        max_tokens=max_tokens,
+        stop=stop,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        model=model,
+        disable_thinking=disable_thinking,
+    )
+    return content
+
+
+def call_llm_with_metrics(
+    user_text: str,
+    response_format: str = "free",
+    max_tokens: Optional[int] = None,
+    stop: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    temperature: Optional[float] = None,
+    model: Optional[str] = None,
+    disable_thinking: bool = False,
+) -> tuple:
+    """Как call_llm, но дополнительно возвращает метрики запроса.
+
+    Возвращает (content, metrics|None). metrics — словарь
+    {"model", "elapsed_seconds", "prompt_tokens", "completion_tokens",
+    "total_tokens"}; равен None, если ключ не задан или запрос не выполнен
+    (тогда content='' — вызывающий использует фолбэк). Используется настройкой
+    «Тест моделей» для аналитики судьи.
+
+    disable_thinking — принудительно отключает reasoning (thinking: disabled)
+    независимо от других параметров. Нужно для честного/быстрого сравнения
+    моделей: иначе reasoning-модель (deepseek) тратит время на цепочку
+    размышлений и отвечает в разы дольше остальных.
+    """
+    return _perform_call(
+        user_text,
+        response_format=response_format,
+        max_tokens=max_tokens,
+        stop=stop,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        model=model,
+        disable_thinking=disable_thinking,
+    )
+
+
+def _perform_call(
+    user_text: str,
+    response_format: str = "free",
+    max_tokens: Optional[int] = None,
+    stop: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    temperature: Optional[float] = None,
+    model: Optional[str] = None,
+    disable_thinking: bool = False,
+) -> tuple:
+    """Низкоуровневый вызов: возвращает (content, metrics|None)."""
     if not config.LLM_API_KEY:
-        return ""
+        return "", None
 
     if system_prompt is not None:
         system_prompt_content = system_prompt
@@ -75,8 +141,9 @@ def call_llm(
     # отключаем, чтобы весь бюджет ушёл на сам ответ.
     expert_mode = system_prompt is not None
 
+    used_model = model or config.LLM_MODEL
     payload = {
-        "model": config.LLM_MODEL,
+        "model": used_model,
         "messages": [
             {"role": "system", "content": system_prompt_content},
             {"role": "user", "content": user_text},
@@ -103,7 +170,12 @@ def call_llm(
     # Если задано ЛЮБОЕ управление генерацией (лимит токенов, стоп, температура
     # или экспертный системный промпт) — отключаем reasoning. Иначе reasoning-модель
     # может потратить бюджет на «размышления» и оставить content пустым.
-    if max_tokens or stop_sequences or expert_mode or temperature is not None:
+    # disable_thinking принудительно отключает reasoning (используется в
+    # «Тест моделей»), чтобы все модели отвечали сопоставимо и быстро.
+    if (
+        max_tokens or stop_sequences or expert_mode or temperature is not None
+        or disable_thinking
+    ):
         payload["thinking"] = {"type": "disabled"}
 
     url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"
@@ -117,15 +189,31 @@ def call_llm(
         method="POST",
     )
 
+    start = time.perf_counter()
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             data = json.loads(response.read().decode("utf-8"))
-        msg = data["choices"][0]["message"]
-
-        # Возвращаем только content; reasoning пользователю не показываем.
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-        return ""
     except Exception:
-        return ""
+        return "", None
+    elapsed = time.perf_counter() - start
+
+    try:
+        msg = data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return "", None
+
+    content = msg.get("content")
+    if not (isinstance(content, str) and content.strip()):
+        content = ""
+    else:
+        content = content.strip()
+
+    usage = data.get("usage") or {}
+    metrics = {
+        "model": used_model,
+        "elapsed_seconds": round(elapsed, 3),
+        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+        "total_tokens": int(usage.get("total_tokens", 0) or 0),
+    }
+    return content, metrics

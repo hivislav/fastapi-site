@@ -329,6 +329,27 @@
             font-size: 0.82rem;
             color: #888;
         }
+        .param-models[hidden] { display: none; }
+        .param-models {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 4px;
+        }
+        .model-check {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9rem;
+            color: #333;
+            cursor: pointer;
+        }
+        .model-check input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: #667eea;
+            cursor: pointer;
+        }
         /* ---------- Статистика ответов (экспертный режим) ---------- */
         /* Третья колонка справа от окна чата. Контейнеру задаём фиксированную
            ширину, достаточную для всех трёх колонок, и центрируем — чат и
@@ -478,12 +499,19 @@
                     <select id="param-select" class="param-select">
                         <option value="default" selected>По умолчанию</option>
                         <option value="temperature">Температура</option>
+                        <option value="models">Тест моделей</option>
                     </select>
                     <div class="param-fields" id="param-fields" hidden>
                         <p class="modal-hint">Числовые значения (целые или с точкой).</p>
                         <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
                         <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
                         <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
+                    </div>
+                    <div class="param-models" id="param-models" hidden>
+                        <p class="modal-hint">Выберите модели — запрос уйдёт в каждую из них.</p>
+                        <label class="model-check"><input type="checkbox" value="deepseek" checked> DeepSeek 4 Flash</label>
+                        <label class="model-check"><input type="checkbox" value="alice"> Alice AI LLM</label>
+                        <label class="model-check"><input type="checkbox" value="alice-flash"> Alice AI LLM Flash</label>
                     </div>
                     <div class="modal-actions">
                         <button type="button" class="clear" id="params-close">закрыть</button>
@@ -645,12 +673,18 @@
         const paramSelect = document.getElementById('param-select');
         const paramFields = document.getElementById('param-fields');
         const tempInputs = Array.from(paramFields.querySelectorAll('.param-field'));
+        const paramModels = document.getElementById('param-models');
+        const modelChecks = Array.from(paramModels.querySelectorAll('input[type=checkbox]'));
 
-        // Сохранённые параметры. Пока поддерживается только «Температура» —
-        // до трёх числовых значений (бэкенд-логика появится в следующей итерации).
-        let savedParams = { temperature: ['', '', ''] };
+        // Сохранённые параметры. «Температура» — до трёх числовых значений;
+        // «Тест моделей» — список выбранных ключей моделей.
+        let savedParams = {
+            temperature: ['', '', ''],
+            models: []
+        };
         // Активная настройка — та, что была «применена» последней. Одномоментно
-        // работает только она: либо «по умолчанию» (влияния нет), либо «температура».
+        // работает только она: «по умолчанию» (влияния нет), «температура» или
+        // «тест моделей».
         let activeParam = 'default';
 
         function numericOnly(value) {
@@ -673,16 +707,20 @@
             inp.addEventListener('input', () => { inp.value = numericOnly(inp.value); });
         });
 
-        // Поля появляются только для пункта «Температура»; «По умолчанию» — без полей.
+        // Поля появляются только для пункта «Температура»; «По умолчанию» и «Тест
+        // моделей» — показывают свои блоки или ничего.
         function syncParamFields() {
             paramFields.hidden = paramSelect.value !== 'temperature';
+            paramModels.hidden = paramSelect.value !== 'models';
         }
         paramSelect.addEventListener('change', syncParamFields);
 
         paramsBtn.addEventListener('click', () => {
-            // открываем: подставляем сохранённые значения (если это «Температура»)
+            // открываем: подставляем сохранённые значения выбранной настройки
             const values = savedParams[paramSelect.value] || ['', '', ''];
             tempInputs.forEach((inp, i) => { inp.value = values[i] || ''; });
+            const savedModels = savedParams.models || [];
+            modelChecks.forEach(c => { c.checked = savedModels.includes(c.value); });
             syncParamFields();
             paramsModal.hidden = false;
         });
@@ -692,8 +730,14 @@
             activeParam = paramSelect.value;
             if (paramSelect.value === 'default') {
                 // «По умолчанию» — сбрасываем все настройки меню и закрываем окно
-                for (const key in savedParams) savedParams[key] = ['', '', ''];
+                for (const key in savedParams) {
+                    savedParams[key] = key === 'models' ? [] : ['', '', ''];
+                }
                 tempInputs.forEach(inp => { inp.value = ''; });
+                modelChecks.forEach(c => { c.checked = false; });
+            } else if (paramSelect.value === 'models') {
+                // «Тест моделей» — сохраняем выбранные модели
+                savedParams.models = modelChecks.filter(c => c.checked).map(c => c.value);
             } else {
                 // иначе сохраняем текущие значения полей
                 savedParams[paramSelect.value] = tempInputs.map(inp => inp.value);
@@ -771,6 +815,45 @@
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
+        // Форматирует рубли с запятой (например 2,02 руб).
+        function fmtRub(x) {
+            return x.toFixed(2).replace('.', ',') + ' руб';
+        }
+
+        // Рисует сообщение-аналитику судьи по настройке «Тест моделей».
+        function addAnalyticsTable(rows) {
+            const wrap = document.createElement('div');
+            wrap.className = 'msg bot';
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+
+            let html = '<div class="judge-title">🧑‍⚖️ Судья-аналитик</div>';
+            html += '<table class="judge-table"><thead><tr>';
+            html += '<th>Модель</th><th>Время, с</th><th>Токены на вход</th>'
+                + '<th>Токены на выход</th><th>Стоимость</th>';
+            html += '</tr></thead><tbody>';
+            rows.forEach(r => {
+                html += `<tr><td>${r.model}</td>`
+                    + `<td>${r.seconds.toFixed(2)}</td>`
+                    + `<td>${r.input_tokens}</td>`
+                    + `<td>${r.output_tokens}</td>`
+                    + `<td>${fmtRub(r.cost_rub)}</td></tr>`;
+            });
+            html += '</tbody></table>';
+            // Краткое резюме судьи по каждой модели (скорость, стоимость,
+            // ресурсоёмкость, качество) — под таблицей.
+            rows.forEach(r => {
+                if (r.summary) {
+                    html += `<div class="judge-summary"><b>${r.model}:</b> ${r.summary}</div>`;
+                }
+            });
+
+            bubble.innerHTML = html;
+            wrap.appendChild(bubble);
+            messagesEl.appendChild(wrap);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
         async function send() {
             const content = input.value.trim();
             if (!content) return;
@@ -816,6 +899,11 @@
                 if (temperatures && temperatures.length) {
                     body.temperatures = temperatures;
                 }
+                // Настройка «Тест моделей»: если активна и выбрана хотя бы одна
+                // модель — запрос уходит в каждую из выбранных моделей.
+                if (activeParam === 'models' && (savedParams.models || []).length) {
+                    body.models = savedParams.models;
+                }
             } else {
                 // Экспертный режим: старые настройки (format/max_tokens/stop) в
                 // модель не отправляются — только выбранный режим и роли.
@@ -843,9 +931,18 @@
                     body: JSON.stringify(body)
                 });
                 const data = await res.json();
-                // Настройка «Температура»: каждый ответ с отдельным значением —
-                // выводим по одному, затем — резюме судьи-аналитика.
-                if (Array.isArray(data.responses) && data.responses.length) {
+                // Настройка «Тест моделей»: ответ каждой модели по отдельности.
+                if (Array.isArray(data.model_responses) && data.model_responses.length) {
+                    data.model_responses.forEach(r => {
+                        addMessage('bot', `Ответ модели ${r.model}:\n\n${r.text}`);
+                    });
+                    // Аналитика судьи-аналитика (время, токены, стоимость).
+                    if (Array.isArray(data.analytics) && data.analytics.length) {
+                        addAnalyticsTable(data.analytics);
+                    }
+                } else if (Array.isArray(data.responses) && data.responses.length) {
+                    // Настройка «Температура»: каждый ответ с отдельным значением —
+                    // выводим по одному, затем — резюме судьи-аналитика.
                     data.responses.forEach(r => {
                         addMessage('bot', `Ответ при значении temperature ${r.temperature}.\n\n${r.text}`);
                     });

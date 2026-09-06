@@ -35,3 +35,6 @@ class ChatMessage(BaseModel):
     # отдельный запрос к LLM. Пустой/None — параметр не используется
     # (выполняется один запрос как обычно). Заполненные значения — числа.
     temperatures: Optional[List[float]] = Field(default=None)
+    # Настройка «Тест моделей» (обычный режим): список ключей моделей, в каждую
+    # из которых отправляется запрос. Пустой/None — параметр не используется.
+    models: Optional[List[str]] = Field(default=None)
