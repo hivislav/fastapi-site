@@ -177,6 +177,15 @@
         }
         .input-row button:hover { background: #5563c1; }
         .input-row button:disabled { background: #aaa; cursor: not-allowed; }
+        /* Кнопка «Параметры» (шестерёнка) рядом с «Отправить» */
+        .input-row .gear-btn {
+            background: #eef1fb;
+            color: #4a3b8f;
+            padding: 12px 14px;
+            font-size: 1.15rem;
+            line-height: 1;
+        }
+        .input-row .gear-btn:hover { background: #e0e5fb; color: #3a2e7a; }
         .typing {
             color: #888;
             font-size: 0.85rem;
@@ -287,6 +296,39 @@
         .modal-actions .accept:hover { background: #5563c1; }
         .modal-actions .clear { background: #eee; color: #333; }
         .modal-actions .clear:hover { background: #e0e0e0; }
+        /* ---------- Диалог «Параметры» ---------- */
+        .param-select {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            font-size: 0.9rem;
+            outline: none;
+            color: #333;
+            background: #fff;
+        }
+        .param-fields {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .param-fields[hidden] { display: none; }
+        .param-field {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            outline: none;
+            color: #333;
+        }
+        .param-field:focus { border-color: #667eea; }
+        .modal-hint {
+            margin: 0 0 12px;
+            font-size: 0.82rem;
+            color: #888;
+        }
         /* ---------- Статистика ответов (экспертный режим) ---------- */
         /* Третья колонка справа от окна чата. Контейнеру задаём фиксированную
            ширину, достаточную для всех трёх колонок, и центрируем — чат и
@@ -323,6 +365,29 @@
         .stats-table td:nth-child(1) { color: #333; }
         .stats-table td:nth-child(2),
         .stats-table td:nth-child(3) { text-align: center; color: #333; }
+        /* ---------- Таблица судьи-аналитика ---------- */
+        .judge-title { font-weight: 600; color: #4a3b8f; margin-bottom: 8px; }
+        .judge-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+            margin-bottom: 10px;
+        }
+        .judge-table th,
+        .judge-table td {
+            border: 1px solid #e0e0e0;
+            padding: 6px 8px;
+            text-align: center;
+        }
+        .judge-table th { background: #eef1fb; color: #4a3b8f; font-weight: 600; }
+        .judge-table td:first-child { font-weight: 600; color: #333; }
+        .judge-summary {
+            font-size: 0.85rem;
+            color: #333;
+            margin-bottom: 6px;
+            line-height: 1.4;
+        }
+        .judge-summary b { color: #4a3b8f; }
         @media (max-width: 768px) {
             .layout { grid-template-columns: 1fr; }
             .sidebar { display: none; }
@@ -406,6 +471,26 @@
                     </div>
                 </div>
             </div>
+
+            <div class="modal-overlay" id="params-modal" hidden>
+                <div class="modal-box">
+                    <h3>Параметры</h3>
+                    <select id="param-select" class="param-select">
+                        <option value="default" selected>По умолчанию</option>
+                        <option value="temperature">Температура</option>
+                    </select>
+                    <div class="param-fields" id="param-fields" hidden>
+                        <p class="modal-hint">Числовые значения (целые или с точкой).</p>
+                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
+                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
+                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="params-close">закрыть</button>
+                        <button type="button" class="accept" id="params-apply">применить</button>
+                    </div>
+                </div>
+            </div>
             <div id="messages" class="messages">
                 <div class="msg bot">
                     <div class="bubble">Привет! 👋 Я демо-чат-бот. Напишите что-нибудь в поле ниже.</div>
@@ -415,6 +500,7 @@
             <div class="input-row">
                 <input id="input" type="text" placeholder="Введите сообщение..." autocomplete="off">
                 <button id="send">Отправить</button>
+                <button id="params-btn" class="gear-btn" type="button" title="Параметры">⚙️</button>
             </div>
         </main>
         <aside class="stats" id="stats-panel" hidden>
@@ -553,6 +639,78 @@
             if (e.target === errorModal) errorModal.hidden = true;
         });
 
+        // ---------- Диалог «Параметры» ----------
+        const paramsBtn = document.getElementById('params-btn');
+        const paramsModal = document.getElementById('params-modal');
+        const paramSelect = document.getElementById('param-select');
+        const paramFields = document.getElementById('param-fields');
+        const tempInputs = Array.from(paramFields.querySelectorAll('.param-field'));
+
+        // Сохранённые параметры. Пока поддерживается только «Температура» —
+        // до трёх числовых значений (бэкенд-логика появится в следующей итерации).
+        let savedParams = { temperature: ['', '', ''] };
+        // Активная настройка — та, что была «применена» последней. Одномоментно
+        // работает только она: либо «по умолчанию» (влияния нет), либо «температура».
+        let activeParam = 'default';
+
+        function numericOnly(value) {
+            // оставляем цифры и не более одной точки (целое или с точкой)
+            let out = '';
+            let dotSeen = false;
+            for (const ch of value) {
+                if (ch >= '0' && ch <= '9') {
+                    out += ch;
+                } else if (ch === '.' && !dotSeen) {
+                    out += ch;
+                    dotSeen = true;
+                }
+                // знак «-» и прочие символы отбрасываем
+            }
+            return out;
+        }
+
+        tempInputs.forEach(inp => {
+            inp.addEventListener('input', () => { inp.value = numericOnly(inp.value); });
+        });
+
+        // Поля появляются только для пункта «Температура»; «По умолчанию» — без полей.
+        function syncParamFields() {
+            paramFields.hidden = paramSelect.value !== 'temperature';
+        }
+        paramSelect.addEventListener('change', syncParamFields);
+
+        paramsBtn.addEventListener('click', () => {
+            // открываем: подставляем сохранённые значения (если это «Температура»)
+            const values = savedParams[paramSelect.value] || ['', '', ''];
+            tempInputs.forEach((inp, i) => { inp.value = values[i] || ''; });
+            syncParamFields();
+            paramsModal.hidden = false;
+        });
+
+        document.getElementById('params-apply').addEventListener('click', () => {
+            // Активная настройка становится той, что применили.
+            activeParam = paramSelect.value;
+            if (paramSelect.value === 'default') {
+                // «По умолчанию» — сбрасываем все настройки меню и закрываем окно
+                for (const key in savedParams) savedParams[key] = ['', '', ''];
+                tempInputs.forEach(inp => { inp.value = ''; });
+            } else {
+                // иначе сохраняем текущие значения полей
+                savedParams[paramSelect.value] = tempInputs.map(inp => inp.value);
+            }
+            paramsModal.hidden = true;
+        });
+
+        document.getElementById('params-close').addEventListener('click', () => {
+            // закрываем БЕЗ сохранения (правки в полях отбрасываются)
+            paramsModal.hidden = true;
+        });
+
+        paramsModal.addEventListener('click', (e) => {
+            // клик по подложке = «закрыть» (не сохраняем)
+            if (e.target === paramsModal) paramsModal.hidden = true;
+        });
+
         function addHistory(text) {
             // убрать заглушку
             const empty = historyEl.querySelector('.history-empty');
@@ -569,6 +727,45 @@
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
             bubble.textContent = text;
+            wrap.appendChild(bubble);
+            messagesEl.appendChild(wrap);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        // Параметры оценки судьи (ключ в ответе -> заголовок колонки).
+        const JUDGE_PARAMS = [
+            { key: 'accuracy', label: 'Точность' },
+            { key: 'creativity', label: 'Креативность' },
+            { key: 'vocabulary', label: 'Вариативность словарного запаса' },
+            { key: 'conciseness', label: 'Лаконичность' },
+            { key: 'tokens', label: 'Оптимальность затраченных токенов' }
+        ];
+
+        // Рисует сообщение судьи: таблица (строки = температуры) + резюме.
+        function addJudgeTable(rows) {
+            const wrap = document.createElement('div');
+            wrap.className = 'msg bot';
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+
+            let html = '<div class="judge-title">🧑‍⚖️ Судья-аналитик</div>';
+            html += '<table class="judge-table"><thead><tr>';
+            html += '<th>Температура</th>';
+            JUDGE_PARAMS.forEach(p => { html += `<th>${p.label}</th>`; });
+            html += '</tr></thead><tbody>';
+            rows.forEach(r => {
+                html += `<tr><td>${r.temperature}</td>`;
+                JUDGE_PARAMS.forEach(p => { html += `<td>${r[p.key]}</td>`; });
+                html += '</tr>';
+            });
+            html += '</tbody></table>';
+            rows.forEach(r => {
+                if (r.summary) {
+                    html += `<div class="judge-summary"><b>temperature ${r.temperature}:</b> ${r.summary}</div>`;
+                }
+            });
+
+            bubble.innerHTML = html;
             wrap.appendChild(bubble);
             messagesEl.appendChild(wrap);
             messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -602,12 +799,23 @@
                     }
                     maxTokens = num;
                 }
+                // Настройка «Температура»: если активна и есть заполненные поля —
+                // выполняются отдельные запросы по числу заполненных значений.
+                let temperatures = null;
+                const tempValues = (savedParams.temperature || [])
+                    .map(v => v.trim()).filter(Boolean);
+                if (activeParam === 'temperature' && tempValues.length) {
+                    temperatures = tempValues.map(Number);
+                }
                 body = {
                     content,
                     format: formatSelect.value,
                     max_tokens: maxTokens,
                     stop: stopValue
                 };
+                if (temperatures && temperatures.length) {
+                    body.temperatures = temperatures;
+                }
             } else {
                 // Экспертный режим: старые настройки (format/max_tokens/stop) в
                 // модель не отправляются — только выбранный режим и роли.
@@ -635,7 +843,22 @@
                     body: JSON.stringify(body)
                 });
                 const data = await res.json();
-                addMessage('bot', data.bot);
+                // Настройка «Температура»: каждый ответ с отдельным значением —
+                // выводим по одному, затем — резюме судьи-аналитика.
+                if (Array.isArray(data.responses) && data.responses.length) {
+                    data.responses.forEach(r => {
+                        addMessage('bot', `Ответ при значении temperature ${r.temperature}.\n\n${r.text}`);
+                    });
+                    if (data.judge) {
+                        if (Array.isArray(data.judge) && data.judge.length) {
+                            addJudgeTable(data.judge);
+                        } else {
+                            addMessage('bot', `🧑⚖️ Судья-аналитик\n\n${data.judge}`);
+                        }
+                    }
+                } else {
+                    addMessage('bot', data.bot);
+                }
                 // Вердикт о верности выносит сама модель; инкрементируем
                 // счётчик активного в данный момент режима.
                 if (expertOn && (data.correct === true || data.correct === false)) {

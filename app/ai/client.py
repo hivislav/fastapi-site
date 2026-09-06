@@ -37,6 +37,7 @@ def call_llm(
     max_tokens: Optional[int] = None,
     stop: Optional[str] = None,
     system_prompt: Optional[str] = None,
+    temperature: Optional[float] = None,
 ) -> str:
     """Отправляет запрос к реальной модели и возвращает текст ответа.
 
@@ -50,6 +51,8 @@ def call_llm(
     Когда лимит задан, reasoning принудительно отключается (thinking disabled):
     иначе модель тратит бюджет токенов на «размышления» и content не появляется.
     stop принимает одну или несколько (через запятую) stop-последовательностей.
+    temperature — необязательное значение «температуры» модели (0..n), уходит
+    провайдеру как есть. Его задание также отключает reasoning.
 
     Для JSON-режима используется только системная инструкция (без нативного
     response_format=json_object), т.к. он заставляет модель дописывать лишний
@@ -92,10 +95,15 @@ def call_llm(
     if stop_sequences:
         payload["stop"] = stop_sequences
 
-    # Если задано ЛЮБОЕ управление генерацией (лимит токенов, стоп или
-    # экспертный системный промпт) — отключаем reasoning. Иначе reasoning-модель
+    # Настройка «Температура» легла в параметр temperature API. Если задано —
+    # уходит провайдеру ровно как есть (так же, как max_tokens).
+    if temperature is not None:
+        payload["temperature"] = temperature
+
+    # Если задано ЛЮБОЕ управление генерацией (лимит токенов, стоп, температура
+    # или экспертный системный промпт) — отключаем reasoning. Иначе reasoning-модель
     # может потратить бюджет на «размышления» и оставить content пустым.
-    if max_tokens or stop_sequences or expert_mode:
+    if max_tokens or stop_sequences or expert_mode or temperature is not None:
         payload["thinking"] = {"type": "disabled"}
 
     url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"

@@ -31,3 +31,7 @@ class ChatMessage(BaseModel):
     expert_mode_type: ExpertModeType = "direct"
     # Роли экспертов для режима "group". Пустой список — ошибка.
     expert_roles: Optional[List[str]] = Field(default=None)
+    # Настройка «Температура» (обычный режим). Каждое непустое значение —
+    # отдельный запрос к LLM. Пустой/None — параметр не используется
+    # (выполняется один запрос как обычно). Заполненные значения — числа.
+    temperatures: Optional[List[float]] = Field(default=None)

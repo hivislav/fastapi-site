@@ -43,4 +43,4 @@ LLM_MODEL = os.getenv(
     "LLM_MODEL", "gpt://b1gkm5u908if6dc0focb/deepseek-v4-flash/latest"
 )
 LLM_API_KEY = os.getenv("YANDEX_API_KEY", "")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
