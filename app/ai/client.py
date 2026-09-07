@@ -4,6 +4,7 @@
 Не содержит маршрутов и демо-логики — только HTTP-вызов модели.
 """
 
+import asyncio
 import json
 import time
 import urllib.request
@@ -41,6 +42,7 @@ def call_llm(
     temperature: Optional[float] = None,
     model: Optional[str] = None,
     disable_thinking: bool = False,
+    messages: Optional[list] = None,
 ) -> str:
     """Отправляет запрос к реальной модели и возвращает текст ответа.
 
@@ -68,6 +70,11 @@ def call_llm(
     system_prompt — необязательная полностью своя системная инструкция
     (используется экспертными режимами вместо стандартной). Передача своего
     системного промпта также отключает reasoning, как и задание max_tokens/stop.
+
+    messages — необязательный ПОЛНЫЙ список сообщений [{"role", "content"}, ...]
+    (например, system + история диалога + текущий запрос, как у AI-агента).
+    Если задан, используется как есть: response_format/system_prompt не влияют
+    на построение запроса.
     """
     content, _ = _perform_call(
         user_text,
@@ -78,6 +85,7 @@ def call_llm(
         temperature=temperature,
         model=model,
         disable_thinking=disable_thinking,
+        messages=messages,
     )
     return content
 
@@ -91,6 +99,7 @@ def call_llm_with_metrics(
     temperature: Optional[float] = None,
     model: Optional[str] = None,
     disable_thinking: bool = False,
+    messages: Optional[list] = None,
 ) -> tuple:
     """Как call_llm, но дополнительно возвращает метрики запроса.
 
@@ -104,6 +113,9 @@ def call_llm_with_metrics(
     независимо от других параметров. Нужно для честного/быстрого сравнения
     моделей: иначе reasoning-модель (deepseek) тратит время на цепочку
     размышлений и отвечает в разы дольше остальных.
+
+    messages — см. call_llm: полный список сообщений вместо схемы
+    [system, user], используется AI-агентом.
     """
     return _perform_call(
         user_text,
@@ -114,6 +126,38 @@ def call_llm_with_metrics(
         temperature=temperature,
         model=model,
         disable_thinking=disable_thinking,
+        messages=messages,
+    )
+
+
+async def call_llm_async(
+    user_text: str,
+    response_format: str = "free",
+    max_tokens: Optional[int] = None,
+    stop: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    temperature: Optional[float] = None,
+    model: Optional[str] = None,
+    disable_thinking: bool = False,
+    messages: Optional[list] = None,
+) -> tuple:
+    """Асинхронная версия вызова LLM: (content, metrics|None).
+
+    Синхронный HTTP-запрос выполняется в отдельном потоке (asyncio.to_thread),
+    поэтому агента можно использовать из async-кода FastAPI/Flask, не блокируя
+    event loop. Параметры — как у call_llm_with_metrics.
+    """
+    return await asyncio.to_thread(
+        _perform_call,
+        user_text=user_text,
+        response_format=response_format,
+        max_tokens=max_tokens,
+        stop=stop,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        model=model,
+        disable_thinking=disable_thinking,
+        messages=messages,
     )
 
 
@@ -126,28 +170,42 @@ def _perform_call(
     temperature: Optional[float] = None,
     model: Optional[str] = None,
     disable_thinking: bool = False,
+    messages: Optional[list] = None,
 ) -> tuple:
-    """Низкоуровневый вызов: возвращает (content, metrics|None)."""
+    """Низкоуровневый вызов: возвращает (content, metrics|None).
+
+    messages — необязательный полный список сообщений (AI-агент), иначе
+    строится стандартная схема [system, user] из остальных параметров.
+    """
     if not config.LLM_API_KEY:
         return "", None
 
-    if system_prompt is not None:
-        system_prompt_content = system_prompt
+    if messages is None:
+        # Стандартная схема запроса: системная инструкция (своя или базовая +
+        # дополнение для JSON) и один user-запрос.
+        if system_prompt is not None:
+            system_prompt_content = system_prompt
+        else:
+            system_prompt_content = SYSTEM_PROMPT
+            if response_format == "json":
+                system_prompt_content += SYSTEM_PROMPT_JSON
+        # Свой системный промпт считается экспертной инструкцией: reasoning
+        # отключаем, чтобы весь бюджет ушёл на сам ответ.
+        expert_mode = system_prompt is not None
+        payload_messages = [
+            {"role": "system", "content": system_prompt_content},
+            {"role": "user", "content": user_text},
+        ]
     else:
-        system_prompt_content = SYSTEM_PROMPT
-        if response_format == "json":
-            system_prompt_content += SYSTEM_PROMPT_JSON
-    # Свой системный промпт считается экспертной инструкцией: reasoning
-    # отключаем, чтобы весь бюджет ушёл на сам ответ.
-    expert_mode = system_prompt is not None
+        # Полный список сообщений задан вызывающим кодом (AI-агент сам собрал
+        # системный промпт + историю + запрос) — используем как есть.
+        expert_mode = False
+        payload_messages = messages
 
     used_model = model or config.LLM_MODEL
     payload = {
         "model": used_model,
-        "messages": [
-            {"role": "system", "content": system_prompt_content},
-            {"role": "user", "content": user_text},
-        ],
+        "messages": payload_messages,
         "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
     }
 

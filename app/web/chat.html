@@ -148,6 +148,19 @@
             color: #333;
             border-bottom-left-radius: 4px;
         }
+        /* Сообщения-отладка режима «AI-агент»: чем агент занят сейчас */
+        .msg.debug { justify-content: flex-start; }
+        .msg.debug .bubble {
+            background: rgba(255, 255, 255, 0.7);
+            border: 1px dashed #b9b2d9;
+            color: #6f6790;
+            font-size: 0.78rem;
+            line-height: 1.35;
+            padding: 6px 10px;
+            border-radius: 10px;
+            max-width: 85%;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
         .input-row {
             display: flex;
             gap: 10px;
@@ -199,7 +212,7 @@
             flex-wrap: wrap;
         }
         [hidden] { display: none !important; }
-        #expert-toggle {
+        #expert-toggle, #agent-toggle {
             padding: 8px 12px;
             border: 2px solid #fff;
             border-radius: 8px;
@@ -209,8 +222,8 @@
             cursor: pointer;
             transition: background 0.2s, color 0.2s, border-color 0.2s;
         }
-        #expert-toggle:hover { background: rgba(255, 255, 255, 0.2); }
-        #expert-toggle.active {
+        #expert-toggle:hover, #agent-toggle:hover { background: rgba(255, 255, 255, 0.2); }
+        #expert-toggle.active, #agent-toggle.active {
             background: #fff;
             color: #5b4bb8;
             border-color: #fff;
@@ -439,6 +452,7 @@
                         </div>
                     </div>
                     <button id="expert-toggle" type="button" title="Экспертный режим">Экспертный режим</button>
+                    <button id="agent-toggle" type="button" title="AI-агент: агент сам выбирает параметры генерации и ведёт историю диалога">AI-агент</button>
                 </div>
                 <div class="chat-settings">
                     <div class="basic-settings" id="basic-settings">
@@ -551,6 +565,7 @@
         const maxLengthInput = document.getElementById('max-length');
         const formatSelect = document.getElementById('format');
         const stopInput = document.getElementById('stop-condition');
+        const agentToggle = document.getElementById('agent-toggle');
 
         // Поле «Длина» принимает только целые числа (не пропускаем не-цифры).
         maxLengthInput.addEventListener('input', () => {
@@ -620,7 +635,25 @@
         }
 
         expertToggle.addEventListener('click', () => {
-            setExpertMode(!expertToggle.classList.contains('active'));
+            const on = !expertToggle.classList.contains('active');
+            if (on) setAgentMode(false);  // режимы взаимоисключающие
+            setExpertMode(on);
+        });
+
+        // ---------- Режим «AI-агент» ----------
+        // Включается отдельной кнопкой в шапке. Агент сам ведёт историю диалога,
+        // подбирает параметры генерации и шлёт debug-сообщения о своей работе.
+        function setAgentMode(on) {
+            agentToggle.classList.toggle('active', !!on);
+            document.body.classList.toggle('agent-mode', !!on);
+            // Настройки «Параметры» (температура/тест моделей) в этом режиме
+            // не действуют — скрываем шестерёнку, пока агент включён.
+            paramsBtn.hidden = !!on;
+            if (on) setExpertMode(false);  // агент несовместим с экспертным режимом
+        }
+
+        agentToggle.addEventListener('click', () => {
+            setAgentMode(!agentToggle.classList.contains('active'));
         });
 
         expertRadios.forEach(r => {
@@ -854,9 +887,84 @@
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
+        // Отправка в режиме «AI-агент»: сервер отвечает NDJSON-потоком событий.
+        // Каждое debug-событие показываем отдельным сообщением по мере прихода,
+        // затем — финальный ответ (bot). Событие 'done' служебное — не рисуем.
+        async function sendAgentRequest(body) {
+            typingEl.textContent = 'AI-агент думает...';
+            try {
+                const res = await fetch('/api/agent/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                if (!res.ok) {
+                    const text = await res.text();
+                    addMessage('bot', '⚠️ ' + (text || 'Ошибка сервера.'));
+                    return;
+                }
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    let nl;
+                    while ((nl = buf.indexOf('\n')) !== -1) {
+                        const line = buf.slice(0, nl).trim();
+                        buf = buf.slice(nl + 1);
+                        if (!line) continue;
+                        let ev;
+                        try { ev = JSON.parse(line); } catch (e) { continue; }
+                        if (ev.type === 'debug') {
+                            addMessage('debug', ev.text);
+                        } else if (ev.type === 'bot') {
+                            addMessage('bot', ev.text);
+                        } else if (ev.type === 'error') {
+                            addMessage('bot', '⚠️ ' + ev.text);
+                        }
+                    }
+                }
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.');
+            } finally {
+                typingEl.textContent = '';
+                sendBtn.disabled = false;
+                input.focus();
+            }
+        }
+
         async function send() {
             const content = input.value.trim();
             if (!content) return;
+
+            // Режим «AI-агент»: длина проверяется как обычно; эксперт/параметры
+            // не участвуют, ответ приходит потоком debug-сообщений агента.
+            if (agentToggle.classList.contains('active')) {
+                let maxTokens = null;
+                const rawLength = maxLengthInput.value.trim();
+                if (rawLength !== '') {
+                    const num = Number(rawLength);
+                    if (!/^\d+$/.test(rawLength) || num < 1) {
+                        addMessage('bot', '⚠️ Длина ответа должна быть целым числом больше нуля.');
+                        input.focus();
+                        return;
+                    }
+                    maxTokens = num;
+                }
+                input.value = '';
+                sendBtn.disabled = true;
+                addMessage('user', content);
+                addHistory(content);
+                await sendAgentRequest({
+                    content,
+                    format: formatSelect.value,
+                    max_tokens: maxTokens,
+                    stop: stopInput.value.trim() || null
+                });
+                return;
+            }
 
             const expertOn = expertToggle.classList.contains('active');
             const expertMode = (expertRadios.find(r => r.checked) || expertRadios[0]).value;
