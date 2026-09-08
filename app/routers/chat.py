@@ -4,6 +4,10 @@
 потоковый POST /api/agent/chat для режима «AI-агент»: сервер отдаёт NDJSON,
 каждая строка — событие агента (debug/bot/error), которое фронтенд выводит
 в чат отдельным сообщением по мере появления.
+
+История диалога «AI-агента» переживает перезапуск приложения: память
+загружается из JSON-файла при старте процесса и сохраняется туда после
+каждого обмена репликами (см. app/ai/agent_memory.py).
 """
 
 import asyncio
@@ -16,6 +20,7 @@ from fastapi.responses import StreamingResponse
 
 from app.ai import service
 from app.ai.agent import Agent, AgentConfig
+from app.ai.agent_memory import load_agent_memory, save_agent_memory
 from app.schemas import ChatMessage
 
 logger = logging.getLogger(__name__)
@@ -25,7 +30,9 @@ router = APIRouter(prefix="/api")
 # Память диалога режима «AI-агент»: список {"role", "content"} всех реплик
 # агентского диалога в рамках процесса. Сериализуется блокировкой — агент
 # работает асинхронно, а память у нас одна на приложение.
-_agent_memory: List[Dict[str, str]] = []
+# При старте процесса история восстанавливается из JSON-файла (если он есть),
+# поэтому после перезапуска диалог продолжается с того же места.
+_agent_memory: List[Dict[str, str]] = load_agent_memory()
 _agent_lock = asyncio.Lock()
 
 
@@ -101,8 +108,13 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
             async with _agent_lock:
                 async for event in agent.stream_generate(msg.content, history=_agent_memory):
                     yield encode(event)
-                # Обработка завершена — сохраняем обновлённую память диалога.
+                # Обработка завершена — сохраняем обновлённую память диалога и
+                # записываем её в файл, чтобы история пережила перезапуск.
                 _agent_memory[:] = list(agent.memory)
+                try:
+                    await asyncio.to_thread(save_agent_memory, list(agent.memory))
+                except Exception:  # noqa: BLE001 — сбой сохранения не должен рвать диалог
+                    logger.warning("Не удалось сохранить историю диалога AI-агента", exc_info=True)
         except asyncio.CancelledError:
             raise  # клиент отключился — просто останавливаем поток
         except Exception as exc:  # noqa: BLE001
@@ -110,3 +122,34 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
             yield encode({"type": "error", "text": "Внутренняя ошибка агента. Попробуйте ещё раз."})
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@router.get("/agent/history")
+async def agent_history() -> dict:
+    """Сохранённая история диалога режима «AI-агент».
+
+    Отдаёт {"messages": [{"role": "user"|"assistant", "content": "..."}, ...]} —
+    тот же список, который агент использует как память диалога (загружен из
+    файла при старте процесса). Фронтенд вызывает этот маршрут при открытии
+    страницы, чтобы нарисовать старые реплики в окне чата и в «Истории
+    введённых данных» — диалог выглядит так, будто агент не выключался.
+    """
+    async with _agent_lock:
+        return {"messages": list(_agent_memory)}
+
+
+@router.delete("/agent/history")
+async def agent_history_clear() -> dict:
+    """Очищает историю диалога режима «AI-агент».
+
+    Стирает память диалога в процессе и сохраняет пустую историю в JSON-файл,
+    чтобы после перезапуска приложения диалог не восстановился. Вызывается по
+    кнопке «Очистить историю» рядом с «Отправить» в режиме агента.
+    """
+    async with _agent_lock:
+        _agent_memory.clear()
+        try:
+            await asyncio.to_thread(save_agent_memory, [])
+        except Exception:  # noqa: BLE001 — сбой записи не должен рвать запрос
+            logger.warning("Не удалось сохранить очищенную историю AI-агента", exc_info=True)
+    return {"ok": True}

@@ -7,15 +7,16 @@
 
 import os
 
+# Корень проекта: каталог, где лежат main.py, .env, data/ и т.п.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # ---------------------------------------------------------------------------
 # Простая загрузка .env (без внешней зависимости): читает KEY=VALUE строки
 # из файла .env рядом с корнем проекта, не перезаписывая уже заданные
 # переменные окружения.
 # ---------------------------------------------------------------------------
 def load_dotenv() -> None:
-    env_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
-    )
+    env_path = os.path.join(PROJECT_ROOT, ".env")
     if not os.path.isfile(env_path):
         return
     with open(env_path, "r", encoding="utf-8") as fh:
@@ -44,3 +45,11 @@ LLM_MODEL = os.getenv(
 )
 LLM_API_KEY = os.getenv("YANDEX_API_KEY", "")
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
+
+# Файл, в котором хранится история диалога режима «AI-агент» (JSON).
+# По умолчанию — data/agent_memory.json в корне проекта; путь можно
+# переопределить переменной окружения AGENT_MEMORY_FILE (например, в тестах).
+AGENT_MEMORY_FILE = os.getenv(
+    "AGENT_MEMORY_FILE",
+    os.path.join(PROJECT_ROOT, "data", "agent_memory.json"),
+)

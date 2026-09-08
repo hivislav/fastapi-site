@@ -199,6 +199,15 @@
             line-height: 1;
         }
         .input-row .gear-btn:hover { background: #e0e5fb; color: #3a2e7a; }
+        /* Кнопка «Очистить историю» — видна только в режиме «AI-агент» */
+        .input-row .clear-btn {
+            background: #fdecec;
+            color: #b3403a;
+            padding: 12px 16px;
+            font-size: 0.9rem;
+        }
+        .input-row .clear-btn:hover { background: #f6d4d4; color: #8f2f2a; }
+        .input-row .clear-btn:disabled { background: #ddd; color: #999; cursor: not-allowed; }
         .typing {
             color: #888;
             font-size: 0.85rem;
@@ -542,6 +551,7 @@
             <div class="input-row">
                 <input id="input" type="text" placeholder="Введите сообщение..." autocomplete="off">
                 <button id="send">Отправить</button>
+                <button id="agent-clear" class="clear-btn" type="button" title="Очистить историю диалога AI-агента" hidden>🗑 Очистить историю</button>
                 <button id="params-btn" class="gear-btn" type="button" title="Параметры">⚙️</button>
             </div>
         </main>
@@ -559,7 +569,9 @@
     <script>
         const input = document.getElementById('input');
         const sendBtn = document.getElementById('send');
+        const agentClearBtn = document.getElementById('agent-clear');
         const messagesEl = document.getElementById('messages');
+        const greetingMsg = messagesEl.querySelector('.msg'); // статичное приветствие чата
         const historyEl = document.getElementById('history');
         const typingEl = document.getElementById('typing');
         const maxLengthInput = document.getElementById('max-length');
@@ -649,7 +661,20 @@
             // Настройки «Параметры» (температура/тест моделей) в этом режиме
             // не действуют — скрываем шестерёнку, пока агент включён.
             paramsBtn.hidden = !!on;
-            if (on) setExpertMode(false);  // агент несовместим с экспертным режимом
+            // Кнопка «Очистить историю» видна только в режиме агента.
+            agentClearBtn.hidden = !on;
+            if (!on) {
+                // Обычный режим контекст не хранит: убираем агентский диалог
+                // (восстановленный + реплики сеанса агента) из окна чата и из
+                // «Истории введённых данных» — в обычном режиме его быть не должно.
+                removeAgentConversation();
+                return;
+            }
+            setExpertMode(false);  // агент несовместим с экспертным режимом
+            // Старый диалог восстанавливаем ТОЛЬКО при включении агента:
+            // в обычном режиме модель не помнит контекст переписки, поэтому
+            // показывать там прошлые реплики нельзя.
+            restoreAgentHistory();
         }
 
         agentToggle.addEventListener('click', () => {
@@ -788,24 +813,96 @@
             if (e.target === paramsModal) paramsModal.hidden = true;
         });
 
-        function addHistory(text) {
+        // agentMsg=true помечает узел как принадлежащий диалогу «AI-агента»:
+        // при выключении режима такие узлы убираются из окна (см.
+        // removeAgentConversation), потому что в обычном режиме контекст
+        // переписки не хранится.
+        function addHistory(text, agentMsg) {
             // убрать заглушку
             const empty = historyEl.querySelector('.history-empty');
             if (empty) empty.remove();
             const div = document.createElement('div');
             div.className = 'history-item';
             div.textContent = text;
+            if (agentMsg) div.setAttribute('data-agent', '1');
             historyEl.prepend(div);
+            return div;
         }
 
-        function addMessage(role, text) {
+        function addMessage(role, text, agentMsg) {
             const wrap = document.createElement('div');
             wrap.className = 'msg ' + role;
+            if (agentMsg) wrap.setAttribute('data-agent', '1');
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
             bubble.textContent = text;
             wrap.appendChild(bubble);
             messagesEl.appendChild(wrap);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            return wrap;
+        }
+
+        // Восстановление диалога «AI-агента»: вызывается ТОЛЬКО при включении
+        // режима агента (обычный режим контекст не хранит — прошлая переписка
+        // там не показывается). Сохранённые реплики рисуются в окне чата,
+        // запросы пользователя — в «Истории введённых данных».
+        async function restoreAgentHistory() {
+            try {
+                const res = await fetch('/api/agent/history');
+                if (!res.ok) return;
+                const data = await res.json();
+                const msgs = Array.isArray(data.messages) ? data.messages : [];
+                // Пользователь уже начал переписку (в обычном режиме или в этом
+                // же сеансе агента) — старую историю не рисуем, чтобы не смешать.
+                if (msgs.length && !messagesEl.querySelector('.msg.user')) {
+                    for (const m of msgs) {
+                        if (m.role === 'user') {
+                            addMessage('user', m.content, true);
+                            addHistory(m.content, true);
+                        } else if (m.role === 'assistant') {
+                            addMessage('bot', m.content, true);
+                        }
+                    }
+                    messagesEl.scrollTop = messagesEl.scrollHeight;
+                }
+            } catch (e) {
+                // история недоступна — просто пустой чат
+            }
+        }
+
+        // Выключение агента: агентский диалог (восстановленный + реплики
+        // текущего сеанса агента) убирается из окна чата и из «Истории
+        // введённых данных». В обычном/экспертном режимах модель не хранит
+        // контекст переписки, поэтому диалог агента там показываться не должен.
+        function removeAgentConversation() {
+            messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
+            historyEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
+            // Если в «Истории» не осталось записей — вернуть заглушку.
+            if (!historyEl.querySelector('.history-item')
+                    && !historyEl.querySelector('.history-empty')) {
+                historyEl.innerHTML = '<div class="history-empty">Здесь появится, что вы вводили</div>';
+            }
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        // Кнопка «Очистить историю» (только в режиме «AI-агент»): стирает диалог
+        // на сервере (память + JSON-файл) и убирает реплики из окна чата и из
+        // «Истории введённых данных». Приветствие чата остаётся на месте.
+        async function clearAgentHistory() {
+            try {
+                const res = await fetch('/api/agent/history', { method: 'DELETE' });
+                if (!res.ok) {
+                    addMessage('bot', '⚠️ Не удалось очистить историю. Попробуйте ещё раз.');
+                    return;
+                }
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.');
+                return;
+            }
+            messagesEl.querySelectorAll('.msg').forEach(el => {
+                if (el !== greetingMsg) el.remove();
+            });
+            historyEl.innerHTML = '<div class="history-empty">Здесь появится, что вы вводили</div>';
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
@@ -892,6 +989,10 @@
         // затем — финальный ответ (bot). Событие 'done' служебное — не рисуем.
         async function sendAgentRequest(body) {
             typingEl.textContent = 'AI-агент думает...';
+            // Пока агент отвечает, очистку истории блокируем — иначе реплики
+            // потока перемешались бы с удалением.
+            sendBtn.disabled = true;
+            agentClearBtn.disabled = true;
             try {
                 const res = await fetch('/api/agent/chat', {
                     method: 'POST',
@@ -900,7 +1001,7 @@
                 });
                 if (!res.ok) {
                     const text = await res.text();
-                    addMessage('bot', '⚠️ ' + (text || 'Ошибка сервера.'));
+                    addMessage('bot', '⚠️ ' + (text || 'Ошибка сервера.'), true);
                     return;
                 }
                 const reader = res.body.getReader();
@@ -917,20 +1018,25 @@
                         if (!line) continue;
                         let ev;
                         try { ev = JSON.parse(line); } catch (e) { continue; }
+                        // Режим агента выключили во время ответа — события не
+                        // рисуем (агентский диалог уже убран из окна), но поток
+                        // дочитываем, чтобы сервер завершил сохранение истории.
+                        if (!agentToggle.classList.contains('active')) continue;
                         if (ev.type === 'debug') {
-                            addMessage('debug', ev.text);
+                            addMessage('debug', ev.text, true);
                         } else if (ev.type === 'bot') {
-                            addMessage('bot', ev.text);
+                            addMessage('bot', ev.text, true);
                         } else if (ev.type === 'error') {
-                            addMessage('bot', '⚠️ ' + ev.text);
+                            addMessage('bot', '⚠️ ' + ev.text, true);
                         }
                     }
                 }
             } catch (e) {
-                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.');
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
             } finally {
                 typingEl.textContent = '';
                 sendBtn.disabled = false;
+                agentClearBtn.disabled = false;
                 input.focus();
             }
         }
@@ -955,8 +1061,8 @@
                 }
                 input.value = '';
                 sendBtn.disabled = true;
-                addMessage('user', content);
-                addHistory(content);
+                addMessage('user', content, true);
+                addHistory(content, true);
                 await sendAgentRequest({
                     content,
                     format: formatSelect.value,
@@ -1082,6 +1188,11 @@
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') send();
         });
+        agentClearBtn.addEventListener('click', clearAgentHistory);
+
+        // Открытие страницы с нуля: скролл окна чата — внизу, как в типичных
+        // чатах. История не рисуется, пока пользователь не включит агента.
+        messagesEl.scrollTop = messagesEl.scrollHeight;
         input.focus();
     </script>
 </body>
