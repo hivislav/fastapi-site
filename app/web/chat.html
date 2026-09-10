@@ -408,6 +408,62 @@
         .stats-table td:nth-child(1) { color: #333; }
         .stats-table td:nth-child(2),
         .stats-table td:nth-child(3) { text-align: center; color: #333; }
+        /* ---------- Панель «Токены диалога» (режим «AI-агент») ---------- */
+        /* Занимает ровно то же место и тот же размер, что панель статистики
+           в экспертном режиме: третья колонка справа (520px), высота 50vh. */
+        body.agent-mode .layout {
+            grid-template-columns: 260px 1fr 520px;
+            max-width: 1760px;
+        }
+        /* Диаграмма не влезала в 50vh как у статистики: в режиме агента панель
+           выше в 1.5 раза (50vh -> 75vh), поэтому сама диаграмма (flex:1)
+           получает в полтора раза больше высоты. */
+        body.agent-mode .stats { height: 75vh; }
+        /* Диаграмма расхода токенов растягивается на свободное место панели,
+           под ней — легенда и таблица. */
+        .agent-chart {
+            position: relative;
+            flex: 1 1 auto;
+            min-height: 165px;
+            margin-bottom: 4px;
+        }
+        /* Легенда: две линии диаграммы — входящие и исходящие токены. */
+        .agent-legend {
+            display: flex;
+            gap: 14px;
+            font-size: 0.72rem;
+            color: #333;
+            margin: 2px 0 4px;
+        }
+        .agent-legend i {
+            display: inline-block;
+            width: 14px;
+            height: 2px;
+            margin-right: 5px;
+            vertical-align: middle;
+        }
+        /* SVG растягивается на всю высоту блока (панель — flex-колонка),
+           пропорции держит preserveAspectRatio на стороне диаграммы. */
+        .agent-chart svg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        .agent-table { font-size: 0.78rem; margin-top: 6px; table-layout: fixed; }
+        .agent-table th,
+        .agent-table td { padding: 6px 3px; line-height: 1.15; }
+        .agent-table th {
+            font-size: 0.68rem;
+            color: #5b4bb8;
+            font-weight: 600;
+            text-align: center;
+            vertical-align: bottom;
+        }
+        .agent-table td:first-child { text-align: left; }
+        .agent-table td:not(:first-child) { text-align: center; color: #333; }
+        .agent-hint { margin-top: 6px; font-size: 0.68rem; color: #777; line-height: 1.25; }
         /* ---------- Таблица судьи-аналитика ---------- */
         .judge-title { font-weight: 600; color: #4a3b8f; margin-bottom: 8px; }
         .judge-table {
@@ -435,7 +491,9 @@
             .layout { grid-template-columns: 1fr; }
             .sidebar { display: none; }
             body.expert-mode .layout { grid-template-columns: 1fr; max-width: none; }
+            body.agent-mode .layout { grid-template-columns: 1fr; max-width: none; }
             .stats { height: auto; max-height: 50vh; }
+            body.agent-mode .stats { max-height: 75vh; }
         }
     </style>
 </head>
@@ -564,6 +622,30 @@
                 <tbody id="stats-body"></tbody>
             </table>
         </aside>
+        <!-- Панель режима «AI-агент»: диаграмма расхода токенов по запросам
+             диалога + таблица «текущий запрос / весь диалог». Место и размер
+             те же, что у панели статистики в экспертном режиме. -->
+        <aside class="stats" id="agent-panel" hidden>
+            <h2>Токены диалога</h2>
+            <div id="agent-chart" class="agent-chart"></div>
+            <div class="agent-legend">
+                <span><i style="background:#e07b39"></i>Исходящие токены</span>
+                <span><i style="background:#667eea"></i>Входящие токены</span>
+            </div>
+            <table class="stats-table agent-table">
+                <thead>
+                    <tr>
+                        <th>Тип</th>
+                        <th>Количество запросов</th>
+                        <th>Исходящих токенов</th>
+                        <th>Входящих токенов</th>
+                        <th>Сумма токенов</th>
+                    </tr>
+                </thead>
+                <tbody id="agent-stats-body"></tbody>
+            </table>
+            <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса.</div>
+        </aside>
     </div>
 
     <script>
@@ -632,6 +714,144 @@
             renderStats();
         }
 
+        // ---------- Панель «Токены диалога» (режим «AI-агент») ----------
+        const agentPanel = document.getElementById('agent-panel');
+        const agentChart = document.getElementById('agent-chart');
+        const agentStatsBody = document.getElementById('agent-stats-body');
+        // agentUsage — по одному замеру на запрос пользователя:
+        // {requests, input, output, limit, overflow}. Замер приходит с событием
+        // "done" агентского потока и восстанавливается с сервера вместе с
+        // историей диалога (GET /api/agent/history).
+        let agentUsage = [];
+        // Шаг вертикальной оси диаграммы — 200 токенов.
+        const AGENT_CHART_STEP = 200;
+
+        function usageSum(u) {
+            return (Number(u.input) || 0) + (Number(u.output) || 0);
+        }
+
+        function renderAgentPanel() {
+            renderAgentChart();
+            renderAgentStats();
+        }
+
+        // Таблица под диаграммой: «Текущий запрос» — последний замер,
+        // «Весь диалог» — сумма по всем запросам текущей переписки.
+        function renderAgentStats() {
+            const last = agentUsage.length ? agentUsage[agentUsage.length - 1] : null;
+            let input = 0;
+            let output = 0;
+            agentUsage.forEach(u => {
+                input += Number(u.input) || 0;
+                output += Number(u.output) || 0;
+            });
+            const rows = [
+                {
+                    label: 'Текущий запрос',
+                    requests: last ? (Number(last.requests) || 1) : 0,
+                    input: last ? (Number(last.input) || 0) : 0,
+                    output: last ? (Number(last.output) || 0) : 0
+                },
+                { label: 'Весь диалог', requests: agentUsage.length, input: input, output: output }
+            ];
+            agentStatsBody.innerHTML = '';
+            rows.forEach(r => {
+                const tr = document.createElement('tr');
+                [r.label, r.requests, r.output, r.input, r.input + r.output].forEach(v => {
+                    const td = document.createElement('td');
+                    td.textContent = v;
+                    tr.appendChild(td);
+                });
+                agentStatsBody.appendChild(tr);
+            });
+        }
+
+        // Диаграмма: по оси X — номера запросов пользователя в истории (шаг 1,
+        // от 0 до текущего числа запросов), по оси Y — накопленные затраченные
+        // токены (шаг 200 токенов, от 0 до текущего значения). Две линии:
+        // входящие токены (промпт) и исходящие токены (ответ модели).
+        function renderAgentChart() {
+            const W = 460;
+            const H = 285;  // в 1.5 раза выше прежних 190
+            const L = 62;   // отступ слева — под подписи оси Y
+            const R = 10;
+            const T = 16;
+            const B = 30;
+            const plotW = W - L - R;
+            const plotH = H - T - B;
+            // Накопленные суммы по запросам: точка 0 — начало диалога, далее по
+            // одному узлу на каждый запрос пользователя.
+            const inputTotals = [0];
+            const outputTotals = [0];
+            let accIn = 0;
+            let accOut = 0;
+            agentUsage.forEach(u => {
+                accIn += Number(u.input) || 0;
+                accOut += Number(u.output) || 0;
+                inputTotals.push(accIn);
+                outputTotals.push(accOut);
+            });
+            const requests = agentUsage.length;
+            const peak = Math.max(accIn, accOut);
+
+            // Ось Y: шаг 200 токенов; при большом расходе шаг укрупняется
+            // (×2, ×5, ×10 … — значения остаются кратными 200 токенов),
+            // иначе подписи слились бы и сетка превратилась в штриховку.
+            const steps = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+            let step = AGENT_CHART_STEP * steps[steps.length - 1];
+            for (const k of steps) {
+                step = AGENT_CHART_STEP * k;
+                if (peak / step <= 10) break;
+            }
+            const yMax = Math.max(step, Math.ceil(peak / step) * step);
+
+            const xOf = i => L + (requests ? (i / requests) * plotW : 0);
+            const yOf = v => T + plotH - (v / yMax) * plotH;
+
+            const parts = [];
+            parts.push(`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" role="img">`);
+            // Горизонтальная сетка с подписями: 0, 200, 400, ... токенов.
+            for (let v = 0; v <= yMax + 0.5; v += step) {
+                const y = yOf(v).toFixed(1);
+                parts.push(`<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="#e8e8f2" stroke-width="1"/>`);
+                parts.push(`<text x="${L - 6}" y="${(yOf(v) + 3).toFixed(1)}" text-anchor="end" font-size="9" fill="#8a86a8">${v}</text>`);
+            }
+            // Вертикальные линии — по одной на запрос (шаг 1 запрос).
+            for (let i = 1; i <= requests; i++) {
+                const x = xOf(i).toFixed(1);
+                parts.push(`<line x1="${x}" y1="${T}" x2="${x}" y2="${T + plotH}" stroke="#f2f2f8" stroke-width="1"/>`);
+            }
+            // Оси.
+            parts.push(`<line x1="${L}" y1="${T}" x2="${L}" y2="${T + plotH}" stroke="#c9c6dd" stroke-width="1"/>`);
+            parts.push(`<line x1="${L}" y1="${T + plotH}" x2="${W - R}" y2="${T + plotH}" stroke="#c9c6dd" stroke-width="1"/>`);
+            // Подписи оси X: номер запроса (каждый, если их немного).
+            let labelStep = 1;
+            while (requests / labelStep > 12) labelStep *= 2;
+            for (let i = 0; i <= requests; i++) {
+                if (i % labelStep !== 0 && i !== requests) continue;
+                parts.push(`<text x="${xOf(i).toFixed(1)}" y="${T + plotH + 15}" text-anchor="middle" font-size="9" fill="#8a86a8">${i}</text>`);
+            }
+            // Линии расхода токенов: исходящие (оранжевая) и входящие (синяя).
+            const series = [
+                { values: outputTotals, color: '#e07b39' },
+                { values: inputTotals, color: '#667eea' }
+            ];
+            series.forEach(s => {
+                const points = s.values.map((v, i) => `${xOf(i).toFixed(1)},${yOf(v).toFixed(1)}`).join(' ');
+                parts.push(`<polyline points="${points}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round"/>`);
+                s.values.forEach((v, i) => {
+                    parts.push(`<circle cx="${xOf(i).toFixed(1)}" cy="${yOf(v).toFixed(1)}" r="2.4" fill="${s.color}"/>`);
+                });
+            });
+            parts.push(`<text x="${L}" y="${T - 5}" font-size="9" fill="#8a86a8">токены</text>`);
+            parts.push(`<text x="${W - R}" y="${H - 4}" text-anchor="end" font-size="9" fill="#8a86a8">запросов: ${requests}</text>`);
+            if (!requests) {
+                parts.push(`<text x="${L + plotW / 2}" y="${T + plotH / 2}" text-anchor="middle" font-size="10" fill="#b3b0c8">Пока нет запросов</text>`);
+            }
+            parts.push('</svg>');
+            agentChart.innerHTML = parts.join('');
+        }
+
         function setExpertMode(on) {
             expertToggle.classList.toggle('active', !!on);
             basicSettings.hidden = !!on;   // старые настройки скрываются
@@ -658,6 +878,9 @@
         function setAgentMode(on) {
             agentToggle.classList.toggle('active', !!on);
             document.body.classList.toggle('agent-mode', !!on);
+            // Панель «Токены диалога» — только в режиме агента (то же место и
+            // размер, что у панели статистики в экспертном режиме).
+            agentPanel.hidden = !on;
             // Настройки «Параметры» (температура/тест моделей) в этом режиме
             // не действуют — скрываем шестерёнку, пока агент включён.
             paramsBtn.hidden = !!on;
@@ -667,13 +890,17 @@
                 // Обычный режим контекст не хранит: убираем агентский диалог
                 // (восстановленный + реплики сеанса агента) из окна чата и из
                 // «Истории введённых данных» — в обычном режиме его быть не должно.
+                agentUsage = [];
+                renderAgentPanel();
                 removeAgentConversation();
                 return;
             }
             setExpertMode(false);  // агент несовместим с экспертным режимом
-            // Старый диалог восстанавливаем ТОЛЬКО при включении агента:
-            // в обычном режиме модель не помнит контекст переписки, поэтому
-            // показывать там прошлые реплики нельзя.
+            // Данные панели токенов и старый диалог подтягиваем ТОЛЬКО при
+            // включении агента: в обычном режиме модель не помнит контекст
+            // переписки, поэтому показывать там прошлые реплики нельзя.
+            agentUsage = [];
+            renderAgentPanel();
             restoreAgentHistory();
         }
 
@@ -852,6 +1079,10 @@
                 if (!res.ok) return;
                 const data = await res.json();
                 const msgs = Array.isArray(data.messages) ? data.messages : [];
+                // Расход токенов по запросам — для панели «Токены диалога»:
+                // обновляем её всегда, даже если реплики в чат не рисуем.
+                agentUsage = Array.isArray(data.usage) ? data.usage : [];
+                renderAgentPanel();
                 // Пользователь уже начал переписку (в обычном режиме или в этом
                 // же сеансе агента) — старую историю не рисуем, чтобы не смешать.
                 if (msgs.length && !messagesEl.querySelector('.msg.user')) {
@@ -903,6 +1134,9 @@
                 if (el !== greetingMsg) el.remove();
             });
             historyEl.innerHTML = '<div class="history-empty">Здесь появится, что вы вводили</div>';
+            // Панель токенов — тоже начисто: истории больше нет.
+            agentUsage = [];
+            renderAgentPanel();
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
@@ -1028,6 +1262,10 @@
                             addMessage('bot', ev.text, true);
                         } else if (ev.type === 'error') {
                             addMessage('bot', '⚠️ ' + ev.text, true);
+                        } else if (ev.type === 'done' && ev.usage) {
+                            // Замер токенов запроса — панель «Токены диалога».
+                            agentUsage.push(ev.usage);
+                            renderAgentPanel();
                         }
                     }
                 }

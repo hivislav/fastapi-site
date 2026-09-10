@@ -140,12 +140,17 @@ async def call_llm_async(
     model: Optional[str] = None,
     disable_thinking: bool = False,
     messages: Optional[list] = None,
+    omit_default_max_tokens: bool = False,
 ) -> tuple:
     """Асинхронная версия вызова LLM: (content, metrics|None).
 
     Синхронный HTTP-запрос выполняется в отдельном потоке (asyncio.to_thread),
     поэтому агента можно использовать из async-кода FastAPI/Flask, не блокируя
     event loop. Параметры — как у call_llm_with_metrics.
+
+    omit_default_max_tokens=True — если max_tokens не задан, параметр вообще
+    НЕ отправляется в API (действует предел провайдера), а не подставляется
+    лимит приложения config.LLM_MAX_TOKENS. Использует AI-агент.
     """
     return await asyncio.to_thread(
         _perform_call,
@@ -158,6 +163,7 @@ async def call_llm_async(
         model=model,
         disable_thinking=disable_thinking,
         messages=messages,
+        omit_default_max_tokens=omit_default_max_tokens,
     )
 
 
@@ -171,6 +177,7 @@ def _perform_call(
     model: Optional[str] = None,
     disable_thinking: bool = False,
     messages: Optional[list] = None,
+    omit_default_max_tokens: bool = False,
 ) -> tuple:
     """Низкоуровневый вызов: возвращает (content, metrics|None).
 
@@ -203,17 +210,17 @@ def _perform_call(
         payload_messages = messages
 
     used_model = model or config.LLM_MODEL
-    payload = {
-        "model": used_model,
-        "messages": payload_messages,
-        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
-    }
+    payload = {"model": used_model, "messages": payload_messages}
 
-    # Если задан лимит токенов — отключаем reasoning, чтобы весь бюджет
-    # ушёл именно на ответ, а не на «размышления». Значение в max_tokens
-    # отправляем ровно как ввёл пользователь.
+    # max_tokens уходит ровно тем значением, которое задал пользователь.
+    # Если его нет — либо подставляем лимит приложения, либо (при
+    # omit_default_max_tokens) не отправляем параметр вообще: тогда ответ
+    # ограничивает только сам провайдер. Значение в max_tokens отправляем
+    # ровно как ввёл пользователь.
     if max_tokens:
         payload["max_tokens"] = max_tokens
+    elif not omit_default_max_tokens:
+        payload["max_tokens"] = config.LLM_MAX_TOKENS
 
     # Условие завершения — OpenAI принимает его как список stop-последовательностей.
     stop_sequences = _split_stop_sequences(stop)
