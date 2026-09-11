@@ -9,6 +9,13 @@ generate()/stream_generate() и update_config() — внутри агент са
 Модуль асинхронный (async/await): HTTP-вызов модели выполняется в отдельном
 потоке через asyncio.to_thread, поэтому агент безопасно использовать в
 FastAPI/Flask без блокировки event loop.
+
+Режим «суммаризация» (чекбокс в панели «Токены диалога»): память диалога
+делится на две части — последние N сообщений хранятся «как есть», а всё, что
+старше, сжимается в резюме (по одному резюме на каждые N сообщений). В запрос
+к модели уходит: текущий запрос + последние сообщения «как есть» + резюме
+прежней переписки отдельным блоком. N (поле «summary») агент получает из
+интерфейса.
 """
 
 import asyncio
@@ -48,6 +55,26 @@ SAFETY_REFUSAL = (
 )
 
 
+# --- Суммаризация памяти (режим «суммаризация», чекбокс в панели) ----------
+# Сколько последних сообщений хранить «как есть», если пользователь не задал
+# своё значение в поле «summary» (один запрос юзера = 2 сообщения).
+DEFAULT_SUMMARY_SIZE = 10
+
+# Единственное место, где агенту нужен промпт: служебный вызов сжатия истории.
+# Результат — не ответ пользователю, а данные для следующего запроса.
+SUMMARIZE_PROMPT = (
+    "Ты сжимаешь фрагмент истории диалога в краткое резюме. Сохрани только "
+    "ключевую информацию: о чём спрашивал пользователь, что отвечала модель, "
+    "какие факты, имена, числа, решения и договорённости важны для продолжения "
+    "разговора. Ничего не выдумывай и не продолжай диалог. Без вступлений, "
+    "оценок и обращений — только суть, не более 10 предложений."
+)
+
+# Заголовок блока резюме в контексте (не инструкция, а данные: сжатая часть
+# той же переписки, поэтому роль system).
+SUMMARY_HEADER = "Резюме предыдущей части этого же диалога (по частям, от старых к новым):"
+
+
 # ---------------------------------------------------------------------------
 # События агента (тип -> смысл):
 #   debug — агент сообщает, чем сейчас занят (выводится в чат отдельным
@@ -64,6 +91,10 @@ class AgentConfig:
     Поля со значением None означают «пользователь ничего не задал» — тогда
     параметр в запрос к API не отправляется вовсе (никаких ограничений по
     умолчанию: ни temperature, ни max_tokens, ни stop).
+
+    Отдельная группа полей — суммаризация памяти (summarization/summary_size):
+    она управляет не запросом к API, а тем, какая часть памяти диалога уходит
+    в контекст как есть, а какая — сжатой в резюме.
     """
 
     def __init__(
@@ -74,6 +105,9 @@ class AgentConfig:
         model: Optional[str] = None,
         max_history_messages: int = 24,
         max_history_chars: int = 16000,
+        summarization: bool = False,
+        summary_size: int = DEFAULT_SUMMARY_SIZE,
+        max_summaries_per_request: int = 3,
     ) -> None:
         # Ограничение длины ответа (токены); None — в API не отправляется.
         self.max_tokens = max_tokens
@@ -86,6 +120,16 @@ class AgentConfig:
         # Ограничения памяти диалога (обрезание истории).
         self.max_history_messages = max_history_messages
         self.max_history_chars = max_history_chars
+        # Суммаризация памяти (чекбокс «суммаризация» в панели режима агента).
+        self.summarization = summarization
+        # N — сколько последних сообщений держать в контексте «как есть»
+        # (поле «summary» в интерфейсе); всё, что старше, уходит в резюме.
+        self.summary_size = summary_size
+        # Сколько резюме разрешено составить за один запрос пользователя —
+        # предохранитель от лавины вызовов LLM (например, если пользователь
+        # резко уменьшил N при длинной истории). Лимит общий на сжатие до и
+        # после ответа, счётчик — Agent._summaries_this_request.
+        self.max_summaries_per_request = max_summaries_per_request
 
     def as_dict(self) -> Dict[str, Any]:
         """Все поля конфигурации словарём (для логов)."""
@@ -96,6 +140,9 @@ class AgentConfig:
             "model": self.model,
             "max_history_messages": self.max_history_messages,
             "max_history_chars": self.max_history_chars,
+            "summarization": self.summarization,
+            "summary_size": self.summary_size,
+            "max_summaries_per_request": self.max_summaries_per_request,
         }
 
 
@@ -136,8 +183,17 @@ class Agent:
         # Если в generate() передана внешняя история — она авторитетна и
         # заменяет внутреннюю (веб-слой хранит диалог сам).
         self.memory: List[Dict[str, str]] = []
+        # Резюме старой части диалога (режим «суммаризация»): список строк, по
+        # одному резюме на каждые N сообщений, от старых к новым. Хранится
+        # ОТДЕЛЬНО от memory и так же может прийти извне (веб-слой сохраняет
+        # его в JSON-файл рядом с историей).
+        self.summary: List[str] = []
         # Последние использованные параметры генерации (для generate()).
         self.last_params: Dict[str, Any] = {}
+        # Сколько резюме составлено в ТЕКУЩЕМ запросе (обнуляется в начале
+        # каждого запроса): общий предохранитель на сжатие памяти до и после
+        # ответа, чтобы один запрос не породил лавину вызовов LLM.
+        self._summaries_this_request = 0
         # Расход токенов ТЕКУЩЕГО запроса пользователя: вход/выход вызова LLM,
         # выставленный лимит и признак его превышения по входящим токенам.
         # Уезжает на фронт в событии "done" (панель «Токены диалога»).
@@ -168,11 +224,14 @@ class Agent:
         self,
         user_message: str,
         history: Optional[List[Dict[str, str]]] = None,
+        summary: Optional[List[str]] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
         history — внешняя история диалога (список {"role", "content"}).
         None — агент использует свою внутреннюю память (накопленную ранее).
+        summary — внешние резюме прежней переписки (режим «суммаризация»);
+        None — агент использует свои накопленные (self.summary).
 
         Собирает все debug-события в result.debug — пригодится, когда
         показывать их по одному не нужно (например, в API-ответах).
@@ -182,7 +241,7 @@ class Agent:
         async def sink(event: Step) -> None:
             steps.append(event)
 
-        await self._process(user_message, history, sink)
+        await self._process(user_message, history, sink, summary)
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
         final = next((e["text"] for e in reversed(steps) if e["type"] == "bot"), "")
@@ -198,6 +257,7 @@ class Agent:
         self,
         user_message: str,
         history: Optional[List[Dict[str, str]]] = None,
+        summary: Optional[List[str]] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -213,7 +273,7 @@ class Agent:
         async def sink(event: Step) -> None:
             queue.put_nowait(event)
 
-        runner = asyncio.create_task(self._process(user_message, history, sink))
+        runner = asyncio.create_task(self._process(user_message, history, sink, summary))
         try:
             while True:
                 event = await queue.get()
@@ -236,15 +296,21 @@ class Agent:
         user_message: str,
         history: Optional[List[Dict[str, str]]],
         emit: EmitFn,
+        summary: Optional[List[str]] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
         # Счётчик токенов обнуляем на каждый запрос пользователя.
         self.last_usage = self._new_usage()
+        # Бюджет резюме тоже на запрос (см. _compact_memory).
+        self._summaries_this_request = 0
         try:
             # Внешняя история авторитетна; без неё — продолжаем внутреннюю.
             if history is not None:
                 self.memory = self._normalize_history(history)
+            # То же для резюме прежней переписки (режим «суммаризация»).
+            if summary is not None:
+                self.summary = self._normalize_summary(summary)
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
@@ -276,20 +342,38 @@ class Agent:
             for note in notes:
                 await emit(self._step("debug", f"{self.name}: {note}"))
 
-            # 3. Память диалога: сколько контекста уже накоплено.
+            # 3. Суммаризация памяти (если включён чекбокс): всё, что старше
+            #    последних N сообщений, сжимаем в резюме ДО сборки контекста —
+            #    в модель уйдут только свежие сообщения «как есть». Обычно тут
+            #    работы нет: память уже сжата в конце прошлого запроса, но так
+            #    учитывается и смена N пользователем по ходу диалога.
+            if self.config.summarization:
+                await self._compact_memory(emit)
+
+            # 4. Память диалога: сколько контекста уже накоплено.
             history_len = len(self.memory)
             context_chars = sum(len(m["content"]) for m in self.memory)
             await emit(self._step(
                 "debug",
                 f"{self.name}: история диалога: {history_len} реплик "
-                f"(≈{context_chars // 4} токенов эвристически) — добавляю текущий запрос.",
+                f"(≈{context_chars // 4} токенов эвристически) — добавляю текущий запрос."
+                + (
+                    f" Плюс резюме прежней переписки: {len(self.summary)} част."
+                    if self.summary else ""
+                ),
             ))
 
-            # 4. ЕДИНСТВЕННЫЙ вызов LLM: запрос уходит в модель КАК ЕСТЬ (без
-            #    системного промпта и формата) + история диалога, если она уже
-            #    есть. Вызов идёт в отдельном потоке и event loop не блокирует.
-            messages: List[Dict[str, str]] = list(self.memory)  # прошлые реплики
-            messages.append({"role": "user", "content": text})
+            # 5. Вызов LLM: запрос уходит в модель КАК ЕСТЬ (без системного
+            #    промпта и формата) + последние реплики диалога + резюме
+            #    прежней переписки, если суммаризация их уже составила. При
+            #    включённой суммаризации вызовов два: сжатие старой части
+            #    памяти (см. _compact_memory) и сам ответ. Вызов идёт в
+            #    отдельном потоке и event loop не блокирует.
+            messages: List[Dict[str, str]] = []
+            if self.summary:
+                messages.append({"role": "system", "content": self._summary_block()})
+            messages.extend(self.memory)          # свежие реплики «как есть»
+            messages.append({"role": "user", "content": text})  # текущий запрос
 
             short_model = (params["model"] or config.LLM_MODEL).split("/")[-1]
             await emit(self._step(
@@ -315,7 +399,7 @@ class Agent:
                     f"{self.name}: модель вернула пустой ответ ({elapsed:.1f} с) — включаю запасной сценарий.",
                 ))
 
-            # 5. Пустой ответ (сбой/нет ключа) — понятное сообщение вместо
+            # 6. Пустой ответ (сбой/нет ключа) — понятное сообщение вместо
             #    технического стека или пустоты.
             if not content:
                 content = self._fallback_text(text)
@@ -327,14 +411,14 @@ class Agent:
                        "LLM не ответила — возвращаю пользователю понятное сообщение."),
                 ))
 
-            # 6. Запоминаем ход диалога (содержательный обмен).
+            # 7. Запоминаем ход диалога (содержательный обмен).
             self.memory.append({"role": "user", "content": text})
             self.memory.append({"role": "assistant", "content": content})
             self._trim_memory()
 
             await emit(self._step("bot", content))
 
-            # 7. Лимит токенов превышен — отдельным сообщением с ошибкой
+            # 8. Лимит токенов превышен — отдельным сообщением с ошибкой
             #    (сам ответ пользователь уже получил выше).
             if overflow and metrics:
                 await emit(self._step(
@@ -344,6 +428,13 @@ class Agent:
                         int(metrics.get("prompt_tokens") or 0),
                     ),
                 ))
+
+            # 9. Суммаризация: после обмена репликами памяти стало больше N
+            #    сообщений — самую старую часть сжимаем в резюме. Делаем это
+            #    ПОСЛЕ ответа (пользователь его уже видит), чтобы служебный
+            #    вызов LLM не задерживал ответ.
+            if self.config.summarization:
+                await self._compact_memory(emit)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — внешний код видит только понятное сообщение
@@ -354,6 +445,8 @@ class Agent:
                 "params": self.last_params,
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
                 "memory_len": len(self.memory),
+                # Сколько частей резюме накоплено (режим «суммаризация»).
+                "summary_parts": len(self.summary),
                 # Расход токенов текущего запроса — фронт рисует по нему
                 # панель «Токены диалога».
                 "usage": dict(self.last_usage),
@@ -377,24 +470,48 @@ class Agent:
     def _new_usage() -> Dict[str, Any]:
         """Пустой замер расхода токенов одного запроса пользователя.
 
-        input/output — токены единственного вызова LLM по этому запросу;
+        requests/input/output — ВСЕ вызовы LLM по этому запросу (1 — обычный
+        режим, 2 и больше — когда включена суммаризация: служебное сжатие
+        памяти + сам ответ), их суммарные токены (промпт и ответ);
+        summary_requests/summary_input/summary_output — вклад только служебных
+        вызовов сжатия: он входит в общие числа и дополнительно считается
+        отдельно (строка «из них суммаризация» в панели);
         limit — выставленный пользователем лимит токенов («Длина»); overflow —
         входящие токены запроса превысили этот лимит.
         """
         return {
-            "requests": 1,
+            "requests": 0,
             "input": 0,
             "output": 0,
             "limit": None,
             "overflow": False,
+            "summary_requests": 0,
+            "summary_input": 0,
+            "summary_output": 0,
         }
 
-    def _track_usage(self, metrics: Optional[Dict[str, Any]]) -> None:
-        """Добавляет метрики вызова LLM в расход текущего запроса."""
+    def _track_usage(
+        self,
+        metrics: Optional[Dict[str, Any]],
+        summarization: bool = False,
+    ) -> None:
+        """Добавляет метрики вызова LLM в расход текущего запроса.
+
+        summarization=True — вызов служебный (сжатие памяти): его токены входят
+        в общий расход запроса, но дополнительно копятся в отдельных полях,
+        чтобы панель могла показать вклад суммаризации отдельной строкой.
+        """
         if not metrics:
             return
-        self.last_usage["input"] += int(metrics.get("prompt_tokens") or 0)
-        self.last_usage["output"] += int(metrics.get("completion_tokens") or 0)
+        prompt = int(metrics.get("prompt_tokens") or 0)
+        completion = int(metrics.get("completion_tokens") or 0)
+        self.last_usage["requests"] += 1
+        self.last_usage["input"] += prompt
+        self.last_usage["output"] += completion
+        if summarization:
+            self.last_usage["summary_requests"] += 1
+            self.last_usage["summary_input"] += prompt
+            self.last_usage["summary_output"] += completion
 
     @staticmethod
     def _is_limit_exceeded(
@@ -436,7 +553,22 @@ class Agent:
         return clean
 
     def _trim_memory(self) -> None:
-        """Обрезает память диалога по количеству реплик и эвристике токенов."""
+        """Обрезает память диалога по количеству реплик и эвристике токенов.
+
+        В режиме «суммаризация» размер памяти ограничивает само сжатие: старое
+        уходит в резюме, а не выбрасывается молча, поэтому обычная обрезка тут
+        не работает. Остаётся лишь страховочный предел на случай, когда резюме
+        перестали получаться (например, LLM недоступна) — иначе контекст рос бы
+        безгранично.
+        """
+        if self.config.summarization:
+            safety = max(
+                self.config.max_history_messages,
+                self._summary_size() * 3,
+            )
+            while len(self.memory) > safety:
+                self.memory.pop(0)
+            return
         while len(self.memory) > self.config.max_history_messages:
             self.memory.pop(0)
         while sum(len(m["content"]) for m in self.memory) > self.config.max_history_chars:
@@ -447,6 +579,136 @@ class Agent:
                 self.name,
                 len(self.memory),
             )
+
+    # ------------------------------------------------------------------
+    # Суммаризация памяти (чекбокс «суммаризация» в панели режима агента)
+    # ------------------------------------------------------------------
+    def _summary_size(self) -> int:
+        """N — сколько последних сообщений памяти держать «как есть».
+
+        Значение приходит из поля «summary» в интерфейсе (один запрос юзера —
+        это два сообщения: запрос и ответ). Некорректное/незаданное значение
+        заменяется значением по умолчанию.
+        """
+        try:
+            size = int(self.config.summary_size)
+        except (TypeError, ValueError):
+            size = DEFAULT_SUMMARY_SIZE
+        return max(2, size)
+
+    def _needs_compaction(self, size: int) -> bool:
+        """Пора ли сжимать: сообщений больше N.
+
+        Дополнительное условие — после сжатия в памяти должно остаться не
+        меньше пары сообщений, иначе из контекста пропал бы только что
+        завершённый обмен «запрос + ответ».
+        """
+        return len(self.memory) - size >= 2
+
+    async def _compact_memory(self, emit: EmitFn) -> None:
+        """Сжимает самую старую часть памяти в резюме (режим «суммаризация»).
+
+        Пока сообщений больше N, берём N самых старых и просим модель сжать их
+        в одно резюме (до 10 предложений), после чего убираем их из памяти —
+        они остаются только в резюме (self.summary, по элементу на сжатие).
+
+        Вызывается ДО сборки контекста (память могла разрастись после смены N)
+        и ПОСЛЕ ответа пользователю (свежий обмен перевалил за N). За один
+        запрос составляется не больше max_summaries_per_request резюме —
+        предохранитель от лавины вызовов LLM. Если резюме получить не удалось,
+        сообщения остаются в памяти как есть: терять их нельзя.
+        """
+        size = self._summary_size()
+        if not self._needs_compaction(size):
+            return
+        budget = max(1, int(self.config.max_summaries_per_request or 1))
+        while self._needs_compaction(size):
+            if self._summaries_this_request >= budget:
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: суммаризация: за один запрос не больше {budget} резюме "
+                    "— остальное сожму при следующем запросе.",
+                ))
+                break
+            chunk = self.memory[:size]
+            summary = await self._summarize_chunk(chunk)
+            if not summary:
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: суммаризация: не удалось сжать {len(chunk)} сообщений "
+                    "— оставляю их в контексте как есть.",
+                ))
+                break
+            del self.memory[:len(chunk)]
+            self.summary.append(summary)
+            self._summaries_this_request += 1
+            logger.info(
+                "Агент %s: суммаризация — %d сообщений сжаты в резюме №%d",
+                self.name, len(chunk), len(self.summary),
+            )
+            await emit(self._step(
+                "debug",
+                f"{self.name}: суммаризация: {len(chunk)} сообщений сжаты в резюме "
+                f"№{len(self.summary)} — «{self._shorten(summary)}» "
+                f"(в контексте осталось {len(self.memory)} реплик как есть).",
+            ))
+
+    async def _summarize_chunk(self, chunk: List[Dict[str, str]]) -> str:
+        """Сжимает фрагмент памяти в резюме (служебный вызов LLM).
+
+        Единственный вызов, где агенту нужен промпт: результат — не ответ
+        пользователю, а данные для следующего запроса. Лимит «Длина» и
+        «Завершение» сюда НЕ передаются: они заданы для ответа пользователю, а
+        стоп-последовательность или короткий лимит обрезали бы резюме.
+
+        Возвращает текст резюме; пустая строка — вызов не удался (тогда память
+        не трогаем, см. _compact_memory).
+        """
+        rendered = "\n".join(
+            f"{'Пользователь' if msg['role'] == 'user' else 'Ассистент'}: {msg['content']}"
+            for msg in chunk
+        )
+        content, metrics = await client.call_llm_async(
+            user_text=rendered,
+            model=self.config.model or config.LLM_MODEL,
+            disable_thinking=True,  # служебный вызов — reasoning не нужен
+            messages=[
+                {"role": "system", "content": SUMMARIZE_PROMPT},
+                {"role": "user", "content": rendered},
+            ],
+            omit_default_max_tokens=True,  # лимит приложения сюда не подставляем
+        )
+        # Токены служебного вызова: входят в общий расход запроса и отдельно —
+        # в поля summary_* (панель показывает вклад суммаризации строкой).
+        self._track_usage(metrics, summarization=True)
+        return (content or "").strip()
+
+    def _summary_block(self) -> str:
+        """Текст резюме прежней переписки для контекста запроса.
+
+        Уходит отдельным сообщением с ролью system (это не инструкция, а
+        сжатая часть того же диалога) — до последних реплик «как есть».
+        """
+        parts = "\n".join(
+            f"{i}) {text}" for i, text in enumerate(self.summary, 1)
+        )
+        return f"{SUMMARY_HEADER}\n{parts}"
+
+    @staticmethod
+    def _shorten(text: str, limit: int = 200) -> str:
+        """Обрезает длинный текст для debug-сообщения."""
+        one_line = " ".join((text or "").split())
+        return one_line if len(one_line) <= limit else one_line[:limit].rstrip() + "…"
+
+    @staticmethod
+    def _normalize_summary(summary: Optional[List[str]]) -> List[str]:
+        """Приводит внешнее резюме к списку непустых строк (по порядку частей)."""
+        clean: List[str] = []
+        for part in summary or []:
+            text = str(part or "").strip()
+            if text:
+                clean.append(text)
+        return clean
 
     def _merge_params(self):
         """Параметры генерации: ТОЛЬКО то, что задал пользователь.

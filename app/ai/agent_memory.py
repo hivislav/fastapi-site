@@ -7,9 +7,15 @@
 старте процесса — диалог продолжается так, будто агент не выключался.
 
 Формат файла:
-    {"version": 1,
+    {"version": 2,
      "messages": [{"role": "user"|"assistant", "content": "..."}, ...],
-     "usage": [{"requests": 1, "input": 0, "output": 0, "limit": null, "overflow": false}, ...]}
+     "usage": [{"requests": 1, "input": 0, "output": 0, "limit": null, "overflow": false}, ...],
+     "summary": ["резюме старой части переписки (до 10 предложений)", ...]}
+
+"summary" — резюме той части диалога, которая уже не хранится в "messages"
+целиком (режим «суммаризация», см. app/ai/agent.py): каждый элемент — отдельное
+резюме по N сообщениям, от старых к новым. Ключ необязателен: файл без него
+читается как «резюме ещё нет» (обратная совместимость с version 1).
 
 "usage" — расход токенов по каждому запросу пользователя (вход/выход всех
 вызовов LLM, лимит вывода и признак его переполнения). Нужен для панели
@@ -32,7 +38,9 @@ from app import config
 logger = logging.getLogger(__name__)
 
 # Версия формата файла (для будущих миграций структуры).
-_VERSION = 1
+# 2 — добавлен ключ "summary" (резюме старой части переписки); файлы версии 1
+# читаются без изменений, просто без резюме.
+_VERSION = 2
 
 # Страховочные лимиты на загрузку: сам агент обрезает историю до 24 реплик /
 # ~16 000 символов (см. AgentConfig), поэтому эти значения срабатывают только
@@ -42,6 +50,9 @@ _MAX_TOTAL_CHARS = 200_000
 
 # Сколько замеров расхода токенов хранить (сам агент помнит ≤ 12 запросов).
 _MAX_USAGE = 500
+
+# Сколько частей резюме хранить (режим «суммаризация»).
+_MAX_SUMMARY = 500
 
 
 def _read_payload(path: Optional[str] = None) -> Any:
@@ -124,6 +135,12 @@ def load_agent_usage(path: Optional[str] = None) -> List[Dict[str, Any]]:
                 "output": max(0, int(item.get("output") or 0)),
                 "limit": int(item["limit"]) if item.get("limit") else None,
                 "overflow": item.get("overflow") is True,
+                # Вклад служебных вызовов сжатия памяти (суммаризация): строка
+                # «из них суммаризация» в панели. У старых замеров (до
+                # появления суммаризации) этих полей нет — читаются как нули.
+                "summary_requests": max(0, int(item.get("summary_requests") or 0)),
+                "summary_input": max(0, int(item.get("summary_input") or 0)),
+                "summary_output": max(0, int(item.get("summary_output") or 0)),
             }
         except (TypeError, ValueError):
             continue
@@ -131,15 +148,41 @@ def load_agent_usage(path: Optional[str] = None) -> List[Dict[str, Any]]:
     return clean[-_MAX_USAGE:]
 
 
+def load_agent_summary(path: Optional[str] = None) -> List[str]:
+    """Загружает сохранённые части резюме (режим «суммаризация»).
+
+    Возвращает список строк-резюме (от старых частей переписки к новым) —
+    именно их агент отправляет в модель отдельным блоком вместе с последними
+    N сообщениями «как есть». Файла нет / он повреждён / ключа "summary" нет
+    (в т.ч. файл версии 1) — пустой список.
+    """
+    data = _read_payload(path)
+    if not isinstance(data, dict) or not isinstance(data.get("summary"), list):
+        return []
+
+    clean: List[str] = []
+    for part in data["summary"]:
+        text = str(part or "").strip()
+        if text:
+            clean.append(text)
+    return clean[-_MAX_SUMMARY:]
+
+
 def save_agent_memory(
     messages: List[Dict[str, str]],
     usage: Optional[List[Dict[str, Any]]] = None,
+    summary: Optional[List[str]] = None,
     path: Optional[str] = None,
 ) -> None:
-    """Сохраняет историю диалога (и расход токенов) в JSON-файл (атомарно).
+    """Сохраняет историю диалога (расход токенов и резюме) в JSON-файл.
+
+    Атомарная запись (временный файл + os.replace), поэтому файл не
+    повреждается при обрыве записи.
 
     usage — список замеров токенов по запросам пользователя (может быть
     пустым); None — ключ "usage" в файл не пишется.
+    summary — части резюме старой части переписки (режим «суммаризация»);
+    None — ключ "summary" в файл не пишется.
     path — путь к файлу; None — путь по умолчанию из конфигурации. Каталог
     создаётся при необходимости. Ошибки ввода-вывода пробрасываются наверх —
     вызывающий код решает, как на них реагировать (лог и продолжение работы).
@@ -151,6 +194,8 @@ def save_agent_memory(
     payload: Dict[str, Any] = {"version": _VERSION, "messages": list(messages)}
     if usage is not None:
         payload["usage"] = [dict(item) for item in usage]
+    if summary is not None:
+        payload["summary"] = [str(part) for part in summary]
     tmp_fd, tmp_path = tempfile.mkstemp(
         prefix=".agent_memory.", suffix=".tmp", dir=directory
     )

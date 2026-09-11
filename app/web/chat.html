@@ -463,7 +463,71 @@
         }
         .agent-table td:first-child { text-align: left; }
         .agent-table td:not(:first-child) { text-align: center; color: #333; }
+        /* Общий блок итогов («Весь диалог» + «из них суммаризация»): фон и
+           рамка объединяют эти строки в один блок — в отличие от строки
+           «Текущий запрос», которая показывает только сам ответ модели. */
+        .agent-table tbody.agent-total-block td {
+            background: #f5f5fc;
+            padding-top: 6px;
+            padding-bottom: 6px;
+        }
+        .agent-table tbody.agent-total-block tr:first-child td { border-top: 1px solid #d6d3e6; }
+        .agent-table tbody.agent-total-block tr:last-child td { border-bottom: 1px solid #d6d3e6; }
+        .agent-table tbody.agent-total-block td:first-child {
+            border-left: 3px solid #667eea;
+            padding-left: 6px;
+        }
+        /* Строка «из них суммаризация» — вклад служебных вызовов сжатия
+           памяти: часть суммы «Весь диалог», поэтому подписана и приглушена. */
+        .agent-table tr.agent-subrow td {
+            color: #8a86a8;
+            font-style: italic;
+            padding-top: 2px;
+        }
         .agent-hint { margin-top: 6px; font-size: 0.68rem; color: #777; line-height: 1.25; }
+        /* ---------- Суммаризация памяти (чекбокс в панели агента) ---------- */
+        /* Чекбокс «суммаризация» и поле «summary»: сколько последних сообщений
+           агент держит в контексте как есть, а всё, что старше, сжимает в
+           резюме. Значение по умолчанию — 10. */
+        .agent-summary {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #e8e8f2;
+            font-size: 0.72rem;
+            color: #333;
+        }
+        .agent-summary label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+        .agent-summary input[type="checkbox"] {
+            width: 14px;
+            height: 14px;
+            margin: 0;
+            accent-color: #667eea;
+            cursor: pointer;
+        }
+        .agent-summary-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 6px;
+            padding-left: 20px;
+        }
+        .agent-summary-row input {
+            width: 58px;
+            padding: 3px 6px;
+            font: inherit;
+            font-size: 0.72rem;
+            color: #333;
+            border: 1px solid #d6d3e6;
+            border-radius: 6px;
+        }
+        .agent-summary-row input:focus { outline: 2px solid #c9c6dd; outline-offset: 0; }
+        .agent-summary-row span { color: #8a86a8; }
         /* ---------- Таблица судьи-аналитика ---------- */
         .judge-title { font-weight: 600; color: #4a3b8f; margin-bottom: 8px; }
         .judge-table {
@@ -642,9 +706,30 @@
                         <th>Сумма токенов</th>
                     </tr>
                 </thead>
+                <!-- Строка «Текущий запрос» — ТОЛЬКО сам ответ модели, без
+                     служебных вызовов сжатия памяти (суммаризации). -->
                 <tbody id="agent-stats-body"></tbody>
+                <!-- Общий блок: итог по всей переписке («Весь диалог») и вклад
+                     суммаризации в этот итог — выделены фоном и рамкой как один
+                     блок (см. .agent-total-block). -->
+                <tbody id="agent-total-body" class="agent-total-block"></tbody>
             </table>
-            <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса.</div>
+            <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса. Строка «Текущий запрос» — только сам ответ модели (без служебного сжатия памяти); «Весь диалог» и «из них суммаризация» — общий итог переписки вместе со сжатием и вклад сжатия в него.</div>
+            <!-- Суммаризация памяти: при нажатом чекбоксе агент держит в
+                 контексте последние N сообщений «как есть» (N — поле
+                 «summary», по умолчанию 10), а всё, что старше, сжимает в
+                 резюме и отправляет его отдельным блоком. -->
+            <div class="agent-summary">
+                <label title="Агент держит в контексте только последние сообщения, а старую часть переписки сжимает в резюме">
+                    <input type="checkbox" id="agent-summary-on">
+                    <span>суммаризация</span>
+                </label>
+                <div class="agent-summary-row" id="agent-summary-row" hidden>
+                    <input type="text" id="agent-summary-size" value="10" inputmode="numeric" autocomplete="off"
+                           title="Сколько последних сообщений диалога агент хранит как есть (один запрос юзера — это 2 сообщения). Всё, что старше, сжимается в резюме.">
+                    <span>summary</span>
+                </div>
+            </div>
         </aside>
     </div>
 
@@ -665,6 +750,37 @@
         maxLengthInput.addEventListener('input', () => {
             maxLengthInput.value = maxLengthInput.value.replace(/\D/g, '');
         });
+
+        // ---------- Суммаризация памяти (панель режима «AI-агент») ----------
+        // Чекбокс «суммаризация» + поле «summary» (значение по умолчанию 10):
+        // сколько последних сообщений агент держит в контексте как есть, а всё,
+        // что старше, сжимает в резюме. Поле показывается только при нажатом
+        // чекбоксе и принимает только цифры.
+        const agentSummaryToggle = document.getElementById('agent-summary-on');
+        const agentSummaryRow = document.getElementById('agent-summary-row');
+        const agentSummarySize = document.getElementById('agent-summary-size');
+        // Минимум 2: один запрос юзера — это пара «запрос + ответ», она должна
+        // оставаться в контексте целиком.
+        const AGENT_SUMMARY_MIN = 2;
+
+        agentSummarySize.addEventListener('input', () => {
+            agentSummarySize.value = agentSummarySize.value.replace(/\D/g, '');
+        });
+
+        agentSummaryToggle.addEventListener('change', () => {
+            agentSummaryRow.hidden = !agentSummaryToggle.checked;
+        });
+
+        // Настройка суммаризации для тела запроса в режиме агента: null, если
+        // чекбокс не нажат или значение поля некорректно (тогда отправку
+        // блокируем и показываем предупреждение).
+        function agentSummarySettings() {
+            if (!agentSummaryToggle.checked) return { summarization: false, summary: null };
+            const raw = agentSummarySize.value.trim();
+            const num = Number(raw);
+            if (!/^\d+$/.test(raw) || num < AGENT_SUMMARY_MIN) return null;
+            return { summarization: true, summary: num };
+        }
 
         // ---------- Экспертный режим ----------
         const expertToggle = document.getElementById('expert-toggle');
@@ -718,6 +834,9 @@
         const agentPanel = document.getElementById('agent-panel');
         const agentChart = document.getElementById('agent-chart');
         const agentStatsBody = document.getElementById('agent-stats-body');
+        // Второй tbody таблицы — общий блок «Весь диалог» + «из них
+        // суммаризация» (строка «Текущий запрос» рисуется в первом).
+        const agentTotalBody = document.getElementById('agent-total-body');
         // agentUsage — по одному замеру на запрос пользователя:
         // {requests, input, output, limit, overflow}. Замер приходит с событием
         // "done" агентского потока и восстанавливается с сервера вместе с
@@ -735,35 +854,64 @@
             renderAgentStats();
         }
 
-        // Таблица под диаграммой: «Текущий запрос» — последний замер,
-        // «Весь диалог» — сумма по всем запросам текущей переписки.
+        // Таблица под диаграммой. Строка «Текущий запрос» показывает ТОЛЬКО сам
+        // ответ модели — служебные вызовы сжатия памяти (суммаризации) в неё не
+        // входят, поэтому их токены и вызовы вычитаются из полного замера.
+        // «Весь диалог» (итог по всей переписке вместе со сжатием) и «из них
+        // суммаризация» (вклад сжатия в этот итог) — общий блок (см.
+        // .agent-total-block, второй tbody таблицы).
         function renderAgentStats() {
             const last = agentUsage.length ? agentUsage[agentUsage.length - 1] : null;
+            // Вклад служебных вызовов в последнем замере (у старых замеров
+            // полей summary_* нет — считаются нулями).
+            const lastSumReq = last ? (Number(last.summary_requests) || 0) : 0;
+            const lastSumIn = last ? (Number(last.summary_input) || 0) : 0;
+            const lastSumOut = last ? (Number(last.summary_output) || 0) : 0;
             let input = 0;
             let output = 0;
+            let sumRequests = 0;
+            let sumInput = 0;
+            let sumOutput = 0;
             agentUsage.forEach(u => {
                 input += Number(u.input) || 0;
                 output += Number(u.output) || 0;
+                sumRequests += Number(u.summary_requests) || 0;
+                sumInput += Number(u.summary_input) || 0;
+                sumOutput += Number(u.summary_output) || 0;
             });
-            const rows = [
+            const draw = (body, rows) => {
+                body.innerHTML = '';
+                rows.forEach(r => {
+                    const tr = document.createElement('tr');
+                    if (r.sub) tr.className = 'agent-subrow';
+                    if (r.title) tr.title = r.title;
+                    [r.label, r.requests, r.output, r.input, r.input + r.output].forEach(v => {
+                        const td = document.createElement('td');
+                        td.textContent = v;
+                        tr.appendChild(td);
+                    });
+                    body.appendChild(tr);
+                });
+            };
+            draw(agentStatsBody, [
                 {
                     label: 'Текущий запрос',
-                    requests: last ? (Number(last.requests) || 1) : 0,
-                    input: last ? (Number(last.input) || 0) : 0,
-                    output: last ? (Number(last.output) || 0) : 0
-                },
-                { label: 'Весь диалог', requests: agentUsage.length, input: input, output: output }
-            ];
-            agentStatsBody.innerHTML = '';
-            rows.forEach(r => {
-                const tr = document.createElement('tr');
-                [r.label, r.requests, r.output, r.input, r.input + r.output].forEach(v => {
-                    const td = document.createElement('td');
-                    td.textContent = v;
-                    tr.appendChild(td);
-                });
-                agentStatsBody.appendChild(tr);
-            });
+                    requests: last ? Math.max(0, (Number(last.requests) || 1) - lastSumReq) : 0,
+                    input: last ? Math.max(0, (Number(last.input) || 0) - lastSumIn) : 0,
+                    output: last ? Math.max(0, (Number(last.output) || 0) - lastSumOut) : 0,
+                    title: 'Только сам ответ модели: служебные вызовы сжатия памяти (суммаризация) не учитываются'
+                }
+            ]);
+            draw(agentTotalBody, [
+                { label: 'Весь диалог', requests: agentUsage.length, input: input, output: output },
+                {
+                    label: 'из них суммаризация',
+                    requests: sumRequests,
+                    input: sumInput,
+                    output: sumOutput,
+                    sub: true
+                }
+            ]);
         }
 
         // Диаграмма: по оси X — номера запросов пользователя в истории (шаг 1,
@@ -1297,6 +1445,14 @@
                     }
                     maxTokens = num;
                 }
+                // Суммаризация памяти: чекбокс + поле «summary». Нажат, но
+                // значение не задано/меньше минимума — отправку блокируем.
+                const summarySettings = agentSummarySettings();
+                if (!summarySettings) {
+                    addMessage('bot', `⚠️ Суммаризация: значение «summary» должно быть целым числом не меньше ${AGENT_SUMMARY_MIN}.`);
+                    agentSummarySize.focus();
+                    return;
+                }
                 input.value = '';
                 sendBtn.disabled = true;
                 addMessage('user', content, true);
@@ -1305,7 +1461,9 @@
                     content,
                     format: formatSelect.value,
                     max_tokens: maxTokens,
-                    stop: stopInput.value.trim() || null
+                    stop: stopInput.value.trim() || null,
+                    summarization: summarySettings.summarization,
+                    summary: summarySettings.summary
                 });
                 return;
             }
