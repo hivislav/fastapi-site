@@ -6,11 +6,21 @@
 
 import asyncio
 import json
+import logging
 import time
+import urllib.error
 import urllib.request
 from typing import Optional
 
 from app import config
+
+logger = logging.getLogger(__name__)
+
+# Таймаут HTTP-запроса к модели по умолчанию (секунды). Ответ на 2000 токенов
+# при ~25 ток/с занимает около 80 с, поэтому прежние 60 с обрезали длинные
+# ответы и тяжёлые служебные вызовы агента (план ветвления) — запрос падал по
+# таймауту, а клиент молча возвращал пустую строку.
+HTTP_TIMEOUT = 120
 
 # Базовая системная инструкция ассистента.
 SYSTEM_PROMPT = (
@@ -43,6 +53,7 @@ def call_llm(
     model: Optional[str] = None,
     disable_thinking: bool = False,
     messages: Optional[list] = None,
+    timeout: float = HTTP_TIMEOUT,
 ) -> str:
     """Отправляет запрос к реальной модели и возвращает текст ответа.
 
@@ -86,6 +97,7 @@ def call_llm(
         model=model,
         disable_thinking=disable_thinking,
         messages=messages,
+        timeout=timeout,
     )
     return content
 
@@ -100,6 +112,7 @@ def call_llm_with_metrics(
     model: Optional[str] = None,
     disable_thinking: bool = False,
     messages: Optional[list] = None,
+    timeout: float = HTTP_TIMEOUT,
 ) -> tuple:
     """Как call_llm, но дополнительно возвращает метрики запроса.
 
@@ -127,6 +140,7 @@ def call_llm_with_metrics(
         model=model,
         disable_thinking=disable_thinking,
         messages=messages,
+        timeout=timeout,
     )
 
 
@@ -141,6 +155,7 @@ async def call_llm_async(
     disable_thinking: bool = False,
     messages: Optional[list] = None,
     omit_default_max_tokens: bool = False,
+    timeout: float = HTTP_TIMEOUT,
 ) -> tuple:
     """Асинхронная версия вызова LLM: (content, metrics|None).
 
@@ -151,6 +166,9 @@ async def call_llm_async(
     omit_default_max_tokens=True — если max_tokens не задан, параметр вообще
     НЕ отправляется в API (действует предел провайдера), а не подставляется
     лимит приложения config.LLM_MAX_TOKENS. Использует AI-агент.
+
+    timeout — таймаут HTTP-запроса: у длинных служебных вызовов агента
+    (план ветвления) он больше, чем у обычного ответа.
     """
     return await asyncio.to_thread(
         _perform_call,
@@ -164,6 +182,7 @@ async def call_llm_async(
         disable_thinking=disable_thinking,
         messages=messages,
         omit_default_max_tokens=omit_default_max_tokens,
+        timeout=timeout,
     )
 
 
@@ -178,11 +197,17 @@ def _perform_call(
     disable_thinking: bool = False,
     messages: Optional[list] = None,
     omit_default_max_tokens: bool = False,
+    timeout: float = HTTP_TIMEOUT,
 ) -> tuple:
     """Низкоуровневый вызов: возвращает (content, metrics|None).
 
     messages — необязательный полный список сообщений (AI-агент), иначе
     строится стандартная схема [system, user] из остальных параметров.
+    timeout — таймаут HTTP-запроса в секундах (по умолчанию HTTP_TIMEOUT);
+    тяжёлые служебные вызовы агента (план ветвления) задают больше.
+    При любой ошибке возвращается пустая строка и None, а причина пишется в
+    лог (таймаут, HTTP-код с телом ответа и т.п.) — иначе сбой выглядел бы как
+    «модель ничего не ответила» без объяснения.
     """
     if not config.LLM_API_KEY:
         return "", None
@@ -256,15 +281,29 @@ def _perform_call(
 
     start = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
-    except Exception:
+    except urllib.error.HTTPError as exc:
+        # Провайдер ответил ошибкой (400/401/429/5xx) — показываем код и тело:
+        # без этого сбой выглядел как «модель не ответила».
+        try:
+            body = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:  # noqa: BLE001 — тело может быть уже прочитано
+            body = ""
+        logger.warning("LLM: HTTP %s за %.1f с: %s", exc.code, time.perf_counter() - start, body)
+        return "", None
+    except Exception as exc:  # noqa: BLE001 — таймаут, сеть, битый JSON
+        logger.warning(
+            "LLM: %s за %.1f с (timeout=%.0f с): %s",
+            exc.__class__.__name__, time.perf_counter() - start, timeout, exc,
+        )
         return "", None
     elapsed = time.perf_counter() - start
 
     try:
         msg = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
+        logger.warning("LLM: неожиданная структура ответа за %.1f с", elapsed)
         return "", None
 
     content = msg.get("content")

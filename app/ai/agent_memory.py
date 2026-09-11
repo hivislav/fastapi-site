@@ -7,15 +7,24 @@
 старте процесса — диалог продолжается так, будто агент не выключался.
 
 Формат файла:
-    {"version": 2,
+    {"version": 3,
      "messages": [{"role": "user"|"assistant", "content": "..."}, ...],
      "usage": [{"requests": 1, "input": 0, "output": 0, "limit": null, "overflow": false}, ...],
-     "summary": ["резюме старой части переписки (до 10 предложений)", ...]}
+     "summary": ["резюме старой части переписки (до 10 предложений)", ...],
+     "covered": 10,
+     "facts": {"цель": "..."},
+     "branches": {"A": {"title": "...", "approach": "...", "messages": [...]}},
+     "active_branch": "A"}
 
-"summary" — резюме той части диалога, которая уже не хранится в "messages"
-целиком (режим «суммаризация», см. app/ai/agent.py): каждый элемент — отдельное
-резюме по N сообщениям, от старых к новым. Ключ необязателен: файл без него
-читается как «резюме ещё нет» (обратная совместимость с version 1).
+"summary"/"covered" — стратегия «summary»: части резюме (от старых к новым) и
+сколько ПЕРВЫХ сообщений истории уже в них свёрнуто (сообщения при этом
+остаются в "messages" — пользователь видит всю переписку в чате).
+"facts" — стратегия «sticky facts»: блок «ключ: значение» о диалоге (цель,
+ограничения, решения, договорённости), обновляется после каждого запроса.
+"branches"/"active_branch" — стратегия «branching»: ветви плана (у каждой своя
+история сообщений — диалоги в ветках независимы) и активная ветка по умолчанию.
+Все ключи необязательны: файл без них (в т.ч. версий 1–2) читается как «этих
+данных ещё нет» (обратная совместимость).
 
 "usage" — расход токенов по каждому запросу пользователя (вход/выход всех
 вызовов LLM, лимит вывода и признак его переполнения). Нужен для панели
@@ -38,9 +47,12 @@ from app import config
 logger = logging.getLogger(__name__)
 
 # Версия формата файла (для будущих миграций структуры).
-# 2 — добавлен ключ "summary" (резюме старой части переписки); файлы версии 1
-# читаются без изменений, просто без резюме.
-_VERSION = 2
+# 2 — добавлен ключ "summary" (резюме старой части переписки).
+# 3 — добавлены ключи "covered" (сколько первых сообщений уже в резюме),
+#     "facts" (блок фактов стратегии sticky facts) и "branches"/"active_branch"
+#     (ветви плана стратегии branching). Файлы версий 1–2 читаются без
+#     изменений — просто без этих данных.
+_VERSION = 3
 
 # Страховочные лимиты на загрузку: сам агент обрезает историю до 24 реплик /
 # ~16 000 символов (см. AgentConfig), поэтому эти значения срабатывают только
@@ -51,8 +63,17 @@ _MAX_TOTAL_CHARS = 200_000
 # Сколько замеров расхода токенов хранить (сам агент помнит ≤ 12 запросов).
 _MAX_USAGE = 500
 
-# Сколько частей резюме хранить (режим «суммаризация»).
+# Сколько частей резюме хранить (стратегия «summary»).
 _MAX_SUMMARY = 500
+
+# Сколько ветвей плана хранить и сколько реплик допускается в каждой ветке
+# (стратегия «branching»). У ветки СВОЯ история сообщений — диалог в ней
+# независим от других ветвей.
+_MAX_BRANCHES = 5
+_MAX_BRANCH_MESSAGES = 500
+
+# Сколько фактов хранить (стратегия «sticky facts»).
+_MAX_FACTS = 40
 
 
 def _read_payload(path: Optional[str] = None) -> Any:
@@ -168,21 +189,98 @@ def load_agent_summary(path: Optional[str] = None) -> List[str]:
     return clean[-_MAX_SUMMARY:]
 
 
+def load_agent_covered(path: Optional[str] = None) -> int:
+    """Сколько ПЕРВЫХ сообщений истории уже свёрнуто в резюме (стратегия «summary»).
+
+    Граница нужна, чтобы после перезапуска приложения в контекст уходил блок
+    резюме вместо уже сжатой части переписки (сами сообщения остаются в
+    "messages" — пользователь видит их в чате). Файла нет / ключа нет — 0.
+    """
+    data = _read_payload(path)
+    if not isinstance(data, dict):
+        return 0
+    try:
+        return max(0, int(data.get("covered") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_agent_facts(path: Optional[str] = None) -> Dict[str, str]:
+    """Загружает блок фактов о диалоге (стратегия «sticky facts»).
+
+    Возвращает словарь «ключ: значение» (непустые строки), не более _MAX_FACTS
+    записей. Файла нет / он повреждён / ключа "facts" нет — пустой словарь.
+    """
+    data = _read_payload(path)
+    if not isinstance(data, dict) or not isinstance(data.get("facts"), dict):
+        return {}
+
+    clean: Dict[str, str] = {}
+    for key, value in data["facts"].items():
+        name = " ".join(str(key or "").split())[:80]
+        text = " ".join(str(value if value is not None else "").split())[:600]
+        if name and text:
+            clean[name] = text
+        if len(clean) >= _MAX_FACTS:
+            break
+    return clean
+
+
+def load_agent_branches(path: Optional[str] = None) -> Dict[str, Any]:
+    """Загружает ветви плана и активную ветку (стратегия «branching»).
+
+    Возвращает {"branches": {id: {...}}, "active": id|None}. У каждой ветки своя
+    история сообщений ("messages") — диалог в ветке продолжается после
+    перезапуска приложения независимо от других ветвей. Файла нет / ключей нет
+    — пустой результат.
+    """
+    data = _read_payload(path)
+    if not isinstance(data, dict):
+        return {"branches": {}, "active": None}
+
+    raw = data.get("branches")
+    branches: Dict[str, Any] = {}
+    if isinstance(raw, dict):
+        for key, value in list(raw.items())[:_MAX_BRANCHES]:
+            branch_id = str(key or "").strip()[:40]
+            if not branch_id or not isinstance(value, dict):
+                continue
+            item = dict(value)
+            messages = item.get("messages")
+            if isinstance(messages, list):
+                item["messages"] = messages[-_MAX_BRANCH_MESSAGES:] if len(messages) > _MAX_BRANCH_MESSAGES else messages
+            branches[branch_id] = item
+
+    active = data.get("active_branch")
+    active = str(active).strip()[:40] if active else None
+    if active and active not in branches:
+        active = None
+    return {"branches": branches, "active": active}
+
+
 def save_agent_memory(
     messages: List[Dict[str, str]],
     usage: Optional[List[Dict[str, Any]]] = None,
     summary: Optional[List[str]] = None,
+    facts: Optional[Dict[str, str]] = None,
+    branches: Optional[Dict[str, Any]] = None,
+    active_branch: Optional[str] = None,
+    covered: Optional[int] = None,
     path: Optional[str] = None,
 ) -> None:
-    """Сохраняет историю диалога (расход токенов и резюме) в JSON-файл.
+    """Сохраняет историю диалога (расход токенов, резюме, факты, ветви) в файл.
 
     Атомарная запись (временный файл + os.replace), поэтому файл не
     повреждается при обрыве записи.
 
     usage — список замеров токенов по запросам пользователя (может быть
     пустым); None — ключ "usage" в файл не пишется.
-    summary — части резюме старой части переписки (режим «суммаризация»);
-    None — ключ "summary" в файл не пишется.
+    summary/covered — стратегия «summary»: части резюме старой части переписки
+    и сколько первых сообщений истории в них уже свёрнуто; None — ключи не
+    пишутся.
+    facts — стратегия «sticky facts»: блок «ключ: значение»; None — не пишется.
+    branches/active_branch — стратегия «branching»: ветви плана (у каждой своя
+    история сообщений) и активная ветка; None — не пишутся.
     path — путь к файлу; None — путь по умолчанию из конфигурации. Каталог
     создаётся при необходимости. Ошибки ввода-вывода пробрасываются наверх —
     вызывающий код решает, как на них реагировать (лог и продолжение работы).
@@ -196,6 +294,16 @@ def save_agent_memory(
         payload["usage"] = [dict(item) for item in usage]
     if summary is not None:
         payload["summary"] = [str(part) for part in summary]
+    if covered is not None:
+        payload["covered"] = max(0, int(covered))
+    if facts is not None:
+        payload["facts"] = {str(key): str(value) for key, value in dict(facts).items()}
+    if branches is not None:
+        payload["branches"] = {
+            str(branch_id): dict(branch) for branch_id, branch in dict(branches).items()
+        }
+    if active_branch is not None:
+        payload["active_branch"] = str(active_branch)
     tmp_fd, tmp_path = tempfile.mkstemp(
         prefix=".agent_memory.", suffix=".tmp", dir=directory
     )

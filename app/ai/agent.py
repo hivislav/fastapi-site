@@ -10,15 +10,30 @@ generate()/stream_generate() и update_config() — внутри агент са
 потоке через asyncio.to_thread, поэтому агент безопасно использовать в
 FastAPI/Flask без блокировки event loop.
 
-Режим «суммаризация» (чекбокс в панели «Токены диалога»): память диалога
-делится на две части — последние N сообщений хранятся «как есть», а всё, что
-старше, сжимается в резюме (по одному резюме на каждые N сообщений). В запрос
-к модели уходит: текущий запрос + последние сообщения «как есть» + резюме
-прежней переписки отдельным блоком. N (поле «summary») агент получает из
-интерфейса.
+Стратегия работы с контекстом выбирается в выпадающем списке «Стратегия» в
+панели «Токены диалога» и определяет, какая часть переписки уходит в модель:
+  summary        — вся история видна пользователю в чате, а в контекст идут
+                   последние N сообщений «как есть» (N — поле «summary») плюс
+                   резюме более старой части (по одному резюме на каждые N
+                   сообщений); сама история при этом НЕ затирается;
+  sliding window — в контекст идут последние N сообщений переписки (N — поле
+                   «Количество сообщений в окне»), затем текущий запрос;
+  sticky facts   — в контекст идут блок «фактов» (ключ-значение: цель,
+                   ограничения, предпочтения, решения, договорённости — он
+                   обновляется после каждого запроса) плюс последние N
+                   сообщений переписки;
+  branching      — агент фиксирует контекст, генерирует 3–5 альтернативных
+                   ветвей решения, оценивает их, отбирает лучшие, углубляет их
+                   и ведёт в выбранной ветке ОТДЕЛЬНЫЙ независимый диалог
+                   (переключение веток — в интерфейсе).
+
+Память диалога (self.memory) хранит ВСЮ переписку: она нужна интерфейсу, чтобы
+пользователь по-прежнему видел свои сообщения. Размер контекста ограничивают
+стратегии, а не обрезка истории.
 """
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -26,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from app import config
-from app.ai import client, demo
+from app.ai import client, demo, json_utils
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +90,153 @@ SUMMARIZE_PROMPT = (
 SUMMARY_HEADER = "Резюме предыдущей части этого же диалога (по частям, от старых к новым):"
 
 
+# --- Стратегии работы с контекстом (список «Стратегия» в панели агента) -----
+# summary        — последние N сообщений «как есть» + резюме старой части;
+# sliding        — последние N сообщений переписки (окно);
+# facts          — блок фактов (ключ-значение) + последние N сообщений;
+# branching      — план из 3–5 ветвей и независимый диалог в выбранной ветке.
+STRATEGY_SUMMARY = "summary"
+STRATEGY_SLIDING = "sliding"
+STRATEGY_FACTS = "facts"
+STRATEGY_BRANCHING = "branching"
+# Порядок — как в выпадающем списке интерфейса.
+STRATEGIES = (STRATEGY_SUMMARY, STRATEGY_SLIDING, STRATEGY_FACTS, STRATEGY_BRANCHING)
+# Значение по умолчанию (и запасное для некорректного): окно последних
+# сообщений — ближайший аналог прежнего поведения агента.
+DEFAULT_STRATEGY = STRATEGY_SLIDING
+
+# Привычные названия из интерфейса/конфигурации -> код стратегии.
+_STRATEGY_ALIASES = {
+    "summary": STRATEGY_SUMMARY,
+    "суммаризация": STRATEGY_SUMMARY,
+    "sliding": STRATEGY_SLIDING,
+    "sliding window": STRATEGY_SLIDING,
+    "sliding_window": STRATEGY_SLIDING,
+    "окно": STRATEGY_SLIDING,
+    "facts": STRATEGY_FACTS,
+    "sticky facts": STRATEGY_FACTS,
+    "sticky_facts": STRATEGY_FACTS,
+    "branching": STRATEGY_BRANCHING,
+    "ветвление": STRATEGY_BRANCHING,
+}
+
+# Сколько последних сообщений уходит в контекст в стратегиях sliding window и
+# sticky facts, если пользователь не задал своё значение (поле «Количество
+# сообщений в окне»).
+DEFAULT_WINDOW_SIZE = 10
+
+# --- Стратегия sticky facts -------------------------------------------------
+# Блок фактов — словарь «ключ: значение» о диалоге (цель, ограничения,
+# предпочтения, решения, договорённости). Обновляется после КАЖДОГО запроса
+# пользователя отдельным служебным вызовом LLM и уходит в контекст сообщением
+# system перед последними N сообщениями окна.
+FACTS_PROMPT = (
+    "Ты ведёшь блок «фактов» о диалоге пользователя с ассистентом. Тебе дают "
+    "текущие факты (ключ-значение) и последний обмен репликами. Верни "
+    "ОБНОВЛЁННЫЙ набор фактов строго как JSON-объект (плоский словарь, все "
+    "значения — строки), без пояснений, markdown и комментариев. Сохраняй "
+    "факты, которые остаются верными, исправляй устаревшие и добавляй новые: "
+    "цель пользователя, ограничения, предпочтения, принятые решения, "
+    "договорённости, важные имена, числа, сроки. Ключи короткие, на русском, "
+    "не больше 40 ключей. Ничего не выдумывай."
+)
+FACTS_HEADER = (
+    "Известные факты о диалоге (ключ: значение) — учитывай их при ответе, "
+    "противоречий с ними не создавай:"
+)
+# Пределы блока фактов (защита от разрастания контекста и файла истории).
+MAX_FACTS = 40
+FACTS_VALUE_LIMIT = 600
+
+# --- Стратегия branching ----------------------------------------------------
+# Ветви с итоговым скором ниже порога отсеиваются (шаг 4 алгоритма), а из
+# оставшихся углубляются top-2. Оценки — по шкале 1–10, где риск трактуется
+# как «безопасность» (10 — риска почти нет), чтобы argmax по среднему скору
+# выбирал лучшую ветвь.
+BRANCH_MIN_SCORE = 6
+BRANCH_MAX = 5
+
+# Единственный промпт стратегии «branching»: модель выполняет весь алгоритм
+# (фиксация контекста, генерация ветвей, оценка, отбор, углубление, выбор) за
+# один вызов и возвращает план в виде JSON — по нему интерфейс рисует блок
+# плана и список веток для переключения.
+BRANCH_PROMPT = (
+    "Ты — планировщик, который исследует задачу методом ветвления.\n"
+    "ВХОДНЫЕ ДАННЫЕ: история чата (весь предыдущий диалог) и текущий запрос "
+    "пользователя. Ограничения (бюджет шагов, допустимые инструменты, критерии "
+    "успеха) задай сам, если пользователь их не задал.\n\n"
+    "АЛГОРИТМ (выполняй пошагово):\n"
+    "1. ФИКСАЦИЯ КОНТЕКСТА — кратко резюмируй цель, известные факты, "
+    "ограничения и открытые вопросы из истории чата (не более 5–7 пунктов).\n"
+    "2. ГЕНЕРАЦИЯ ВЕТВЕЙ (N = 3–5) — предложи N альтернативных путей решения "
+    "задачи. Для каждой ветви укажи: ID и название; суть подхода; ключевые "
+    "шаги; требуемые ресурсы/инструменты; риски и слабые места.\n"
+    "3. ОЦЕНКА ВЕТВЕЙ — оцени каждую ветвь по шкале 1–10: вероятность успеха, "
+    "стоимость (10 — дёшево), скорость (10 — быстро), безопасность (10 — "
+    "риска почти нет), соответствие контексту чата; посчитай итоговый скор как "
+    "их среднее.\n"
+    f"4. ОТБОР (PRUNING) — отсеиваются ветви с итоговым скором ниже "
+    f"{BRANCH_MIN_SCORE}; оставь top-2 для углубления и объясни, почему "
+    "отброшены остальные.\n"
+    "5. УГЛУБЛЕНИЕ ЛУЧШИХ ВЕТВЕЙ — для каждой из top-2 распиши детальный "
+    "план: шаги, ожидаемый результат, checkpoints. При необходимости "
+    "рекурсивно примени шаги 2–4 к подзадачам, сохраняя вложенные ID "
+    "(A.1, A.2, B.1).\n"
+    "6. ВЫБОР — выбери активную ветвь по умолчанию (argmax итогового скора).\n\n"
+    "КОМПАКТНОСТЬ (обязательно): каждый пункт — одна короткая строка не длиннее "
+    "12 слов; context — не больше 5 пунктов; steps у ветви — не больше 3; "
+    "resources и risks — не больше 2 пунктов; deep.steps — не больше 4; "
+    "deep.checkpoints — не больше 3. Никаких пояснений вне JSON.\n\n"
+    "ОТВЕТ — ТОЛЬКО один JSON-объект, без markdown и пояснений:\n"
+    '{"context": ["пункт", "..."], '
+    '"branches": [{"id": "A", "title": "название", "approach": "суть подхода", '
+    '"steps": ["шаг"], "resources": ["ресурс"], "risks": ["риск"]}], '
+    '"scores": [{"id": "A", "success": 8, "cost": 6, "speed": 7, "risk": 5, '
+    '"fit": 9, "total": 7.0}], '
+    '"kept": ["A", "B"], "rejected": [{"id": "C", "reason": "почему отброшена"}], '
+    '"deep": [{"id": "A", "steps": ["шаг"], "expected": "ожидаемый результат", '
+    '"checkpoints": ["точка проверки"]}], "chosen": "A"}'
+)
+
+# Повторный (более компактный) вариант того же алгоритма: используется, если
+# первый вызов плана не дал ответа (провайдер оборвал запрос по времени или
+# ответил ошибкой). Требование краткости жёстче — ответ получается быстрее.
+BRANCH_PROMPT_COMPACT = (
+    "Ты — планировщик, который исследует задачу методом ветвления. По истории "
+    "чата и текущему запросу пользователя выполни: 1) кратко зафиксируй цель, "
+    "факты и ограничения (не больше 4 пунктов); 2) предложи 3 альтернативные "
+    "ветви решения (ID, название, суть, ключевые шаги, ресурсы, риски); "
+    "3) оцени каждую ветвь по шкале 1–10 (успех, стоимость, скорость, "
+    "безопасность, соответствие контексту), итог — среднее; 4) отбрось ветви с "
+    f"итогом ниже {BRANCH_MIN_SCORE} и оставь top-2, объяснив отброс; "
+    "5) кратко распиши шаги и checkpoints лучшей ветви; 6) выбери активную "
+    "ветвь (argmax).\n"
+    "Пиши КРАЙНЕ сжато: каждый пункт — одна строка до 10 слов. "
+    "Ответ — только JSON, без markdown:\n"
+    '{"context": ["..."], "branches": [{"id": "A", "title": "", "approach": "", '
+    '"steps": [""], "resources": [""], "risks": [""]}], '
+    '"scores": [{"id": "A", "success": 0, "cost": 0, "speed": 0, "risk": 0, '
+    '"fit": 0, "total": 0}], "kept": ["A", "B"], '
+    '"rejected": [{"id": "C", "reason": ""}], '
+    '"deep": [{"id": "A", "steps": [""], "expected": "", "checkpoints": [""]}], '
+    '"chosen": "A"}'
+)
+
+# План ветвления — тяжёлый служебный вызов: ответ на ~2000 токенов занимает
+# около минуты, поэтому ему даётся больше времени, чем обычному ответу, и явный
+# лимит вывода (чтобы провайдер не обрезал JSON на своей стороне).
+PLAN_TIMEOUT = 150.0
+PLAN_MAX_TOKENS = 4000
+
+# Заголовок блока ветки: уходит сообщением system, когда пользователь ведёт
+# диалог внутри выбранной ветки (история ветки независима от других ветвей).
+BRANCH_HEADER = (
+    "Ты работаешь внутри ОДНОЙ выбранной ветви плана. Продолжай именно эту "
+    "ветвь: её контекст, шаги и ожидаемый результат ниже. Диалог этой ветки "
+    "независим от других ветвей плана."
+)
+
+
 # ---------------------------------------------------------------------------
 # События агента (тип -> смысл):
 #   debug — агент сообщает, чем сейчас занят (выводится в чат отдельным
@@ -92,9 +254,10 @@ class AgentConfig:
     параметр в запрос к API не отправляется вовсе (никаких ограничений по
     умолчанию: ни temperature, ни max_tokens, ни stop).
 
-    Отдельная группа полей — суммаризация памяти (summarization/summary_size):
-    она управляет не запросом к API, а тем, какая часть памяти диалога уходит
-    в контекст как есть, а какая — сжатой в резюме.
+    Отдельная группа полей — стратегия работы с контекстом (strategy плюс
+    summary_size/window_size): она управляет не запросом к API, а тем, какая
+    часть памяти диалога уходит в контекст (окно последних сообщений, резюме
+    старой части, блок фактов или план ветвления).
     """
 
     def __init__(
@@ -105,9 +268,11 @@ class AgentConfig:
         model: Optional[str] = None,
         max_history_messages: int = 24,
         max_history_chars: int = 16000,
-        summarization: bool = False,
+        strategy: str = DEFAULT_STRATEGY,
         summary_size: int = DEFAULT_SUMMARY_SIZE,
+        window_size: int = DEFAULT_WINDOW_SIZE,
         max_summaries_per_request: int = 3,
+        max_display_messages: int = 500,
     ) -> None:
         # Ограничение длины ответа (токены); None — в API не отправляется.
         self.max_tokens = max_tokens
@@ -117,19 +282,26 @@ class AgentConfig:
         self.temperature = temperature
         # URI модели; None — модель по умолчанию из конфигурации приложения.
         self.model = model
-        # Ограничения памяти диалога (обрезание истории).
+        # Ограничения контекста диалога (страховка поверх стратегий).
         self.max_history_messages = max_history_messages
         self.max_history_chars = max_history_chars
-        # Суммаризация памяти (чекбокс «суммаризация» в панели режима агента).
-        self.summarization = summarization
+        # Стратегия работы с контекстом (список «Стратегия» в панели агента):
+        # summary / sliding / facts / branching (см. STRATEGIES).
+        self.strategy = strategy
         # N — сколько последних сообщений держать в контексте «как есть»
         # (поле «summary» в интерфейсе); всё, что старше, уходит в резюме.
         self.summary_size = summary_size
+        # N — размер окна последних сообщений (поле «Количество сообщений в
+        # окне») для стратегий sliding window и sticky facts.
+        self.window_size = window_size
         # Сколько резюме разрешено составить за один запрос пользователя —
         # предохранитель от лавины вызовов LLM (например, если пользователь
         # резко уменьшил N при длинной истории). Лимит общий на сжатие до и
         # после ответа, счётчик — Agent._summaries_this_request.
         self.max_summaries_per_request = max_summaries_per_request
+        # Страховочный предел памяти: история НЕ обрезается по стратегиям (её
+        # видит пользователь в чате), это лишь защита от безграничного роста.
+        self.max_display_messages = max_display_messages
 
     def as_dict(self) -> Dict[str, Any]:
         """Все поля конфигурации словарём (для логов)."""
@@ -140,9 +312,11 @@ class AgentConfig:
             "model": self.model,
             "max_history_messages": self.max_history_messages,
             "max_history_chars": self.max_history_chars,
-            "summarization": self.summarization,
+            "strategy": self.strategy,
             "summary_size": self.summary_size,
+            "window_size": self.window_size,
             "max_summaries_per_request": self.max_summaries_per_request,
+            "max_display_messages": self.max_display_messages,
         }
 
 
@@ -183,11 +357,25 @@ class Agent:
         # Если в generate() передана внешняя история — она авторитетна и
         # заменяет внутреннюю (веб-слой хранит диалог сам).
         self.memory: List[Dict[str, str]] = []
-        # Резюме старой части диалога (режим «суммаризация»): список строк, по
+        # Резюме старой части диалога (стратегия «summary»): список строк, по
         # одному резюме на каждые N сообщений, от старых к новым. Хранится
         # ОТДЕЛЬНО от memory и так же может прийти извне (веб-слой сохраняет
         # его в JSON-файл рядом с историей).
         self.summary: List[str] = []
+        # Сколько ПЕРВЫХ сообщений памяти уже свёрнуто в резюме: в контекст
+        # вместо них уходит блок резюме, а в памяти (и в чате) они остаются.
+        # Приходит извне вместе с историей, как и summary.
+        self.covered = 0
+        # Блок фактов (стратегия «sticky facts»): «ключ: значение» о диалоге.
+        # Обновляется после каждого запроса; тоже приходит извне.
+        self.facts: Dict[str, str] = {}
+        # Ветви плана (стратегия «branching»): id -> {title, approach, steps,
+        # resources, risks, task, plan, expected, checkpoints, messages}.
+        # У каждой ветки СВОЯ история сообщений — диалоги независимы.
+        self.branches: Dict[str, Dict[str, Any]] = {}
+        # Активная ветка (argmax по итоговому скору плана; либо выбранная
+        # пользователем в интерфейсе во время её диалога).
+        self.active_branch: Optional[str] = None
         # Последние использованные параметры генерации (для generate()).
         self.last_params: Dict[str, Any] = {}
         # Сколько резюме составлено в ТЕКУЩЕМ запросе (обнуляется в начале
@@ -225,13 +413,22 @@ class Agent:
         user_message: str,
         history: Optional[List[Dict[str, str]]] = None,
         summary: Optional[List[str]] = None,
+        facts: Optional[Dict[str, str]] = None,
+        branches: Optional[Dict[str, Any]] = None,
+        branch: Optional[str] = None,
+        covered: Optional[int] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
         history — внешняя история диалога (список {"role", "content"}).
         None — агент использует свою внутреннюю память (накопленную ранее).
-        summary — внешние резюме прежней переписки (режим «суммаризация»);
+        summary — внешние резюме прежней переписки (стратегия «summary»);
         None — агент использует свои накопленные (self.summary).
+        facts — внешний блок фактов (стратегия «sticky facts»).
+        branches — внешние ветви плана (стратегия «branching»); branch — id
+        ветки, в которой пользователь ведёт диалог (None — корневой запрос:
+        агент строит план ветвления заново).
+        covered — сколько первых сообщений истории уже свёрнуто в резюме.
 
         Собирает все debug-события в result.debug — пригодится, когда
         показывать их по одному не нужно (например, в API-ответах).
@@ -241,7 +438,7 @@ class Agent:
         async def sink(event: Step) -> None:
             steps.append(event)
 
-        await self._process(user_message, history, sink, summary)
+        await self._process(user_message, history, sink, summary, facts, branches, branch, covered)
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
         final = next((e["text"] for e in reversed(steps) if e["type"] == "bot"), "")
@@ -258,6 +455,10 @@ class Agent:
         user_message: str,
         history: Optional[List[Dict[str, str]]] = None,
         summary: Optional[List[str]] = None,
+        facts: Optional[Dict[str, str]] = None,
+        branches: Optional[Dict[str, Any]] = None,
+        branch: Optional[str] = None,
+        covered: Optional[int] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -266,14 +467,18 @@ class Agent:
         агент занят в реальном времени). Поток всегда заканчивается
         событием {"type": "done"} (в нём же — расход токенов запроса);
         события "error" (в т.ч. предупреждение о переполнении лимита
-        токенов) поток НЕ прерывают.
+        токенов) поток НЕ прерывают. Отдельное событие "branches" несёт план
+        ветвления (стратегия «branching») — интерфейс рисует по нему блок
+        плана и список веток для переключения.
         """
         queue: asyncio.Queue = asyncio.Queue()
 
         async def sink(event: Step) -> None:
             queue.put_nowait(event)
 
-        runner = asyncio.create_task(self._process(user_message, history, sink, summary))
+        runner = asyncio.create_task(
+            self._process(user_message, history, sink, summary, facts, branches, branch, covered)
+        )
         try:
             while True:
                 event = await queue.get()
@@ -297,6 +502,10 @@ class Agent:
         history: Optional[List[Dict[str, str]]],
         emit: EmitFn,
         summary: Optional[List[str]] = None,
+        facts: Optional[Dict[str, str]] = None,
+        branches: Optional[Dict[str, Any]] = None,
+        branch: Optional[str] = None,
+        covered: Optional[int] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -308,9 +517,18 @@ class Agent:
             # Внешняя история авторитетна; без неё — продолжаем внутреннюю.
             if history is not None:
                 self.memory = self._normalize_history(history)
-            # То же для резюме прежней переписки (режим «суммаризация»).
+            # То же для резюме прежней переписки (стратегия «summary») и для
+            # границы «что уже свёрнуто в резюме».
             if summary is not None:
                 self.summary = self._normalize_summary(summary)
+            if covered is not None:
+                self.covered = self._normalize_covered(covered)
+            # Блок фактов (стратегия «sticky facts»).
+            if facts is not None:
+                self.facts = self._normalize_facts(facts)
+            # Ветви плана (стратегия «branching») — у каждой своя история.
+            if branches is not None:
+                self.branches = self._normalize_branches(branches)
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
@@ -342,39 +560,37 @@ class Agent:
             for note in notes:
                 await emit(self._step("debug", f"{self.name}: {note}"))
 
-            # 3. Суммаризация памяти (если включён чекбокс): всё, что старше
-            #    последних N сообщений, сжимаем в резюме ДО сборки контекста —
-            #    в модель уйдут только свежие сообщения «как есть». Обычно тут
-            #    работы нет: память уже сжата в конце прошлого запроса, но так
-            #    учитывается и смена N пользователем по ходу диалога.
-            if self.config.summarization:
+            strategy = self._strategy()
+
+            # 3. Стратегия «branching» — отдельный путь: либо строим план из
+            #    ветвей (корневой запрос), либо продолжаем диалог внутри
+            #    выбранной ветки (у неё своя, независимая история сообщений).
+            if strategy == STRATEGY_BRANCHING:
+                await self._branching(text, params, emit, branch)
+                return
+
+            # 4. Стратегия «summary»: всё, что старше последних N сообщений,
+            #    сжимаем в резюме ДО сборки контекста — в модель уйдут только
+            #    свежие сообщения «как есть». Память при этом хранит всю
+            #    переписку целиком (её видит пользователь в чате), а в контекст
+            #    вместо сжатой части уходит блок резюме (self.covered).
+            if strategy == STRATEGY_SUMMARY:
                 await self._compact_memory(emit)
 
-            # 4. Память диалога: сколько контекста уже накоплено.
-            history_len = len(self.memory)
-            context_chars = sum(len(m["content"]) for m in self.memory)
+            # 5. Что реально уйдёт в модель: стратегия решает, какая часть
+            #    переписки попадёт в контекст (окно, резюме, факты).
+            messages = self._build_context(text)
             await emit(self._step(
                 "debug",
-                f"{self.name}: история диалога: {history_len} реплик "
-                f"(≈{context_chars // 4} токенов эвристически) — добавляю текущий запрос."
-                + (
-                    f" Плюс резюме прежней переписки: {len(self.summary)} част."
-                    if self.summary else ""
-                ),
+                f"{self.name}: {self._strategy_note()} — в контекст уходит "
+                f"{len(messages)} сообщений (в памяти диалога {len(self.memory)} реплик).",
             ))
 
-            # 5. Вызов LLM: запрос уходит в модель КАК ЕСТЬ (без системного
-            #    промпта и формата) + последние реплики диалога + резюме
-            #    прежней переписки, если суммаризация их уже составила. При
-            #    включённой суммаризации вызовов два: сжатие старой части
-            #    памяти (см. _compact_memory) и сам ответ. Вызов идёт в
-            #    отдельном потоке и event loop не блокирует.
-            messages: List[Dict[str, str]] = []
-            if self.summary:
-                messages.append({"role": "system", "content": self._summary_block()})
-            messages.extend(self.memory)          # свежие реплики «как есть»
-            messages.append({"role": "user", "content": text})  # текущий запрос
-
+            # 6. Вызов LLM: запрос уходит в модель КАК ЕСТЬ (без системного
+            #    промпта и формата) + выбранная стратегией часть контекста.
+            #    Служебные вызовы (сжатие памяти, обновление фактов) идут
+            #    отдельно. Вызов выполняется в отдельном потоке и event loop
+            #    не блокирует.
             short_model = (params["model"] or config.LLM_MODEL).split("/")[-1]
             await emit(self._step(
                 "debug",
@@ -386,20 +602,9 @@ class Agent:
             # задано настройкой «Длина» (считаем ВХОДЯЩИЕ — запрос + история).
             overflow = self._is_limit_exceeded(metrics, params.get("max_tokens"))
             self.last_usage["overflow"] = overflow
-            if content:
-                await emit(self._step(
-                    "debug",
-                    f"{self.name}: ответ получен за {elapsed:.1f} с"
-                    + (f", токены: вход {metrics['prompt_tokens']} / выход {metrics['completion_tokens']}."
-                       if metrics else "."),
-                ))
-            else:
-                await emit(self._step(
-                    "debug",
-                    f"{self.name}: модель вернула пустой ответ ({elapsed:.1f} с) — включаю запасной сценарий.",
-                ))
+            await self._report_answer(emit, content, metrics, elapsed)
 
-            # 6. Пустой ответ (сбой/нет ключа) — понятное сообщение вместо
+            # 7. Пустой ответ (сбой/нет ключа) — понятное сообщение вместо
             #    технического стека или пустоты.
             if not content:
                 content = self._fallback_text(text)
@@ -411,14 +616,14 @@ class Agent:
                        "LLM не ответила — возвращаю пользователю понятное сообщение."),
                 ))
 
-            # 7. Запоминаем ход диалога (содержательный обмен).
+            # 8. Запоминаем ход диалога (содержательный обмен).
             self.memory.append({"role": "user", "content": text})
             self.memory.append({"role": "assistant", "content": content})
             self._trim_memory()
 
             await emit(self._step("bot", content))
 
-            # 8. Лимит токенов превышен — отдельным сообщением с ошибкой
+            # 9. Лимит токенов превышен — отдельным сообщением с ошибкой
             #    (сам ответ пользователь уже получил выше).
             if overflow and metrics:
                 await emit(self._step(
@@ -429,12 +634,17 @@ class Agent:
                     ),
                 ))
 
-            # 9. Суммаризация: после обмена репликами памяти стало больше N
-            #    сообщений — самую старую часть сжимаем в резюме. Делаем это
-            #    ПОСЛЕ ответа (пользователь его уже видит), чтобы служебный
-            #    вызов LLM не задерживал ответ.
-            if self.config.summarization:
+            # 10. Стратегия «summary»: после обмена репликами непокрытых
+            #    сообщений стало больше N — самую старую часть сжимаем в
+            #    резюме. Делаем это ПОСЛЕ ответа (пользователь его уже видит),
+            #    чтобы служебный вызов LLM не задерживал ответ.
+            if strategy == STRATEGY_SUMMARY:
                 await self._compact_memory(emit)
+
+            # 11. Стратегия «sticky facts»: обновляем блок фактов по свежему
+            #     обмену репликами (служебный вызов LLM — тоже после ответа).
+            if strategy == STRATEGY_FACTS:
+                await self._update_facts(emit)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — внешний код видит только понятное сообщение
@@ -445,8 +655,17 @@ class Agent:
                 "params": self.last_params,
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
                 "memory_len": len(self.memory),
-                # Сколько частей резюме накоплено (режим «суммаризация»).
+                # Сколько частей резюме накоплено (стратегия «summary»).
                 "summary_parts": len(self.summary),
+                # Стратегия и её состояние — интерфейс восстанавливает по ним
+                # список веток, блок фактов и панель токенов.
+                "strategy": self._strategy(),
+                "facts": dict(self.facts),
+                "branches": [
+                    {"id": bid, "title": branch.get("title", "")}
+                    for bid, branch in self.branches.items()
+                ],
+                "active_branch": self.active_branch,
                 # Расход токенов текущего запроса — фронт рисует по нему
                 # панель «Токены диалога».
                 "usage": dict(self.last_usage),
@@ -462,6 +681,626 @@ class Agent:
         if extra:
             event.update(extra)
         return event
+
+    async def _report_answer(
+        self,
+        emit: EmitFn,
+        content: str,
+        metrics: Optional[Dict[str, Any]],
+        elapsed: float,
+    ) -> None:
+        """Debug-сообщение о результате вызова LLM (общее для всех стратегий)."""
+        if content:
+            await emit(self._step(
+                "debug",
+                f"{self.name}: ответ получен за {elapsed:.1f} с"
+                + (f", токены: вход {metrics['prompt_tokens']} / выход {metrics['completion_tokens']}."
+                   if metrics else "."),
+            ))
+        else:
+            await emit(self._step(
+                "debug",
+                f"{self.name}: модель вернула пустой ответ ({elapsed:.1f} с) — включаю запасной сценарий.",
+            ))
+
+    # ------------------------------------------------------------------
+    # Стратегии работы с контекстом
+    # ------------------------------------------------------------------
+    def _strategy(self) -> str:
+        """Код выбранной стратегии (summary/sliding/facts/branching).
+
+        Принимает и «человеческие» названия из интерфейса («sliding window»,
+        «sticky facts»). Неизвестное значение не ломает агента — работаем как
+        в стратегии по умолчанию.
+        """
+        value = str(self.config.strategy or "").strip().lower()
+        return _STRATEGY_ALIASES.get(value, DEFAULT_STRATEGY)
+
+    def _window_size(self) -> int:
+        """N — сколько последних сообщений уходит в контекст в окне."""
+        try:
+            size = int(self.config.window_size)
+        except (TypeError, ValueError):
+            size = DEFAULT_WINDOW_SIZE
+        return max(1, size)
+
+    def _strategy_note(self) -> str:
+        """Строка-пояснение стратегии для debug-чата."""
+        strategy = self._strategy()
+        if strategy == STRATEGY_SUMMARY:
+            return (
+                f"стратегия «summary»: последние {self._summary_size()} сообщений «как есть» "
+                f"+ резюме старой части ({len(self.summary)} част., свёрнуто {self.covered} сообщений)"
+            )
+        if strategy == STRATEGY_FACTS:
+            return (
+                f"стратегия «sticky facts»: блок фактов ({len(self.facts)} ключей) "
+                f"+ последние {self._window_size()} сообщений окна"
+            )
+        return f"стратегия «sliding window»: последние {self._window_size()} сообщений"
+
+    def _build_context(self, text: str) -> List[Dict[str, str]]:
+        """Собирает список сообщений для LLM по текущей стратегии.
+
+        Текущий запрос всегда последний. Память (self.memory) хранит всю
+        переписку, но в контекст попадает только её часть — смотря что выбрано
+        в выпадающем списке «Стратегия»:
+          summary        — блок резюме прежней части + последние сообщения, ещё
+                           не свёрнутые в резюме (self.covered — граница);
+          sliding window — последние N сообщений;
+          sticky facts   — блок фактов + последние N сообщений.
+        """
+        strategy = self._strategy()
+        messages: List[Dict[str, str]] = []
+        if strategy == STRATEGY_SUMMARY:
+            if self.summary:
+                messages.append({"role": "system", "content": self._summary_block()})
+            messages.extend(self.memory[self.covered:])
+        else:
+            if strategy == STRATEGY_FACTS and self.facts:
+                messages.append({"role": "system", "content": self._facts_block()})
+            messages.extend(self.memory[-self._window_size():])
+        messages.append({"role": "user", "content": text})  # текущий запрос
+        return self._cap_context(messages)
+
+    def _build_plain_context(self, text: str) -> List[Dict[str, str]]:
+        """Контекст для обычного ответа, когда план ветвления не получился.
+
+        Ветвей нет, поэтому ограничиваемся окном последних N сообщений
+        переписки (как в стратегии sliding window) + текущим запросом.
+        """
+        messages = list(self.memory[-self._window_size():])
+        messages.append({"role": "user", "content": text})
+        return self._cap_context(messages)
+
+    def _cap_context(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Страховка от слишком длинного контекста (max_history_chars).
+
+        Системные блоки (резюме/факты/план ветки) сохраняем, а самые старые
+        реплики выкидываем — так контекст не разрастётся даже там, где окно не
+        задано (диалог внутри ветки плана).
+        """
+        limit = int(self.config.max_history_chars or 0)
+        if limit <= 0 or not messages:
+            return messages
+        system = [m for m in messages if m.get("role") == "system"]
+        body = [m for m in messages if m.get("role") != "system"]
+        total = sum(len(m["content"]) for m in messages)
+        while total > limit and len(body) > 1:
+            total -= len(body[0]["content"])
+            body.pop(0)
+        return system + body
+
+    def _normalize_covered(self, value: Any) -> int:
+        """Граница «сколько первых сообщений уже в резюме» (0..len(memory)).
+
+        Округляем вниз до чётного: один запрос пользователя — это пара
+        «запрос + ответ», она не должна распадаться из-за границы резюме.
+        """
+        try:
+            covered = int(value)
+        except (TypeError, ValueError):
+            covered = 0
+        covered = max(0, min(covered, len(self.memory)))
+        return covered - (covered % 2)
+
+    # ------------------------------------------------------------------
+    # Стратегия «sticky facts» (блок фактов о диалоге)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_facts(facts: Any) -> Dict[str, str]:
+        """Приводит блок фактов к словарю непустых строковых значений."""
+        clean: Dict[str, str] = {}
+        if not isinstance(facts, dict):
+            return clean
+        for key, value in facts.items():
+            name = " ".join(str(key or "").split())[:80]
+            text = " ".join(str(value if value is not None else "").split())[:FACTS_VALUE_LIMIT]
+            if name and text:
+                clean[name] = text
+            if len(clean) >= MAX_FACTS:
+                break
+        return clean
+
+    def _facts_block(self) -> str:
+        """Текст блока фактов для контекста (сообщение system)."""
+        lines = "\n".join(f"- {key}: {value}" for key, value in self.facts.items())
+        return f"{FACTS_HEADER}\n{lines}"
+
+    async def _update_facts(self, emit: EmitFn) -> None:
+        """Обновляет блок фактов по свежему обмену репликами (sticky facts).
+
+        Вызывается ПОСЛЕ ответа пользователю: служебный вызов LLM получает
+        текущие факты и последний обмен и возвращает обновлённый JSON
+        «ключ: значение». Сбой вызова или разбора факты не портит — остаются
+        прежними, в чат уходит debug-сообщение.
+        """
+        if len(self.memory) < 2:
+            return
+        exchange = "\n".join(
+            f"{'Пользователь' if msg['role'] == 'user' else 'Ассистент'}: {msg['content']}"
+            for msg in self.memory[-2:]
+        )
+        current = self._facts_block() if self.facts else "Фактов пока нет."
+        payload = f"{current}\n\nПоследний обмен репликами:\n{exchange}"
+        content, metrics = await client.call_llm_async(
+            user_text=payload,
+            model=self.config.model or config.LLM_MODEL,
+            disable_thinking=True,  # служебный вызов — reasoning не нужен
+            messages=[
+                {"role": "system", "content": FACTS_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+            omit_default_max_tokens=True,  # лимит приложения сюда не подставляем
+        )
+        self._track_usage(metrics, service=True)
+        fresh = self._parse_facts_json(content)
+        if not fresh:
+            await emit(self._step(
+                "debug",
+                f"{self.name}: sticky facts: не удалось обновить факты — оставляю прежние "
+                f"({len(self.facts)} ключей).",
+            ))
+            return
+        before = len(self.facts)
+        merged = dict(self.facts)
+        merged.update(fresh)
+        # Предел по числу ключей: новые факты идут в конец и вытесняют самые
+        # старые (по порядку появления).
+        self.facts = dict(list(merged.items())[-MAX_FACTS:])
+        logger.info("Агент %s: sticky facts обновлены (%d -> %d ключей)", self.name, before, len(self.facts))
+        await emit(self._step(
+            "debug",
+            f"{self.name}: sticky facts: обновил блок фактов — {before} → {len(self.facts)} ключей "
+            f"({', '.join(list(fresh)[:5])}{'…' if len(fresh) > 5 else ''}).",
+        ))
+
+    @classmethod
+    def _parse_facts_json(cls, content: str) -> Dict[str, str]:
+        """Разбирает ответ модели в блок фактов (пусто — не удалось)."""
+        data = _load_json_object(content)
+        if not isinstance(data, dict):
+            return {}
+        # Модель иногда заворачивает словарь в {"facts": {...}}.
+        if len(data) == 1:
+            only = next(iter(data.values()))
+            if isinstance(only, dict):
+                data = only
+        return cls._normalize_facts(data)
+
+    # ------------------------------------------------------------------
+    # Стратегия «branching» (план из ветвей и независимый диалог в ветке)
+    # ------------------------------------------------------------------
+    async def _branching(
+        self,
+        text: str,
+        params: Dict[str, Any],
+        emit: EmitFn,
+        branch: Optional[str],
+    ) -> None:
+        """Развилка стратегии «branching».
+
+        branch — id ветки, выбранной в интерфейсе: если такая ветка есть в
+        плане, продолжаем НЕЗАВИСИМЫЙ диалог внутри неё. Иначе (корневой
+        запрос) строим план ветвления по всей истории чата и текущему запросу.
+        """
+        target = str(branch or "").strip()
+        if target and target in self.branches:
+            await self._branch_dialogue(target, text, params, emit)
+            return
+        if target:
+            await emit(self._step(
+                "debug",
+                f"{self.name}: ветка «{target}» не найдена — строю план ветвления заново.",
+            ))
+        await self._build_branches(text, params, emit)
+
+    async def _build_branches(
+        self,
+        text: str,
+        params: Dict[str, Any],
+        emit: EmitFn,
+    ) -> None:
+        """Шаги 1–6 алгоритма ветвления: вызов LLM (с повтором) и разбор плана.
+
+        Модель получает весь предыдущий диалог и текущий запрос и возвращает
+        план JSON: контекст, ветви, оценки, отбор, углубление top-2 и активную
+        ветку (argmax). Ход этапов кратко проговаривается в debug-чате, а сам
+        план уезжает в интерфейс событием "branches".
+
+        Вызов тяжёлый (ответ ~2000 токенов ≈ минута), поэтому у него отдельный
+        таймаут PLAN_TIMEOUT и явный лимит вывода PLAN_MAX_TOKENS. Если модель
+        не ответила (таймаут/ошибка провайдера — причина пишется в лог),
+        делается ОДНА повторная попытка с более компактным промптом
+        (BRANCH_PROMPT_COMPACT). Если и она пуста — агент не оставляет
+        пользователя с непонятным отказом: он отвечает как обычно одним
+        вызовом (стратегия sliding window) и объясняет причину сообщением об
+        ошибке.
+        """
+        await emit(self._step(
+            "debug",
+            f"{self.name}: стратегия «branching» — 1. фиксирую контекст "
+            "(цель, известные факты, ограничения, открытые вопросы).",
+        ))
+        rendered = "\n".join(
+            f"{'Пользователь' if msg['role'] == 'user' else 'Ассистент'}: {msg['content']}"
+            for msg in self.memory
+        ) or "(история чата пуста)"
+        payload = f"История чата:\n{rendered}\n\nТекущий запрос пользователя:\n{text}"
+
+        content = ""
+        for attempt, prompt in enumerate((BRANCH_PROMPT, BRANCH_PROMPT_COMPACT), start=1):
+            if attempt > 1:
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: план не получен — повторяю запрос в более компактном виде "
+                    f"(таймаут {PLAN_TIMEOUT:.0f} с на попытку).",
+                ))
+            content, metrics = await client.call_llm_async(
+                user_text=payload,
+                model=self.config.model or config.LLM_MODEL,
+                disable_thinking=True,  # планирование — служебный вызов, без reasoning
+                max_tokens=PLAN_MAX_TOKENS,  # JSON не должен обрезаться провайдером
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": payload},
+                ],
+                timeout=PLAN_TIMEOUT,
+            )
+            self._track_usage(metrics, service=True)  # служебный вызов (панель токенов)
+            if content:
+                break
+
+        analysis = self._parse_branch_json(content) if content else None
+        if not analysis:
+            if content:
+                # Ответ есть, но разобрать не удалось — показываем его как есть.
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: не удалось разобрать план ветвления — показываю ответ модели как есть.",
+                ))
+                fallback = content.strip()
+                self.memory.append({"role": "user", "content": text})
+                self.memory.append({"role": "assistant", "content": fallback})
+                self._trim_memory()
+                await emit(self._step("bot", fallback))
+                return
+            # Пустой ответ после повтора: не оставляем пользователя с отказом —
+            # отвечаем как обычно (одним вызовом) и объясняем, что случилось.
+            await emit(self._step(
+                "error",
+                f"Не удалось построить план ветвления: модель не ответила за {PLAN_TIMEOUT:.0f} с "
+                "(две попытки). Отвечаю обычным способом, без ветвей — попробуйте повторить запрос позже.",
+            ))
+            await emit(self._step(
+                "debug",
+                f"{self.name}: план ветвления не получен — отвечаю одним вызовом "
+                "по последним сообщениям диалога.",
+            ))
+            messages = self._build_plain_context(text)
+            short_model = (params["model"] or config.LLM_MODEL).split("/")[-1]
+            fallback_content, fallback_metrics, elapsed = await self._call_model(text, messages, params)
+            self._track_usage(fallback_metrics)
+            self.last_usage["overflow"] = self._is_limit_exceeded(fallback_metrics, params.get("max_tokens"))
+            await self._report_answer(emit, fallback_content, fallback_metrics, elapsed)
+            if not fallback_content:
+                fallback_content = self._fallback_text(text)
+            self.memory.append({"role": "user", "content": text})
+            self.memory.append({"role": "assistant", "content": fallback_content})
+            self._trim_memory()
+            await emit(self._step("bot", fallback_content))
+            return
+
+        # Ветви плана: у каждой своя (пока пустая) история сообщений — диалоги
+        # в ветках независимы друг от друга.
+        branches: Dict[str, Dict[str, Any]] = {}
+        for item in analysis["branches"][:BRANCH_MAX]:
+            deep = next((d for d in analysis["deep"] if d["id"] == item["id"]), {})
+            branches[item["id"]] = {
+                "title": item["title"],
+                "approach": item["approach"],
+                "steps": list(item["steps"]),
+                "resources": list(item["resources"]),
+                "risks": list(item["risks"]),
+                "task": text,
+                "plan": list(deep.get("steps") or []),
+                "expected": deep.get("expected", ""),
+                "checkpoints": list(deep.get("checkpoints") or []),
+                "messages": [],
+            }
+        self.branches = branches
+        best = analysis["scores"][0]["id"] if analysis["scores"] else None
+        if analysis["scores"]:
+            top = max(analysis["scores"], key=lambda s: s["total"])
+            best = top["id"]
+        self.active_branch = analysis["chosen"] if analysis["chosen"] in branches else (
+            best if best in branches else (next(iter(branches)) if branches else None)
+        )
+
+        ids = ", ".join(b["id"] for b in analysis["branches"])
+        await emit(self._step("debug", f"{self.name}: 2. предложил {len(analysis['branches'])} ветвей: {ids}."))
+        if analysis["scores"]:
+            await emit(self._step(
+                "debug",
+                f"{self.name}: 3. оценил ветви по шкале 1–10 (успех/стоимость/скорость/"
+                f"безопасность/соответствие контексту) — таблица оценок в блоке плана; "
+                f"лучший итоговый скор у {best} ({max(s['total'] for s in analysis['scores'])}).",
+            ))
+        if analysis["kept"]:
+            rejected = "; ".join(f"{r['id']} — {r['reason']}" for r in analysis["rejected"] if r["reason"])
+            await emit(self._step(
+                "debug",
+                f"{self.name}: 4. отбор: для углубления оставлены {', '.join(analysis['kept'])}"
+                + (f"; отброшены (скор < {BRANCH_MIN_SCORE}): {rejected}." if rejected else "."),
+            ))
+        if analysis["deep"]:
+            await emit(self._step(
+                "debug",
+                f"{self.name}: 5. углубил лучшие ветви: "
+                + "; ".join(f"{d['id']} — {len(d['steps'])} шагов" for d in analysis["deep"]) + ".",
+            ))
+        chosen_title = self.branches.get(str(self.active_branch), {}).get("title", "")
+        await emit(self._step(
+            "debug",
+            f"{self.name}: 6. активная ветка по умолчанию — {self.active_branch} «{chosen_title}» "
+            "(argmax). Переключение ветвей и диалог внутри ветки — списком «Ветка».",
+        ))
+        # План целиком — интерфейсу (блок плана + список веток для переключения).
+        await emit(self._step("branches", "", {"analysis": analysis, "active": self.active_branch}))
+
+        brief = self._branch_brief(analysis)
+        self.memory.append({"role": "user", "content": text})
+        self.memory.append({"role": "assistant", "content": brief})
+        self._trim_memory()
+        await emit(self._step("bot", brief))
+
+    async def _branch_dialogue(
+        self,
+        branch_id: str,
+        text: str,
+        params: Dict[str, Any],
+        emit: EmitFn,
+    ) -> None:
+        """Диалог внутри выбранной ветки плана (своя история сообщений).
+
+        В контекст уходит: системный блок с сутью и планом ветки, история
+        ЭТОЙ ветки и текущий запрос. Обмен репликами остаётся в ветке и не
+        попадает в корневую историю — поэтому диалоги ветвей независимы.
+        """
+        branch = self.branches[branch_id]
+        title = branch.get("title", "")
+        self.active_branch = branch_id
+        branch_messages = branch.setdefault("messages", [])
+        await emit(self._step(
+            "debug",
+            f"{self.name}: ветка {branch_id} «{title}» — продолжаю диалог внутри ветки "
+            f"({len(branch_messages)} реплик в ветке, история ветки независима от других).",
+        ))
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": self._branch_block(branch_id, branch)}
+        ]
+        messages.extend(branch_messages)
+        messages.append({"role": "user", "content": text})
+        messages = self._cap_context(messages)
+
+        short_model = (params["model"] or config.LLM_MODEL).split("/")[-1]
+        await emit(self._step(
+            "debug",
+            f"{self.name}: отправляю запрос в LLM (ветка {branch_id}, модель {short_model}, "
+            "thinking выключен) — жду…",
+        ))
+        content, metrics, elapsed = await self._call_model(text, messages, params)
+        self._track_usage(metrics)
+        overflow = self._is_limit_exceeded(metrics, params.get("max_tokens"))
+        self.last_usage["overflow"] = overflow
+        await self._report_answer(emit, content, metrics, elapsed)
+        if not content:
+            content = self._fallback_text(text)
+            await emit(self._step(
+                "debug",
+                f"{self.name}: "
+                + ("API-ключ не задан — отвечаю по демо-правилам."
+                   if not config.LLM_API_KEY else
+                   "LLM не ответила — возвращаю пользователю понятное сообщение."),
+            ))
+        branch_messages.append({"role": "user", "content": text})
+        branch_messages.append({"role": "assistant", "content": content})
+        await emit(self._step("bot", content))
+        if overflow and metrics:
+            await emit(self._step(
+                "error",
+                self._limit_warning(int(params["max_tokens"]), int(metrics.get("prompt_tokens") or 0)),
+            ))
+
+    @staticmethod
+    def _branch_block(branch_id: str, branch: Dict[str, Any]) -> str:
+        """Системный блок ветки: суть, шаги и углублённый план (данные, не инструкция)."""
+        lines = [
+            BRANCH_HEADER,
+            f"Исходная задача: {branch.get('task', '')}",
+            f"Ветка {branch_id} — «{branch.get('title', '')}»: {branch.get('approach', '')}",
+        ]
+        steps = branch.get("steps") or []
+        if steps:
+            lines.append("Ключевые шаги: " + "; ".join(f"{i}) {s}" for i, s in enumerate(steps, 1)) + ".")
+        plan = branch.get("plan") or []
+        if plan:
+            lines.append("Углублённый план: " + "; ".join(f"{i}) {s}" for i, s in enumerate(plan, 1)) + ".")
+        if branch.get("expected"):
+            lines.append(f"Ожидаемый результат: {branch['expected']}")
+        checkpoints = branch.get("checkpoints") or []
+        if checkpoints:
+            lines.append("Checkpoints: " + "; ".join(checkpoints) + ".")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _branch_brief(analysis: Dict[str, Any]) -> str:
+        """Краткий текст плана для чата (детали рисует интерфейс по событию branches)."""
+        chosen = str(analysis.get("chosen") or "")
+        title = next((b["title"] for b in analysis["branches"] if b["id"] == chosen), "")
+        kept = ", ".join(analysis.get("kept") or []) or "—"
+        return (
+            f"🧭 План ветвления построен: {len(analysis['branches'])} ветвей. "
+            f"Отобраны для углубления: {kept}. Активная ветка по умолчанию — {chosen} «{title}» "
+            "(argmax по итоговому скору). Оценки и планы — в блоке плана выше. "
+            "Выберите ветку в списке «Ветка», чтобы вести в ней отдельный диалог."
+        )
+
+    @classmethod
+    def _parse_branch_json(cls, content: str) -> Optional[Dict[str, Any]]:
+        """Разбирает ответ модели в план ветвления (None — не получилось).
+
+        Всё полевое содержимое приводится к строкам, оценки ограничиваются
+        шкалой 1–10, итоговый скор при отсутствии считается как среднее.
+        Активная ветка проверяется по списку ветвей, при расхождении берётся
+        argmax по скору.
+        """
+        data = _load_json_object(content)
+        if not isinstance(data, dict):
+            return None
+        raw_branches = data.get("branches")
+        if not isinstance(raw_branches, list):
+            return None
+
+        branches: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_branches):
+            if not isinstance(item, dict):
+                continue
+            branch_id = str(item.get("id") or "").strip() or chr(ord("A") + index)
+            branches.append({
+                "id": branch_id[:40],
+                "title": " ".join(str(item.get("title") or "").split())[:200],
+                "approach": " ".join(str(item.get("approach") or "").split())[:2000],
+                "steps": cls._as_list(item.get("steps")),
+                "resources": cls._as_list(item.get("resources")),
+                "risks": cls._as_list(item.get("risks")),
+            })
+            if len(branches) >= BRANCH_MAX:
+                break
+        if not branches:
+            return None
+
+        scores: List[Dict[str, Any]] = []
+        for item in data.get("scores") or []:
+            if not isinstance(item, dict):
+                continue
+            score_id = str(item.get("id") or "").strip()[:40]
+            if not score_id:
+                continue
+            marks = {key: _clamp_score(item.get(key)) for key in ("success", "cost", "speed", "risk", "fit")}
+            total = _clamp_score(item.get("total"))
+            if not total:
+                filled = [value for value in marks.values() if value]
+                total = round(sum(filled) / len(filled), 1) if filled else 0.0
+            scores.append({"id": score_id, **marks, "total": total})
+
+        deep: List[Dict[str, Any]] = []
+        for item in data.get("deep") or []:
+            if not isinstance(item, dict):
+                continue
+            deep_id = str(item.get("id") or "").strip()[:40]
+            if not deep_id:
+                continue
+            deep.append({
+                "id": deep_id,
+                "steps": cls._as_list(item.get("steps")),
+                "expected": " ".join(str(item.get("expected") or "").split())[:2000],
+                "checkpoints": cls._as_list(item.get("checkpoints")),
+            })
+
+        kept = cls._as_list(data.get("kept"), limit=BRANCH_MAX)
+        rejected: List[Dict[str, str]] = []
+        for item in data.get("rejected") or []:
+            if isinstance(item, dict):
+                rejected_id = str(item.get("id") or "").strip()[:40]
+                if rejected_id:
+                    rejected.append({
+                        "id": rejected_id,
+                        "reason": " ".join(str(item.get("reason") or "").split())[:1000],
+                    })
+            elif isinstance(item, str) and item.strip():
+                rejected.append({"id": item.strip()[:40], "reason": ""})
+
+        ids = [branch["id"] for branch in branches]
+        chosen = str(data.get("chosen") or "").strip()[:40]
+        if chosen not in ids:
+            if scores:
+                chosen = max(scores, key=lambda score: score["total"])["id"]
+            if chosen not in ids:
+                chosen = ids[0]
+        if not kept:
+            kept = [chosen] + [branch_id for branch_id in ids if branch_id != chosen][:1]
+
+        return {
+            "context": cls._as_list(data.get("context"), limit=7),
+            "branches": branches,
+            "scores": scores,
+            "kept": kept,
+            "rejected": rejected,
+            "deep": deep,
+            "chosen": chosen,
+        }
+
+    @staticmethod
+    def _normalize_branches(branches: Any) -> Dict[str, Dict[str, Any]]:
+        """Приводит внешние ветви плана (из файла истории) к рабочему виду."""
+        clean: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(branches, dict):
+            return clean
+        for key, value in branches.items():
+            branch_id = str(key or "").strip()[:40]
+            if not branch_id:
+                continue
+            item = value if isinstance(value, dict) else {}
+            clean[branch_id] = {
+                "title": " ".join(str(item.get("title") or "").split())[:200],
+                "approach": " ".join(str(item.get("approach") or "").split())[:2000],
+                "steps": Agent._as_list(item.get("steps")),
+                "resources": Agent._as_list(item.get("resources")),
+                "risks": Agent._as_list(item.get("risks")),
+                "task": str(item.get("task") or "").strip()[:4000],
+                "plan": Agent._as_list(item.get("plan")),
+                "expected": " ".join(str(item.get("expected") or "").split())[:2000],
+                "checkpoints": Agent._as_list(item.get("checkpoints")),
+                "messages": Agent._normalize_history(item.get("messages") or []),
+            }
+        return clean
+
+    @staticmethod
+    def _as_list(value: Any, limit: int = 20) -> List[str]:
+        """Приводит значение модели к списку непустых строк (не более limit)."""
+        if isinstance(value, (str, int, float)):
+            value = [value]
+        if not isinstance(value, (list, tuple)):
+            return []
+        result: List[str] = []
+        for item in value:
+            text = " ".join(str(item if item is not None else "").split())
+            if text:
+                result.append(text[:1000])
+            if len(result) >= limit:
+                break
+        return result
 
     # ------------------------------------------------------------------
     # Учёт токенов (панель «Токены диалога» на фронте)
@@ -493,13 +1332,14 @@ class Agent:
     def _track_usage(
         self,
         metrics: Optional[Dict[str, Any]],
-        summarization: bool = False,
+        service: bool = False,
     ) -> None:
         """Добавляет метрики вызова LLM в расход текущего запроса.
 
-        summarization=True — вызов служебный (сжатие памяти): его токены входят
-        в общий расход запроса, но дополнительно копятся в отдельных полях,
-        чтобы панель могла показать вклад суммаризации отдельной строкой.
+        service=True — вызов служебный (сжатие памяти, блок фактов, план
+        ветвления): его токены входят в общий расход запроса, но дополнительно
+        копятся в отдельных полях, чтобы панель могла показать вклад служебных
+        вызовов отдельной строкой и исключить его из строки «Текущий запрос».
         """
         if not metrics:
             return
@@ -508,7 +1348,7 @@ class Agent:
         self.last_usage["requests"] += 1
         self.last_usage["input"] += prompt
         self.last_usage["output"] += completion
-        if summarization:
+        if service:
             self.last_usage["summary_requests"] += 1
             self.last_usage["summary_input"] += prompt
             self.last_usage["summary_output"] += completion
@@ -553,35 +1393,34 @@ class Agent:
         return clean
 
     def _trim_memory(self) -> None:
-        """Обрезает память диалога по количеству реплик и эвристике токенов.
+        """Страховочный предел памяти диалога (историю не обрезаем).
 
-        В режиме «суммаризация» размер памяти ограничивает само сжатие: старое
-        уходит в резюме, а не выбрасывается молча, поэтому обычная обрезка тут
-        не работает. Остаётся лишь страховочный предел на случай, когда резюме
-        перестали получаться (например, LLM недоступна) — иначе контекст рос бы
-        безгранично.
+        Раньше память обрезалась до 24 реплик, и восстановленный в интерфейсе
+        диалог терял реплики. Теперь память хранит ВСЮ переписку — её видит
+        пользователь в чате, — а размер контекста ограничивают СТРАТЕГИИ: окно
+        последних N сообщений, резюме старой части или блок фактов. Здесь
+        остаётся лишь грубый предохранитель от безграничного роста файла
+        истории (max_display_messages).
         """
-        if self.config.summarization:
-            safety = max(
-                self.config.max_history_messages,
-                self._summary_size() * 3,
-            )
-            while len(self.memory) > safety:
-                self.memory.pop(0)
-            return
-        while len(self.memory) > self.config.max_history_messages:
+        limit = max(2, int(self.config.max_display_messages or 0))
+        dropped = 0
+        while len(self.memory) > limit:
             self.memory.pop(0)
-        while sum(len(m["content"]) for m in self.memory) > self.config.max_history_chars:
-            self.memory.pop(0)
-        if self.memory:
+            dropped += 1
+        if dropped:
+            # Первые сообщения могли быть уже свёрнуты в резюме — сдвигаем
+            # границу, чтобы резюме не «съело» свежие реплики.
+            self.covered = max(0, self.covered - dropped)
+            if self.covered % 2:
+                self.covered -= 1
             logger.info(
-                "Агент %s: память диалога обрезана до %d реплик",
+                "Агент %s: память диалога обрезана предохранителем до %d реплик",
                 self.name,
                 len(self.memory),
             )
 
     # ------------------------------------------------------------------
-    # Суммаризация памяти (чекбокс «суммаризация» в панели режима агента)
+    # Стратегия «summary» (резюме старой части переписки)
     # ------------------------------------------------------------------
     def _summary_size(self) -> int:
         """N — сколько последних сообщений памяти держать «как есть».
@@ -597,26 +1436,28 @@ class Agent:
         return max(2, size)
 
     def _needs_compaction(self, size: int) -> bool:
-        """Пора ли сжимать: сообщений больше N.
+        """Пора ли сжимать: несжатых сообщений больше N.
 
-        Дополнительное условие — после сжатия в памяти должно остаться не
-        меньше пары сообщений, иначе из контекста пропал бы только что
-        завершённый обмен «запрос + ответ».
+        Дополнительное условие — после сжатия в контексте должно остаться не
+        меньше пары сообщений, иначе из него пропал бы только что завершённый
+        обмен «запрос + ответ».
         """
-        return len(self.memory) - size >= 2
+        return len(self.memory) - self.covered - size >= 2
 
     async def _compact_memory(self, emit: EmitFn) -> None:
-        """Сжимает самую старую часть памяти в резюме (режим «суммаризация»).
+        """Сжимает самую старую часть переписки в резюме (стратегия «summary»).
 
-        Пока сообщений больше N, берём N самых старых и просим модель сжать их
-        в одно резюме (до 10 предложений), после чего убираем их из памяти —
-        они остаются только в резюме (self.summary, по элементу на сжатие).
+        Пока несжатых сообщений больше N, берём N самых старых из них и просим
+        модель сжать их в одно резюме (до 10 предложений). Из ПАМЯТИ сообщения
+        при этом НЕ удаляются — пользователь продолжает видеть всю переписку в
+        чате; в контекст вместо них уходит блок резюме, а границей служит
+        self.covered (сколько первых сообщений истории уже свёрнуто).
 
         Вызывается ДО сборки контекста (память могла разрастись после смены N)
         и ПОСЛЕ ответа пользователю (свежий обмен перевалил за N). За один
         запрос составляется не больше max_summaries_per_request резюме —
         предохранитель от лавины вызовов LLM. Если резюме получить не удалось,
-        сообщения остаются в памяти как есть: терять их нельзя.
+        сообщения просто остаются в контексте как есть: терять их нельзя.
         """
         size = self._summary_size()
         if not self._needs_compaction(size):
@@ -630,7 +1471,7 @@ class Agent:
                     "— остальное сожму при следующем запросе.",
                 ))
                 break
-            chunk = self.memory[:size]
+            chunk = self.memory[self.covered:self.covered + size]
             summary = await self._summarize_chunk(chunk)
             if not summary:
                 await emit(self._step(
@@ -639,7 +1480,7 @@ class Agent:
                     "— оставляю их в контексте как есть.",
                 ))
                 break
-            del self.memory[:len(chunk)]
+            self.covered += len(chunk)
             self.summary.append(summary)
             self._summaries_this_request += 1
             logger.info(
@@ -650,7 +1491,8 @@ class Agent:
                 "debug",
                 f"{self.name}: суммаризация: {len(chunk)} сообщений сжаты в резюме "
                 f"№{len(self.summary)} — «{self._shorten(summary)}» "
-                f"(в контексте осталось {len(self.memory)} реплик как есть).",
+                f"(в контексте как есть {len(self.memory) - self.covered} реплик; "
+                f"вся история — {len(self.memory)} реплик, она остаётся в чате).",
             ))
 
     async def _summarize_chunk(self, chunk: List[Dict[str, str]]) -> str:
@@ -679,8 +1521,8 @@ class Agent:
             omit_default_max_tokens=True,  # лимит приложения сюда не подставляем
         )
         # Токены служебного вызова: входят в общий расход запроса и отдельно —
-        # в поля summary_* (панель показывает вклад суммаризации строкой).
-        self._track_usage(metrics, summarization=True)
+        # в поля summary_* (панель показывает вклад служебных вызовов строкой).
+        self._track_usage(metrics, service=True)
         return (content or "").strip()
 
     def _summary_block(self) -> str:
@@ -794,3 +1636,57 @@ class Agent:
         if not config.LLM_API_KEY:
             return demo.demo_ai(original_text)
         return "Извините, не удалось получить ответ от модели. Попробуйте ещё раз."
+
+
+# ---------------------------------------------------------------------------
+# Разбор JSON-ответов модели (служебные вызовы: факты, план ветвления)
+# ---------------------------------------------------------------------------
+def _strip_code_fences(text: str) -> str:
+    """Убирает markdown-обёртку ```json ... ``` вокруг ответа модели."""
+    value = (text or "").strip()
+    if not value.startswith("```"):
+        return value
+    value = value[3:]
+    if value[:4].lower() == "json":
+        value = value[4:]
+    end = value.rfind("```")
+    if end != -1:
+        value = value[:end]
+    return value.strip()
+
+
+def _load_json_object(text: str) -> Any:
+    """Достаёт JSON-объект из ответа модели (markdown, пояснения, обрезка).
+
+    Сначала пробуем обычный разбор, затем — «починку» обрезанного JSON
+    (json_utils.repair_json). None — разобрать не удалось.
+    """
+    value = _strip_code_fences(text)
+    if not value:
+        return None
+    # Модель иногда добавляет пояснение перед JSON — берём от первой «{».
+    start = value.find("{")
+    if start > 0:
+        value = value[start:]
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        pass
+    repaired = json_utils.repair_json(value)
+    if repaired:
+        try:
+            return json.loads(repaired)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _clamp_score(value: Any) -> float:
+    """Оценка ветви по шкале 1–10; мусор и пропуски — 0 (не учитываются)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number <= 0:
+        return 0.0
+    return round(max(1.0, min(10.0, number)), 1)

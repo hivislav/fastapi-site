@@ -485,39 +485,45 @@
             padding-top: 2px;
         }
         .agent-hint { margin-top: 6px; font-size: 0.68rem; color: #777; line-height: 1.25; }
-        /* ---------- Суммаризация памяти (чекбокс в панели агента) ---------- */
-        /* Чекбокс «суммаризация» и поле «summary»: сколько последних сообщений
-           агент держит в контексте как есть, а всё, что старше, сжимает в
-           резюме. Значение по умолчанию — 10. */
-        .agent-summary {
+        /* ---------- Стратегия агента (панель режима «AI-агент») ---------- */
+        /* Выпадающий список «Стратегия» и поля выбранной стратегии:
+           summary — поле «summary» (сколько последних сообщений держать как
+           есть, всё старшее сжимается в резюме); sliding window / sticky facts —
+           поле «Количество сообщений в окне»; branching — список веток плана
+           для переключения между ними. */
+        .agent-strategy {
             margin-top: 8px;
             padding-top: 8px;
             border-top: 1px solid #e8e8f2;
             font-size: 0.72rem;
             color: #333;
         }
-        .agent-summary label {
+        .agent-strategy-head {
             display: flex;
             align-items: center;
             gap: 6px;
-            cursor: pointer;
-            user-select: none;
         }
-        .agent-summary input[type="checkbox"] {
-            width: 14px;
-            height: 14px;
-            margin: 0;
-            accent-color: #667eea;
+        .agent-strategy-head > span { color: #8a86a8; white-space: nowrap; }
+        .agent-strategy select {
+            flex: 1;
+            min-width: 0;
+            padding: 3px 6px;
+            font: inherit;
+            font-size: 0.72rem;
+            color: #333;
+            background: #fff;
+            border: 1px solid #d6d3e6;
+            border-radius: 6px;
             cursor: pointer;
         }
-        .agent-summary-row {
+        .agent-strategy select:focus { outline: 2px solid #c9c6dd; outline-offset: 0; }
+        .agent-strategy-row {
             display: flex;
             align-items: center;
             gap: 6px;
             margin-top: 6px;
-            padding-left: 20px;
         }
-        .agent-summary-row input {
+        .agent-strategy-row input {
             width: 58px;
             padding: 3px 6px;
             font: inherit;
@@ -526,8 +532,35 @@
             border: 1px solid #d6d3e6;
             border-radius: 6px;
         }
-        .agent-summary-row input:focus { outline: 2px solid #c9c6dd; outline-offset: 0; }
-        .agent-summary-row span { color: #8a86a8; }
+        .agent-strategy-row input:focus { outline: 2px solid #c9c6dd; outline-offset: 0; }
+        /* Список веток плана (branching) занимает всю ширину строки. */
+        .agent-strategy-row select {
+            flex: 1;
+            min-width: 0;
+            padding: 3px 6px;
+            font: inherit;
+            font-size: 0.72rem;
+            color: #333;
+            background: #fff;
+            border: 1px solid #d6d3e6;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        .agent-strategy-row select:focus { outline: 2px solid #c9c6dd; outline-offset: 0; }
+        .agent-strategy-row span { color: #8a86a8; }
+        .agent-strategy-note { margin-top: 5px; font-size: 0.68rem; color: #8a86a8; line-height: 1.25; }
+        /* ---------- Блок плана ветвления (стратегия «branching») ---------- */
+        .branch-part { margin-bottom: 8px; }
+        .branch-part > b { color: #4a3b8f; }
+        .branch-part ul { margin: 4px 0 0 16px; padding: 0; }
+        .branch-item {
+            margin-top: 6px;
+            padding-left: 8px;
+            border-left: 2px solid #e0ddf0;
+        }
+        .branch-item b { color: #333; }
+        .branch-item div { color: #555; }
+
         /* ---------- Таблица судьи-аналитика ---------- */
         .judge-title { font-weight: 600; color: #4a3b8f; margin-bottom: 8px; }
         .judge-table {
@@ -714,21 +747,51 @@
                      блок (см. .agent-total-block). -->
                 <tbody id="agent-total-body" class="agent-total-block"></tbody>
             </table>
-            <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса. Строка «Текущий запрос» — только сам ответ модели (без служебного сжатия памяти); «Весь диалог» и «из них суммаризация» — общий итог переписки вместе со сжатием и вклад сжатия в него.</div>
-            <!-- Суммаризация памяти: при нажатом чекбоксе агент держит в
-                 контексте последние N сообщений «как есть» (N — поле
-                 «summary», по умолчанию 10), а всё, что старше, сжимает в
-                 резюме и отправляет его отдельным блоком. -->
-            <div class="agent-summary">
-                <label title="Агент держит в контексте только последние сообщения, а старую часть переписки сжимает в резюме">
-                    <input type="checkbox" id="agent-summary-on">
-                    <span>суммаризация</span>
-                </label>
-                <div class="agent-summary-row" id="agent-summary-row" hidden>
+            <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса. Строка «Текущий запрос» — только сам ответ модели (без служебных вызовов: сжатия памяти, блока фактов, плана ветвления); «Весь диалог» и «из них служебные вызовы» — общий итог переписки вместе со служебными вызовами и их вклад в него.</div>
+            <!-- Стратегия работы агента с контекстом диалога: выпадающий список
+                 и поля выбранной стратегии. Поля показываются только у той
+                 стратегии, которой они нужны. -->
+            <div class="agent-strategy">
+                <div class="agent-strategy-head">
+                    <span>Стратегия</span>
+                    <select id="agent-strategy" title="Как агент работает с контекстом диалога">
+                        <option value="summary">summary</option>
+                        <option value="sliding" selected>sliding window</option>
+                        <option value="facts">sticky facts</option>
+                        <option value="branching">branching</option>
+                    </select>
+                </div>
+                <!-- summary: поле «summary» — сколько последних сообщений агент
+                     держит в контексте как есть, а всё, что старше, сжимает в
+                     резюме. История при этом не затирается: вся переписка
+                     остаётся в чате. -->
+                <div class="agent-strategy-row" id="agent-summary-row" hidden>
                     <input type="text" id="agent-summary-size" value="10" inputmode="numeric" autocomplete="off"
-                           title="Сколько последних сообщений диалога агент хранит как есть (один запрос юзера — это 2 сообщения). Всё, что старше, сжимается в резюме.">
+                           title="Сколько последних сообщений диалога агент хранит как есть (один запрос юзера — это 2 сообщения). Всё, что старше, сжимается в резюме и уходит в контекст вместо этих сообщений; сама история в чате сохраняется.">
                     <span>summary</span>
                 </div>
+                <!-- sliding window: в модель уходят последние N сообщений
+                     переписки (и запросы юзера, и ответы модели). -->
+                <div class="agent-strategy-row" id="agent-window-row" hidden>
+                    <input type="text" id="agent-window-size" value="10" inputmode="numeric" autocomplete="off"
+                           title="Сколько последних сообщений переписки уходит в модель вместе с новым запросом (один запрос юзера — это 2 сообщения: запрос и ответ).">
+                    <span>Количество сообщений в окне</span>
+                </div>
+                <!-- sticky facts: блок фактов (ключ-значение) обновляется после
+                     каждого запроса и уходит в контекст вместе с последними N
+                     сообщениями окна. -->
+                <div class="agent-strategy-row" id="agent-facts-row" hidden>
+                    <input type="text" id="agent-facts-size" value="10" inputmode="numeric" autocomplete="off"
+                           title="Сколько последних сообщений переписки уходит в модель вместе с новым запросом. Дополнительно агент ведёт блок фактов о диалоге (цель, ограничения, решения, договорённости) и обновляет его после каждого запроса.">
+                    <span>Количество сообщений в окне</span>
+                </div>
+                <!-- branching: ветки плана — переключение между ними. Диалог в
+                     каждой ветке ведётся независимо; «корень» — построение
+                     нового плана ветвления. -->
+                <div class="agent-strategy-row" id="agent-branch-row" hidden>
+                    <select id="agent-branch-select" title="Ветка плана: у каждой ветки свой независимый диалог. «Корень» — построить план ветвления заново."></select>
+                </div>
+                <div class="agent-strategy-note" id="agent-strategy-note" hidden></div>
             </div>
         </aside>
     </div>
@@ -751,35 +814,112 @@
             maxLengthInput.value = maxLengthInput.value.replace(/\D/g, '');
         });
 
-        // ---------- Суммаризация памяти (панель режима «AI-агент») ----------
-        // Чекбокс «суммаризация» + поле «summary» (значение по умолчанию 10):
-        // сколько последних сообщений агент держит в контексте как есть, а всё,
-        // что старше, сжимает в резюме. Поле показывается только при нажатом
-        // чекбоксе и принимает только цифры.
-        const agentSummaryToggle = document.getElementById('agent-summary-on');
-        const agentSummaryRow = document.getElementById('agent-summary-row');
+        // ---------- Стратегия агента (панель режима «AI-агент») ----------
+        // Выпадающий список «Стратегия»: summary (резюме старой части переписки),
+        // sliding window (окно последних N сообщений), sticky facts (блок фактов
+        // + окно), branching (план из ветвей и независимый диалог в ветке).
+        // Поля показываются только у выбранной стратегии; значения полей — это
+        // НАСТРОЙКИ, они сохраняются при выключении/включении режима агента.
+        const agentStrategySelect = document.getElementById('agent-strategy');
         const agentSummarySize = document.getElementById('agent-summary-size');
+        const agentWindowSize = document.getElementById('agent-window-size');
+        const agentFactsSize = document.getElementById('agent-facts-size');
+        const agentBranchSelect = document.getElementById('agent-branch-select');
+        const agentStrategyNote = document.getElementById('agent-strategy-note');
+        const agentStrategyRows = {
+            summary: document.getElementById('agent-summary-row'),
+            sliding: document.getElementById('agent-window-row'),
+            facts: document.getElementById('agent-facts-row'),
+            branching: document.getElementById('agent-branch-row')
+        };
         // Минимум 2: один запрос юзера — это пара «запрос + ответ», она должна
-        // оставаться в контексте целиком.
+        // оставаться в контексте (окне/резюме) целиком.
         const AGENT_SUMMARY_MIN = 2;
+        const AGENT_WINDOW_MIN = 2;
 
-        agentSummarySize.addEventListener('input', () => {
-            agentSummarySize.value = agentSummarySize.value.replace(/\D/g, '');
+        // Поля принимают только цифры.
+        [agentSummarySize, agentWindowSize, agentFactsSize].forEach(inp => {
+            inp.addEventListener('input', () => {
+                inp.value = inp.value.replace(/\D/g, '');
+            });
         });
 
-        agentSummaryToggle.addEventListener('change', () => {
-            agentSummaryRow.hidden = !agentSummaryToggle.checked;
+        // Показывает поля выбранной стратегии (у branching — список веток, и
+        // только когда план уже построен) и пояснение под ними.
+        function showAgentStrategyRows() {
+            const value = agentStrategySelect.value;
+            Object.keys(agentStrategyRows).forEach(key => {
+                agentStrategyRows[key].hidden = (key !== value) || (key === 'branching' && !agentBranches.length);
+            });
+            const notes = {
+                summary: 'В чате видна вся переписка; в модель уходят последние N сообщений как есть + резюме более старой части.',
+                sliding: 'В модель уходят последние N сообщений переписки (запросы юзера и ответы модели) + новый запрос.',
+                facts: 'Агент ведёт блок фактов о диалоге (цель, ограничения, решения, договорённости), обновляет его после каждого запроса и отправляет вместе с последними N сообщениями.',
+                branching: agentBranches.length
+                    ? 'Выберите ветку — диалог в каждой ветке ведётся независимо. «Корень» — построить план ветвления заново.'
+                    : 'Отправьте запрос: агент построит план из 3–5 ветвей, оценит их и отберёт лучшие — затем ветки можно переключать здесь.'
+            };
+            agentStrategyNote.textContent = notes[value] || '';
+            agentStrategyNote.hidden = !agentStrategyNote.textContent;
+        }
+
+        agentStrategySelect.addEventListener('change', showAgentStrategyRows);
+
+        // Список веток плана (стратегия «branching»): «корень» + сами ветки.
+        // Активная ветка агента (argmax по итоговому скору) помечена звёздочкой.
+        function renderBranchSelect() {
+            const previous = agentBranchSelect.value;
+            agentBranchSelect.innerHTML = '';
+            const root = document.createElement('option');
+            root.value = '';
+            root.textContent = '— корень (план ветвления) —';
+            agentBranchSelect.appendChild(root);
+            agentBranches.forEach(branch => {
+                const option = document.createElement('option');
+                option.value = branch.id;
+                option.textContent = branch.id + ' — ' + (branch.title || 'ветка')
+                    + (branch.id === agentActiveBranch ? ' ★' : '');
+                agentBranchSelect.appendChild(option);
+            });
+            // Возвращаем прежний выбор, если такая ветка ещё есть.
+            agentBranchSelect.value = agentBranches.some(b => b.id === previous) ? previous : '';
+            agentBranchSelect.value = agentView && agentBranches.some(b => b.id === agentView) ? agentView : agentBranchSelect.value;
+            showAgentStrategyRows();
+        }
+
+        // Переключение ветки: показываем диалог выбранной ветки («корень» —
+        // корневую переписку с планом ветвления). Диалоги веток независимы.
+        agentBranchSelect.addEventListener('change', () => {
+            agentView = agentBranchSelect.value;
+            renderAgentDialog();
+            input.focus();
         });
 
-        // Настройка суммаризации для тела запроса в режиме агента: null, если
-        // чекбокс не нажат или значение поля некорректно (тогда отправку
-        // блокируем и показываем предупреждение).
-        function agentSummarySettings() {
-            if (!agentSummaryToggle.checked) return { summarization: false, summary: null };
-            const raw = agentSummarySize.value.trim();
-            const num = Number(raw);
-            if (!/^\d+$/.test(raw) || num < AGENT_SUMMARY_MIN) return null;
-            return { summarization: true, summary: num };
+        // Настройки стратегии для тела запроса в режиме агента. Возвращает
+        // {body: {...}} либо {error: 'текст предупреждения'} — тогда отправку
+        // блокируем и показываем предупреждение.
+        function agentStrategySettings() {
+            const value = agentStrategySelect.value;
+            if (value === 'summary') {
+                const raw = agentSummarySize.value.trim();
+                const num = Number(raw);
+                if (!/^\d+$/.test(raw) || num < AGENT_SUMMARY_MIN) {
+                    return { error: `⚠️ Стратегия «summary»: значение «summary» должно быть целым числом не меньше ${AGENT_SUMMARY_MIN}.` };
+                }
+                return { body: { agent_strategy: 'summary', summary: num, window: null, branch: null } };
+            }
+            if (value === 'sliding' || value === 'facts') {
+                const field = value === 'sliding' ? agentWindowSize : agentFactsSize;
+                const raw = field.value.trim();
+                const num = Number(raw);
+                if (!/^\d+$/.test(raw) || num < AGENT_WINDOW_MIN) {
+                    return { error: `⚠️ Стратегия «${value === 'sliding' ? 'sliding window' : 'sticky facts'}»: значение «Количество сообщений в окне» должно быть целым числом не меньше ${AGENT_WINDOW_MIN}.` };
+                }
+                return { body: { agent_strategy: value, summary: null, window: num, branch: null } };
+            }
+            // branching: отправляем запрос в выбранную ветку; «корень» (пусто) —
+            // агент строит план ветвления по всей истории чата.
+            return { body: { agent_strategy: 'branching', summary: null, window: null, branch: agentView || null } };
         }
 
         // ---------- Экспертный режим ----------
@@ -834,8 +974,8 @@
         const agentPanel = document.getElementById('agent-panel');
         const agentChart = document.getElementById('agent-chart');
         const agentStatsBody = document.getElementById('agent-stats-body');
-        // Второй tbody таблицы — общий блок «Весь диалог» + «из них
-        // суммаризация» (строка «Текущий запрос» рисуется в первом).
+        // Второй tbody таблицы — общий блок «Весь диалог» + «из них служебные
+        // вызовы» (строка «Текущий запрос» рисуется в первом).
         const agentTotalBody = document.getElementById('agent-total-body');
         // agentUsage — по одному замеру на запрос пользователя:
         // {requests, input, output, limit, overflow}. Замер приходит с событием
@@ -844,6 +984,23 @@
         let agentUsage = [];
         // Шаг вертикальной оси диаграммы — 200 токенов.
         const AGENT_CHART_STEP = 200;
+
+        // ---------- Диалоги агента: корень и ветки плана (branching) ----------
+        // В стратегии «branching» у каждой ветки плана СВОЯ история сообщений —
+        // диалог в ветке независим от других ветвей. Здесь хранится то, что
+        // нужно, чтобы переключаться между ветками без потери реплик:
+        //   agentRootMessages   — корневая переписка (в т.ч. план ветвления);
+        //   agentBranchMessages — истории сообщений по ветвям (id -> [...]);
+        //   agentBranches       — список ветвей плана ({id, title});
+        //   agentActiveBranch   — активная ветка по умолчанию (argmax);
+        //   agentView           — что показано в окне: '' — корень, иначе id ветки;
+        //   agentAnalysis       — последний план ветвления (рисуется в корне).
+        let agentRootMessages = [];
+        let agentBranchMessages = {};
+        let agentBranches = [];
+        let agentActiveBranch = null;
+        let agentView = '';
+        let agentAnalysis = null;
 
         function usageSum(u) {
             return (Number(u.input) || 0) + (Number(u.output) || 0);
@@ -855,11 +1012,11 @@
         }
 
         // Таблица под диаграммой. Строка «Текущий запрос» показывает ТОЛЬКО сам
-        // ответ модели — служебные вызовы сжатия памяти (суммаризации) в неё не
-        // входят, поэтому их токены и вызовы вычитаются из полного замера.
-        // «Весь диалог» (итог по всей переписке вместе со сжатием) и «из них
-        // суммаризация» (вклад сжатия в этот итог) — общий блок (см.
-        // .agent-total-block, второй tbody таблицы).
+        // ответ модели — служебные вызовы (сжатие памяти, блок фактов, план
+        // ветвления) в неё не входят, поэтому их токены и вызовы вычитаются из
+        // полного замера. «Весь диалог» (итог по всей переписке вместе со
+        // служебными вызовами) и «из них служебные вызовы» (их вклад в этот
+        // итог) — общий блок (см. .agent-total-block, второй tbody таблицы).
         function renderAgentStats() {
             const last = agentUsage.length ? agentUsage[agentUsage.length - 1] : null;
             // Вклад служебных вызовов в последнем замере (у старых замеров
@@ -899,13 +1056,13 @@
                     requests: last ? Math.max(0, (Number(last.requests) || 1) - lastSumReq) : 0,
                     input: last ? Math.max(0, (Number(last.input) || 0) - lastSumIn) : 0,
                     output: last ? Math.max(0, (Number(last.output) || 0) - lastSumOut) : 0,
-                    title: 'Только сам ответ модели: служебные вызовы сжатия памяти (суммаризация) не учитываются'
+                    title: 'Только сам ответ модели: служебные вызовы (сжатие памяти, блок фактов, план ветвления) не учитываются'
                 }
             ]);
             draw(agentTotalBody, [
                 { label: 'Весь диалог', requests: agentUsage.length, input: input, output: output },
                 {
-                    label: 'из них суммаризация',
+                    label: 'из них служебные вызовы',
                     requests: sumRequests,
                     input: sumInput,
                     output: sumOutput,
@@ -1038,8 +1195,11 @@
                 // Обычный режим контекст не хранит: убираем агентский диалог
                 // (восстановленный + реплики сеанса агента) из окна чата и из
                 // «Истории введённых данных» — в обычном режиме его быть не должно.
+                // Данные панели (токены, ветви плана) тоже сбрасываются, а вот
+                // настройки стратегии и её полей остаются как есть.
                 agentUsage = [];
                 renderAgentPanel();
+                resetAgentDialogs();
                 removeAgentConversation();
                 return;
             }
@@ -1217,6 +1377,146 @@
             return wrap;
         }
 
+        // ---------- Диалог агента: корень и ветки плана ----------
+        // Реплики хранятся по «представлениям»: корневое (agentRootMessages) и
+        // по одной истории на ветку плана (agentBranchMessages). Переключение
+        // ветки просто перерисовывает окно — реплики каждой ветки сохраняются.
+        function agentViewMessages() {
+            if (!agentView) return agentRootMessages;
+            if (!agentBranchMessages[agentView]) agentBranchMessages[agentView] = [];
+            return agentBranchMessages[agentView];
+        }
+
+        function escapeHtml(text) {
+            return String(text == null ? '' : text)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
+        // Рисует один узел диалога агента (в окне чата и в «Истории введённых
+        // данных»): user — реплика юзера, debug — сообщение агента о работе,
+        // error — предупреждение, иначе ответ бота.
+        function drawAgentNode(role, text) {
+            if (role === 'user') {
+                addMessage('user', text, true);
+                addHistory(text, true);
+            } else if (role === 'debug') {
+                addMessage('debug', text, true);
+            } else if (role === 'error') {
+                addMessage('bot', '⚠️ ' + text, true);
+            } else {
+                addMessage('bot', text, true);
+            }
+        }
+
+        // Добавляет реплику в текущее представление и сразу рисует её.
+        function pushAgentNode(role, text) {
+            agentViewMessages().push({ role: role, text: text });
+            drawAgentNode(role, text);
+        }
+
+        // Полная перерисовка окна для текущего представления (после
+        // переключения ветки или восстановления истории).
+        function renderAgentDialog() {
+            messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
+            historyEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
+            if (!historyEl.querySelector('.history-item')
+                    && !historyEl.querySelector('.history-empty')) {
+                historyEl.innerHTML = '<div class="history-empty">Здесь появится, что вы вводили</div>';
+            }
+            agentViewMessages().forEach(m => drawAgentNode(m.role, m.text));
+            // План ветвления показываем в корневом диалоге (он относится к нему).
+            if (!agentView && agentAnalysis) renderBranchPlan(agentAnalysis);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        // Блок плана ветвления (стратегия «branching»): контекст, ветви с шагами,
+        // таблица оценок 1–10, отбор, углубление лучших и активная ветка.
+        function renderBranchPlan(analysis) {
+            const wrap = document.createElement('div');
+            wrap.className = 'msg bot';
+            wrap.setAttribute('data-agent', '1');
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+
+            let html = '<div class="judge-title">🧭 План ветвления</div>';
+            const context = analysis.context || [];
+            if (context.length) {
+                html += '<div class="branch-part"><b>1. Фиксация контекста</b><ul>';
+                context.forEach(item => { html += '<li>' + escapeHtml(item) + '</li>'; });
+                html += '</ul></div>';
+            }
+            const branches = analysis.branches || [];
+            if (branches.length) {
+                html += '<div class="branch-part"><b>2. Ветви решения</b>';
+                branches.forEach(b => {
+                    html += '<div class="branch-item"><b>' + escapeHtml(b.id) + ' — ' + escapeHtml(b.title) + '</b>';
+                    if (b.approach) html += '<div>' + escapeHtml(b.approach) + '</div>';
+                    if ((b.steps || []).length) html += '<div>Ключевые шаги: ' + b.steps.map(escapeHtml).join('; ') + '</div>';
+                    if ((b.resources || []).length) html += '<div>Ресурсы: ' + b.resources.map(escapeHtml).join('; ') + '</div>';
+                    if ((b.risks || []).length) html += '<div>Риски: ' + b.risks.map(escapeHtml).join('; ') + '</div>';
+                    html += '</div>';
+                });
+                html += '</div>';
+            }
+            const scores = analysis.scores || [];
+            if (scores.length) {
+                html += '<div class="branch-part"><b>3. Оценка ветвей (1–10)</b>';
+                html += '<table class="judge-table"><thead><tr>';
+                html += '<th>Ветвь</th><th>Успех</th><th>Стоимость</th><th>Скорость</th><th>Безопасность</th><th>Контекст</th><th>Итог</th>';
+                html += '</tr></thead><tbody>';
+                scores.forEach(s => {
+                    const chosen = s.id === analysis.chosen ? ' ★' : '';
+                    html += '<tr><td>' + escapeHtml(s.id) + chosen + '</td><td>' + s.success + '</td><td>' + s.cost
+                        + '</td><td>' + s.speed + '</td><td>' + s.risk + '</td><td>' + s.fit + '</td><td>' + s.total + '</td></tr>';
+                });
+                html += '</tbody></table></div>';
+            }
+            const kept = analysis.kept || [];
+            const rejected = analysis.rejected || [];
+            if (kept.length || rejected.length) {
+                html += '<div class="branch-part"><b>4. Отбор</b><div>Для углубления оставлены: '
+                    + (kept.map(escapeHtml).join(', ') || '—');
+                if (rejected.length) {
+                    html += '; отброшены: ' + rejected.map(r => escapeHtml(r.id) + (r.reason ? ' — ' + escapeHtml(r.reason) : '')).join('; ');
+                }
+                html += '</div></div>';
+            }
+            const deep = analysis.deep || [];
+            if (deep.length) {
+                html += '<div class="branch-part"><b>5. Углубление лучших ветвей</b>';
+                deep.forEach(d => {
+                    html += '<div class="branch-item"><b>' + escapeHtml(d.id) + '</b>';
+                    if ((d.steps || []).length) html += '<div>Шаги: ' + d.steps.map(escapeHtml).join('; ') + '</div>';
+                    if (d.expected) html += '<div>Ожидаемый результат: ' + escapeHtml(d.expected) + '</div>';
+                    if ((d.checkpoints || []).length) html += '<div>Checkpoints: ' + d.checkpoints.map(escapeHtml).join('; ') + '</div>';
+                    html += '</div>';
+                });
+                html += '</div>';
+            }
+            html += '<div class="judge-summary"><b>6. Активная ветка по умолчанию: '
+                + escapeHtml(analysis.chosen) + '</b> — выберите ветку в списке «Ветка», чтобы вести в ней диалог.</div>';
+
+            bubble.innerHTML = html;
+            wrap.appendChild(bubble);
+            messagesEl.appendChild(wrap);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            return wrap;
+        }
+
+        // Сброс агентских диалогов (выключение режима, очистка истории):
+        // корневая переписка, все ветки, план и выбранная ветка.
+        function resetAgentDialogs() {
+            agentRootMessages = [];
+            agentBranchMessages = {};
+            agentBranches = [];
+            agentActiveBranch = null;
+            agentView = '';
+            agentAnalysis = null;
+            renderBranchSelect();
+        }
+
         // Восстановление диалога «AI-агента»: вызывается ТОЛЬКО при включении
         // режима агента (обычный режим контекст не хранит — прошлая переписка
         // там не показывается). Сохранённые реплики рисуются в окне чата,
@@ -1231,17 +1531,36 @@
                 // обновляем её всегда, даже если реплики в чат не рисуем.
                 agentUsage = Array.isArray(data.usage) ? data.usage : [];
                 renderAgentPanel();
+                // Ветви плана и их независимые диалоги (стратегия «branching»):
+                // переключение ветки сразу после включения агента.
+                const branches = (data.branches && typeof data.branches === 'object') ? data.branches : {};
+                agentBranchMessages = {};
+                agentBranches = Object.keys(branches).map(id => ({
+                    id: id,
+                    title: (branches[id] && branches[id].title) || ''
+                }));
+                agentBranches.forEach(b => {
+                    agentBranchMessages[b.id] = ((branches[b.id] && branches[b.id].messages) || [])
+                        .filter(m => m && m.content)
+                        .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', text: m.content }));
+                });
+                agentActiveBranch = data.active_branch || null;
+                agentView = '';
+                agentAnalysis = null;
+                agentRootMessages = msgs
+                    .filter(m => m && m.content)
+                    .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', text: m.content }));
+                renderBranchSelect();
+                // История есть — переключаем список «Стратегия» на branching,
+                // иначе ветки было бы не выбрать.
+                if (agentBranches.length) {
+                    agentStrategySelect.value = 'branching';
+                }
+                showAgentStrategyRows();
                 // Пользователь уже начал переписку (в обычном режиме или в этом
                 // же сеансе агента) — старую историю не рисуем, чтобы не смешать.
-                if (msgs.length && !messagesEl.querySelector('.msg.user')) {
-                    for (const m of msgs) {
-                        if (m.role === 'user') {
-                            addMessage('user', m.content, true);
-                            addHistory(m.content, true);
-                        } else if (m.role === 'assistant') {
-                            addMessage('bot', m.content, true);
-                        }
-                    }
+                if (agentRootMessages.length && !messagesEl.querySelector('.msg.user')) {
+                    agentRootMessages.forEach(m => drawAgentNode(m.role, m.text));
                     messagesEl.scrollTop = messagesEl.scrollHeight;
                 }
             } catch (e) {
@@ -1265,8 +1584,9 @@
         }
 
         // Кнопка «Очистить историю» (только в режиме «AI-агент»): стирает диалог
-        // на сервере (память + JSON-файл) и убирает реплики из окна чата и из
-        // «Истории введённых данных». Приветствие чата остаётся на месте.
+        // на сервере (память, токены, резюме, факты, ветви плана и JSON-файл) и
+        // убирает реплики из окна чата и из «Истории введённых данных».
+        // Приветствие чата остаётся на месте.
         async function clearAgentHistory() {
             try {
                 const res = await fetch('/api/agent/history', { method: 'DELETE' });
@@ -1282,9 +1602,10 @@
                 if (el !== greetingMsg) el.remove();
             });
             historyEl.innerHTML = '<div class="history-empty">Здесь появится, что вы вводили</div>';
-            // Панель токенов — тоже начисто: истории больше нет.
+            // Панель токенов и ветви плана — тоже начисто: истории больше нет.
             agentUsage = [];
             renderAgentPanel();
+            resetAgentDialogs();
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
@@ -1366,6 +1687,27 @@
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
+        // Событие "branches": агент прислал план ветвления (стратегия
+        // «branching»). План относится к корневому диалогу — показываем его там
+        // и обновляем список веток: у каждой ветки своя, пока пустая, история
+        // сообщений, и диалог в ней ведётся независимо.
+        function applyBranchesEvent(ev) {
+            const analysis = ev.analysis;
+            if (!analysis) return;
+            agentAnalysis = analysis;
+            agentBranches = (analysis.branches || []).map(b => ({ id: b.id, title: b.title || '' }));
+            agentBranchMessages = {};
+            agentBranches.forEach(b => { agentBranchMessages[b.id] = []; });
+            agentActiveBranch = ev.active || analysis.chosen || null;
+            agentView = '';
+            renderBranchSelect();
+            renderBranchPlan(analysis);
+            // Раз ветки появились — список «Стратегия» точно branching, чтобы
+            // список веток был виден в панели.
+            agentStrategySelect.value = 'branching';
+            showAgentStrategyRows();
+        }
+
         // Отправка в режиме «AI-агент»: сервер отвечает NDJSON-потоком событий.
         // Каждое debug-событие показываем отдельным сообщением по мере прихода,
         // затем — финальный ответ (bot). Событие 'done' служебное — не рисуем.
@@ -1405,15 +1747,31 @@
                         // дочитываем, чтобы сервер завершил сохранение истории.
                         if (!agentToggle.classList.contains('active')) continue;
                         if (ev.type === 'debug') {
-                            addMessage('debug', ev.text, true);
+                            pushAgentNode('debug', ev.text);
+                        } else if (ev.type === 'branches') {
+                            // План ветвления (стратегия «branching»): блок плана в
+                            // корневом диалоге + список веток для переключения.
+                            applyBranchesEvent(ev);
                         } else if (ev.type === 'bot') {
-                            addMessage('bot', ev.text, true);
+                            pushAgentNode('assistant', ev.text);
                         } else if (ev.type === 'error') {
-                            addMessage('bot', '⚠️ ' + ev.text, true);
-                        } else if (ev.type === 'done' && ev.usage) {
-                            // Замер токенов запроса — панель «Токены диалога».
-                            agentUsage.push(ev.usage);
-                            renderAgentPanel();
+                            pushAgentNode('error', ev.text);
+                        } else if (ev.type === 'done') {
+                            if (ev.usage) {
+                                // Замер токенов запроса — панель «Токены диалога».
+                                agentUsage.push(ev.usage);
+                                renderAgentPanel();
+                            }
+                            // Состояние стратегии с сервера: список веток и
+                            // активная ветка (могли появиться/смениться).
+                            if (Array.isArray(ev.branches)) {
+                                agentBranches = ev.branches.map(b => ({ id: b.id, title: b.title || '' }));
+                                agentBranches.forEach(b => {
+                                    if (!agentBranchMessages[b.id]) agentBranchMessages[b.id] = [];
+                                });
+                                if (ev.active_branch) agentActiveBranch = ev.active_branch;
+                                renderBranchSelect();
+                            }
                         }
                     }
                 }
@@ -1445,26 +1803,29 @@
                     }
                     maxTokens = num;
                 }
-                // Суммаризация памяти: чекбокс + поле «summary». Нажат, но
-                // значение не задано/меньше минимума — отправку блокируем.
-                const summarySettings = agentSummarySettings();
-                if (!summarySettings) {
-                    addMessage('bot', `⚠️ Суммаризация: значение «summary» должно быть целым числом не меньше ${AGENT_SUMMARY_MIN}.`);
-                    agentSummarySize.focus();
+                // Стратегия работы с контекстом (список «Стратегия»): summary,
+                // sliding window, sticky facts или branching. Значения её полей
+                // проверяются до отправки — иначе показываем предупреждение.
+                const strategySettings = agentStrategySettings();
+                if (strategySettings.error) {
+                    addMessage('bot', strategySettings.error);
+                    (agentStrategySelect.value === 'summary' ? agentSummarySize
+                        : agentStrategySelect.value === 'sliding' ? agentWindowSize : agentFactsSize).focus();
                     return;
                 }
                 input.value = '';
                 sendBtn.disabled = true;
+                // Реплика юзера — в диалог текущего представления (корень или
+                // выбранная ветка плана): у каждой ветки своя история.
+                agentViewMessages().push({ role: 'user', text: content });
                 addMessage('user', content, true);
                 addHistory(content, true);
-                await sendAgentRequest({
+                await sendAgentRequest(Object.assign({
                     content,
                     format: formatSelect.value,
                     max_tokens: maxTokens,
-                    stop: stopInput.value.trim() || null,
-                    summarization: summarySettings.summarization,
-                    summary: summarySettings.summary
-                });
+                    stop: stopInput.value.trim() || null
+                }, strategySettings.body));
                 return;
             }
 
@@ -1588,6 +1949,9 @@
 
         // Открытие страницы с нуля: скролл окна чата — внизу, как в типичных
         // чатах. История не рисуется, пока пользователь не включит агента.
+        // Список «Стратегия» приводим к исходному виду (поля выбранной стратегии).
+        renderBranchSelect();
+        showAgentStrategyRows();
         messagesEl.scrollTop = messagesEl.scrollHeight;
         input.focus();
     </script>
