@@ -5,38 +5,108 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Чат-бот</title>
     <style>
+        /* ---------- Тема: киберпанк/матрица — неон на тёмном, минимализм ------
+           Палитра и базовые примитивы в переменных: тёмный фон с еле заметной
+           сеткой и двумя неоновыми засветками, полупрозрачные «стеклянные»
+           панели, тонкие неоновые линии, моноширинный шрифт для заголовков,
+           подписей и кнопок (сам текст сообщений — обычный, чтобы читалось). */
+        :root {
+            /* Нативные контролы (выпадающие списки, чекбоксы, скроллбары) —
+               в тёмном исполнении, иначе они «выпадают» из темы. */
+            color-scheme: dark;
+            --bg: #05070a;
+            --surface: rgba(10, 15, 21, 0.94);
+            --surface-2: rgba(16, 25, 33, 0.92);
+            --surface-3: rgba(22, 34, 43, 0.95);
+            --line: rgba(0, 255, 157, 0.20);
+            --line-strong: rgba(0, 255, 157, 0.45);
+            --line-soft: rgba(125, 211, 252, 0.14);
+            --text: #d9f7ec;
+            --text-dim: #8fb0a8;
+            --muted: #6b8a84;
+            --accent: #22d3ee;         /* циан — основные действия */
+            --accent-hover: #67e8f9;
+            --accent-2: #00ff9c;       /* матричный зелёный — заголовки, активное */
+            --accent-3: #ff2ea6;       /* маджента — редкие акценты */
+            --warn: #ffb020;
+            --danger: #ff6b81;
+            --radius: 12px;
+            --glow: 0 0 0 1px var(--line), 0 12px 32px rgba(0, 0, 0, 0.55);
+            --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+        }
         * { box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             margin: 0;
             min-height: 100vh;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: #333;
+            color: var(--text);
+            background-color: var(--bg);
+            /* Сетка «матрицы» + две мягкие неоновые засветки — фон, а не декор
+               поверх контента: никаких анимаций, только статичная подложка. */
+            background-image:
+                radial-gradient(1100px 520px at 12% -12%, rgba(0, 255, 157, 0.10), transparent 62%),
+                radial-gradient(900px 520px at 100% 0%, rgba(34, 211, 238, 0.10), transparent 58%),
+                linear-gradient(rgba(0, 255, 157, 0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 255, 157, 0.05) 1px, transparent 1px);
+            background-size: auto, auto, 30px 30px, 30px 30px;
+            background-attachment: fixed;
         }
+        ::selection { background: rgba(0, 255, 157, 0.28); color: #eafff6; }
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.03); }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(0, 255, 157, 0.22);
+            border-radius: 6px;
+        }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(0, 255, 157, 0.38); }
+        /* Заголовки, подписи и кнопки — моноширинный шрифт: «терминальный» вид
+           без потери читаемости основного текста. */
+        h1, h2, h3, .sub, .task-head, .chat-settings label, .stats-table th,
+        .agent-table th, .judge-table th, .agent-legend, .typing, .memory-btn,
+        .agent-view-toggle, .task-new, .session-new, .input-row button,
+        .modal-actions button, .chat-header button, .memory-meta, .agent-hint,
+        .agent-strategy-head > span, .history-empty, .memory-empty {
+            font-family: var(--mono);
+        }
+        h1, h2, h3 { letter-spacing: 0.02em; }
+        /* Тонкие неоновые линии вместо белых рамок — единый акцент везде. */
+        input:focus-visible, select:focus-visible, button:focus-visible {
+            outline: 1px solid var(--line-strong);
+            outline-offset: 1px;
+        }
+        /* Страница занимает ВСЁ окно браузера: панель истории (в режиме агента —
+           Workspace с задачами и диалогами) прижата к левому краю, окно чата
+           идёт сразу за ней и растягивается на всё свободное место. Ширина
+           колонки под панели статистики (эксперт/AI-агент) зарезервирована в
+           правилах body.expert-mode / body.agent-mode ниже — чат занимает
+           остаток, поэтому ничего не перекрывается. */
         .layout {
             display: grid;
             grid-template-columns: 260px 1fr;
             gap: 16px;
             height: 100vh;
-            max-width: 1200px;
-            margin: 0 auto;
+            width: 100%;
+            max-width: none;
+            margin: 0;
             padding: 16px;
             position: relative;
         }
         /* ---------- Боковая панель: история юзера ---------- */
         .sidebar {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 16px;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
             padding: 16px;
             display: flex;
             flex-direction: column;
             overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            box-shadow: var(--glow);
+            backdrop-filter: blur(6px);
         }
         .sidebar h2 {
             margin: 0 0 12px;
             font-size: 1rem;
-            color: #4a3b8f;
+            color: var(--accent-2);
         }
         .user-history {
             flex: 1;
@@ -45,33 +115,253 @@
             flex-direction: column;
             gap: 8px;
         }
+        .user-history[hidden] { display: none; }
+        /* Пока агент отвечает, смена задачи/диалога недоступна. */
+        .user-history.busy { opacity: 0.6; pointer-events: none; }
         .history-item {
-            background: #f0ebff;
+            background: var(--surface-2);
             border-radius: 10px;
             padding: 8px 10px;
             font-size: 0.85rem;
             word-break: break-word;
-            border-left: 4px solid #667eea;
+            border-left: 4px solid var(--accent);
         }
         .history-empty {
-            color: #999;
+            color: var(--muted);
             font-size: 0.85rem;
             text-align: center;
             margin-top: 20px;
         }
+        /* ---------- Workspace: задачи и диалоги (режим «AI-агент») ---------- */
+        /* Блок «Текущая задача»: пояснение над выпадающим списком, сам список на
+           всю ширину панели (отступы — это padding панели, слева и справа
+           одинаковые) и кнопка «Новая задача» под ним. */
+        .task-block {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--line-soft);
+        }
+        .task-block[hidden] { display: none; }
+        .task-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            font-size: 0.78rem;
+            color: var(--text-dim);
+        }
+        .task-actions { display: flex; gap: 4px; }
+        .icon-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 24px;
+            height: 24px;
+            flex: none;
+            padding: 0;
+            border: none;
+            border-radius: 8px;
+            background: var(--surface-2);
+            color: var(--accent-2);
+            font-size: 0.78rem;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .icon-btn:hover { background: var(--surface-3); }
+        .icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .task-select,
+        .task-new,
+        .session-new {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            background: var(--surface-2);
+            color: var(--text);
+        }
+        .task-select:disabled { background: rgba(16, 25, 33, 0.6); color: var(--muted); }
+        .task-new,
+        .session-new {
+            border: 1px solid var(--line-strong);
+            background: rgba(0, 255, 157, 0.12);
+            color: var(--accent-2);
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s, box-shadow 0.15s;
+        }
+        .task-new:hover,
+        .session-new:hover {
+            background: rgba(0, 255, 157, 0.2);
+            box-shadow: 0 0 16px rgba(0, 255, 157, 0.18);
+        }
+        /* «Новая сессия» — в самом низу панели истории диалогов. */
+        .session-new { margin-top: 12px; flex: none; }
+        .session-new[hidden] { display: none; }
+        /* Элемент истории диалогов: название (первые слова первого запроса или
+           своё, после переименования) + карандаш и корзина. Клик — переход в
+           этот диалог. */
+        .session-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            border-left: 4px solid transparent;
+        }
+        .session-item:hover { background: var(--surface-3); }
+        .session-item.active {
+            background: var(--surface-3);
+            border-left-color: var(--accent);
+        }
+        .session-title {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .session-actions { display: flex; gap: 4px; opacity: 0.55; }
+        .session-item:hover .session-actions,
+        .session-item.active .session-actions { opacity: 1; }
+        .session-actions .icon-btn { width: 22px; height: 22px; font-size: 0.72rem; }
+        /* Переключатель вида панели агента: «токены диалога» (по умолчанию) /
+           «состояние памяти» (рабочая и долговременная память). */
+        .agent-view-toggle {
+            width: 100%;
+            flex: none;
+            margin: 0 0 10px;
+            padding: 7px 10px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--surface-2);
+            color: var(--accent-2);
+            font-family: var(--mono);
+            font-size: 0.76rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            cursor: pointer;
+            transition: background 0.15s, box-shadow 0.15s;
+        }
+        .agent-view-toggle:hover {
+            background: var(--surface-3);
+            box-shadow: 0 0 14px rgba(0, 255, 157, 0.15);
+        }
+        .agent-view {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            flex: 1;
+            overflow-y: auto;
+        }
+        .agent-view[hidden] { display: none; }
+        /* Блок слоя памяти в панели: заголовок с областью действия и список записей. */
+        .memory-section { margin-bottom: 14px; }
+        .memory-section h3 {
+            margin: 0 0 6px;
+            font-size: 0.85rem;
+            color: var(--accent-2);
+            display: flex;
+            align-items: baseline;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .memory-scope { font-size: 0.68rem; font-weight: 400; color: var(--text-dim); }
+        .memory-list { display: flex; flex-direction: column; gap: 6px; }
+        .memory-item {
+            background: var(--surface-2);
+            border-left: 3px solid var(--accent);
+            border-radius: 8px;
+            padding: 6px 8px;
+        }
+        .memory-item.long-term { border-left-color: var(--warn); background: rgba(255, 176, 32, 0.07); }
+        .memory-text {
+            font-size: 0.75rem;
+            color: var(--text);
+            line-height: 1.3;
+            word-break: break-word;
+            white-space: pre-wrap;
+            max-height: 8.4em;
+            overflow-y: auto;
+        }
+        .memory-meta {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            margin-top: 4px;
+            font-size: 0.65rem;
+            color: var(--text-dim);
+        }
+        .memory-meta .icon-btn { width: 20px; height: 20px; font-size: 0.7rem; }
+        .memory-empty {
+            font-size: 0.72rem;
+            color: var(--muted);
+            padding: 4px 0;
+        }
+        /* Кнопки «добавить в рабочую/долговременную память» под сообщениями
+           пользователя и ответами агента. Строка всегда занимает всю ширину
+           окна чата (flex-basis: 100%) и стоит ПОД пузырём, поэтому кнопки не
+           прыгают вслед за размером сообщения; прижаты к своей стороне —
+           справа у сообщений пользователя, слева у ответов агента. */
+        .memory-actions {
+            flex: 0 0 100%;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 6px;
+        }
+        .msg.user .memory-actions { justify-content: flex-end; }
+        .msg.bot .memory-actions { justify-content: flex-start; }
+        .memory-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: rgba(34, 211, 238, 0.06);
+            color: var(--text-dim);
+            font-size: 0.67rem;
+            padding: 3px 8px;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s, color 0.15s;
+        }
+        /* Значок состояния: «+» — не в памяти, «✓» — уже добавлено. */
+        .memory-btn::before { content: "＋"; color: var(--accent); }
+        .memory-btn:hover {
+            background: rgba(34, 211, 238, 0.14);
+            border-color: rgba(34, 211, 238, 0.45);
+            color: var(--text);
+        }
+        .memory-btn:disabled { opacity: 0.6; cursor: default; }
+        /* Сообщение уже лежит в этом слое памяти: кнопка подсвечена, повторное
+           нажатие убирает запись из памяти. */
+        .memory-btn.active {
+            background: rgba(0, 255, 157, 0.16);
+            border-color: var(--accent-2);
+            color: var(--accent-2);
+            box-shadow: 0 0 12px rgba(0, 255, 157, 0.18);
+        }
+        .memory-btn.active::before { content: "✓"; color: var(--accent-2); }
         /* ---------- Основная область чата ---------- */
         .chat {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 16px;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
             display: flex;
             flex-direction: column;
             overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            box-shadow: var(--glow);
+            backdrop-filter: blur(6px);
         }
         .chat-header {
             padding: 16px 20px;
-            background: #5b4bb8;
-            color: #fff;
+            background: linear-gradient(180deg, rgba(0, 255, 157, 0.10), rgba(5, 7, 10, 0.35));
+            border-bottom: 1px solid var(--line);
+            color: var(--text);
             display: flex;
             flex-direction: column;
             gap: 12px;
@@ -89,9 +379,14 @@
             gap: 10px;
             margin-right: auto;
         }
-        .chat-header .avatar { font-size: 1.6rem; }
-        .chat-header h1 { margin: 0; font-size: 1.2rem; }
-        .chat-header .sub { font-size: 0.8rem; opacity: 0.85; }
+        .chat-header .avatar { font-size: 1.6rem; filter: drop-shadow(0 0 10px rgba(0, 255, 157, 0.35)); }
+        .chat-header h1 {
+            margin: 0;
+            font-size: 1.15rem;
+            color: var(--accent-2);
+            text-shadow: 0 0 14px rgba(0, 255, 157, 0.35);
+        }
+        .chat-header .sub { font-size: 0.78rem; color: var(--text-dim); }
         .chat-settings {
             display: flex;
             align-items: center;
@@ -108,15 +403,16 @@
         .chat-settings select,
         .chat-settings input {
             padding: 7px 10px;
-            border: none;
+            border: 1px solid var(--line-soft);
             border-radius: 8px;
             font-size: 0.85rem;
-            color: #333;
-            background: #fff;
+            font-family: var(--mono);
+            color: var(--text);
+            background: var(--surface-2);
             outline: none;
         }
         .chat-settings input { width: 130px; }
-        .chat-settings input::placeholder { color: #999; }
+        .chat-settings input::placeholder { color: var(--muted); }
         .chat-settings #stop-condition { width: 190px; }
         .messages {
             flex: 1;
@@ -126,90 +422,119 @@
             flex-direction: column;
             gap: 14px;
         }
-        .msg { display: flex; }
+        /* Сообщение — обёртка в строку с переносом: пузырь сверху, а кнопки
+           памяти ВСЕГДА отдельной строкой под ним на всю ширину окна. Поэтому
+           их положение и размер не зависят от длины сообщения. */
+        .msg { display: flex; flex-wrap: wrap; }
         .msg.user { justify-content: flex-end; }
         .msg.bot { justify-content: flex-start; }
         .bubble {
             max-width: 70%;
             padding: 12px 16px;
-            border-radius: 18px;
+            border-radius: 14px;
             line-height: 1.4;
             font-size: 0.95rem;
             white-space: pre-wrap;
             word-break: break-word;
         }
         .msg.user .bubble {
-            background: #667eea;
-            color: #fff;
+            background: linear-gradient(135deg, rgba(0, 255, 157, 0.16), rgba(34, 211, 238, 0.14));
+            border: 1px solid var(--line-strong);
+            color: #eafff6;
+            box-shadow: 0 0 18px rgba(0, 255, 157, 0.08);
             border-bottom-right-radius: 4px;
         }
         .msg.bot .bubble {
-            background: #eee6ff;
-            color: #333;
+            background: var(--surface-3);
+            border: 1px solid var(--line-soft);
+            color: var(--text);
             border-bottom-left-radius: 4px;
         }
         /* Сообщения-отладка режима «AI-агент»: чем агент занят сейчас */
         .msg.debug { justify-content: flex-start; }
         .msg.debug .bubble {
-            background: rgba(255, 255, 255, 0.7);
-            border: 1px dashed #b9b2d9;
-            color: #6f6790;
+            background: rgba(34, 211, 238, 0.05);
+            border: 1px dashed rgba(34, 211, 238, 0.35);
+            color: #7fd7e6;
             font-size: 0.78rem;
             line-height: 1.35;
             padding: 6px 10px;
             border-radius: 10px;
             max-width: 85%;
-            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-family: var(--mono);
         }
         .input-row {
             display: flex;
             gap: 10px;
             padding: 14px;
-            border-top: 1px solid #ececec;
-            background: #fff;
+            border-top: 1px solid var(--line);
+            background: rgba(8, 12, 17, 0.85);
         }
         .input-row input {
             flex: 1;
             padding: 12px 16px;
-            border: 2px solid #e0e0e0;
-            border-radius: 24px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
             font-size: 0.95rem;
+            font-family: inherit;
+            background: var(--surface-2);
+            color: var(--text);
             outline: none;
-            transition: border-color 0.2s;
+            transition: border-color 0.2s, box-shadow 0.2s;
         }
-        .input-row input:focus { border-color: #667eea; }
+        .input-row input::placeholder { color: var(--muted); }
+        .input-row input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 14px rgba(34, 211, 238, 0.15);
+        }
         .input-row button {
             padding: 12px 22px;
-            border: none;
-            border-radius: 24px;
-            background: #667eea;
-            color: #fff;
-            font-size: 0.95rem;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: rgba(0, 255, 157, 0.14);
+            color: var(--accent-2);
+            font-size: 0.85rem;
+            font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s;
+            transition: background 0.2s, box-shadow 0.2s;
         }
-        .input-row button:hover { background: #5563c1; }
-        .input-row button:disabled { background: #aaa; cursor: not-allowed; }
+        .input-row button:hover {
+            background: rgba(0, 255, 157, 0.22);
+            box-shadow: 0 0 16px rgba(0, 255, 157, 0.18);
+        }
+        .input-row button:disabled {
+            background: rgba(16, 25, 33, 0.7);
+            border-color: var(--line-soft);
+            color: var(--muted);
+            box-shadow: none;
+            cursor: not-allowed;
+        }
         /* Кнопка «Параметры» (шестерёнка) рядом с «Отправить» */
         .input-row .gear-btn {
-            background: #eef1fb;
-            color: #4a3b8f;
+            background: var(--surface-2);
+            border-color: var(--line-soft);
+            color: var(--accent);
             padding: 12px 14px;
             font-size: 1.15rem;
             line-height: 1;
         }
-        .input-row .gear-btn:hover { background: #e0e5fb; color: #3a2e7a; }
+        .input-row .gear-btn:hover { background: var(--surface-3); color: var(--accent-hover); }
         /* Кнопка «Очистить историю» — видна только в режиме «AI-агент» */
         .input-row .clear-btn {
-            background: #fdecec;
-            color: #b3403a;
+            background: rgba(255, 46, 166, 0.10);
+            border-color: rgba(255, 46, 166, 0.35);
+            color: #ff8fc4;
             padding: 12px 16px;
-            font-size: 0.9rem;
+            font-size: 0.82rem;
         }
-        .input-row .clear-btn:hover { background: #f6d4d4; color: #8f2f2a; }
-        .input-row .clear-btn:disabled { background: #ddd; color: #999; cursor: not-allowed; }
+        .input-row .clear-btn:hover { background: rgba(255, 46, 166, 0.18); color: #ffc2e0; }
+        .input-row .clear-btn:disabled {
+            background: rgba(16, 25, 33, 0.7);
+            border-color: var(--line-soft);
+            color: var(--muted);
+        }
         .typing {
-            color: #888;
+            color: var(--muted);
             font-size: 0.85rem;
             padding: 4px 16px 0;
         }
@@ -223,26 +548,29 @@
         [hidden] { display: none !important; }
         #expert-toggle, #agent-toggle {
             padding: 8px 12px;
-            border: 2px solid #fff;
+            border: 1px solid var(--line-strong);
             border-radius: 8px;
-            background: transparent;
-            color: #fff;
-            font-size: 0.85rem;
+            background: rgba(0, 255, 157, 0.04);
+            color: var(--accent-2);
+            font-size: 0.82rem;
+            font-family: var(--mono);
             cursor: pointer;
-            transition: background 0.2s, color 0.2s, border-color 0.2s;
+            transition: background 0.2s, color 0.2s, border-color 0.2s, box-shadow 0.2s;
         }
-        #expert-toggle:hover, #agent-toggle:hover { background: rgba(255, 255, 255, 0.2); }
+        #expert-toggle:hover, #agent-toggle:hover { background: rgba(0, 255, 157, 0.12); }
         #expert-toggle.active, #agent-toggle.active {
-            background: #fff;
-            color: #5b4bb8;
-            border-color: #fff;
+            background: rgba(0, 255, 157, 0.18);
+            color: var(--accent-2);
+            border-color: var(--accent-2);
+            box-shadow: 0 0 16px rgba(0, 255, 157, 0.22);
         }
         .expert-panel {
             display: flex;
             align-items: center;
             gap: 14px;
             flex-wrap: wrap;
-            background: rgba(255, 255, 255, 0.16);
+            background: rgba(34, 211, 238, 0.06);
+            border: 1px solid var(--line-soft);
             border-radius: 10px;
             padding: 8px 14px;
         }
@@ -264,43 +592,48 @@
         .group-settings {
             margin-left: 2px;
             padding: 2px 9px;
-            border: none;
+            border: 1px solid var(--line-soft);
             border-radius: 6px;
-            background: rgba(255, 255, 255, 0.9);
-            color: #5b4bb8;
+            background: var(--surface-2);
+            color: var(--accent);
             font-size: 0.8rem;
             cursor: pointer;
         }
-        .group-settings:hover { background: #fff; }
+        .group-settings:hover { background: var(--surface-3); }
         .modal-overlay {
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.45);
+            background: rgba(2, 4, 6, 0.72);
+            backdrop-filter: blur(3px);
             display: flex;
             align-items: center;
             justify-content: center;
             z-index: 1000;
         }
         .modal-box {
-            background: #fff;
-            border-radius: 14px;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
             padding: 20px;
             width: 320px;
-            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
-            color: #333;
+            box-shadow: 0 0 0 1px var(--line), 0 18px 50px rgba(0, 0, 0, 0.65);
+            color: var(--text);
         }
-        .modal-box h3 { margin: 0 0 14px; font-size: 1rem; color: #4a3b8f; }
+        .modal-box h3 { margin: 0 0 14px; font-size: 1rem; color: var(--accent-2); }
         .roles-field {
             width: 100%;
             padding: 8px 10px;
-            border: 1px solid #ddd;
+            border: 1px solid var(--line);
             border-radius: 8px;
             margin-bottom: 8px;
             font-size: 0.9rem;
+            font-family: inherit;
+            background: var(--surface-2);
             outline: none;
-            color: #333;
+            color: var(--text);
         }
-        .roles-field:focus { border-color: #667eea; }
+        .roles-field::placeholder { color: var(--muted); }
+        .roles-field:focus { border-color: var(--accent); }
         .modal-actions {
             display: flex;
             gap: 10px;
@@ -314,21 +647,30 @@
             cursor: pointer;
             font-size: 0.9rem;
         }
-        .modal-actions .accept { background: #667eea; color: #fff; }
-        .modal-actions .accept:hover { background: #5563c1; }
-        .modal-actions .clear { background: #eee; color: #333; }
-        .modal-actions .clear:hover { background: #e0e0e0; }
+        .modal-actions .accept {
+            background: rgba(0, 255, 157, 0.16);
+            border: 1px solid var(--line-strong);
+            color: var(--accent-2);
+            font-weight: 600;
+        }
+        .modal-actions .accept:hover { background: rgba(0, 255, 157, 0.26); }
+        .modal-actions .clear {
+            background: var(--surface-2);
+            border: 1px solid var(--line-soft);
+            color: var(--text-dim);
+        }
+        .modal-actions .clear:hover { background: var(--surface-3); color: var(--text); }
         /* ---------- Диалог «Параметры» ---------- */
         .param-select {
             width: 100%;
             padding: 8px 10px;
-            border: 1px solid #ddd;
+            border: 1px solid var(--line);
             border-radius: 8px;
             margin-bottom: 12px;
             font-size: 0.9rem;
             outline: none;
-            color: #333;
-            background: #fff;
+            color: var(--text);
+            background: var(--surface-2);
         }
         .param-fields {
             display: flex;
@@ -339,17 +681,20 @@
         .param-field {
             width: 100%;
             padding: 8px 10px;
-            border: 1px solid #ddd;
+            border: 1px solid var(--line);
             border-radius: 8px;
             font-size: 0.9rem;
+            font-family: inherit;
+            background: var(--surface-2);
             outline: none;
-            color: #333;
+            color: var(--text);
         }
-        .param-field:focus { border-color: #667eea; }
+        .param-field::placeholder { color: var(--muted); }
+        .param-field:focus { border-color: var(--accent); }
         .modal-hint {
             margin: 0 0 12px;
             font-size: 0.82rem;
-            color: #888;
+            color: var(--muted);
         }
         .param-models[hidden] { display: none; }
         .param-models {
@@ -363,36 +708,37 @@
             align-items: center;
             gap: 8px;
             font-size: 0.9rem;
-            color: #333;
+            color: var(--text);
             cursor: pointer;
         }
         .model-check input[type="checkbox"] {
             width: 16px;
             height: 16px;
-            accent-color: #667eea;
+            accent-color: var(--accent);
             cursor: pointer;
         }
         /* ---------- Статистика ответов (экспертный режим) ---------- */
-        /* Третья колонка справа от окна чата. Контейнеру задаём фиксированную
-           ширину, достаточную для всех трёх колонок, и центрируем — чат и
-           история не растягиваются на всю страницу, панель просто возникает
-           справа с тем же отступом 16px, что и между чатом и историей слева. */
+        /* Третья колонка справа от окна чата. Контейнер по-прежнему занимает всё
+           окно браузера, но под панель зарезервировано 520px: окно чата
+           растягивается на остаток ширины, а сама панель занимает свою колонку. */
         body.expert-mode .layout {
             grid-template-columns: 260px 1fr 520px;
-            max-width: 1760px;
+            max-width: none;
         }
         .stats {
             width: 100%;
             height: 50vh;
             align-self: start;
-            background: rgba(255, 255, 255, 0.97);
-            border-radius: 16px;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
             padding: 16px;
             display: flex;
             flex-direction: column;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+            box-shadow: var(--glow);
+            backdrop-filter: blur(6px);
         }
-        .stats h2 { margin: 0 0 12px; font-size: 1rem; color: #4a3b8f; }
+        .stats h2 { margin: 0 0 12px; font-size: 1rem; color: var(--accent-2); }
         .stats-table {
             width: 100%;
             border-collapse: collapse;
@@ -402,18 +748,18 @@
         .stats-table td {
             padding: 8px 10px;
             text-align: left;
-            border-bottom: 1px solid #eee;
+            border-bottom: 1px solid var(--line-soft);
         }
-        .stats-table th { color: #5b4bb8; font-weight: 600; }
-        .stats-table td:nth-child(1) { color: #333; }
+        .stats-table th { color: var(--accent); font-weight: 600; }
+        .stats-table td:nth-child(1) { color: var(--text); }
         .stats-table td:nth-child(2),
-        .stats-table td:nth-child(3) { text-align: center; color: #333; }
+        .stats-table td:nth-child(3) { text-align: center; color: var(--text); }
         /* ---------- Панель «Токены диалога» (режим «AI-агент») ---------- */
         /* Занимает ровно то же место и тот же размер, что панель статистики
-           в экспертном режиме: третья колонка справа (520px), высота 50vh. */
+           в экспертном режиме: третья колонка справа (520px). */
         body.agent-mode .layout {
             grid-template-columns: 260px 1fr 520px;
-            max-width: 1760px;
+            max-width: none;
         }
         /* Диаграмма не влезала в 50vh как у статистики: в режиме агента панель
            выше в 1.5 раза (50vh -> 75vh), поэтому сама диаграмма (flex:1)
@@ -432,7 +778,7 @@
             display: flex;
             gap: 14px;
             font-size: 0.72rem;
-            color: #333;
+            color: var(--text);
             margin: 2px 0 4px;
         }
         .agent-legend i {
@@ -456,35 +802,35 @@
         .agent-table td { padding: 6px 3px; line-height: 1.15; }
         .agent-table th {
             font-size: 0.68rem;
-            color: #5b4bb8;
+            color: var(--accent);
             font-weight: 600;
             text-align: center;
             vertical-align: bottom;
         }
         .agent-table td:first-child { text-align: left; }
-        .agent-table td:not(:first-child) { text-align: center; color: #333; }
+        .agent-table td:not(:first-child) { text-align: center; color: var(--text); }
         /* Общий блок итогов («Весь диалог» + «из них суммаризация»): фон и
            рамка объединяют эти строки в один блок — в отличие от строки
            «Текущий запрос», которая показывает только сам ответ модели. */
         .agent-table tbody.agent-total-block td {
-            background: #f5f5fc;
+            background: rgba(0, 255, 157, 0.05);
             padding-top: 6px;
             padding-bottom: 6px;
         }
-        .agent-table tbody.agent-total-block tr:first-child td { border-top: 1px solid #d6d3e6; }
-        .agent-table tbody.agent-total-block tr:last-child td { border-bottom: 1px solid #d6d3e6; }
+        .agent-table tbody.agent-total-block tr:first-child td { border-top: 1px solid var(--line); }
+        .agent-table tbody.agent-total-block tr:last-child td { border-bottom: 1px solid var(--line); }
         .agent-table tbody.agent-total-block td:first-child {
-            border-left: 3px solid #667eea;
+            border-left: 3px solid var(--accent);
             padding-left: 6px;
         }
         /* Строка «из них суммаризация» — вклад служебных вызовов сжатия
            памяти: часть суммы «Весь диалог», поэтому подписана и приглушена. */
         .agent-table tr.agent-subrow td {
-            color: #8a86a8;
+            color: var(--text-dim);
             font-style: italic;
             padding-top: 2px;
         }
-        .agent-hint { margin-top: 6px; font-size: 0.68rem; color: #777; line-height: 1.25; }
+        .agent-hint { margin-top: 6px; font-size: 0.68rem; color: var(--muted); line-height: 1.25; }
         /* ---------- Стратегия агента (панель режима «AI-агент») ---------- */
         /* Выпадающий список «Стратегия» и поля выбранной стратегии:
            summary — поле «summary» (сколько последних сообщений держать как
@@ -494,29 +840,29 @@
         .agent-strategy {
             margin-top: 8px;
             padding-top: 8px;
-            border-top: 1px solid #e8e8f2;
+            border-top: 1px solid var(--line-soft);
             font-size: 0.72rem;
-            color: #333;
+            color: var(--text);
         }
         .agent-strategy-head {
             display: flex;
             align-items: center;
             gap: 6px;
         }
-        .agent-strategy-head > span { color: #8a86a8; white-space: nowrap; }
+        .agent-strategy-head > span { color: var(--text-dim); white-space: nowrap; }
         .agent-strategy select {
             flex: 1;
             min-width: 0;
             padding: 3px 6px;
             font: inherit;
             font-size: 0.72rem;
-            color: #333;
-            background: #fff;
-            border: 1px solid #d6d3e6;
+            color: var(--text);
+            background: var(--surface-2);
+            border: 1px solid var(--line);
             border-radius: 6px;
             cursor: pointer;
         }
-        .agent-strategy select:focus { outline: 2px solid #c9c6dd; outline-offset: 0; }
+        .agent-strategy select:focus { outline: 2px solid var(--line-strong); outline-offset: 0; }
         .agent-strategy-row {
             display: flex;
             align-items: center;
@@ -528,11 +874,12 @@
             padding: 3px 6px;
             font: inherit;
             font-size: 0.72rem;
-            color: #333;
-            border: 1px solid #d6d3e6;
+            color: var(--text);
+            background: var(--surface-2);
+            border: 1px solid var(--line);
             border-radius: 6px;
         }
-        .agent-strategy-row input:focus { outline: 2px solid #c9c6dd; outline-offset: 0; }
+        .agent-strategy-row input:focus { outline: 2px solid var(--line-strong); outline-offset: 0; }
         /* Список веток плана (branching) занимает всю ширину строки. */
         .agent-strategy-row select {
             flex: 1;
@@ -540,29 +887,29 @@
             padding: 3px 6px;
             font: inherit;
             font-size: 0.72rem;
-            color: #333;
-            background: #fff;
-            border: 1px solid #d6d3e6;
+            color: var(--text);
+            background: var(--surface-2);
+            border: 1px solid var(--line);
             border-radius: 6px;
             cursor: pointer;
         }
-        .agent-strategy-row select:focus { outline: 2px solid #c9c6dd; outline-offset: 0; }
-        .agent-strategy-row span { color: #8a86a8; }
-        .agent-strategy-note { margin-top: 5px; font-size: 0.68rem; color: #8a86a8; line-height: 1.25; }
+        .agent-strategy-row select:focus { outline: 2px solid var(--line-strong); outline-offset: 0; }
+        .agent-strategy-row span { color: var(--text-dim); }
+        .agent-strategy-note { margin-top: 5px; font-size: 0.68rem; color: var(--text-dim); line-height: 1.25; }
         /* ---------- Блок плана ветвления (стратегия «branching») ---------- */
         .branch-part { margin-bottom: 8px; }
-        .branch-part > b { color: #4a3b8f; }
+        .branch-part > b { color: var(--accent-2); }
         .branch-part ul { margin: 4px 0 0 16px; padding: 0; }
         .branch-item {
             margin-top: 6px;
             padding-left: 8px;
-            border-left: 2px solid #e0ddf0;
+            border-left: 2px solid var(--line-soft);
         }
-        .branch-item b { color: #333; }
-        .branch-item div { color: #555; }
+        .branch-item b { color: var(--text); }
+        .branch-item div { color: var(--text-dim); }
 
         /* ---------- Таблица судьи-аналитика ---------- */
-        .judge-title { font-weight: 600; color: #4a3b8f; margin-bottom: 8px; }
+        .judge-title { font-weight: 600; color: var(--accent-2); margin-bottom: 8px; }
         .judge-table {
             width: 100%;
             border-collapse: collapse;
@@ -571,19 +918,19 @@
         }
         .judge-table th,
         .judge-table td {
-            border: 1px solid #e0e0e0;
+            border: 1px solid var(--line);
             padding: 6px 8px;
             text-align: center;
         }
-        .judge-table th { background: #eef1fb; color: #4a3b8f; font-weight: 600; }
-        .judge-table td:first-child { font-weight: 600; color: #333; }
+        .judge-table th { background: var(--surface-2); color: var(--accent-2); font-weight: 600; }
+        .judge-table td:first-child { font-weight: 600; color: var(--text); }
         .judge-summary {
             font-size: 0.85rem;
-            color: #333;
+            color: var(--text);
             margin-bottom: 6px;
             line-height: 1.4;
         }
-        .judge-summary b { color: #4a3b8f; }
+        .judge-summary b { color: var(--accent-2); }
         @media (max-width: 768px) {
             .layout { grid-template-columns: 1fr; }
             .sidebar { display: none; }
@@ -596,12 +943,35 @@
 </head>
 <body>
     <div class="layout">
-        <!-- Боковая панель: история введённых данных юзером -->
+        <!-- Боковая панель. В обычном/экспертном режимах — история введённых
+             данных юзером; в режиме «AI-агент» — Workspace: текущая задача,
+             её диалоги (сессии) и кнопка нового диалога. -->
         <aside class="sidebar">
-            <h2>🕘 История введённых данных</h2>
+            <h2 id="sidebar-title">🕘 История введённых данных</h2>
+            <!-- Workspace режима агента: пояснение «Текущая задача», выпадающий
+                 список задач на всю ширину панели, переименование/удаление
+                 задачи и кнопка «Новая задача». -->
+            <div class="task-block" id="task-block" hidden>
+                <div class="task-head">
+                    <span>Текущая задача</span>
+                    <span class="task-actions">
+                        <button type="button" class="icon-btn" id="task-rename" title="Переименовать задачу">✏️</button>
+                        <button type="button" class="icon-btn" id="task-delete" title="Удалить задачу">🗑</button>
+                    </span>
+                </div>
+                <select class="task-select" id="task-select" title="Текущая задача: у каждой задачи своя история диалогов">
+                    <option value="">— задачи нет —</option>
+                </select>
+                <button type="button" class="task-new" id="task-new">Новая задача</button>
+            </div>
             <div id="history" class="user-history">
                 <div class="history-empty">Здесь появится, что вы вводили</div>
             </div>
+            <!-- История диалогов задачи (только в режиме агента): элементы
+                 кликабельны — переход в диалог; карандаш переименовывает,
+                 корзина удаляет. -->
+            <div id="sessions" class="user-history" hidden></div>
+            <button type="button" class="session-new" id="session-new" hidden>Новая сессия</button>
         </aside>
 
         <!-- Основное окно чата -->
@@ -697,6 +1067,31 @@
                     </div>
                 </div>
             </div>
+            <!-- Модалка названия: «Новая задача» и переименование задачи/диалога.
+                 «закрыть» — ничего не меняется, «ок» — применяет введённое имя. -->
+            <div class="modal-overlay" id="name-modal" hidden>
+                <div class="modal-box">
+                    <h3 id="name-modal-title">Новая задача</h3>
+                    <input class="roles-field" id="name-modal-input" placeholder="Название" autocomplete="off">
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="name-modal-close">закрыть</button>
+                        <button type="button" class="accept" id="name-modal-ok">ок</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Модалка подтверждения удаления задачи или диалога. -->
+            <div class="modal-overlay" id="confirm-modal" hidden>
+                <div class="modal-box">
+                    <h3 id="confirm-modal-title">Удаление</h3>
+                    <p class="modal-hint" id="confirm-modal-text"></p>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="confirm-modal-cancel">отмена</button>
+                        <button type="button" class="accept" id="confirm-modal-ok">удалить</button>
+                    </div>
+                </div>
+            </div>
+
             <div id="messages" class="messages">
                 <div class="msg bot">
                     <div class="bubble">Привет! 👋 Я демо-чат-бот. Напишите что-нибудь в поле ниже.</div>
@@ -723,31 +1118,53 @@
              диалога + таблица «текущий запрос / весь диалог». Место и размер
              те же, что у панели статистики в экспертном режиме. -->
         <aside class="stats" id="agent-panel" hidden>
-            <h2>Токены диалога</h2>
-            <div id="agent-chart" class="agent-chart"></div>
-            <div class="agent-legend">
-                <span><i style="background:#e07b39"></i>Исходящие токены</span>
-                <span><i style="background:#667eea"></i>Входящие токены</span>
+            <h2 id="agent-panel-title">Токены диалога</h2>
+            <!-- Переключатель вида панели: статистика по токенам (по умолчанию)
+                 или состояние памяти агента (рабочая + долговременная). -->
+            <button type="button" class="agent-view-toggle" id="agent-view-toggle"
+                    title="Переключить панель: статистика по токенам / состояние памяти">Показать состояние памяти</button>
+            <!-- Вид «Токены диалога» — текущая логика панели. -->
+            <div class="agent-view" id="agent-tokens-view">
+                <div id="agent-chart" class="agent-chart"></div>
+                <div class="agent-legend">
+                    <span><i style="background:#ffb020"></i>Исходящие токены</span>
+                    <span><i style="background:#22d3ee"></i>Входящие токены</span>
+                </div>
+                <table class="stats-table agent-table">
+                    <thead>
+                        <tr>
+                            <th>Тип</th>
+                            <th>Количество запросов</th>
+                            <th>Исходящих токенов</th>
+                            <th>Входящих токенов</th>
+                            <th>Сумма токенов</th>
+                        </tr>
+                    </thead>
+                    <!-- Строка «Текущий запрос» — ТОЛЬКО сам ответ модели, без
+                         служебных вызовов сжатия памяти (суммаризации). -->
+                    <tbody id="agent-stats-body"></tbody>
+                    <!-- Общий блок: итог по всей переписке («Весь диалог») и вклад
+                         суммаризации в этот итог — выделены фоном и рамкой как один
+                         блок (см. .agent-total-block). -->
+                    <tbody id="agent-total-body" class="agent-total-block"></tbody>
+                </table>
+                <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса. Строка «Текущий запрос» — только сам ответ модели (без служебных вызовов: сжатия памяти, блока фактов, плана ветвления); «Весь диалог» и «из них служебные вызовы» — общий итог переписки вместе со служебными вызовами и их вклад в него.</div>
             </div>
-            <table class="stats-table agent-table">
-                <thead>
-                    <tr>
-                        <th>Тип</th>
-                        <th>Количество запросов</th>
-                        <th>Исходящих токенов</th>
-                        <th>Входящих токенов</th>
-                        <th>Сумма токенов</th>
-                    </tr>
-                </thead>
-                <!-- Строка «Текущий запрос» — ТОЛЬКО сам ответ модели, без
-                     служебных вызовов сжатия памяти (суммаризации). -->
-                <tbody id="agent-stats-body"></tbody>
-                <!-- Общий блок: итог по всей переписке («Весь диалог») и вклад
-                     суммаризации в этот итог — выделены фоном и рамкой как один
-                     блок (см. .agent-total-block). -->
-                <tbody id="agent-total-body" class="agent-total-block"></tbody>
-            </table>
-            <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса. Строка «Текущий запрос» — только сам ответ модели (без служебных вызовов: сжатия памяти, блока фактов, плана ветвления); «Весь диалог» и «из них служебные вызовы» — общий итог переписки вместе со служебными вызовами и их вклад в него.</div>
+            <!-- Вид «Состояние памяти»: рабочая память текущей задачи и
+                 долговременная (глобальная) — отдельными разбивками. Оба слоя
+                 наполняет пользователь кнопками под сообщениями и стратегиям
+                 управления контекстом они не подчиняются. -->
+            <div class="agent-view" id="agent-memory-view" hidden>
+                <div class="memory-section">
+                    <h3>Рабочая память <span class="memory-scope">текущая задача: <b id="memory-task-name">—</b></span></h3>
+                    <div class="memory-list" id="memory-work-list"></div>
+                </div>
+                <div class="memory-section">
+                    <h3>Долговременная память <span class="memory-scope">глобальная база знаний</span></h3>
+                    <div class="memory-list" id="memory-long-list"></div>
+                </div>
+                <div class="agent-hint">Эти слои памяти не подчиняются стратегиям управления контекстом: их записи уходят в модель в каждом запросе целиком (окно и резюме их не сокращают). Пополняются кнопками «добавить в рабочую память» и «добавить в долговременную память» под сообщениями — и своими, и агента. Краткосрочная память — текущий диалог; её расход виден на вкладке «Токены диалога».</div>
+            </div>
             <!-- Стратегия работы агента с контекстом диалога: выпадающий список
                  и поля выбранной стратегии. Поля показываются только у той
                  стратегии, которой они нужны. -->
@@ -977,6 +1394,15 @@
         // Второй tbody таблицы — общий блок «Весь диалог» + «из них служебные
         // вызовы» (строка «Текущий запрос» рисуется в первом).
         const agentTotalBody = document.getElementById('agent-total-body');
+        // Виды панели агента: статистика по токенам (по умолчанию) и состояние
+        // памяти (рабочая + долговременная). Переключаются одной кнопкой.
+        const agentPanelTitle = document.getElementById('agent-panel-title');
+        const agentViewToggle = document.getElementById('agent-view-toggle');
+        const agentTokensView = document.getElementById('agent-tokens-view');
+        const agentMemoryView = document.getElementById('agent-memory-view');
+        const memoryWorkList = document.getElementById('memory-work-list');
+        const memoryLongList = document.getElementById('memory-long-list');
+        const memoryTaskName = document.getElementById('memory-task-name');
         // agentUsage — по одному замеру на запрос пользователя:
         // {requests, input, output, limit, overflow}. Замер приходит с событием
         // "done" агентского потока и восстанавливается с сервера вместе с
@@ -1004,6 +1430,198 @@
 
         function usageSum(u) {
             return (Number(u.input) || 0) + (Number(u.output) || 0);
+        }
+
+        // ---------- Вид панели: токены / состояние памяти ----------
+        // По умолчанию панель показывает статистику по токенам (текущая логика).
+        // Кнопка переключает панель на «состояние памяти» — срезы рабочей памяти
+        // текущей задачи и долговременной (глобальной) памяти.
+        let agentPanelView = 'tokens';
+        // Снимок слоёв памяти с сервера (GET /api/agent/memory).
+        let agentMemory = { task: null, working: [], long_term: [] };
+
+        function setAgentPanelView(view) {
+            agentPanelView = (view === 'memory') ? 'memory' : 'tokens';
+            const memory = agentPanelView === 'memory';
+            agentPanelTitle.textContent = memory ? 'Состояние памяти' : 'Токены диалога';
+            agentViewToggle.textContent = memory ? 'Показать статистику по токенам'
+                : 'Показать состояние памяти';
+            agentTokensView.hidden = memory;
+            agentMemoryView.hidden = !memory;
+            if (memory) loadMemory();
+        }
+
+        agentViewToggle.addEventListener('click', () => {
+            setAgentPanelView(agentPanelView === 'memory' ? 'tokens' : 'memory');
+        });
+
+        // Загружает срезы рабочей и долговременной памяти и рисует их.
+        async function loadMemory() {
+            try {
+                const res = await fetch('/api/agent/memory');
+                if (!res.ok) return;
+                agentMemory = await res.json();
+            } catch (e) {
+                return;   // память недоступна — панель просто останется как была
+            }
+            renderMemory();
+        }
+
+        // Метка времени записи памяти: «01.01.2026, 12:00» (или пусто).
+        function memoryStamp(entry) {
+            const raw = String(entry.created || '');
+            const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+            if (!match) return '';
+            return `${match[3]}.${match[2]}.${match[1]}, ${match[4]}:${match[5]}`;
+        }
+
+        function memoryMeta(entry) {
+            const parts = [];
+            if (entry.created) parts.push(memoryStamp(entry));
+            parts.push(entry.source === 'assistant' ? 'из ответа агента' : 'из вашего сообщения');
+            return parts.filter(Boolean).join(' · ');
+        }
+
+        function memoryItem(entry, layer) {
+            const item = document.createElement('div');
+            item.className = 'memory-item' + (layer === 'long' ? ' long-term' : '');
+            const text = document.createElement('div');
+            text.className = 'memory-text';
+            text.textContent = entry.text;
+            item.appendChild(text);
+            const meta = document.createElement('div');
+            meta.className = 'memory-meta';
+            const stamp = document.createElement('span');
+            stamp.textContent = memoryMeta(entry);
+            meta.appendChild(stamp);
+            meta.appendChild(iconButton('🗑', 'Удалить запись из памяти', () => deleteMemoryEntry(layer, entry.id)));
+            item.appendChild(meta);
+            return item;
+        }
+
+        // Рисует оба слоя памяти отдельными разбивками.
+        function renderMemory() {
+            const task = agentMemory.task;
+            memoryTaskName.textContent = task ? task.name : 'задача не создана';
+            const fill = (list, entries, layer, empty) => {
+                list.innerHTML = '';
+                if (!entries.length) {
+                    list.innerHTML = '<div class="memory-empty">' + empty + '</div>';
+                    return;
+                }
+                entries.forEach(entry => list.appendChild(memoryItem(entry, layer)));
+            };
+            fill(memoryWorkList, agentMemory.working || [], 'work',
+                task ? 'Пока пусто — добавьте сообщение кнопкой «добавить в рабочую память».'
+                     : 'Рабочая память привязана к задаче: сначала создайте задачу.');
+            fill(memoryLongList, agentMemory.long_term || [], 'long',
+                'Пока пусто — добавьте сообщение кнопкой «добавить в долговременную память».');
+            // Записи могли добавить/удалить — синхронизируем подсветку кнопок.
+            syncMemoryButtons();
+        }
+
+        // Слой памяти, с которым работает кнопка: 'work' — рабочая, 'long' — долговременная.
+        function memoryList(layer) {
+            return layer === 'long' ? (agentMemory.long_term || []) : (agentMemory.working || []);
+        }
+
+        // Находит запись слоя, соответствующую тексту сообщения (сервер режет
+        // слишком длинные записи, поэтому сравниваем и с обрезком).
+        function memoryEntryFor(layer, text) {
+            const value = String(text || '');
+            if (!value) return null;
+            return memoryList(layer).find(entry =>
+                entry.text === value || entry.text === value.slice(0, 4000)) || null;
+        }
+
+        // Приводит кнопки под сообщениями в соответствие с памятью: если текст
+        // сообщения уже лежит в слое — кнопка подсвечена (active) и знает id
+        // записи, повторное нажатие её уберёт.
+        function syncMemoryButtons() {
+            messagesEl.querySelectorAll('.memory-actions').forEach(row => {
+                const bubble = row.closest('.msg').querySelector('.bubble');
+                if (!bubble) return;
+                row.querySelectorAll('.memory-btn').forEach(btn => {
+                    const layer = btn.dataset.layer;
+                    const entry = memoryEntryFor(layer, bubble.textContent);
+                    btn.classList.toggle('active', !!entry);
+                    btn.dataset.entry = entry ? entry.id : '';
+                    btn.title = entry
+                        ? 'Уже в памяти — нажмите, чтобы убрать'
+                        : (layer === 'work'
+                            ? 'Добавить в рабочую память (данные текущей задачи) — запись уходит в модель в каждом запросе.'
+                            : 'Добавить в долговременную память (глобальная база знаний) — запись уходит в модель в каждом запросе.');
+                });
+            });
+        }
+
+        // Кнопка памяти — переключатель: нет записи — добавляем, есть — убираем.
+        async function toggleMemory(layer, text, source, button) {
+            const value = String(text || '').trim();
+            if (!value) return;
+            const entryId = button.dataset.entry;
+            button.disabled = true;
+            try {
+                const res = entryId
+                    ? await fetch('/api/agent/memory/' + layer + '/' + encodeURIComponent(entryId),
+                                 { method: 'DELETE' })
+                    : await fetch('/api/agent/memory', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ layer: layer, text: value, source: source })
+                    });
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    addMessage('bot', '⚠️ ' + (detail
+                        || (entryId ? 'Не удалось убрать из памяти.' : 'Не удалось добавить в память.')), true);
+                    return;
+                }
+                agentMemory = await res.json();
+                renderMemory();   // перерисует панель и вызовет syncMemoryButtons()
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function deleteMemoryEntry(layer, entryId) {
+            try {
+                const res = await fetch('/api/agent/memory/' + layer + '/' + encodeURIComponent(entryId),
+                    { method: 'DELETE' });
+                if (!res.ok) return;
+                agentMemory = await res.json();
+            } catch (e) {
+                return;
+            }
+            renderMemory();
+        }
+
+        // Кнопки памяти под сообщением: и под сообщением пользователя, и под
+        // ответом агента (см. addMessage — четвёртый аргумент).
+        function addMemoryButtons(wrap, source) {
+            const bubble = wrap.querySelector('.bubble');
+            if (!bubble) return;
+            const row = document.createElement('div');
+            row.className = 'memory-actions';
+            [['work', 'добавить в рабочую память'],
+             ['long', 'добавить в долговременную память']].forEach(([layer, label]) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'memory-btn';
+                btn.textContent = label;
+                btn.dataset.layer = layer;
+                btn.title = label.charAt(0).toUpperCase() + label.slice(1)
+                    + (layer === 'work' ? ' (данные текущей задачи)' : ' (глобальная база знаний)')
+                    + ' — запись уходит в модель в каждом запросе.';
+                btn.addEventListener('click', () => toggleMemory(layer, bubble.textContent, source, btn));
+                row.appendChild(btn);
+            });
+            wrap.appendChild(row);
+            // Кнопки могли появиться в уже наполненном слое памяти (например,
+            // сообщение восстановили из истории) — сразу ставим их состояние.
+            syncMemoryButtons();
         }
 
         function renderAgentPanel() {
@@ -1118,28 +1736,28 @@
             // Горизонтальная сетка с подписями: 0, 200, 400, ... токенов.
             for (let v = 0; v <= yMax + 0.5; v += step) {
                 const y = yOf(v).toFixed(1);
-                parts.push(`<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="#e8e8f2" stroke-width="1"/>`);
-                parts.push(`<text x="${L - 6}" y="${(yOf(v) + 3).toFixed(1)}" text-anchor="end" font-size="9" fill="#8a86a8">${v}</text>`);
+                parts.push(`<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>`);
+                parts.push(`<text x="${L - 6}" y="${(yOf(v) + 3).toFixed(1)}" text-anchor="end" font-size="9" fill="#8fb0a8">${v}</text>`);
             }
             // Вертикальные линии — по одной на запрос (шаг 1 запрос).
             for (let i = 1; i <= requests; i++) {
                 const x = xOf(i).toFixed(1);
-                parts.push(`<line x1="${x}" y1="${T}" x2="${x}" y2="${T + plotH}" stroke="#f2f2f8" stroke-width="1"/>`);
+                parts.push(`<line x1="${x}" y1="${T}" x2="${x}" y2="${T + plotH}" stroke="rgba(255,255,255,0.05)" stroke-width="1"/>`);
             }
             // Оси.
-            parts.push(`<line x1="${L}" y1="${T}" x2="${L}" y2="${T + plotH}" stroke="#c9c6dd" stroke-width="1"/>`);
-            parts.push(`<line x1="${L}" y1="${T + plotH}" x2="${W - R}" y2="${T + plotH}" stroke="#c9c6dd" stroke-width="1"/>`);
+            parts.push(`<line x1="${L}" y1="${T}" x2="${L}" y2="${T + plotH}" stroke="rgba(0,255,157,0.35)" stroke-width="1"/>`);
+            parts.push(`<line x1="${L}" y1="${T + plotH}" x2="${W - R}" y2="${T + plotH}" stroke="rgba(0,255,157,0.35)" stroke-width="1"/>`);
             // Подписи оси X: номер запроса (каждый, если их немного).
             let labelStep = 1;
             while (requests / labelStep > 12) labelStep *= 2;
             for (let i = 0; i <= requests; i++) {
                 if (i % labelStep !== 0 && i !== requests) continue;
-                parts.push(`<text x="${xOf(i).toFixed(1)}" y="${T + plotH + 15}" text-anchor="middle" font-size="9" fill="#8a86a8">${i}</text>`);
+                parts.push(`<text x="${xOf(i).toFixed(1)}" y="${T + plotH + 15}" text-anchor="middle" font-size="9" fill="#8fb0a8">${i}</text>`);
             }
             // Линии расхода токенов: исходящие (оранжевая) и входящие (синяя).
             const series = [
-                { values: outputTotals, color: '#e07b39' },
-                { values: inputTotals, color: '#667eea' }
+                { values: outputTotals, color: '#ffb020' },
+                { values: inputTotals, color: '#22d3ee' }
             ];
             series.forEach(s => {
                 const points = s.values.map((v, i) => `${xOf(i).toFixed(1)},${yOf(v).toFixed(1)}`).join(' ');
@@ -1148,10 +1766,10 @@
                     parts.push(`<circle cx="${xOf(i).toFixed(1)}" cy="${yOf(v).toFixed(1)}" r="2.4" fill="${s.color}"/>`);
                 });
             });
-            parts.push(`<text x="${L}" y="${T - 5}" font-size="9" fill="#8a86a8">токены</text>`);
-            parts.push(`<text x="${W - R}" y="${H - 4}" text-anchor="end" font-size="9" fill="#8a86a8">запросов: ${requests}</text>`);
+            parts.push(`<text x="${L}" y="${T - 5}" font-size="9" fill="#8fb0a8">токены</text>`);
+            parts.push(`<text x="${W - R}" y="${H - 4}" text-anchor="end" font-size="9" fill="#8fb0a8">запросов: ${requests}</text>`);
             if (!requests) {
-                parts.push(`<text x="${L + plotW / 2}" y="${T + plotH / 2}" text-anchor="middle" font-size="10" fill="#b3b0c8">Пока нет запросов</text>`);
+                parts.push(`<text x="${L + plotW / 2}" y="${T + plotH / 2}" text-anchor="middle" font-size="10" fill="#6b8a84">Пока нет запросов</text>`);
             }
             parts.push('</svg>');
             agentChart.innerHTML = parts.join('');
@@ -1177,6 +1795,345 @@
             setExpertMode(on);
         });
 
+        // ---------- Workspace: задачи и диалоги (режим «AI-агент») ----------
+        // В режиме агента левая панель — это workspace: сверху пояснение
+        // «Текущая задача» с выпадающим списком задач (и кнопкой «Новая
+        // задача»), ниже — история ДИАЛОГОВ этой задачи (сессии), в самом низу —
+        // кнопка «Новая сессия». Диалог нельзя начать, пока задача не создана;
+        // у каждой задачи своя история диалогов, внутри задачи можно
+        // переключаться между сессиями (у каждой своё состояние агента).
+        const sidebarTitle = document.getElementById('sidebar-title');
+        const taskBlock = document.getElementById('task-block');
+        const taskSelect = document.getElementById('task-select');
+        const taskNewBtn = document.getElementById('task-new');
+        const taskRenameBtn = document.getElementById('task-rename');
+        const taskDeleteBtn = document.getElementById('task-delete');
+        const sessionsEl = document.getElementById('sessions');
+        const sessionNewBtn = document.getElementById('session-new');
+
+        // Снимок workspace с сервера: задачи, текущая задача, её диалоги и
+        // текущий диалог.
+        let workspace = { tasks: [], active_task: null, sessions: [], active_session: null };
+        // Идёт запрос к агенту: пока он отвечает, задачу и диалог менять нельзя —
+        // сервер обрабатывает запрос под блокировкой, и ответ лёг бы не в тот
+        // диалог. Кнопки на это время блокируются.
+        let requestBusy = false;
+
+        function agentModeOn() {            return agentToggle.classList.contains('active');
+        }
+
+        function jsonOptions(method, body) {
+            return {
+                method: method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {})
+            };
+        }
+
+        // Запрос к API workspace: возвращает снимок (или null — ошибка уже
+        // показана в чате).
+        async function workspaceRequest(url, options) {
+            try {
+                const res = await fetch(url, options);
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    addMessage('bot', '⚠️ ' + (detail || 'Не удалось выполнить действие.'), true);
+                    return null;
+                }
+                return await res.json();
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+                return null;
+            }
+        }
+
+        // Загружает снимок workspace и перерисовывает панель.
+        async function loadWorkspace() {
+            const data = await workspaceRequest('/api/agent/workspace');
+            if (!data) return;
+            workspace = data;
+            renderWorkspace();
+        }
+
+        // Показывает/прячет блоки панели и рисует задачи и диалоги.
+        function renderWorkspace() {
+            const agentOn = agentModeOn();
+            // Заголовок панели: в режиме агента — Workspace.
+            sidebarTitle.textContent = agentOn ? 'Workspace' : '🕘 История введённых данных';
+            taskBlock.hidden = !agentOn;
+            sessionNewBtn.hidden = !agentOn;
+            historyEl.hidden = agentOn;
+            sessionsEl.hidden = !agentOn;
+            if (agentOn) {
+                // Выпадающий список «Текущая задача».
+                taskSelect.innerHTML = '';
+                if (!workspace.tasks.length) {
+                    const empty = document.createElement('option');
+                    empty.value = '';
+                    empty.textContent = '— задачи нет —';
+                    taskSelect.appendChild(empty);
+                }
+                workspace.tasks.forEach(task => {
+                    const option = document.createElement('option');
+                    option.value = task.id;
+                    option.textContent = task.name;
+                    taskSelect.appendChild(option);
+                });
+                taskSelect.value = workspace.active_task || '';
+                // История диалогов текущей задачи.
+                sessionsEl.innerHTML = '';
+                if (!workspace.active_task) {
+                    sessionsEl.innerHTML = '<div class="history-empty">Создайте задачу — кнопка «Новая задача»</div>';
+                } else if (!workspace.sessions.length) {
+                    sessionsEl.innerHTML = '<div class="history-empty">Диалогов пока нет</div>';
+                }
+                workspace.sessions.forEach(session => {
+                    sessionsEl.appendChild(sessionItem(session));
+                });
+                // Срезы памяти тоже привязаны к задаче — держим их свежими.
+                loadMemory();
+            }
+            updateComposerState();
+        }
+
+        // Доступность поля ввода и кнопок: диалог в режиме агента возможен
+        // только когда задача создана.
+        function updateComposerState() {
+            const agentOn = agentModeOn();
+            const needTask = agentOn && !workspace.active_task;
+            input.disabled = needTask;
+            input.placeholder = needTask
+                ? 'Сначала создайте задачу — кнопка «Новая задача»'
+                : 'Введите сообщение...';
+            sendBtn.disabled = needTask || requestBusy;
+            agentClearBtn.disabled = requestBusy;
+            if (agentOn) {
+                taskSelect.disabled = requestBusy || !workspace.tasks.length;
+                taskRenameBtn.disabled = requestBusy || !workspace.active_task;
+                taskDeleteBtn.disabled = requestBusy || !workspace.active_task;
+                sessionNewBtn.disabled = requestBusy || !workspace.active_task;
+            }
+            sessionsEl.classList.toggle('busy', requestBusy);
+        }
+
+        function iconButton(label, title, handler) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'icon-btn';
+            btn.textContent = label;
+            btn.title = title;
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();   // клик по иконке не должен открывать диалог
+                handler();
+            });
+            return btn;
+        }
+
+        // Элемент истории диалогов: название (первые слова первого запроса
+        // пользователя или своё, после переименования) + карандаш и корзина.
+        function sessionItem(session) {
+            const item = document.createElement('div');
+            const title = session.title || 'Новый диалог';
+            item.className = 'history-item session-item'
+                + (session.id === workspace.active_session ? ' active' : '');
+            const label = document.createElement('span');
+            label.className = 'session-title';
+            label.textContent = title;
+            label.title = title;
+            item.appendChild(label);
+            const actions = document.createElement('span');
+            actions.className = 'session-actions';
+            actions.appendChild(iconButton('✏️', 'Переименовать диалог', () => renameSession(session)));
+            actions.appendChild(iconButton('🗑', 'Удалить диалог', () => deleteSession(session)));
+            item.appendChild(actions);
+            item.addEventListener('click', () => selectSession(session.id));
+            return item;
+        }
+
+        // Переключение диалога: сервер делает сессию текущей, после чего окно
+        // чата перерисовывается диалогом этой сессии.
+        async function selectSession(sessionId) {
+            if (requestBusy || !sessionId || sessionId === workspace.active_session) return;
+            const data = await workspaceRequest(
+                '/api/agent/sessions/' + encodeURIComponent(sessionId) + '/select', jsonOptions('POST'));
+            if (!data) return;
+            workspace = data;
+            renderWorkspace();
+            await loadActiveDialog();
+        }
+
+        // Переключение задачи: у каждой задачи своя история диалогов, поэтому
+        // после переключения подтягиваем диалог её текущей сессии.
+        async function selectTask(taskId) {
+            if (requestBusy || !taskId || taskId === workspace.active_task) return;
+            const data = await workspaceRequest(
+                '/api/agent/tasks/' + encodeURIComponent(taskId) + '/select', jsonOptions('POST'));
+            if (!data) return;
+            workspace = data;
+            renderWorkspace();
+            await loadActiveDialog();
+        }
+
+        // Новый диалог в текущей задаче (кнопка «Новая сессия»): сессия пустая,
+        // название подтянется по первому запросу.
+        async function createSession() {
+            if (requestBusy || !workspace.active_task) return;
+            const data = await workspaceRequest('/api/agent/sessions', jsonOptions('POST'));
+            if (!data) return;
+            workspace = data;
+            renderWorkspace();
+            await loadActiveDialog();
+            input.focus();
+        }
+
+        async function createTask(name) {
+            const data = await workspaceRequest('/api/agent/tasks', jsonOptions('POST', { name: name }));
+            if (!data) return;
+            workspace = data;
+            renderWorkspace();
+            await loadActiveDialog();
+            input.focus();
+        }
+
+        function currentTask() {
+            return workspace.tasks.find(task => task.id === workspace.active_task) || null;
+        }
+
+        function renameTask() {
+            const task = currentTask();
+            if (!task || requestBusy) return;
+            openNameModal('Переименовать задачу', task.name, async (name) => {
+                const data = await workspaceRequest(
+                    '/api/agent/tasks/' + encodeURIComponent(task.id), jsonOptions('PUT', { name: name }));
+                if (!data) return;
+                workspace = data;
+                renderWorkspace();
+            });
+        }
+
+        function deleteTask() {
+            const task = currentTask();
+            if (!task || requestBusy) return;
+            openConfirmModal(
+                'Удалить задачу?',
+                'Задача «' + task.name + '» будет удалена вместе со всеми её диалогами.',
+                async () => {
+                    const data = await workspaceRequest(
+                        '/api/agent/tasks/' + encodeURIComponent(task.id), { method: 'DELETE' });
+                    if (!data) return;
+                    workspace = data;
+                    renderWorkspace();
+                    await loadActiveDialog();
+                });
+        }
+
+        function renameSession(session) {
+            if (requestBusy) return;
+            const title = session.title || 'Новый диалог';
+            openNameModal('Переименовать диалог', title === 'Новый диалог' ? '' : title, async (name) => {
+                const data = await workspaceRequest(
+                    '/api/agent/sessions/' + encodeURIComponent(session.id), jsonOptions('PUT', { name: name }));
+                if (!data) return;
+                workspace = data;
+                renderWorkspace();
+            });
+        }
+
+        function deleteSession(session) {
+            if (requestBusy) return;
+            openConfirmModal(
+                'Удалить диалог?',
+                'Диалог «' + (session.title || 'Новый диалог') + '» будет удалён вместе с его историей и расходом токенов.',
+                async () => {
+                    const data = await workspaceRequest(
+                        '/api/agent/sessions/' + encodeURIComponent(session.id), { method: 'DELETE' });
+                    if (!data) return;
+                    workspace = data;
+                    renderWorkspace();
+                    await loadActiveDialog();
+                });
+        }
+
+        // ---------- Модалки: название и подтверждение ----------
+        const nameModal = document.getElementById('name-modal');
+        const nameModalTitle = document.getElementById('name-modal-title');
+        const nameModalInput = document.getElementById('name-modal-input');
+        let nameModalSubmit = null;
+
+        function openNameModal(title, value, onSubmit) {
+            nameModalTitle.textContent = title;
+            nameModalInput.value = value || '';
+            nameModalSubmit = onSubmit;
+            nameModal.hidden = false;
+            nameModalInput.focus();
+            nameModalInput.select();
+        }
+
+        function closeNameModal() {
+            nameModal.hidden = true;
+            nameModalSubmit = null;
+        }
+
+        async function submitNameModal() {
+            const name = nameModalInput.value.trim();
+            if (!name) {
+                nameModalInput.focus();   // пустое имя не сохраняем
+                return;
+            }
+            const submit = nameModalSubmit;
+            closeNameModal();
+            if (submit) await submit(name);
+        }
+
+        nameModalInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                submitNameModal();
+            }
+        });
+        document.getElementById('name-modal-ok').addEventListener('click', submitNameModal);
+        document.getElementById('name-modal-close').addEventListener('click', closeNameModal);
+        nameModal.addEventListener('click', (e) => {
+            if (e.target === nameModal) closeNameModal();   // «закрыть» — ничего не меняется
+        });
+
+        const confirmModal = document.getElementById('confirm-modal');
+        const confirmModalTitle = document.getElementById('confirm-modal-title');
+        const confirmModalText = document.getElementById('confirm-modal-text');
+        let confirmModalSubmit = null;
+
+        function openConfirmModal(title, text, onSubmit) {
+            confirmModalTitle.textContent = title;
+            confirmModalText.textContent = text;
+            confirmModalSubmit = onSubmit;
+            confirmModal.hidden = false;
+        }
+
+        function closeConfirmModal() {
+            confirmModal.hidden = true;
+            confirmModalSubmit = null;
+        }
+
+        document.getElementById('confirm-modal-ok').addEventListener('click', async () => {
+            const submit = confirmModalSubmit;
+            closeConfirmModal();
+            if (submit) await submit();
+        });
+        document.getElementById('confirm-modal-cancel').addEventListener('click', closeConfirmModal);
+        confirmModal.addEventListener('click', (e) => {
+            if (e.target === confirmModal) closeConfirmModal();
+        });
+
+        taskNewBtn.addEventListener('click', () => {
+            if (requestBusy) return;
+            openNameModal('Новая задача', '', createTask);
+        });
+        taskRenameBtn.addEventListener('click', renameTask);
+        taskDeleteBtn.addEventListener('click', deleteTask);
+        sessionNewBtn.addEventListener('click', createSession);
+        taskSelect.addEventListener('change', () => selectTask(taskSelect.value));
+
         // ---------- Режим «AI-агент» ----------
         // Включается отдельной кнопкой в шапке. Агент сам ведёт историю диалога,
         // подбирает параметры генерации и шлёт debug-сообщения о своей работе.
@@ -1193,23 +2150,25 @@
             agentClearBtn.hidden = !on;
             if (!on) {
                 // Обычный режим контекст не хранит: убираем агентский диалог
-                // (восстановленный + реплики сеанса агента) из окна чата и из
-                // «Истории введённых данных» — в обычном режиме его быть не должно.
+                // (восстановленный + реплики сеанса агента) из окна чата, а
+                // панель возвращаем к «Истории введённых данных» (workspace
+                // остаётся на сервере и вернётся при следующем включении агента).
                 // Данные панели (токены, ветви плана) тоже сбрасываются, а вот
                 // настройки стратегии и её полей остаются как есть.
                 agentUsage = [];
                 renderAgentPanel();
                 resetAgentDialogs();
                 removeAgentConversation();
+                renderWorkspace();
                 return;
             }
             setExpertMode(false);  // агент несовместим с экспертным режимом
-            // Данные панели токенов и старый диалог подтягиваем ТОЛЬКО при
-            // включении агента: в обычном режиме модель не помнит контекст
-            // переписки, поэтому показывать там прошлые реплики нельзя.
+            // Задачи и диалоги (workspace) подтягиваем ТОЛЬКО при включении
+            // агента: в обычном режиме модель не помнит контекст переписки,
+            // поэтому показывать там прошлые реплики нельзя.
             agentUsage = [];
             renderAgentPanel();
-            restoreAgentHistory();
+            refreshWorkspace();
         }
 
         agentToggle.addEventListener('click', () => {
@@ -1364,7 +2323,7 @@
             return div;
         }
 
-        function addMessage(role, text, agentMsg) {
+        function addMessage(role, text, agentMsg, memoryButtons) {
             const wrap = document.createElement('div');
             wrap.className = 'msg ' + role;
             if (agentMsg) wrap.setAttribute('data-agent', '1');
@@ -1372,7 +2331,12 @@
             bubble.className = 'bubble';
             bubble.textContent = text;
             wrap.appendChild(bubble);
+            // Под сообщением пользователя и под ответом агента — кнопки
+            // «добавить в рабочую/долговременную память».
+            if (memoryButtons) addMemoryButtons(wrap, role === 'user' ? 'user' : 'assistant');
             messagesEl.appendChild(wrap);
+            // Заглушка-приветствие видна только в пустом диалоге.
+            if (agentMsg) greetingMsg.hidden = true;
             messagesEl.scrollTop = messagesEl.scrollHeight;
             return wrap;
         }
@@ -1394,19 +2358,21 @@
                 .replace(/>/g, '&gt;');
         }
 
-        // Рисует один узел диалога агента (в окне чата и в «Истории введённых
-        // данных»): user — реплика юзера, debug — сообщение агента о работе,
-        // error — предупреждение, иначе ответ бота.
+        // Рисует один узел диалога агента (только в окне чата): user — реплика
+        // юзера, debug — сообщение агента о работе, error — предупреждение, иначе
+        // ответ бота. В панели слева в режиме агента живут не запросы, а диалоги
+        // (сессии), поэтому в историю введённых данных реплики не пишутся.
+        // Под сообщением пользователя и под ответом агента — кнопки добавления
+        // этого текста в рабочую/долговременную память.
         function drawAgentNode(role, text) {
             if (role === 'user') {
-                addMessage('user', text, true);
-                addHistory(text, true);
+                addMessage('user', text, true, true);
             } else if (role === 'debug') {
                 addMessage('debug', text, true);
             } else if (role === 'error') {
                 addMessage('bot', '⚠️ ' + text, true);
             } else {
-                addMessage('bot', text, true);
+                addMessage('bot', text, true, true);
             }
         }
 
@@ -1416,18 +2382,17 @@
             drawAgentNode(role, text);
         }
 
-        // Полная перерисовка окна для текущего представления (после
-        // переключения ветки или восстановления истории).
+        // Полная перерисовка окна чата для текущего представления (после
+        // переключения диалога, ветки плана или восстановления истории).
+        // Заглушка-приветствие видна только в пустом диалоге.
         function renderAgentDialog() {
             messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
-            historyEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
-            if (!historyEl.querySelector('.history-item')
-                    && !historyEl.querySelector('.history-empty')) {
-                historyEl.innerHTML = '<div class="history-empty">Здесь появится, что вы вводили</div>';
-            }
             agentViewMessages().forEach(m => drawAgentNode(m.role, m.text));
             // План ветвления показываем в корневом диалоге (он относится к нему).
             if (!agentView && agentAnalysis) renderBranchPlan(agentAnalysis);
+            greetingMsg.hidden = !!messagesEl.querySelector('[data-agent]');
+            // Кнопки памяти у восстановленных сообщений — в актуальном состоянии.
+            syncMemoryButtons();
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
@@ -1517,75 +2482,73 @@
             renderBranchSelect();
         }
 
-        // Восстановление диалога «AI-агента»: вызывается ТОЛЬКО при включении
-        // режима агента (обычный режим контекст не хранит — прошлая переписка
-        // там не показывается). Сохранённые реплики рисуются в окне чата,
-        // запросы пользователя — в «Истории введённых данных».
-        async function restoreAgentHistory() {
+        // Диалог текущей сессии: реплики, расход токенов, ветви плана.
+        // Вызывается при включении режима агента и при каждом переключении
+        // задачи или диалога — окно чата перерисовывается целиком. Задачи нет
+        // или диалогов нет — окно остаётся пустым (только приветствие).
+        async function loadActiveDialog() {
+            let data = null;
             try {
                 const res = await fetch('/api/agent/history');
-                if (!res.ok) return;
-                const data = await res.json();
-                const msgs = Array.isArray(data.messages) ? data.messages : [];
-                // Расход токенов по запросам — для панели «Токены диалога»:
-                // обновляем её всегда, даже если реплики в чат не рисуем.
-                agentUsage = Array.isArray(data.usage) ? data.usage : [];
-                renderAgentPanel();
-                // Ветви плана и их независимые диалоги (стратегия «branching»):
-                // переключение ветки сразу после включения агента.
-                const branches = (data.branches && typeof data.branches === 'object') ? data.branches : {};
-                agentBranchMessages = {};
-                agentBranches = Object.keys(branches).map(id => ({
-                    id: id,
-                    title: (branches[id] && branches[id].title) || ''
-                }));
-                agentBranches.forEach(b => {
-                    agentBranchMessages[b.id] = ((branches[b.id] && branches[b.id].messages) || [])
-                        .filter(m => m && m.content)
-                        .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', text: m.content }));
-                });
-                agentActiveBranch = data.active_branch || null;
-                agentView = '';
-                agentAnalysis = null;
-                agentRootMessages = msgs
+                if (res.ok) data = await res.json();
+            } catch (e) {
+                data = null;   // история недоступна — просто пустой чат
+            }
+            const msgs = (data && Array.isArray(data.messages)) ? data.messages : [];
+            // Расход токенов по запросам — для панели «Токены диалога»: он свой
+            // у каждого диалога.
+            agentUsage = (data && Array.isArray(data.usage)) ? data.usage : [];
+            renderAgentPanel();
+            // Ветви плана и их независимые диалоги (стратегия «branching»).
+            const branches = (data && data.branches && typeof data.branches === 'object') ? data.branches : {};
+            agentBranchMessages = {};
+            agentBranches = Object.keys(branches).map(id => ({
+                id: id,
+                title: (branches[id] && branches[id].title) || ''
+            }));
+            agentBranches.forEach(b => {
+                agentBranchMessages[b.id] = ((branches[b.id] && branches[b.id].messages) || [])
                     .filter(m => m && m.content)
                     .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', text: m.content }));
-                renderBranchSelect();
-                // История есть — переключаем список «Стратегия» на branching,
-                // иначе ветки было бы не выбрать.
-                if (agentBranches.length) {
-                    agentStrategySelect.value = 'branching';
-                }
-                showAgentStrategyRows();
-                // Пользователь уже начал переписку (в обычном режиме или в этом
-                // же сеансе агента) — старую историю не рисуем, чтобы не смешать.
-                if (agentRootMessages.length && !messagesEl.querySelector('.msg.user')) {
-                    agentRootMessages.forEach(m => drawAgentNode(m.role, m.text));
-                    messagesEl.scrollTop = messagesEl.scrollHeight;
-                }
-            } catch (e) {
-                // история недоступна — просто пустой чат
+            });
+            agentActiveBranch = (data && data.active_branch) || null;
+            agentView = '';
+            agentAnalysis = null;
+            agentRootMessages = msgs
+                .filter(m => m && m.content)
+                .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', text: m.content }));
+            renderBranchSelect();
+            // Ветви есть — список «Стратегия» переключаем на branching, иначе
+            // ветки было бы не выбрать.
+            if (agentBranches.length) {
+                agentStrategySelect.value = 'branching';
             }
+            showAgentStrategyRows();
+            renderAgentDialog();
+        }
+
+        // Снимок workspace + диалог текущей сессии: включение режима агента,
+        // смена задачи или диалога.
+        async function refreshWorkspace() {
+            await loadWorkspace();
+            await loadActiveDialog();
         }
 
         // Выключение агента: агентский диалог (восстановленный + реплики
-        // текущего сеанса агента) убирается из окна чата и из «Истории
-        // введённых данных». В обычном/экспертном режимах модель не хранит
-        // контекст переписки, поэтому диалог агента там показываться не должен.
+        // текущего сеанса агента) убирается из окна чата. В обычном/экспертном
+        // режимах модель не хранит контекст переписки, поэтому диалог агента там
+        // показываться не должен; панель слева возвращается к истории введённых
+        // данных (workspace при этом остаётся на сервере).
         function removeAgentConversation() {
             messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
-            historyEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
-            // Если в «Истории» не осталось записей — вернуть заглушку.
-            if (!historyEl.querySelector('.history-item')
-                    && !historyEl.querySelector('.history-empty')) {
-                historyEl.innerHTML = '<div class="history-empty">Здесь появится, что вы вводили</div>';
-            }
+            greetingMsg.hidden = false;
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
         // Кнопка «Очистить историю» (только в режиме «AI-агент»): стирает диалог
-        // на сервере (память, токены, резюме, факты, ветви плана и JSON-файл) и
-        // убирает реплики из окна чата и из «Истории введённых данных».
+        // текущей сессии на сервере (память, токены, резюме, факты, ветви плана)
+        // и убирает реплики из окна чата. Сам диалог (сессия) остаётся в истории
+        // задач — его можно продолжить или удалить корзиной.
         // Приветствие чата остаётся на месте.
         async function clearAgentHistory() {
             try {
@@ -1601,7 +2564,7 @@
             messagesEl.querySelectorAll('.msg').forEach(el => {
                 if (el !== greetingMsg) el.remove();
             });
-            historyEl.innerHTML = '<div class="history-empty">Здесь появится, что вы вводили</div>';
+            greetingMsg.hidden = false;
             // Панель токенов и ветви плана — тоже начисто: истории больше нет.
             agentUsage = [];
             renderAgentPanel();
@@ -1713,10 +2676,11 @@
         // затем — финальный ответ (bot). Событие 'done' служебное — не рисуем.
         async function sendAgentRequest(body) {
             typingEl.textContent = 'AI-агент думает...';
-            // Пока агент отвечает, очистку истории блокируем — иначе реплики
-            // потока перемешались бы с удалением.
-            sendBtn.disabled = true;
-            agentClearBtn.disabled = true;
+            // Пока агент отвечает, смену задачи/диалога и очистку истории
+            // блокируем — иначе реплики потока перемешались бы с удалением или
+            // попали бы не в тот диалог.
+            requestBusy = true;
+            updateComposerState();
             try {
                 const res = await fetch('/api/agent/chat', {
                     method: 'POST',
@@ -1745,7 +2709,7 @@
                         // Режим агента выключили во время ответа — события не
                         // рисуем (агентский диалог уже убран из окна), но поток
                         // дочитываем, чтобы сервер завершил сохранение истории.
-                        if (!agentToggle.classList.contains('active')) continue;
+                        if (!agentModeOn()) continue;
                         if (ev.type === 'debug') {
                             pushAgentNode('debug', ev.text);
                         } else if (ev.type === 'branches') {
@@ -1775,12 +2739,16 @@
                         }
                     }
                 }
+                // Обмен завершён и сохранён на сервере: обновляем панель
+                // workspace — у нового диалога появился заголовок (первые слова
+                // первого запроса), у существующего мог смениться.
+                await loadWorkspace();
             } catch (e) {
                 addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
             } finally {
                 typingEl.textContent = '';
-                sendBtn.disabled = false;
-                agentClearBtn.disabled = false;
+                requestBusy = false;
+                updateComposerState();
                 input.focus();
             }
         }
@@ -1788,10 +2756,19 @@
         async function send() {
             const content = input.value.trim();
             if (!content) return;
+            // Пока идёт запрос, второй не отправляем (Enter мимо заблокированной
+            // кнопки): ответы иначе перемешались бы в одном диалоге.
+            if (requestBusy) return;
 
             // Режим «AI-агент»: длина проверяется как обычно; эксперт/параметры
             // не участвуют, ответ приходит потоком debug-сообщений агента.
-            if (agentToggle.classList.contains('active')) {
+            if (agentModeOn()) {
+                // Диалог нельзя начать без задачи: у каждой задачи своя история
+                // диалогов, а внутри задачи можно переключаться между сессиями.
+                if (!workspace.active_task) {
+                    addMessage('bot', '⚠️ Сначала создайте задачу — кнопка «Новая задача» в панели слева.', true);
+                    return;
+                }
                 let maxTokens = null;
                 const rawLength = maxLengthInput.value.trim();
                 if (rawLength !== '') {
@@ -1813,13 +2790,23 @@
                         : agentStrategySelect.value === 'sliding' ? agentWindowSize : agentFactsSize).focus();
                     return;
                 }
+                // Диалог ведётся в сессии текущей задачи. Если диалогов в задаче
+                // ещё нет (или активный удалили), первый запрос заводит новую
+                // сессию — её заголовок появится по этому запросу.
+                if (!workspace.active_session) {
+                    const created = await workspaceRequest('/api/agent/sessions', jsonOptions('POST'));
+                    if (!created) return;
+                    workspace = created;
+                    renderWorkspace();
+                    await loadActiveDialog();
+                }
                 input.value = '';
-                sendBtn.disabled = true;
+                requestBusy = true;
+                updateComposerState();
                 // Реплика юзера — в диалог текущего представления (корень или
                 // выбранная ветка плана): у каждой ветки своя история.
                 agentViewMessages().push({ role: 'user', text: content });
-                addMessage('user', content, true);
-                addHistory(content, true);
+                addMessage('user', content, true, true);
                 await sendAgentRequest(Object.assign({
                     content,
                     format: formatSelect.value,
@@ -1889,7 +2876,8 @@
             }
 
             input.value = '';
-            sendBtn.disabled = true;
+            requestBusy = true;
+            updateComposerState();
 
             addMessage('user', content);
             addHistory(content);
@@ -1936,7 +2924,8 @@
                 addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.');
             } finally {
                 typingEl.textContent = '';
-                sendBtn.disabled = false;
+                requestBusy = false;
+                updateComposerState();
                 input.focus();
             }
         }
@@ -1947,11 +2936,14 @@
         });
         agentClearBtn.addEventListener('click', clearAgentHistory);
 
-        // Открытие страницы с нуля: скролл окна чата — внизу, как в типичных
-        // чатах. История не рисуется, пока пользователь не включит агента.
-        // Список «Стратегия» приводим к исходному виду (поля выбранной стратегии).
+        // Открытие страницы: режим «AI-агент» выбран ПО УМОЛЧАНИЮ — включаем его
+        // сразу, вместе с workspace (задачи, диалоги) и диалогом текущей сессии.
+        // Скролл окна чата — внизу, как в типичных чатах; список «Стратегия»
+        // приводим к исходному виду (поля выбранной стратегии).
         renderBranchSelect();
         showAgentStrategyRows();
+        renderWorkspace();
+        setAgentMode(true);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         input.focus();
     </script>

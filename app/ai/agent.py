@@ -90,6 +90,32 @@ SUMMARIZE_PROMPT = (
 SUMMARY_HEADER = "Резюме предыдущей части этого же диалога (по частям, от старых к новым):"
 
 
+# --- Слои памяти агента (memory layers) -------------------------------------
+# Память агента разделена на три слоя, и живут они отдельно:
+#   1) краткосрочная — текущий диалог (сессия): self.memory + правила стратегии;
+#   2) рабочая — данные ТЕКУЩЕЙ ЗАДАЧИ (workspace), наполняет пользователь
+#      кнопкой «добавить в рабочую память»;
+#   3) долговременная — глобальная база знаний, наполняет пользователь кнопкой
+#      «добавить в долговременную память».
+# Рабочая и долговременная память НЕ подчиняются стратегиям управления
+# контекстом: их записи уходят в модель ВСЕГДА — отдельными системными блоками
+# (см. _memory_blocks) в любой стратегии, включая ветку плана и служебные
+# вызовы. Сокращаются только сообщения краткосрочной памяти (окно/резюме).
+WORKING_MEMORY_HEADER = (
+    "Рабочая память — данные текущей задачи, добавленные пользователем вручную. "
+    "Это постоянный контекст задачи: учитывай его при каждом ответе, "
+    "противоречий с ним не создавай и не пересказывай без просьбы."
+)
+LONG_TERM_MEMORY_HEADER = (
+    "Долговременная память — глобальная база знаний, добавленная пользователем "
+    "вручную (верна для всех задач). Это постоянный контекст: учитывай его при "
+    "каждом ответе, противоречий с ним не создавай и не пересказывай без просьбы."
+)
+# Пределы слоёв памяти (защита от разрастания контекста и файла workspace).
+MAX_MEMORY_ENTRIES = 100
+MEMORY_ENTRY_LIMIT = 4000
+
+
 # --- Стратегии работы с контекстом (список «Стратегия» в панели агента) -----
 # summary        — последние N сообщений «как есть» + резюме старой части;
 # sliding        — последние N сообщений переписки (окно);
@@ -376,6 +402,13 @@ class Agent:
         # Активная ветка (argmax по итоговому скору плана; либо выбранная
         # пользователем в интерфейсе во время её диалога).
         self.active_branch: Optional[str] = None
+        # Слои памяти, которые НЕ подчиняются стратегиям управления контекстом
+        # (см. WORKING_MEMORY_HEADER): рабочая память текущей задачи и
+        # долговременная (глобальная) база знаний. Обе наполняет пользователь
+        # кнопками в интерфейсе, обе приходят извне на каждый запрос и уходят в
+        # модель всегда — отдельными системными блоками.
+        self.working_memory: List[str] = []
+        self.long_term_memory: List[str] = []
         # Последние использованные параметры генерации (для generate()).
         self.last_params: Dict[str, Any] = {}
         # Сколько резюме составлено в ТЕКУЩЕМ запросе (обнуляется в начале
@@ -417,6 +450,8 @@ class Agent:
         branches: Optional[Dict[str, Any]] = None,
         branch: Optional[str] = None,
         covered: Optional[int] = None,
+        working_memory: Optional[List[str]] = None,
+        long_term_memory: Optional[List[str]] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
@@ -429,6 +464,10 @@ class Agent:
         ветки, в которой пользователь ведёт диалог (None — корневой запрос:
         агент строит план ветвления заново).
         covered — сколько первых сообщений истории уже свёрнуто в резюме.
+        working_memory — рабочая память текущей задачи, long_term_memory —
+        долговременная (глобальная) память: списки текстов, добавленных
+        пользователем вручную. Оба слоя уходят в модель ВСЕГДА (системными
+        блоками) и стратегиям управления контекстом не подчиняются.
 
         Собирает все debug-события в result.debug — пригодится, когда
         показывать их по одному не нужно (например, в API-ответах).
@@ -438,7 +477,10 @@ class Agent:
         async def sink(event: Step) -> None:
             steps.append(event)
 
-        await self._process(user_message, history, sink, summary, facts, branches, branch, covered)
+        await self._process(
+            user_message, history, sink, summary, facts, branches, branch, covered,
+            working_memory, long_term_memory,
+        )
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
         final = next((e["text"] for e in reversed(steps) if e["type"] == "bot"), "")
@@ -459,6 +501,8 @@ class Agent:
         branches: Optional[Dict[str, Any]] = None,
         branch: Optional[str] = None,
         covered: Optional[int] = None,
+        working_memory: Optional[List[str]] = None,
+        long_term_memory: Optional[List[str]] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -470,6 +514,11 @@ class Agent:
         токенов) поток НЕ прерывают. Отдельное событие "branches" несёт план
         ветвления (стратегия «branching») — интерфейс рисует по нему блок
         плана и список веток для переключения.
+
+        working_memory / long_term_memory — рабочая (текущая задача) и
+        долговременная (глобальная) память: списки записей, добавленных
+        пользователем вручную; уходят в модель всегда, стратегиям контекста не
+        подчиняются (см. WORKING_MEMORY_HEADER).
         """
         queue: asyncio.Queue = asyncio.Queue()
 
@@ -477,7 +526,10 @@ class Agent:
             queue.put_nowait(event)
 
         runner = asyncio.create_task(
-            self._process(user_message, history, sink, summary, facts, branches, branch, covered)
+            self._process(
+                user_message, history, sink, summary, facts, branches, branch, covered,
+                working_memory, long_term_memory,
+            )
         )
         try:
             while True:
@@ -506,6 +558,8 @@ class Agent:
         branches: Optional[Dict[str, Any]] = None,
         branch: Optional[str] = None,
         covered: Optional[int] = None,
+        working_memory: Optional[List[str]] = None,
+        long_term_memory: Optional[List[str]] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -529,9 +583,23 @@ class Agent:
             # Ветви плана (стратегия «branching») — у каждой своя история.
             if branches is not None:
                 self.branches = self._normalize_branches(branches)
+            # Слои памяти, не подчиняющиеся стратегиям (см. WORKING_MEMORY_HEADER):
+            # рабочая память задачи и долговременная (глобальная) база знаний.
+            if working_memory is not None:
+                self.working_memory = self._normalize_memory_layer(working_memory)
+            if long_term_memory is not None:
+                self.long_term_memory = self._normalize_memory_layer(long_term_memory)
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
+            if self.working_memory or self.long_term_memory:
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: слои памяти — рабочая: {len(self.working_memory)} записей "
+                    f"(текущая задача), долговременная: {len(self.long_term_memory)} записей "
+                    "(глобальная база знаний). Оба слоя уходят в модель всегда, "
+                    "стратегиям управления контекстом они не подчиняются.",
+                ))
 
             # Пустой запрос — уточняем, LLM не трогаем.
             if not text:
@@ -739,6 +807,51 @@ class Agent:
             )
         return f"стратегия «sliding window»: последние {self._window_size()} сообщений"
 
+    @staticmethod
+    def _normalize_memory_layer(layer: Any) -> List[str]:
+        """Приводит слой памяти (рабочий/долговременный) к списку текстов.
+
+        Принимает как строки, так и словари с ключом "text" (записи в файле
+        workspace хранятся словарями — с id и датой). Пустые отбрасываются,
+        слишком длинные обрезаются, а число записей ограничено
+        MAX_MEMORY_ENTRIES (самые старые вытесняются).
+        """
+        if not isinstance(layer, (list, tuple)):
+            return []
+        out: List[str] = []
+        for item in layer:
+            if isinstance(item, dict):
+                text = str(item.get("text") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if not text:
+                continue
+            out.append(text[:MEMORY_ENTRY_LIMIT])
+        return out[-MAX_MEMORY_ENTRIES:]
+
+    def _memory_blocks(self) -> List[Dict[str, str]]:
+        """Системные блоки рабочей и долговременной памяти.
+
+        Идут ПЕРВЫМИ в контексте и присутствуют в ЛЮБОЙ стратегии (summary,
+        sliding window, sticky facts, branching, ветка плана, обычный ответ):
+        слои памяти пользователя стратегиям не подчиняются, поэтому их текст
+        не сокращается и не вытесняется окном или резюме. Порядок: сначала
+        глобальные знания (долговременная), затем данные текущей задачи
+        (рабочая) — она ближе к запросу.
+        """
+        blocks: List[Dict[str, str]] = []
+        if self.long_term_memory:
+            body = "\n".join(f"{i}) {item}" for i, item in enumerate(self.long_term_memory, 1))
+            blocks.append({"role": "system", "content": LONG_TERM_MEMORY_HEADER + "\n" + body})
+        if self.working_memory:
+            body = "\n".join(f"{i}) {item}" for i, item in enumerate(self.working_memory, 1))
+            blocks.append({"role": "system", "content": WORKING_MEMORY_HEADER + "\n" + body})
+        return blocks
+
+    def _memory_text(self) -> str:
+        """Тот же текст слоёв памяти, но одной строкой (для промптов-текстовиков)."""
+        return "\n\n".join(block["content"] for block in self._memory_blocks())
+
     def _build_context(self, text: str) -> List[Dict[str, str]]:
         """Собирает список сообщений для LLM по текущей стратегии.
 
@@ -749,9 +862,12 @@ class Agent:
                            не свёрнутые в резюме (self.covered — граница);
           sliding window — последние N сообщений;
           sticky facts   — блок фактов + последние N сообщений.
+        Поверх этого в контекст ВСЕГДА идут слои памяти пользователя: рабочая
+        (текущая задача) и долговременная (глобальная) — им стратегии не указ
+        (см. _memory_blocks).
         """
         strategy = self._strategy()
-        messages: List[Dict[str, str]] = []
+        messages: List[Dict[str, str]] = self._memory_blocks()
         if strategy == STRATEGY_SUMMARY:
             if self.summary:
                 messages.append({"role": "system", "content": self._summary_block()})
@@ -767,18 +883,20 @@ class Agent:
         """Контекст для обычного ответа, когда план ветвления не получился.
 
         Ветвей нет, поэтому ограничиваемся окном последних N сообщений
-        переписки (как в стратегии sliding window) + текущим запросом.
+        переписки (как в стратегии sliding window) + текущим запросом; слои
+        памяти пользователя и здесь уходят в модель.
         """
-        messages = list(self.memory[-self._window_size():])
+        messages = self._memory_blocks()
+        messages.extend(self.memory[-self._window_size():])
         messages.append({"role": "user", "content": text})
         return self._cap_context(messages)
 
     def _cap_context(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Страховка от слишком длинного контекста (max_history_chars).
 
-        Системные блоки (резюме/факты/план ветки) сохраняем, а самые старые
-        реплики выкидываем — так контекст не разрастётся даже там, где окно не
-        задано (диалог внутри ветки плана).
+        Системные блоки (слои памяти пользователя, резюме/факты/план ветки)
+        сохраняем, а самые старые реплики выкидываем — так контекст не
+        разрастётся даже там, где окно не задано (диалог внутри ветки плана).
         """
         limit = int(self.config.max_history_chars or 0)
         if limit <= 0 or not messages:
@@ -947,6 +1065,12 @@ class Agent:
             for msg in self.memory
         ) or "(история чата пуста)"
         payload = f"История чата:\n{rendered}\n\nТекущий запрос пользователя:\n{text}"
+        # Слои памяти пользователя (рабочая и долговременная) — тоже часть
+        # контекста планирования: план должен учитывать данные задачи и
+        # глобальные знания, а не только переписку.
+        memory_text = self._memory_text()
+        if memory_text:
+            payload = memory_text + "\n\n" + payload
 
         content = ""
         for attempt, prompt in enumerate((BRANCH_PROMPT, BRANCH_PROMPT_COMPACT), start=1):
@@ -1096,9 +1220,8 @@ class Agent:
             f"{self.name}: ветка {branch_id} «{title}» — продолжаю диалог внутри ветки "
             f"({len(branch_messages)} реплик в ветке, история ветки независима от других).",
         ))
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": self._branch_block(branch_id, branch)}
-        ]
+        messages: List[Dict[str, str]] = self._memory_blocks()
+        messages.append({"role": "system", "content": self._branch_block(branch_id, branch)})
         messages.extend(branch_messages)
         messages.append({"role": "user", "content": text})
         messages = self._cap_context(messages)

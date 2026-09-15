@@ -49,7 +49,19 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
 # Файл, в котором хранится история диалога режима «AI-агент» (JSON).
 # По умолчанию — data/agent_memory.json в корне проекта; путь можно
 # переопределить переменной окружения AGENT_MEMORY_FILE (например, в тестах).
+# Файл остаётся только для обратной совместимости: при первом запуске с
+# задачами (workspace) прежняя единая история переносится в задачу «Задача 1»
+# (см. app/ai/workspace.py, _migrate_legacy).
 AGENT_MEMORY_FILE = os.getenv(
     "AGENT_MEMORY_FILE",
     os.path.join(PROJECT_ROOT, "data", "agent_memory.json"),
+)
+
+# Файл «рабочего пространства» режима «AI-агент» (JSON): задачи и их сессии
+# (диалоги). У каждой сессии своё состояние агентского диалога — память,
+# замеры токенов, резюме, факты, ветви плана. По умолчанию —
+# data/agent_workspace.json; путь переопределяется env AGENT_WORKSPACE_FILE.
+AGENT_WORKSPACE_FILE = os.getenv(
+    "AGENT_WORKSPACE_FILE",
+    os.path.join(PROJECT_ROOT, "data", "agent_workspace.json"),
 )
