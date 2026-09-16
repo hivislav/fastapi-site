@@ -25,3 +25,6 @@ data/
 
 # Внутренний промт для старта агент-сессии (не в git)
 SESSION_PROMPT.md
+
+# Резервные копии данных (tools/cleanup_workspace.py)
+*.bak

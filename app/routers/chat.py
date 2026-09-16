@@ -24,9 +24,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.ai import service
+from app.ai import profiles as profile_store
 from app.ai import workspace as workspace_store
 from app.ai.agent import Agent, AgentConfig, DEFAULT_SUMMARY_SIZE, DEFAULT_WINDOW_SIZE
-from app.schemas import ChatMessage, MemoryEntryCreate, NameUpdate, TaskCreate
+from app.schemas import (
+    ChatMessage, MemoryEntryCreate, NameUpdate, ProfileCreate, ProfileFields, TaskCreate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,21 +43,101 @@ router = APIRouter(prefix="/api")
 _workspace: Dict[str, Any] = workspace_store.load_workspace()
 _agent_lock = asyncio.Lock()
 
+# Профили пользователя (data/profiles.json): сведения о пользователе, которые
+# уходят в системный промпт сессии агента. Профилей может быть несколько —
+# пользователь создаёт, удаляет и переключает их в меню профиля.
+# Если профиля нет ни одного (файла ещё нет), он создаётся здесь с
+# автоматическим идентификатором «user_<цифры>» (напр. user_13213123) — так
+# профиль появляется к моменту первого диалога/задачи.
+_profiles: Dict[str, Any] = profile_store.load_profiles()
+if not _profiles.get("profiles"):
+    # Профиля нет — заводим его сразу (идентификатор «user_<цифры>», название
+    # «user<цифры>») и записываем в файл: так профиль существует уже к первому
+    # диалогу/задаче.
+    profile_store.ensure_profile(_profiles)
+    try:
+        profile_store.save_profiles(_profiles)
+    except OSError:  # сбой записи не мешает работе в памяти
+        logger.warning("Не удалось записать профили пользователя", exc_info=True)
+
+# После появления профилей workspace стал профильным: задачи (и их диалоги)
+# принадлежат конкретному профилю. Задачи из файла прежней версии (без владельца)
+# отдаём текущему профилю — иначе прежняя переписка осталась бы ничей.
+_workspace_changed = bool(workspace_store.adopt_orphan_tasks(
+    _workspace,
+    _profiles.get("active"),
+    profile_store.profile_label(profile_store.active_profile(_profiles)),
+))
+# То же для долговременной памяти: прежняя общая база знаний лежала в корне и
+# была видна всем профилям, а удалить её было нельзя (в панели памяти видны
+# только записи профиля). Передаём её текущему профилю — теперь её можно
+# удалить, и она уйдёт вместе с профилем.
+_workspace_changed |= workspace_store.migrate_legacy_long_term(
+    _workspace, _profiles.get("active"))
+if _workspace_changed:
+    try:
+        workspace_store.save_workspace(_workspace)
+    except OSError:
+        logger.warning("Не удалось записать workspace AI-агента", exc_info=True)
+
+# В файле могли остаться данные профилей, которых уже нет (прежние версии не
+# удаляли их вместе с профилем). Сами по себе они ничего не ломают — они никому не
+# видны, — но и не удаляются через интерфейс: подсказываем в логе, чем убрать.
+_orphan_profiles = [pid for pid in workspace_store.profile_ids_with_data(_workspace)
+                    if profile_store.find_profile(_profiles, pid) is None]
+if _orphan_profiles:
+    logger.warning(
+        "Workspace AI-агента: в файле остались данные профилей, которых больше нет (%s) — "
+        "они никому не видны и в модель не попадают. Убрать: "
+        "./venv/bin/python tools/cleanup_workspace.py --apply",
+        ", ".join(_orphan_profiles),
+    )
+
+
+def _current_profile() -> Optional[Dict[str, Any]]:
+    """Текущий профиль пользователя (None — профилей нет: не должно случаться,
+    профиль заводится при старте)."""
+    return profile_store.active_profile(_profiles)
+
+
+def _current_profile_id() -> Optional[str]:
+    """id текущего профиля — им ограничены задачи, диалоги и память."""
+    profile = _current_profile()
+    return profile["id"] if profile else None
+
 
 def _current_task() -> Optional[Dict[str, Any]]:
-    """Текущая задача (None — пользователь ещё не создал ни одной)."""
-    return workspace_store.active_task(_workspace)
+    """Текущая задача ТЕКУЩЕГО ПРОФИЛЯ (None — у профиля ещё нет задач)."""
+    return workspace_store.active_task(_workspace, _current_profile_id())
 
 
 def _current_session() -> Optional[Dict[str, Any]]:
     """Текущая сессия-диалог текущей задачи (None — диалогов ещё нет)."""
-    return workspace_store.active_session(_workspace)
+    return workspace_store.active_session(
+        _workspace, profile_id=_current_profile_id())
+
+
+def _own_task(task: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Задача, если она принадлежит ТЕКУЩЕМУ профилю, иначе None.
+
+    Профили изолированы: чужая задача для запроса не существует (для фронта это
+    «задача не найдена»).
+    """
+    if task is None:
+        return None
+    if not workspace_store.task_belongs(task, _current_profile_id()):
+        return None
+    return task
 
 
 def _find_session_anywhere(session_id: str) -> Tuple[Optional[Dict[str, Any]],
                                                      Optional[Dict[str, Any]]]:
-    """Ищет сессию по id во всех задачах: (задача, сессия)."""
-    for task in _workspace.get("tasks", []):
+    """Ищет сессию по id СРЕДИ ЗАДАЧ ТЕКУЩЕГО ПРОФИЛЯ: (задача, сессия).
+
+    Диалог чужого профиля найти нельзя — вернётся (None, None), фронт покажет
+    «диалог не найден».
+    """
+    for task in workspace_store.profile_tasks(_workspace, _current_profile_id()):
         session = workspace_store.find_session(task, session_id)
         if session is not None:
             return task, session
@@ -69,9 +152,32 @@ async def _persist() -> None:
         logger.warning("Не удалось сохранить workspace AI-агента", exc_info=True)
 
 
+async def _persist_profiles() -> None:
+    """Сохраняет профили пользователя в файл (сбой записи не рвёт диалог)."""
+    try:
+        await asyncio.to_thread(profile_store.save_profiles, _profiles)
+    except Exception:  # noqa: BLE001
+        logger.warning("Не удалось сохранить профили пользователя", exc_info=True)
+
+
+def _profile_block() -> str:
+    """Системный блок профиля пользователя для текущего запроса к агенту.
+
+    Собирается на каждый запрос: пользователь мог переключить профиль или
+    изменить поля, а агент создаётся заново под каждый запрос.
+    """
+    return profile_store.profile_block(profile_store.active_profile(_profiles))
+
+
 def _snapshot() -> dict:
-    """Снимок workspace для фронтенда: задачи, текущая задача, её диалоги."""
-    return workspace_store.snapshot(_workspace)
+    """Снимок workspace для фронтенда: задачи ПРОФИЛЯ, его текущая задача,
+    диалоги и сам профиль."""
+    snapshot = workspace_store.snapshot(_workspace, _current_profile_id())
+    # Профиль — глобальная сущность (не на задачу), но фронту удобно получать
+    # его вместе со снимком workspace: иконка профиля и его поля обновляются
+    # одним ответом на любую операцию с задачами/диалогами.
+    snapshot["profile"] = profile_store.snapshot(_profiles)
+    return snapshot
 
 
 def _usage_matches_history(dialog: Dict[str, Any]) -> None:
@@ -123,12 +229,14 @@ def _exchange_memory(agent: Agent, branch: Optional[str],
 def _memory_target(layer: str) -> Tuple[Optional[Dict[str, Any]], str]:
     """Контейнер и ключ слоя памяти для записи.
 
-    Рабочая память привязана к ТЕКУЩЕЙ ЗАДАЧЕ (её нет — добавлять некуда,
-    вернётся None), долговременная — к workspace целиком: она глобальная.
+    Рабочая память привязана к ТЕКУЩЕЙ ЗАДАЧЕ текущего профиля (её нет —
+    добавлять некуда, вернётся None), долговременная — к ПРОФИЛЮ: профили
+    изолированы, поэтому база знаний у каждого своя.
     """
     normalized = str(layer or "").strip().lower()
     if normalized in ("long", "long_term", "long-term", "долговременная"):
-        return _workspace, workspace_store.MEMORY_LONG_TERM
+        return workspace_store.long_term_container(_workspace, _current_profile_id()), \
+            workspace_store.MEMORY_LONG_TERM
     if normalized in ("work", "working", "рабочая"):
         return _current_task(), workspace_store.MEMORY_WORKING
     raise HTTPException(status_code=400, detail="Неизвестный слой памяти")
@@ -206,7 +314,9 @@ async def task_create(payload: TaskCreate) -> dict:
     if not name:
         raise HTTPException(status_code=400, detail="Введите название задачи")
     async with _agent_lock:
-        workspace_store.create_task(_workspace, name)
+        # Задача создаётся ДЛЯ ТЕКУЩЕГО ПРОФИЛЯ: у профилей свои задачи и
+        # диалоги, чужой профиль их не увидит.
+        workspace_store.create_task(_workspace, name, _current_profile_id())
         await _persist()
         return _snapshot()
 
@@ -218,7 +328,7 @@ async def task_rename(task_id: str, payload: NameUpdate) -> dict:
     if not name:
         raise HTTPException(status_code=400, detail="Введите название задачи")
     async with _agent_lock:
-        task = workspace_store.find_task(_workspace, task_id)
+        task = _own_task(workspace_store.find_task(_workspace, task_id))
         if task is None:
             raise HTTPException(status_code=404, detail="Задача не найдена")
         task["name"] = name[:120]
@@ -230,7 +340,8 @@ async def task_rename(task_id: str, payload: NameUpdate) -> dict:
 async def task_delete(task_id: str) -> dict:
     """Удаляет задачу вместе со всеми её диалогами (корзина у списка задач)."""
     async with _agent_lock:
-        if not workspace_store.delete_task(_workspace, task_id):
+        if _own_task(workspace_store.find_task(_workspace, task_id)) is None \
+                or not workspace_store.delete_task(_workspace, task_id):
             raise HTTPException(status_code=404, detail="Задача не найдена")
         await _persist()
         return _snapshot()
@@ -244,10 +355,11 @@ async def task_select(task_id: str) -> dict:
     запрашивает диалог текущей сессии (GET /api/agent/history).
     """
     async with _agent_lock:
-        task = workspace_store.find_task(_workspace, task_id)
+        task = _own_task(workspace_store.find_task(_workspace, task_id))
         if task is None:
             raise HTTPException(status_code=404, detail="Задача не найдена")
-        _workspace["active_task"] = task["id"]
+        # Текущая задача — у КАЖДОГО профиля своя: чужой указатель не трогаем.
+        workspace_store.set_active_task(_workspace, task)
         await _persist()
         return _snapshot()
 
@@ -306,7 +418,8 @@ async def session_select(session_id: str) -> dict:
         task, session = _find_session_anywhere(session_id)
         if task is None or session is None:
             raise HTTPException(status_code=404, detail="Диалог не найден")
-        _workspace["active_task"] = task["id"]
+        # Переключение диалога внутри задачи своего профиля.
+        workspace_store.set_active_task(_workspace, task)
         task["active_session"] = session["id"]
         await _persist()
         return _snapshot()
@@ -331,7 +444,7 @@ async def memory_get() -> dict:
     # Блокировку здесь НЕ берём намеренно: снимок памяти — чистая операция без
     # await, поэтому гонки с записью в workspace нет, зато панель не ждёт
     # окончания ответа агента (он держит `_agent_lock` всё время стрима).
-    return workspace_store.memory_snapshot(_workspace)
+    return workspace_store.memory_snapshot(_workspace, _current_profile_id())
 
 
 @router.post("/agent/memory")
@@ -349,7 +462,7 @@ async def memory_add(payload: MemoryEntryCreate) -> dict:
             )
         workspace_store.add_memory(container, key, text, payload.source)
         await _persist()
-        return workspace_store.memory_snapshot(_workspace)
+        return workspace_store.memory_snapshot(_workspace, _current_profile_id())
 
 
 @router.delete("/agent/memory/{layer}/{entry_id}")
@@ -360,7 +473,122 @@ async def memory_delete(layer: str, entry_id: str) -> dict:
         if container is None or not workspace_store.delete_memory(container, key, entry_id):
             raise HTTPException(status_code=404, detail="Запись не найдена")
         await _persist()
-        return workspace_store.memory_snapshot(_workspace)
+        return workspace_store.memory_snapshot(_workspace, _current_profile_id())
+
+
+# ---------------------------------------------------------------------------
+# Профиль пользователя: сведения о юзере уходят в системный промпт сессии
+# ---------------------------------------------------------------------------
+def _profile_fields(payload: ProfileFields) -> Dict[str, Any]:
+    """Значения полей профиля из запроса (обновляются только переданные ключи).
+
+    Это название профиля (profile_name — только для интерфейса) и пять полей
+    сведений о пользователе, которые уходят в системный промпт сессии.
+    """
+    data = payload.model_dump(exclude_unset=True) if hasattr(payload, "model_dump") \
+        else payload.dict(exclude_unset=True)
+    return {key: data[key] for key in profile_store.EDITABLE_KEYS if key in data}
+
+
+@router.get("/agent/profiles")
+async def profiles_get() -> dict:
+    """Профили пользователя для меню профиля (иконка рядом с заголовком панели).
+
+    Отдаёт {"active": id|None,
+    "profiles": [{"id", "profile_name", "label", "user_name", "occupation",
+    "style", "answer_format", "limits", "created"}, ...],
+    "profile": {...}|None} —
+    текущий профиль и список всех профилей ("label" — название профиля; id в
+    списке не показывается). Пять полей сведений о пользователе (имя, род
+    деятельности, стиль общения, формат ответа, ограничения) уходят в системный
+    промпт сессии режима «AI-агент» (см. POST /api/agent/chat), название профиля
+    — только для интерфейса. Профилей нет — сервер создаёт профиль с
+    автоматическими id «user_<цифры>» и названием «user<цифры>».
+    """
+    # Блокировку не берём: снимок — чистая операция без await, а панель профиля
+    # не должна ждать, пока агент отвечает (он держит `_agent_lock` весь стрим).
+    if not _profiles.get("profiles"):
+        profile_store.ensure_profile(_profiles)
+        await _persist_profiles()
+    return profile_store.snapshot(_profiles)
+
+
+@router.post("/agent/profiles")
+async def profile_create(payload: ProfileCreate) -> dict:
+    """Создаёт профиль (кнопка «Создать профиль») и делает его текущим.
+
+    Название профиля (profile_name) ОБЯЗАТЕЛЬНО — пустое → 400: по нему профиль
+    выбирается в списке. Идентификатор генерирует сервер: «user_<цифры>» (напр.
+    user_13213123), цифры — номер конкретного профиля. Поля сведений о
+    пользователе можно заполнить и позже.
+    """
+    fields = _profile_fields(payload)
+    if not str(fields.get(profile_store.NAME_KEY) or "").strip():
+        raise HTTPException(status_code=400, detail="Введите название профиля")
+    async with _agent_lock:
+        profile_store.create_profile(_profiles, fields)
+        await _persist_profiles()
+        return profile_store.snapshot(_profiles)
+
+
+@router.put("/agent/profiles/{profile_id}")
+async def profile_update(profile_id: str, payload: ProfileFields) -> dict:
+    """Сохраняет поля профиля (кнопка «Сохранить» в меню профиля).
+
+    Обновляются только переданные поля: название профиля (пустое игнорируется —
+    название обязательно) и пять полей сведений о пользователе (пустая строка
+    очищает поле). Пустые поля в системный промпт не попадают — если профиль не
+    заполнен целиком, агент работает как раньше, без блока профиля.
+    """
+    async with _agent_lock:
+        profile = profile_store.find_profile(_profiles, profile_id)
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Профиль не найден")
+        fields = _profile_fields(payload)
+        if fields:
+            profile_store.apply_fields(profile, fields)
+            await _persist_profiles()
+        return profile_store.snapshot(_profiles)
+
+
+@router.delete("/agent/profiles/{profile_id}")
+async def profile_delete(profile_id: str) -> dict:
+    """Удаляет профиль (корзина в меню профиля).
+
+    Если удалён текущий профиль, текущим становится соседний; когда профилей не
+    осталось, создаётся новый пустой с идентификатором «user_<цифры>» — чтобы
+    диалог в режиме агента всегда был с профилем. Данные профиля удаляются ВМЕСТЕ
+    с ним: его задачи со всеми диалогами, рабочая и долговременная память.
+    """
+    async with _agent_lock:
+        if not profile_store.delete_profile(_profiles, profile_id):
+            raise HTTPException(status_code=404, detail="Профиль не найден")
+        profile_store.ensure_profile(_profiles)
+        await _persist_profiles()
+        # Данные профиля уходят вместе с ним: его задачи с диалогами, рабочая и
+        # долговременная память. Иначе в файле оставался бы мусор, который уже
+        # никому не виден и не удаляется через интерфейс.
+        workspace_store.purge_profile(_workspace, profile_id)
+        await _persist()
+        return profile_store.snapshot(_profiles)
+
+
+@router.post("/agent/profiles/{profile_id}/select")
+async def profile_select(profile_id: str) -> dict:
+    """Переключает текущий профиль (выпадающий список в меню профиля).
+
+    Профили изолированы: вместе с профилем меняются его задачи, диалоги,
+    рабочая и долговременная память, а системный промпт сессии собирается заново
+    (см. POST /api/agent/chat). Ответ — снимок профилей; фронт после него
+    перечитывает снимок workspace, и панель показывает задачи нового профиля.
+    """
+    async with _agent_lock:
+        profile = profile_store.find_profile(_profiles, profile_id)
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Профиль не найден")
+        _profiles["active"] = profile["id"]
+        await _persist_profiles()
+        return profile_store.snapshot(_profiles)
 
 
 @router.post("/agent/chat")
@@ -385,10 +613,13 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
 
     Агент берёт из сообщения длину (max_tokens) и условие завершения (stop),
     стратегию работы с контекстом (agent_strategy) с её полями (summary/window)
-    и выбранную ветку плана (branch).
+    и выбранную ветку плана (branch). Плюс системный промпт сессии — блок
+    профиля пользователя (см. /api/agent/profiles): агент передаёт его модели
+    первым системным сообщением в любой стратегии.
     """
-    # Формат ответа агенту не передаём: системных промптов у него нет,
-    # запрос уходит в модель как есть (см. app/ai/agent.py).
+    # Формат ответа агенту не передаём: единственный системный промпт сессии —
+    # это блок профиля пользователя (см. ниже), а сам запрос уходит в модель
+    # как есть (см. app/ai/agent.py).
     task = _current_task()
     if task is None:
         return JSONResponse({"detail": "Сначала создайте задачу"}, status_code=400)
@@ -400,7 +631,13 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
     # долговременная (глобальная) база знаний. Это снимки — агент получает их
     # на каждый запрос и кладёт в контекст ВСЕГДА, независимо от стратегии.
     working_memory = workspace_store.memory_texts(task, workspace_store.MEMORY_WORKING)
-    long_term_memory = workspace_store.memory_texts(_workspace, workspace_store.MEMORY_LONG_TERM)
+    # Долговременная память — база знаний ТЕКУЩЕГО профиля: профили изолированы.
+    long_term_memory = workspace_store.long_term_texts(_workspace, _current_profile_id())
+    # Профиль пользователя — системный промпт СЕССИИ: сведения о юзере (имя,
+    # род деятельности, стиль общения, формат ответа, ограничения) уходят в
+    # модель первым системным блоком; собирается заново на каждый запрос,
+    # поэтому смена профиля действует сразу.
+    profile = _profile_block()
 
     agent = Agent(AgentConfig(
         max_tokens=msg.max_tokens,
@@ -427,6 +664,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                     branch=msg.branch,
                     working_memory=working_memory,
                     long_term_memory=long_term_memory,
+                    profile=profile,
                 ):
                     # Событие "done" несёт расход токенов текущего запроса.
                     if event.get("type") == "done" and isinstance(event.get("usage"), dict):

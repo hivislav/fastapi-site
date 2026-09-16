@@ -12,8 +12,10 @@
 
     {"version": 1,
      "active_task": "t-1a2b3c4d",
+     "active_tasks": {"user_13213123": "t-1a2b3c4d"},
      "tasks": [
        {"id": "t-1a2b3c4d",
+        "profile": "user_13213123",
         "name": "Задача 1",
         "created": "2025-01-01T12:00:00",
         "active_session": "s-9f8e7d6c",
@@ -26,6 +28,19 @@
                       "active_branch": null}}
         ]}
      ]}
+
+У каждого профиля СВОЯ долговременная память ("long_term_by_profile": {"<id
+профиля>": {"long_term": [...]}}), поэтому её записи видны и удаляются только в
+своём профиле. Список "long_term" в корне — прежняя общая база знаний (до
+профилей): при старте приложения он один раз передаётся текущему профилю и
+очищается (см. migrate_legacy_long_term), чтобы «вечных» записей не оставалось.
+
+Каждая задача (а значит и все её диалоги-сессии) принадлежит КОНКРЕТНОМУ
+ПРОФИЛЮ пользователя (поле "profile" — id профиля из app/ai/profiles.py):
+профили полностью изолированы друг от друга и не видят чужие задачи и
+диалоги. "active_tasks" хранит текущую задачу КАЖДОГО профиля, поэтому
+переключение профиля возвращает его собственную задачу (поле "active_task" —
+прежний одиночный указатель: нужен только для чтения файлов прошлых версий).
 
 "title" пустой — заголовок сессии берётся из ПЕРВЫХ СЛОВ первого запроса
 пользователя (см. session_title); как только пользователь переименовал сессию
@@ -269,6 +284,97 @@ def memory_texts(container: Dict[str, Any], key: str) -> List[str]:
     return [entry["text"] for entry in memory(container, key)]
 
 
+def _normalize_long_term_by_profile(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Приводит долговременную память по профилям к безопасному виду.
+
+    Формат: {"<id профиля>": [записи слоя], ...} — у каждого профиля своя база
+    знаний. Пустые профили отбрасываются.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for profile_id, entries in list(raw.items())[:_MAX_TASKS]:
+        key = str(profile_id or "").strip()[:_MAX_NAME]
+        if not key:
+            continue
+        # Значение может быть как списком записей, так и контейнером
+        # {"id", "long_term": [...]} — принимаем оба вида.
+        if isinstance(entries, dict):
+            entries = entries.get(MEMORY_LONG_TERM)
+        normalized = _normalize_entries(entries)
+        if normalized:
+            out[key] = {MEMORY_LONG_TERM: normalized}
+    return out
+
+
+def long_term_container(workspace: Dict[str, Any],                        profile_id: Optional[str] = None) -> Dict[str, Any]:
+    """Контейнер долговременной памяти ПРОФИЛЯ.
+
+    Профили изолированы, поэтому долговременная память (глобальная база знаний
+    профиля) живёт в workspace по ключу "long_term_by_profile": у каждого профиля
+    свой список записей, и чужие он не видит. Профиль не передан — отдаём сам
+    workspace (прежнее поведение: слой в корне) вместе с унаследованными
+    записями прежних версий.
+    """
+    key = str(profile_id or "").strip()
+    if not key:
+        return workspace
+    by_profile = workspace.setdefault("long_term_by_profile", {})
+    if not isinstance(by_profile, dict):
+        by_profile = {}
+        workspace["long_term_by_profile"] = by_profile
+    container = by_profile.get(key)
+    if not isinstance(container, dict):
+        container = {"id": key, "long_term": []}
+        by_profile[key] = container
+    return container
+
+
+def long_term_texts(workspace: Dict[str, Any],
+                    profile_id: Optional[str] = None) -> List[str]:
+    """Тексты долговременной памяти ПРОФИЛЯ (только его собственные записи).
+
+    Записи в корне workspace («long_term») — это база знаний ВРЕМЁН ДО ПРОФИЛЕЙ:
+    они не принадлежат ни одному профилю и раньше примешивались к каждому из них,
+    из-за чего их нельзя было удалить (см. migrate_legacy_long_term — при старте
+    они один раз переезжают в текущий профиль, а корень очищается).
+    """
+    return memory_texts(long_term_container(workspace, profile_id), MEMORY_LONG_TERM)
+
+
+def migrate_legacy_long_term(workspace: Dict[str, Any],
+                             profile_id: Optional[str]) -> bool:
+    """Переносит прежнюю (общую) долговременную память в текущий профиль.
+
+    База знаний до появления профилей лежала в корне workspace и была видна всем
+    профилям сразу: удалить её из интерфейса было нельзя (в панели видны только
+    записи профиля), поэтому у пользователя оставались «вечные» записи вроде
+    любимого фильма. Здесь она ОДИН РАЗ передаётся текущему профилю (он станет её
+    владельцем, а значит сможет удалить записи в панели памяти и они уйдут вместе
+    с профилем), после чего корень очищается — в контекст агента эти записи
+    больше не попадают ни у одного профиля, кроме владельца.
+
+    True — что-то перенесли (workspace нужно сохранить).
+    """
+    legacy = memory(workspace, MEMORY_LONG_TERM)
+    if not legacy:
+        return False
+    key = str(profile_id or "").strip()
+    if not key:
+        # Профиля нет (не должно случаться: он заводится при старте) — оставляем
+        # записи в корне, чтобы ничего не потерять.
+        return False
+    own = memory(long_term_container(workspace, key), MEMORY_LONG_TERM)
+    own[:0] = list(legacy)          # прежние записи идут первыми (они старше)
+    del own[:-MAX_MEMORY_ENTRIES]
+    workspace[MEMORY_LONG_TERM] = []
+    logger.info(
+        "Workspace AI-агента: прежняя долговременная память (%d записей) передана "
+        "профилю %s и убрана из корня", len(legacy), key,
+    )
+    return True
+
+
 def add_memory(container: Dict[str, Any], key: str, text: str,
                source: str = "") -> Optional[Dict[str, Any]]:
     """Добавляет запись в слой памяти (кнопки «добавить в … память»).
@@ -318,6 +424,11 @@ def _normalize_task(raw: Any) -> Optional[Dict[str, Any]]:
         active = sessions[-1]["id"] if sessions else None
     return {
         "id": str(raw.get("id") or "").strip() or new_id("t"),
+        # Профиль-владелец задачи: задачи (и их диалоги) разных профилей
+        # полностью изолированы. Пустая строка — задача из файла прежней версии
+        # (до появления профилей): её подберёт текущий профиль при первой
+        # миграции, см. adopt_orphan_tasks.
+        "profile": str(raw.get("profile") or "").strip()[:_MAX_NAME],
         "name": name,
         "created": str(raw.get("created") or _now()),
         "sessions": sessions,
@@ -392,16 +503,38 @@ def normalize_workspace(raw: Any) -> Dict[str, Any]:
         if task is not None:
             tasks.append(task)
     tasks = tasks[-_MAX_TASKS:]
-    active = str(raw.get("active_task") or "") or None
-    if active not in [t["id"] for t in tasks]:
-        active = tasks[-1]["id"] if tasks else None
+    ids = [t["id"] for t in tasks]
+    # Текущая задача КАЖДОГО профиля: у профилей свои задачи и диалоги.
+    raw_active = raw.get("active_tasks") if isinstance(raw.get("active_tasks"), dict) else {}
+    active_tasks: Dict[str, str] = {}
+    for profile_id, task_id in list(raw_active.items())[:_MAX_TASKS]:
+        key = str(profile_id or "").strip()[:_MAX_NAME]
+        value = str(task_id or "").strip()
+        if key and value in ids:
+            active_tasks[key] = value
+    # Прежний одиночный указатель (файл прошлой версии): приписываем его той
+    # задаче, к которой он относился, — иначе он потерялся бы после появления
+    # профилей. Новый формат его больше не обновляет.
+    legacy_active = str(raw.get("active_task") or "").strip()
+    if legacy_active in ids:
+        legacy_task = next(t for t in tasks if t["id"] == legacy_active)
+        owner = legacy_task.get("profile") or ""
+        if owner and owner not in active_tasks:
+            active_tasks[owner] = legacy_active
+    else:
+        # Указатель на несуществующую задачу (остался от прежних версий или от
+        # удалённых задач) — просто мусор в файле, не храним его.
+        legacy_active = ""
     return {
         "version": _VERSION,
-        "active_task": active,
+        "active_task": legacy_active or None,
+        "active_tasks": active_tasks,
         "tasks": tasks,
-        # Долговременная память — глобальная база знаний (одна на приложение,
-        # не на задачу); наполняется пользователем вручную.
+        # Долговременная память — база знаний ПРОФИЛЯ (профили изолированы):
+        # словарь «id профиля -> записи». Записи в корне (прежних версий, когда
+        # профилей ещё не было) остаются как общее наследие.
         "long_term": _normalize_entries(raw.get("long_term")),
+        "long_term_by_profile": _normalize_long_term_by_profile(raw.get("long_term_by_profile")),
     }
 
 
@@ -459,9 +592,50 @@ def find_task(workspace: Dict[str, Any], task_id: Optional[str]) -> Optional[Dic
     return None
 
 
-def active_task(workspace: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Текущая задача (None — ни одной задачи ещё не создано)."""
-    return find_task(workspace, workspace.get("active_task"))
+def task_owner(task: Optional[Dict[str, Any]]) -> str:
+    """id профиля-владельца задачи ("" — задача без профиля, старая версия файла)."""
+    return str((task or {}).get("profile") or "").strip()
+
+
+def task_belongs(task: Optional[Dict[str, Any]], profile_id: Optional[str]) -> bool:
+    """True, если задача принадлежит этому профилю.
+
+    Профили полностью изолированы: задача (и все её диалоги) видны только своему
+    профилю. Задача без владельца (файл прежней версии) доступна любому профилю,
+    пока её не подберёт adopt_orphan_tasks.
+    """
+    if task is None:
+        return False
+    owner = task_owner(task)
+    if not owner:
+        return True
+    return owner == str(profile_id or "").strip()
+
+
+def profile_tasks(workspace: Dict[str, Any], profile_id: Optional[str]) -> List[Dict[str, Any]]:
+    """Задачи одного профиля (в порядке создания)."""
+    return [task for task in workspace.get("tasks", [])
+            if task_belongs(task, profile_id)]
+
+
+def active_task(workspace: Dict[str, Any],
+                profile_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Текущая задача ПРОФИЛЯ (None — у профиля ещё нет задач).
+
+    profile_id=None — задачи без владельца (для служебных вызовов и тестов);
+    обычная работа всегда передаёт id профиля, поэтому профили не видят чужие
+    задачи и диалоги.
+    """
+    key = str(profile_id or "").strip()
+    candidates = [task for task in workspace.get("tasks", [])
+                  if task_owner(task) == key]
+    if not candidates:
+        return None
+    active_id = (workspace.get("active_tasks") or {}).get(key)
+    task = find_task(workspace, active_id)
+    if task is not None and task_owner(task) == key:
+        return task
+    return candidates[-1]
 
 
 def find_session(task: Optional[Dict[str, Any]], session_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -475,19 +649,27 @@ def find_session(task: Optional[Dict[str, Any]], session_id: Optional[str]) -> O
 
 
 def active_session(workspace: Dict[str, Any],
-                   task: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Текущая сессия текущей задачи (None — сессии ещё нет)."""
-    task = task if task is not None else active_task(workspace)
+                   task: Optional[Dict[str, Any]] = None,
+                   profile_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Текущая сессия текущей задачи профиля (None — сессии ещё нет)."""
+    task = task if task is not None else active_task(workspace, profile_id)
     if not task:
         return None
     return find_session(task, task.get("active_session"))
 
 
-def create_task(workspace: Dict[str, Any], name: str) -> Dict[str, Any]:
-    """Создаёт задачу (и делает её текущей). Задача создаётся без сессий —
-    первый запрос пользователя заведёт сессию сам."""
+def create_task(workspace: Dict[str, Any], name: str,
+                profile_id: Optional[str] = None) -> Dict[str, Any]:
+    """Создаёт задачу ПРОФИЛЯ (и делает её текущей у этого профиля).
+
+    Задача создаётся без сессий — первый запрос пользователя заведёт сессию сам.
+    Задача привязана к профилю (поле "profile"), поэтому другие профили её не
+    видят.
+    """
+    key = str(profile_id or "").strip()
     task = {
         "id": new_id("t"),
+        "profile": key,
         "name": str(name).strip()[:_MAX_NAME],
         "created": _now(),
         "sessions": [],
@@ -498,7 +680,7 @@ def create_task(workspace: Dict[str, Any], name: str) -> Dict[str, Any]:
     }
     workspace.setdefault("tasks", []).append(task)
     workspace["tasks"] = workspace["tasks"][-_MAX_TASKS:]
-    workspace["active_task"] = task["id"]
+    workspace.setdefault("active_tasks", {})[key] = task["id"]
     return task
 
 
@@ -516,14 +698,27 @@ def create_session(task: Dict[str, Any], title: str = "") -> Dict[str, Any]:
     return session
 
 
+def set_active_task(workspace: Dict[str, Any], task: Dict[str, Any]) -> None:
+    """Делает задачу текущей у ЕЁ профиля (у каждого профиля своя текущая)."""
+    key = task_owner(task)
+    workspace.setdefault("active_tasks", {})[key] = task["id"]
+
+
 def delete_task(workspace: Dict[str, Any], task_id: str) -> bool:
     """Удаляет задачу вместе со всеми её диалогами. True — задача была."""
     tasks = workspace.get("tasks", [])
     for index, task in enumerate(tasks):
         if task.get("id") == task_id:
             tasks.pop(index)
-            if workspace.get("active_task") == task_id:
-                workspace["active_task"] = tasks[-1]["id"] if tasks else None
+            active_tasks = workspace.setdefault("active_tasks", {})
+            key = task_owner(task)
+            if active_tasks.get(key) == task_id:
+                # Текущей становится последняя оставшаяся задача этого профиля.
+                rest = [t for t in tasks if task_owner(t) == key]
+                if rest:
+                    active_tasks[key] = rest[-1]["id"]
+                else:
+                    active_tasks.pop(key, None)
             return True
     return False
 
@@ -542,6 +737,31 @@ def delete_session(task: Dict[str, Any], session_id: str) -> bool:
                     task["active_session"] = None
             return True
     return False
+
+
+def purge_profile(workspace: Dict[str, Any], profile_id: Optional[str]) -> int:
+    """Убирает профиль из workspace ЦЕЛИКОМ: его задачи, диалоги и память.
+
+    Профиль удалён — значит его данных в файле быть не должно: задачи вместе с
+    сессиями (и всей их начинкой: память диалога, замеры токенов, резюме, факты,
+    ветви плана) удаляются, указатель на текущую задачу и долговременная память —
+    тоже. Возвращает число удалённых ЗАДАЧ (0 — удалять было нечего), чтобы
+    веб-слой мог сказать об этом пользователю.
+    """
+    key = str(profile_id or "").strip()
+    if not key:
+        return 0
+    tasks = workspace.get("tasks", [])
+    kept = [task for task in tasks if task_owner(task) != key]
+    purged = len(tasks) - len(kept)
+    if purged:
+        workspace["tasks"] = kept
+    workspace.get("active_tasks", {}).pop(key, None)
+    workspace.get("long_term_by_profile", {}).pop(key, None)
+    if purged:
+        logger.info("Workspace AI-агента: профиль %s удалён вместе с %d задачами",
+                    key, purged)
+    return purged
 
 
 def session_title(session: Optional[Dict[str, Any]]) -> str:
@@ -564,18 +784,72 @@ def session_title(session: Optional[Dict[str, Any]]) -> str:
     return EMPTY_SESSION_TITLE
 
 
-def snapshot(workspace: Dict[str, Any]) -> Dict[str, Any]:
-    """Снимок для фронтенда: задачи, текущая задача, её диалоги и текущий диалог."""
-    task = active_task(workspace)
+def adopt_orphan_tasks(workspace: Dict[str, Any], profile_id: Optional[str],
+                       profile_name: str = "") -> List[Dict[str, Any]]:
+    """Отдаёт текущему профилю задачи без владельца (файл прежней версии).
+
+    До появления профилей workspace был общим для всех: задачи не имели поля
+    "profile" и были видны всем. При первом запуске новой версии такие задачи
+    достаются ТЕКУЩЕМУ профилю (обычно это профиль, созданный автоматически) —
+    иначе вся прежняя переписка осталась бы ничей. Возвращает принятые задачи.
+    """
+    key = str(profile_id or "").strip()
+    if not key:
+        return []
+    adopted = [task for task in workspace.get("tasks", []) if not task_owner(task)]
+    if not adopted:
+        return []
+    for task in adopted:
+        task["profile"] = key
+    # Текущей у профиля становится та задача, что была текущей у старого
+    # одиночного указателя, иначе — последняя принятая.
+    legacy = str(workspace.get("active_task") or "").strip()
+    adopted_ids = [task["id"] for task in adopted]
+    active = legacy if legacy in adopted_ids else adopted_ids[-1]
+    workspace.setdefault("active_tasks", {})[key] = active
+    logger.info(
+        "Workspace AI-агента: задачи без профиля (%d) закреплены за профилем %s%s",
+        len(adopted), key, f" «{profile_name}»" if profile_name else "",
+    )
+    return adopted
+
+
+def profile_ids_with_data(workspace: Dict[str, Any]) -> List[str]:
+    """Список id профилей, данные которых лежат в workspace (задачи/память).
+
+    Нужен веб-слою при старте: если в файле остались данные профилей, которых
+    в data/profiles.json уже нет (наследие прежних версий, когда удаление профиля
+    их не убирало), это НЕ удаляется автоматически — об этом пишется
+    предупреждение в лог, а убрать их можно инструментом
+    tools/cleanup_workspace.py. Никакие данные существующих профилей не трогаем.
+    """
+    owners = {task_owner(task) for task in workspace.get("tasks", [])}
+    owners |= set(workspace.get("long_term_by_profile") or {})
+    owners |= set(workspace.get("active_tasks") or {})
+    owners.discard("")
+    return sorted(owners)
+
+
+def _task_brief(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Краткая запись задачи для снимка фронтенда."""
+    return {"id": task["id"], "name": task["name"]}
+
+
+def snapshot(workspace: Dict[str, Any], profile_id: Optional[str] = None) -> Dict[str, Any]:
+    """Снимок для фронтенда: задачи ПРОФИЛЯ, его текущая задача и её диалоги.
+
+    Профили изолированы: в снимке только задачи переданного профиля (и его
+    текущая задача из active_tasks), поэтому чужой профиль их не видит. В каждой
+    задаче есть поле "profile" — id профиля-владельца.
+    """
+    tasks = profile_tasks(workspace, profile_id)
+    task = active_task(workspace, profile_id)
     sessions = [
         {"id": session["id"], "title": session_title(session)}
         for session in (task.get("sessions", []) if task else [])
     ]
     return {
-        "tasks": [
-            {"id": item["id"], "name": item["name"]}
-            for item in workspace.get("tasks", [])
-        ],
+        "tasks": [_task_brief(item) for item in tasks],
         "active_task": task["id"] if task else None,
         "sessions": sessions,
         "active_session": task.get("active_session") if task else None,
@@ -587,16 +861,19 @@ def snapshot(workspace: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def memory_snapshot(workspace: Dict[str, Any]) -> Dict[str, Any]:
+def memory_snapshot(workspace: Dict[str, Any],
+                    profile_id: Optional[str] = None) -> Dict[str, Any]:
     """Содержимое слоёв памяти, наполняемых пользователем (панель справа).
 
-    Рабочая память — данные ТЕКУЩЕЙ задачи, долговременная — глобальная база
-    знаний (одна на приложение). Краткосрочная память (диалоги сессий) в этот
-    снимок не входит: она живёт в dialog каждой сессии и в панель токенов.
+    Рабочая память — данные ТЕКУЩЕЙ задачи ТЕКУЩЕГО профиля, долговременная —
+    база знаний ЭТОГО профиля (профили изолированы). Краткосрочная память
+    (диалоги сессий) в этот снимок не входит: она живёт в dialog каждой сессии и
+    в панель токенов.
     """
-    task = active_task(workspace)
+    task = active_task(workspace, profile_id)
     return {
         "task": ({"id": task["id"], "name": task["name"]} if task else None),
         "working": [dict(entry) for entry in (memory(task, MEMORY_WORKING) if task else [])],
-        "long_term": [dict(entry) for entry in memory(workspace, MEMORY_LONG_TERM)],
+        "long_term": [dict(entry) for entry in memory(
+            long_term_container(workspace, profile_id), MEMORY_LONG_TERM)],
     }

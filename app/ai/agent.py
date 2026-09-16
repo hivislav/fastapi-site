@@ -115,6 +115,15 @@ LONG_TERM_MEMORY_HEADER = (
 MAX_MEMORY_ENTRIES = 100
 MEMORY_ENTRY_LIMIT = 4000
 
+# --- Профиль пользователя (меню профиля в панели Workspace) -----------------
+# Сведения о пользователе (имя, род деятельности, стиль общения, формат ответа,
+# ограничения) — это СИСТЕМНЫЙ ПРОМПТ СЕССИИ: готовый блок профиля приходит из
+# веб-слоя (app/ai/profiles.py, profile_block) и идёт ПЕРВЫМ системным
+# сообщением в контексте, в любой стратегии (см. Agent.profile). Название
+# профиля в блоке — только метка, в каком профиле идёт диалог; сами данные
+# профиля — пять полей выше. Задачи и диалоги профилей изолированы: агенту
+# всегда передаётся контекст ТОЛЬКО текущего профиля (см. app/routers/chat.py).
+
 
 # --- Стратегии работы с контекстом (список «Стратегия» в панели агента) -----
 # summary        — последние N сообщений «как есть» + резюме старой части;
@@ -409,6 +418,12 @@ class Agent:
         # модель всегда — отдельными системными блоками.
         self.working_memory: List[str] = []
         self.long_term_memory: List[str] = []
+        # Профиль пользователя — СИСТЕМНЫЙ ПРОМПТ СЕССИИ: готовый текстовый блок
+        # (что пользователь рассказал о себе и каким хочет видеть ответ), собранный
+        # веб-слоем из app/ai/profiles.py для ТЕКУЩЕГО профиля. Идёт первым
+        # системным сообщением в любой стратегии; пустая строка — профиль не
+        # заполнен, данных профиля нет и блока нет.
+        self.profile: str = ""
         # Последние использованные параметры генерации (для generate()).
         self.last_params: Dict[str, Any] = {}
         # Сколько резюме составлено в ТЕКУЩЕМ запросе (обнуляется в начале
@@ -452,6 +467,7 @@ class Agent:
         covered: Optional[int] = None,
         working_memory: Optional[List[str]] = None,
         long_term_memory: Optional[List[str]] = None,
+        profile: Optional[str] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
@@ -468,6 +484,9 @@ class Agent:
         долговременная (глобальная) память: списки текстов, добавленных
         пользователем вручную. Оба слоя уходят в модель ВСЕГДА (системными
         блоками) и стратегиям управления контекстом не подчиняются.
+        profile — готовый текстовый блок профиля пользователя (системный промпт
+        сессии): сведения о пользователе и требования к ответу; None — профиль
+        не передан, используется прежний (self.profile).
 
         Собирает все debug-события в result.debug — пригодится, когда
         показывать их по одному не нужно (например, в API-ответах).
@@ -479,7 +498,7 @@ class Agent:
 
         await self._process(
             user_message, history, sink, summary, facts, branches, branch, covered,
-            working_memory, long_term_memory,
+            working_memory, long_term_memory, profile,
         )
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
@@ -503,6 +522,7 @@ class Agent:
         covered: Optional[int] = None,
         working_memory: Optional[List[str]] = None,
         long_term_memory: Optional[List[str]] = None,
+        profile: Optional[str] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -519,6 +539,8 @@ class Agent:
         долговременная (глобальная) память: списки записей, добавленных
         пользователем вручную; уходят в модель всегда, стратегиям контекста не
         подчиняются (см. WORKING_MEMORY_HEADER).
+        profile — готовый блок профиля пользователя (см. Agent.profile):
+        системный промпт сессии, уходит в модель первым системным сообщением.
         """
         queue: asyncio.Queue = asyncio.Queue()
 
@@ -528,7 +550,7 @@ class Agent:
         runner = asyncio.create_task(
             self._process(
                 user_message, history, sink, summary, facts, branches, branch, covered,
-                working_memory, long_term_memory,
+                working_memory, long_term_memory, profile,
             )
         )
         try:
@@ -560,6 +582,7 @@ class Agent:
         covered: Optional[int] = None,
         working_memory: Optional[List[str]] = None,
         long_term_memory: Optional[List[str]] = None,
+        profile: Optional[str] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -589,9 +612,20 @@ class Agent:
                 self.working_memory = self._normalize_memory_layer(working_memory)
             if long_term_memory is not None:
                 self.long_term_memory = self._normalize_memory_layer(long_term_memory)
+            # Профиль пользователя — системный промпт сессии (приходит из
+            # веб-слоя готовым текстом, см. app/ai/profiles.py).
+            if profile is not None:
+                self.profile = str(profile).strip()
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
+            if self.profile:
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: профиль пользователя применён ({len(self.profile)} симв.) — "
+                    "уходит в модель системным промптом сессии: имя, род деятельности, "
+                    "стиль общения, формат ответа и ограничения.",
+                ))
             if self.working_memory or self.long_term_memory:
                 await emit(self._step(
                     "debug",
@@ -830,16 +864,19 @@ class Agent:
         return out[-MAX_MEMORY_ENTRIES:]
 
     def _memory_blocks(self) -> List[Dict[str, str]]:
-        """Системные блоки рабочей и долговременной памяти.
+        """Системные блоки профиля пользователя и слоёв памяти.
 
         Идут ПЕРВЫМИ в контексте и присутствуют в ЛЮБОЙ стратегии (summary,
         sliding window, sticky facts, branching, ветка плана, обычный ответ):
         слои памяти пользователя стратегиям не подчиняются, поэтому их текст
-        не сокращается и не вытесняется окном или резюме. Порядок: сначала
-        глобальные знания (долговременная), затем данные текущей задачи
-        (рабочая) — она ближе к запросу.
+        не сокращается и не вытесняется окном или резюме. Порядок: сначала блок
+        профиля (системный промпт сессии — кто пользователь и каким хочет видеть
+        ответ), затем глобальные знания (долговременная память), затем данные
+        текущей задачи (рабочая память) — она ближе к запросу.
         """
         blocks: List[Dict[str, str]] = []
+        if self.profile:
+            blocks.append({"role": "system", "content": self.profile})
         if self.long_term_memory:
             body = "\n".join(f"{i}) {item}" for i, item in enumerate(self.long_term_memory, 1))
             blocks.append({"role": "system", "content": LONG_TERM_MEMORY_HEADER + "\n" + body})

@@ -65,3 +65,14 @@ AGENT_WORKSPACE_FILE = os.getenv(
     "AGENT_WORKSPACE_FILE",
     os.path.join(PROJECT_ROOT, "data", "agent_workspace.json"),
 )
+
+# Файл профилей пользователя (JSON): сведения о пользователе (имя, род
+# деятельности, стиль общения, формат ответа, ограничения), которые уходят в
+# системный промпт сессии режима «AI-агент». Профилей может быть несколько —
+# пользователь создаёт, удаляет и переключает их в меню профиля. Пока профиля
+# нет, он создаётся автоматически с идентификатором user_<цифры>. По умолчанию —
+# data/profiles.json; путь переопределяется env AGENT_PROFILES_FILE.
+AGENT_PROFILES_FILE = os.getenv(
+    "AGENT_PROFILES_FILE",
+    os.path.join(PROJECT_ROOT, "data", "profiles.json"),
+)

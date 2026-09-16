@@ -108,6 +108,162 @@
             font-size: 1rem;
             color: var(--accent-2);
         }
+        /* Шапка панели: заголовок и иконка профиля на одном уровне слева.
+           Клик по иконке выдвигает слева меню профиля (см. .profile-menu). */
+        .sidebar-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0 0 12px;
+            flex: none;
+        }
+        .sidebar-head h2 { margin: 0; flex: 1; min-width: 0; }
+        .profile-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 30px;
+            height: 30px;
+            flex: none;
+            padding: 0;
+            border: 1px solid var(--line-strong);
+            border-radius: 50%;
+            background: var(--surface-2);
+            color: var(--accent-2);
+            font-size: 0.95rem;
+            line-height: 1;
+            cursor: pointer;
+            transition: background 0.15s, box-shadow 0.15s;
+        }
+        .profile-btn:hover,
+        .profile-btn.active {
+            background: rgba(0, 255, 157, 0.16);
+            box-shadow: 0 0 16px rgba(0, 255, 157, 0.2);
+        }
+        /* Профиль заполнен (есть имя или род деятельности) — иконка ярче. */
+        .profile-btn.filled {
+            border-color: var(--accent-2);
+            color: var(--accent-2);
+            box-shadow: 0 0 12px rgba(0, 255, 157, 0.25);
+        }
+        /* ---------- Меню профиля (выезжает слева, ~20% ширины экрана) ----------
+           Меню лежит ВНЕ .layout (прямой потомок body): у .chat стоит
+           backdrop-filter, который сделал бы .chat containing block для
+           position:fixed — меню «прилипло» бы к окну чата, а не к экрану. */
+        .profile-menu {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            width: 20%;
+            min-width: 168px;
+            max-width: 420px;
+            z-index: 40;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding: 16px;
+            overflow-y: auto;
+            background: var(--surface);
+            border-right: 1px solid var(--line-strong);
+            box-shadow: 12px 0 40px rgba(0, 0, 0, 0.55);
+            backdrop-filter: blur(10px);
+            transform: translateX(-102%);
+            transition: transform 0.25s ease;
+        }
+        .profile-menu.open { transform: translateX(0); }
+        .profile-menu[hidden] { display: none; }
+        .profile-menu h3 {
+            margin: 0;
+            flex: 1;
+            min-width: 0;
+            font-size: 0.95rem;
+            color: var(--accent-2);
+        }
+        .profile-menu-head { display: flex; align-items: center; gap: 8px; }
+        .profile-block {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--line-soft);
+        }
+        .profile-select,
+        .profile-create,
+        .profile-delete,
+        .profile-save {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            background: var(--surface-2);
+            color: var(--text);
+        }
+        .profile-select { margin: 0; }
+        .profile-create,
+        .profile-delete,
+        .profile-save {
+            border: 1px solid var(--line-strong);
+            background: rgba(0, 255, 157, 0.12);
+            color: var(--accent-2);
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s, box-shadow 0.15s;
+        }
+        .profile-delete {
+            border-color: rgba(255, 92, 122, 0.5);
+            background: rgba(255, 92, 122, 0.1);
+            color: var(--danger);
+        }
+        .profile-create:hover { background: rgba(0, 255, 157, 0.2); box-shadow: 0 0 16px rgba(0, 255, 157, 0.18); }
+        .profile-delete:hover { background: rgba(255, 92, 122, 0.2); }
+        .profile-create:disabled,
+        .profile-delete:disabled,
+        .profile-save:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
+        /* «Сохранить» — главное действие меню профиля: заметнее остальных. */
+        .profile-save {
+            margin-top: 2px;
+            background: rgba(0, 255, 157, 0.22);
+        }
+        .profile-save:hover {
+            background: rgba(0, 255, 157, 0.32);
+            box-shadow: 0 0 18px rgba(0, 255, 157, 0.25);
+        }
+        .profile-field {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            font-size: 0.78rem;
+            color: var(--text-dim);
+        }
+        .profile-field input {
+            padding: 8px 10px;
+            border: 1px solid var(--line-soft);
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 0.85rem;
+            background: var(--surface-2);
+            color: var(--text);
+            outline: none;
+        }
+        .profile-field input::placeholder { color: var(--muted); }
+        .profile-field input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 12px rgba(34, 211, 238, 0.15);
+        }
+        .profile-note {
+            font-size: 0.75rem;
+            line-height: 1.35;
+            color: var(--muted);
+        }
+        .profile-status {
+            font-size: 0.75rem;
+            font-family: var(--mono);
+            color: var(--accent);
+            min-height: 1em;
+        }
         .user-history {
             flex: 1;
             overflow-y: auto;
@@ -947,7 +1103,14 @@
              данных юзером; в режиме «AI-агент» — Workspace: текущая задача,
              её диалоги (сессии) и кнопка нового диалога. -->
         <aside class="sidebar">
-            <h2 id="sidebar-title">🕘 История введённых данных</h2>
+            <!-- Иконка профиля и заголовок панели на одном уровне: иконка
+                 СЛЕВА от заголовка, клик по ней выдвигает слева меню профиля
+                 (см. #profile-menu). -->
+            <div class="sidebar-head">
+                <button type="button" class="profile-btn" id="profile-btn"
+                        title="Профиль пользователя: сведения о вас уходят в системный промпт сессии">👤</button>
+                <h2 id="sidebar-title">🕘 История введённых данных</h2>
+            </div>
             <!-- Workspace режима агента: пояснение «Текущая задача», выпадающий
                  список задач на всю ширину панели, переименование/удаление
                  задачи и кнопка «Новая задача». -->
@@ -1212,6 +1375,59 @@
             </div>
         </aside>
     </div>
+
+<!-- Меню профиля: выдвигается слева при клике по иконке профиля слева от
+     заголовка панели Workspace. Сверху — переключение профилей (в списке
+     только НАЗВАНИЯ профилей) и кнопки создать/удалить; ниже — название
+     текущего профиля и пять полей сведений о пользователе (имя, род
+     деятельности, стиль общения, формат ответа, ограничения), которые уходят
+     в системный промпт сессии агента. Изменения применяются ТОЛЬКО по кнопке
+     «Сохранить». Лежит вне .layout: у .chat есть backdrop-filter, который
+     сломал бы position:fixed внутри него. -->
+    <div class="profile-menu" id="profile-menu" hidden>
+            <div class="profile-menu-head">
+                <h3>Профиль пользователя</h3>
+                <button type="button" class="icon-btn" id="profile-close" title="Закрыть меню профиля">✕</button>
+            </div>
+            <div class="profile-block">
+                <div class="task-head">
+                    <span>Текущий профиль</span>
+                </div>
+                <select class="profile-select" id="profile-select"
+                        title="Переключение профилей: задачи и диалоги у каждого профиля свои"></select>
+                <button type="button" class="profile-create" id="profile-create">Создать профиль</button>
+                <button type="button" class="profile-delete" id="profile-delete">Удалить профиль</button>
+            </div>
+            <label class="profile-field">Название профиля
+                <input id="profile-title" type="text" placeholder="напр. Работа" autocomplete="off"
+                       title="Как профиль виден в списке. Нужно только вам — в системный промпт не отправляется.">
+            </label>
+            <label class="profile-field">Имя
+                <input id="profile-name" type="text" placeholder="напр. Иван" autocomplete="off">
+            </label>
+            <label class="profile-field">Род деятельности
+                <input id="profile-occupation" type="text" placeholder="напр. аналитик данных" autocomplete="off">
+            </label>
+            <label class="profile-field">Стиль общения
+                <input id="profile-style" type="text" placeholder="напр. кратко, по делу, без воды" autocomplete="off">
+            </label>
+            <label class="profile-field">Формат ответа
+                <input id="profile-format" type="text" placeholder="напр. маркированный список, таблица" autocomplete="off">
+            </label>
+            <label class="profile-field">Ограничения
+                <input id="profile-limits" type="text" placeholder="напр. без шуток, не более 5 пунктов" autocomplete="off">
+            </label>
+            <button type="button" class="profile-save" id="profile-save">Сохранить</button>
+            <div class="profile-status" id="profile-status"></div>
+            <div class="profile-note">
+                Пять полей сведений о вас уходят в системный промпт сессии режима
+                «AI-агент»: агент учитывает имя, род деятельности, стиль, формат
+                ответа и ограничения в каждом ответе. Название профиля — только для
+                вас. Изменения применяются по кнопке «Сохранить». Задачи и диалоги у
+                каждого профиля свои: переключение профиля меняет и рабочее
+                пространство.
+            </div>
+        </div>
 
     <script>
         const input = document.getElementById('input');
@@ -1894,6 +2110,12 @@
                 // Срезы памяти тоже привязаны к задаче — держим их свежими.
                 loadMemory();
             }
+            // Профиль пользователя сервер отдаёт вместе со снимком workspace:
+            // обновляем иконку и поля меню тем же ответом.
+            if (workspace.profile) {
+                profiles = workspace.profile;
+                renderProfiles();
+            }
             updateComposerState();
         }
 
@@ -2096,6 +2318,264 @@
         document.getElementById('name-modal-close').addEventListener('click', closeNameModal);
         nameModal.addEventListener('click', (e) => {
             if (e.target === nameModal) closeNameModal();   // «закрыть» — ничего не меняется
+        });
+
+        // ---------- Профиль пользователя (меню профиля) ----------
+        // Иконка профиля стоит СЛЕВА от заголовка панели; по клику слева
+        // выезжает меню шириной ~20% экрана. В меню — переключение профилей
+        // (в списке только НАЗВАНИЯ), название текущего профиля и пять полей
+        // сведений о пользователе (имя, род деятельности, стиль общения, формат
+        // ответа, ограничения) + кнопки создать/удалить/сохранить. Поля уходят в
+        // системный промпт сессии агента; название профиля — только для
+        // пользователя. Профили изолированы: у каждого свои задачи и диалоги,
+        // поэтому переключение профиля перечитывает и рабочее пространство.
+        const profileBtn = document.getElementById('profile-btn');
+        const profileMenu = document.getElementById('profile-menu');
+        const profileCloseBtn = document.getElementById('profile-close');
+        const profileSelect = document.getElementById('profile-select');
+        const profileCreateBtn = document.getElementById('profile-create');
+        const profileDeleteBtn = document.getElementById('profile-delete');
+        const profileSaveBtn = document.getElementById('profile-save');
+        const profileStatus = document.getElementById('profile-status');
+        // Название профиля (только для интерфейса) + поля сведений о пользователе
+        // (уходят в системный промпт сессии).
+        const PROFILE_TITLE_ID = 'profile-title';
+        const PROFILE_FIELDS = [
+            ['user_name', 'profile-name'],
+            ['occupation', 'profile-occupation'],
+            ['style', 'profile-style'],
+            ['answer_format', 'profile-format'],
+            ['limits', 'profile-limits']
+        ];
+        const profileInputs = { profile_name: document.getElementById(PROFILE_TITLE_ID) };
+        PROFILE_FIELDS.forEach(([key, id]) => { profileInputs[key] = document.getElementById(id); });
+
+        // Снимок профилей с сервера. Приходит вместе со снимком workspace
+        // (workspace.profile) и отдельно — ответами /api/agent/profiles.
+        let profiles = { active: null, profiles: [], profile: null };
+        // Профиль, данные которого сейчас в полях: ответ на «Сохранить» приходит
+        // асинхронно, и после переключения профиля в поля уже вписаны данные
+        // другого профиля — тогда ответ игнорируем.
+        let profileEditingId = null;
+        // ЭТАЛОН полей: что сейчас реально сохранено для профиля в форме.
+        // Сравнивать поля с живым снимком сервера нельзя — после «Сохранить» (или
+        // переключения) снимок уже новый, и форма навсегда считалась бы
+        // «изменённой», а значит не перерисовывалась бы при смене профиля.
+        let profileBaseline = {};
+        let profileStatusTimer = null;
+
+        function currentProfile() {
+            return profiles.profiles.find(p => p.id === profiles.active) || null;
+        }
+
+        // Подпись профиля в интерфейсе — его НАЗВАНИЕ (id не показываем).
+        function profileLabel(profile) {
+            if (!profile) return 'Профиль';
+            return profile.profile_name || profile.label || 'Профиль';
+        }
+
+        function setProfileStatus(text) {
+            profileStatus.textContent = text || '';
+            if (profileStatusTimer) clearTimeout(profileStatusTimer);
+            if (text) profileStatusTimer = setTimeout(() => { profileStatus.textContent = ''; }, 2500);
+        }
+
+        // Показывает, есть ли в полях несохранённые правки (подсветка кнопки).
+        function profileDirty() {
+            if (!currentProfile()) return false;
+            return Object.keys(profileInputs).some(key =>
+                (profileInputs[key].value.trim() || '') !== (profileBaseline[key] || ''));
+        }
+
+        // Запоминает текущее содержимое полей как «сохранённое».
+        function rememberProfileBaseline() {
+            profileBaseline = {};
+            Object.keys(profileInputs).forEach(key => {
+                profileBaseline[key] = profileInputs[key].value.trim();
+            });
+        }
+
+        function markProfileButtons() {
+            profileSaveBtn.disabled = !currentProfile() || !profileDirty();
+        }
+
+        // Загружает профили с сервера и перерисовывает меню. Без профиля на
+        // сервере профиль создастся сам — сервер вернёт его с id «user_<цифры>»
+        // и названием «user<цифры>».
+        async function loadProfiles() {
+            const data = await workspaceRequest('/api/agent/profiles');
+            if (!data) return null;
+            profiles = data;
+            renderProfiles();
+            return data;
+        }
+
+        // Рисует выпадающий список профилей и поля текущего профиля.
+        function renderProfiles() {
+            const current = currentProfile();
+            // Сменился ли профиль с прошлой отрисовки: тогда поля ОБЯЗАНЫ
+            // перечитаться, даже если в них что-то набрано (пользователь переключил
+            // профиль — правки прежнего профиля не переносим).
+            const switched = profileEditingId !== (current ? current.id : null);
+            profileEditingId = current ? current.id : null;
+            profileSelect.innerHTML = '';
+            if (!profiles.profiles.length) {
+                const empty = document.createElement('option');
+                empty.value = '';
+                empty.textContent = '— профиля нет —';
+                profileSelect.appendChild(empty);
+            }
+            // В списке — ТОЛЬКО названия профилей (id служебный, не показываем).
+            profiles.profiles.forEach(profile => {
+                const option = document.createElement('option');
+                option.value = profile.id;
+                option.textContent = profileLabel(profile);
+                profileSelect.appendChild(option);
+            });
+            profileSelect.value = profiles.active || '';
+            // Поля заполняем, если профиль сменился (переключение, создание,
+            // удаление) — всегда, либо если в них нет несохранённых правок: частые
+            // снимки workspace не должны затирать набранное, но и данные нового
+            // профиля обязаны появиться в форме.
+            if (switched || !profileDirty()) fillProfileInputs(current);
+            profileDeleteBtn.disabled = !current;
+            // Подпись иконки профиля — название текущего профиля.
+            profileBtn.title = 'Профиль: ' + profileLabel(current)
+                + ' — сведения о вас уходят в системный промпт сессии';
+            profileBtn.classList.toggle('filled', !!(current && (current.user_name || current.occupation)));
+            markProfileButtons();
+        }
+
+        // Заполняет поля формами профиля и обновляет эталон «сохранённого».
+        function fillProfileInputs(current) {
+            Object.keys(profileInputs).forEach(key => {
+                profileInputs[key].value = current ? (current[key] || '') : '';
+            });
+            rememberProfileBaseline();
+        }
+
+        // Открывает/закрывает меню профиля. При открытии профили подтягиваются
+        // заново — на случай, если их меняли в другой вкладке.
+        async function setProfileMenu(open) {
+            if (!open) {
+                profileMenu.classList.remove('open');
+                profileBtn.classList.remove('active');
+                setTimeout(() => { if (!profileMenu.classList.contains('open')) profileMenu.hidden = true; }, 260);
+                return;
+            }
+            profileMenu.hidden = false;
+            // Кадр, чтобы transition сработал после снятия hidden.
+            requestAnimationFrame(() => profileMenu.classList.add('open'));
+            profileBtn.classList.add('active');
+            await loadProfiles();
+        }
+
+        function profileMenuOpen() {
+            return !profileMenu.hidden && profileMenu.classList.contains('open');
+        }
+
+        // Сохраняет профиль (кнопка «Сохранить»): название + поля сведений.
+        // Автосохранения нет — до нажатия кнопки данные на сервере не меняются.
+        async function saveProfile() {
+            const current = currentProfile();
+            if (!current) return;
+            const body = {};
+            Object.keys(profileInputs).forEach(key => { body[key] = profileInputs[key].value.trim(); });
+            if (!body.profile_name) {
+                // Название обязательно: по нему профиль выбирается в списке.
+                setProfileStatus('Введите название профиля');
+                profileInputs.profile_name.focus();
+                return;
+            }
+            profileSaveBtn.disabled = true;
+            const data = await workspaceRequest(
+                '/api/agent/profiles/' + encodeURIComponent(current.id), jsonOptions('PUT', body));
+            if (!data) { markProfileButtons(); return; }
+            // Пока запрос шёл, могли переключить профиль — поля не трогаем.
+            if (profileEditingId !== current.id) return;
+            profiles = data;
+            // Сервер вернул сохранённые значения (они нормализованы — например,
+            // без двойных пробелов): берём их за эталон, иначе форма навсегда
+            // осталась бы «изменённой».
+            if (profiles.profile) fillProfileInputs(profiles.profile);
+            renderProfiles();
+            setProfileStatus('Профиль сохранён');
+        }
+
+        // Переключение профиля: текущим становится выбранный. Профили
+        // изолированы — у каждого свои задачи, диалоги и память, поэтому вместе
+        // с профилем перечитываем снимок workspace (панель слева) и диалог.
+        async function selectProfile(profileId) {
+            if (!profileId || profileId === profiles.active) return;
+            const data = await workspaceRequest(
+                '/api/agent/profiles/' + encodeURIComponent(profileId) + '/select', jsonOptions('POST'));
+            if (!data) return;
+            profiles = data;
+            renderProfiles();
+            setProfileStatus('Профиль переключён: ' + profileLabel(currentProfile()));
+            await loadWorkspace();
+            await loadActiveDialog();
+        }
+
+        // Новый профиль: сначала спрашиваем НАЗВАНИЕ (обязательное поле), затем
+        // создаём профиль с этим названием. id генерирует сервер —
+        // «user_<цифры>» (напр. user_13213123).
+        function createProfile() {
+            openNameModal('Название нового профиля', '', async (name) => {
+                const data = await workspaceRequest(
+                    '/api/agent/profiles', jsonOptions('POST', { profile_name: name }));
+                if (!data) return;
+                profiles = data;
+                renderProfiles();
+                setProfileStatus('Создан профиль «' + profileLabel(currentProfile()) + '»');
+                profileInputs.user_name.focus();
+                // У нового профиля своё (пока пустое) пространство задач.
+                await loadWorkspace();
+                await loadActiveDialog();
+            });
+        }
+
+        function deleteProfile() {
+            const current = currentProfile();
+            if (!current) return;
+            openConfirmModal(
+                'Удалить профиль?',
+                'Профиль «' + profileLabel(current) + '» будет удалён ВМЕСТЕ с его задачами, '
+                + 'диалогами и памятью — это необратимо.',
+                async () => {
+                    const data = await workspaceRequest(
+                        '/api/agent/profiles/' + encodeURIComponent(current.id), { method: 'DELETE' });
+                    if (!data) return;
+                    profiles = data;
+                    renderProfiles();
+                    setProfileStatus('Профиль удалён');
+                    await loadWorkspace();
+                    await loadActiveDialog();
+                });
+        }
+
+        // Изменение любого поля: сбрасываем подсветку «Сохранить» (правки есть).
+        Object.keys(profileInputs).forEach(key => {
+            profileInputs[key].addEventListener('input', markProfileButtons);
+            profileInputs[key].addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); saveProfile(); }
+            });
+        });
+
+        profileBtn.addEventListener('click', () => setProfileMenu(!profileMenuOpen()));
+        profileCloseBtn.addEventListener('click', () => setProfileMenu(false));
+        profileSelect.addEventListener('change', () => selectProfile(profileSelect.value));
+        profileCreateBtn.addEventListener('click', createProfile);
+        profileDeleteBtn.addEventListener('click', deleteProfile);
+        profileSaveBtn.addEventListener('click', saveProfile);
+        // Клик мимо меню (и мимо иконки) — закрываем.
+        document.addEventListener('click', (e) => {
+            if (!profileMenuOpen()) return;
+            if (profileMenu.contains(e.target) || profileBtn.contains(e.target)) return;
+            setProfileMenu(false);
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && profileMenuOpen()) setProfileMenu(false);
         });
 
         const confirmModal = document.getElementById('confirm-modal');
@@ -2939,10 +3419,13 @@
         // Открытие страницы: режим «AI-агент» выбран ПО УМОЛЧАНИЮ — включаем его
         // сразу, вместе с workspace (задачи, диалоги) и диалогом текущей сессии.
         // Скролл окна чата — внизу, как в типичных чатах; список «Стратегия»
-        // приводим к исходному виду (поля выбранной стратегии).
+        // приводим к исходному виду (поля выбранной стратегии). Профили
+        // пользователя подтягиваем сразу: если профиля нет, сервер создаст его
+        // сам с идентификатором «user_<цифры>».
         renderBranchSelect();
         showAgentStrategyRows();
         renderWorkspace();
+        loadProfiles();
         setAgentMode(true);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         input.focus();
