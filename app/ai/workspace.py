@@ -60,6 +60,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app import config
+from app.ai import task_state
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,20 @@ _MAX_SUMMARY = 500
 _MAX_BRANCHES = 5
 _MAX_BRANCH_MESSAGES = 500
 _MAX_FACTS = 40
+# Журнал чата сессии (dialog["log"]): что пользователь ВИДЕЛ в окне чата — его
+# сообщения, ответы, показанный план и служебные debug/error-строки агента, в
+# порядке появления. Нужен, чтобы при переключении сессии окно чата
+# восстанавливалось полностью: память диалога (messages) хранит только реплики
+# для модели, а debug-вывод и текст запроса в неё не попадают.
+_MAX_LOG = 400
+_MAX_LOG_CHARS = 200_000
+_MAX_LOG_TEXT = 8000
+# Виды записей журнала (совпадают с ролями узлов чата на фронте).
+LOG_USER = "user"
+LOG_ASSISTANT = "assistant"
+LOG_DEBUG = "debug"
+LOG_ERROR = "error"
+LOG_KINDS = (LOG_USER, LOG_ASSISTANT, LOG_DEBUG, LOG_ERROR)
 
 # Сколько символов первого запроса пользователя попадает в заголовок сессии.
 _TITLE_CHARS = 120
@@ -98,7 +113,7 @@ MEMORY_WORKING = "working"
 MEMORY_LONG_TERM = "long_term"
 
 # Заголовок пустой сессии (пока пользователь не отправил ни одного запроса).
-EMPTY_SESSION_TITLE = "Новый диалог"
+EMPTY_SESSION_TITLE = "Новая задача"
 
 
 def _now() -> str:
@@ -111,8 +126,14 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
-def empty_dialog() -> Dict[str, Any]:
-    """Пустое состояние агентского диалога (одна сессия)."""
+def empty_dialog(task_id: str = "") -> Dict[str, Any]:
+    """Пустое состояние агентского диалога (одна сессия).
+
+    Кроме памяти, замеров, резюме, фактов и ветвей плана здесь лежит состояние
+    конечного автомата задачи (`state`, см. app/ai/task_state.py): этап, текущий
+    шаг и ожидаемое действие. Диалог без автомата не бывает — новое состояние
+    создаётся сразу (этап planning).
+    """
     return {
         "messages": [],
         "usage": [],
@@ -121,6 +142,11 @@ def empty_dialog() -> Dict[str, Any]:
         "facts": {},
         "branches": {},
         "active_branch": None,
+        # Журнал чата (см. _MAX_LOG): порядок узлов окна чата этой сессии.
+        "log": [],
+        # Конечный автомат задачи: этап → шаг → ожидаемое действие + история
+        # переходов. Живёт В СЕССИИ: у каждого диалога свой ход автомата.
+        "state": task_state.to_dict(task_state.new_state(task_id)),
     }
 
 
@@ -128,7 +154,14 @@ def empty_dialog() -> Dict[str, Any]:
 # Нормализация прочитанных данных
 # ---------------------------------------------------------------------------
 def _clean_messages(raw: Any, limit: int = _MAX_MESSAGES) -> List[Dict[str, str]]:
-    """Оставляет только пары {"role": user|assistant, "content": непустое}."""
+    """Оставляет только пары {"role": user|assistant, "content": непустое}.
+
+    Реплика конечного автомата задачи (запрос «выполни текущий шаг плана», см.
+    ChatMessage.continue_step) помечена полем "source": "machine" — интерфейс
+    рисует её служебным сообщением, а не репликой пользователя. Пометка
+    сохраняется здесь, иначе после перезагрузки страницы такая реплика
+    выглядела бы как написанная человеком.
+    """
     clean: List[Dict[str, str]] = []
     for msg in (raw if isinstance(raw, list) else []):
         if not isinstance(msg, dict):
@@ -137,7 +170,11 @@ def _clean_messages(raw: Any, limit: int = _MAX_MESSAGES) -> List[Dict[str, str]
         content = str(msg.get("content") or "").strip()
         if role not in ("user", "assistant") or not content:
             continue
-        clean.append({"role": role, "content": content})
+        item: Dict[str, str] = {"role": role, "content": content}
+        source = str(msg.get("source") or "").strip().lower()
+        if source:
+            item["source"] = source[:20]
+        clean.append(item)
     if len(clean) > limit:
         clean = clean[-limit:]
     total_chars = sum(len(m["content"]) for m in clean)
@@ -168,6 +205,12 @@ def _clean_usage(raw: Any) -> List[Dict[str, Any]]:
                 record["limit"] = None
         if "overflow" in item:
             record["overflow"] = item.get("overflow") is True
+        # kind="plan" — замер запроса, на котором построен только ПЛАН (ответа
+        # пользователю не было): такие записи не привязаны к реплике диалога и
+        # не отбрасываются при синхронизации замеров (см. _usage_matches_history).
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind:
+            record["kind"] = kind[:20]
         clean.append(record)
     return clean
 
@@ -192,6 +235,51 @@ def _clean_facts(raw: Any) -> Dict[str, str]:
     return facts
 
 
+def _clean_log(raw: Any) -> List[Dict[str, str]]:
+    """Приводит журнал чата сессии к списку {"kind", "text"}.
+
+    kind — user | assistant | debug | error (LOG_KINDS). Пустые записи
+    отбрасываются, длинные тексты обрезаются, старые вытесняются
+    (_MAX_LOG записей и _MAX_LOG_CHARS символов).
+    """
+    clean: List[Dict[str, str]] = []
+    for item in (raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        text = str(item.get("text") or "").strip()
+        if kind not in LOG_KINDS or not text:
+            continue
+        clean.append({"kind": kind, "text": text[:_MAX_LOG_TEXT]})
+    if len(clean) > _MAX_LOG:
+        clean = clean[-_MAX_LOG:]
+    total = sum(len(item["text"]) for item in clean)
+    while total > _MAX_LOG_CHARS and clean:
+        total -= len(clean[0]["text"])
+        clean.pop(0)
+    return clean
+
+
+def add_log(dialog: Dict[str, Any], kind: str, text: str) -> None:
+    """Добавляет узел в журнал чата сессии (что пользователь видит в окне).
+
+    Пишется веб-слоем по ходу ответа: реплика пользователя, ответ агента,
+    показанный план и служебные debug/error-строки. Так окно чата можно
+    восстановить целиком при переключении сессии (см. GET /api/agent/history).
+    """
+    value = str(text or "").strip()
+    if kind not in LOG_KINDS or not value:
+        return
+    log = dialog.setdefault("log", [])
+    log.append({"kind": kind, "text": value[:_MAX_LOG_TEXT]})
+    if len(log) > _MAX_LOG:
+        del log[:len(log) - _MAX_LOG]
+    total = sum(len(item.get("text") or "") for item in log)
+    while total > _MAX_LOG_CHARS and len(log) > 1:
+        total -= len(log[0].get("text") or "")
+        log.pop(0)
+
+
 def _clean_branches(raw: Any) -> Dict[str, Dict[str, Any]]:
     """Ветви плана (стратегия «branching») — у каждой своя история сообщений."""
     if not isinstance(raw, dict):
@@ -206,9 +294,9 @@ def _clean_branches(raw: Any) -> Dict[str, Dict[str, Any]]:
     return branches
 
 
-def normalize_dialog(raw: Any) -> Dict[str, Any]:
+def normalize_dialog(raw: Any, task_id: str = "") -> Dict[str, Any]:
     """Приводит состояние диалога сессии к безопасному виду."""
-    dialog = empty_dialog()
+    dialog = empty_dialog(task_id)
     if not isinstance(raw, dict):
         return dialog
     dialog["messages"] = _clean_messages(raw.get("messages"))
@@ -224,6 +312,10 @@ def normalize_dialog(raw: Any) -> Dict[str, Any]:
     active = raw.get("active_branch")
     active = str(active) if active else None
     dialog["active_branch"] = active if active in dialog["branches"] else None
+    # Состояние автомата задачи: битое/отсутствующее поле даёт новое состояние
+    # (этап planning) — диалог без автомата работать не должен.
+    dialog["state"] = task_state.to_dict(task_state.from_dict(raw.get("state"), task_id))
+    dialog["log"] = _clean_log(raw.get("log"))
     return dialog
 
 
@@ -235,8 +327,36 @@ def _normalize_session(raw: Any) -> Optional[Dict[str, Any]]:
         "id": session_id,
         "title": str(raw.get("title") or "").strip()[:_MAX_TITLE],
         "created": str(raw.get("created") or _now()),
-        "dialog": normalize_dialog(raw.get("dialog")),
+        # task_id состояния — это id САМОЙ сессии: задача пользователя в режиме
+        # «AI-агент» ведётся в диалоге (сессии) и своей сессии не имеет.
+        "dialog": normalize_dialog(raw.get("dialog"), session_id),
     }
+
+
+# ---------------------------------------------------------------------------
+# Состояние автомата задачи (Task State Machine) внутри сессии
+# ---------------------------------------------------------------------------
+def dialog_state(session: Optional[Dict[str, Any]]) -> "task_state.TaskState":
+    """Состояние автомата задачи из диалога сессии.
+
+    Сессии нет — новое состояние (этап planning) без имени задачи: вызывающий
+    код (GET /api/agent/state) отдаёт его фронту, чтобы полоса этапов была
+    видна даже до создания диалога.
+    """
+    dialog = (session or {}).get("dialog") or {}
+    return task_state.from_dict(dialog.get("state"), str((session or {}).get("id") or ""))
+
+
+def set_dialog_state(session: Dict[str, Any], state: "task_state.TaskState") -> Dict[str, Any]:
+    """Записывает состояние автомата обратно в диалог сессии.
+
+    Возвращает JSON-словарь состояния — его и отдаём фронту.
+    """
+    if not state.task_id:
+        state.task_id = str(session.get("id") or "")
+    state.steps = task_state.clean_steps(state.steps)
+    session.setdefault("dialog", {})["state"] = task_state.to_dict(state)
+    return session["dialog"]["state"]
 
 
 def _normalize_entries(raw: Any) -> List[Dict[str, Any]]:
@@ -560,14 +680,23 @@ def load_workspace(path: Optional[str] = None) -> Dict[str, Any]:
     return normalize_workspace(data)
 
 
-def save_workspace(workspace: Dict[str, Any], path: Optional[str] = None) -> None:
-    """Сохраняет workspace в JSON-файл атомарно (временный файл + os.replace)."""
+def workspace_payload(workspace: Dict[str, Any]) -> str:
+    """Сериализует workspace в JSON (синхронно, без await).
+
+    Отдельно от записи намеренно: сериализация идёт в ПОТОКЕ EVENT LOOP, а файл
+    пишется в отдельном потоке. Пока агент отвечает, workspace меняют и другие
+    маршруты (переключение диалога, пауза, запись журнала), поэтому снимок для
+    файла нужно снимать атомарно — иначе json.dumps мог бы поймать «изменение
+    словаря во время итерации» (см. _persist в chat.py).
+    """
+    return json.dumps(normalize_workspace(workspace), ensure_ascii=False, indent=2)
+
+
+def write_payload(payload: str, path: Optional[str] = None) -> None:
+    """Пишет готовый JSON в файл атомарно (временный файл + os.replace)."""
     file_path = path or config.AGENT_WORKSPACE_FILE
     directory = os.path.dirname(file_path) or "."
     os.makedirs(directory, exist_ok=True)
-    payload = json.dumps(
-        normalize_workspace(workspace), ensure_ascii=False, indent=2
-    )
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".workspace-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -579,6 +708,15 @@ def save_workspace(workspace: Dict[str, Any], path: Optional[str] = None) -> Non
         except OSError:
             pass
         raise
+
+
+def save_workspace(workspace: Dict[str, Any], path: Optional[str] = None) -> None:
+    """Сохраняет workspace в JSON-файл атомарно (временный файл + os.replace).
+
+    Обёртка над workspace_payload + write_payload — для инструментов и тестов,
+    которым не важна развязка сериализации и записи (в веб-слое см. _persist).
+    """
+    write_payload(workspace_payload(workspace), path)
 
 
 # ---------------------------------------------------------------------------
@@ -686,11 +824,14 @@ def create_task(workspace: Dict[str, Any], name: str,
 
 def create_session(task: Dict[str, Any], title: str = "") -> Dict[str, Any]:
     """Создаёт в задаче новую сессию-диалог и делает её текущей."""
+    session_id = new_id("s")
     session = {
-        "id": new_id("s"),
+        "id": session_id,
         "title": str(title).strip()[:_MAX_TITLE],
         "created": _now(),
-        "dialog": empty_dialog(),
+        # Новый диалог — новая задача для автомата: состояние создаётся сразу
+        # (этап planning), а его task_id — id этой сессии.
+        "dialog": empty_dialog(session_id),
     }
     task.setdefault("sessions", []).append(session)
     task["sessions"] = task["sessions"][-_MAX_SESSIONS:]
@@ -777,7 +918,9 @@ def session_title(session: Optional[Dict[str, Any]]) -> str:
     if title:
         return title
     for message in session.get("dialog", {}).get("messages", []):
-        if message.get("role") == "user":
+        # Реплика автомата (source="machine", см. continue_step) — не запрос
+        # пользователя: по ней заголовок не строим.
+        if message.get("role") == "user" and message.get("source") != "machine":
             text = " ".join(str(message.get("content") or "").split())
             if text:
                 return text[:_TITLE_CHARS] + ("…" if len(text) > _TITLE_CHARS else "")

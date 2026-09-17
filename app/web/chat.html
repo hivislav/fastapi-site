@@ -273,7 +273,10 @@
         }
         .user-history[hidden] { display: none; }
         /* Пока агент отвечает, смена задачи/диалога недоступна. */
-        .user-history.busy { opacity: 0.6; pointer-events: none; }
+        /* «Занято» — приглушение без запрета кликов: переключать задачу/диалог
+           можно и во время ответа агента (переключение мгновенное, а ответ
+           дописывается в свой диалог). */
+        .user-history.busy { opacity: 0.65; }
         .history-item {
             background: var(--surface-2);
             border-radius: 10px;
@@ -291,7 +294,7 @@
         /* ---------- Workspace: задачи и диалоги (режим «AI-агент») ---------- */
         /* Блок «Текущая задача»: пояснение над выпадающим списком, сам список на
            всю ширину панели (отступы — это padding панели, слева и справа
-           одинаковые) и кнопка «Новая задача» под ним. */
+           одинаковые) и кнопка «Новый проект» под ним. */
         .task-block {
             display: flex;
             flex-direction: column;
@@ -570,6 +573,156 @@
         .chat-settings input { width: 130px; }
         .chat-settings input::placeholder { color: var(--muted); }
         .chat-settings #stop-condition { width: 190px; }
+        /* ---------- Полоса состояния задачи (Task State Machine) ----------
+           Отдельная область МЕЖДУ шапкой чата («Чат-бот» + настройки формата,
+           длины и завершения) и окном сообщений. Блоки этапов соединены
+           стрелками и растянуты на всю ширину чата, текущий этап подсвечен, а
+           крайний правый блок — кнопка «Пауза»/«Продолжить» (стрелки к ней
+           нет). Видна только в режиме «AI-агент». */
+        .task-machine {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding: 10px 20px;
+            border-bottom: 1px solid var(--line);
+            background: linear-gradient(180deg, rgba(34, 211, 238, 0.06), rgba(5, 7, 10, 0.28));
+        }
+        .tm-row { display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap; }
+        .tm-track {
+            display: flex;
+            align-items: stretch;
+            gap: 6px;
+            flex: 1 1 420px;
+            min-width: 0;
+        }
+        .tm-block {
+            flex: 1 1 0;
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px 10px;
+            border: 1px solid var(--line-soft);
+            border-radius: 8px;
+            background: var(--surface-2);
+            color: var(--text-dim);
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .tm-block.visited { color: var(--text); border-color: var(--line-strong); }
+        .tm-block.active {
+            color: #04140d;
+            background: var(--accent-2);
+            border-color: var(--accent-2);
+            font-weight: 700;
+            box-shadow: 0 0 14px rgba(0, 255, 157, 0.35);
+        }
+        .tm-block.extra {
+            flex: 0 0 auto;
+            text-transform: none;
+            color: var(--warn);
+            border-color: var(--warn);
+            background: rgba(255, 176, 32, 0.12);
+        }
+        .tm-arrow {
+            flex: 0 0 auto;
+            display: flex;
+            align-items: center;
+            color: var(--accent);
+            font-family: var(--mono);
+            font-size: 0.9rem;
+        }
+        .tm-actions { display: flex; align-items: stretch; gap: 6px; flex: 0 0 auto; }
+        .tm-actions button {
+            padding: 8px 12px;
+            border: 1px solid var(--line-soft);
+            border-radius: 8px;
+            background: var(--surface-2);
+            color: var(--text);
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .tm-actions button:hover:not(:disabled) {
+            border-color: var(--accent);
+            color: var(--accent);
+            box-shadow: 0 0 12px rgba(34, 211, 238, 0.18);
+        }
+        .tm-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
+        /* Крайний правый блок полосы — кнопка «Пауза»/«Продолжить»: тот же
+           размер, что у блоков этапов, но это КНОПКА и стрелки к ней нет. */
+        .tm-pause { min-width: 132px; text-transform: uppercase; letter-spacing: 0.03em; }
+        .tm-pause.paused {
+            border-color: var(--accent-2);
+            color: var(--accent-2);
+            box-shadow: 0 0 12px rgba(0, 255, 157, 0.2);
+        }
+        .tm-confirm { border-color: var(--accent-2); color: var(--accent-2); }
+        .tm-cancel { color: var(--danger); border-color: rgba(255, 86, 106, 0.5); }
+        .tm-cancel:hover:not(:disabled) {
+            color: var(--danger) !important;
+            border-color: var(--danger) !important;
+            box-shadow: 0 0 12px rgba(255, 86, 106, 0.2) !important;
+        }
+        .tm-redo {
+            padding: 3px 9px;
+            border: 1px dashed var(--warn);
+            border-radius: 999px;
+            color: var(--warn);
+            background: rgba(255, 176, 32, 0.1);
+        }
+        .tm-pending {
+            padding: 3px 9px;
+            border: 1px dashed var(--accent);
+            border-radius: 999px;
+            color: var(--accent);
+            background: rgba(34, 211, 238, 0.1);
+        }
+        .tm-idle {
+            padding: 3px 9px;
+            border: 1px dashed var(--warn);
+            border-radius: 999px;
+            color: var(--warn);
+            background: rgba(255, 176, 32, 0.1);
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            cursor: pointer;
+        }
+        .tm-idle:hover:not(:disabled) { border-style: solid; }
+        .tm-idle:disabled { opacity: 0.5; cursor: not-allowed; }
+        .tm-meta {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--text-dim);
+        }
+        .tm-step { color: var(--accent-2); }
+        .tm-plan { display: flex; gap: 6px; flex-wrap: wrap; }
+        .tm-chip {
+            padding: 3px 9px;
+            border: 1px solid var(--line-soft);
+            border-radius: 999px;
+            background: var(--surface-2);
+            color: var(--text-dim);
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            max-width: 260px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .tm-chip.done { opacity: 0.6; }
+        .tm-chip.active { border-color: var(--accent-2); color: var(--accent-2); }
+        .tm-chip.extra { border-style: dashed; color: var(--muted); }
+        .tm-hint { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
         .messages {
             flex: 1;
             overflow-y: auto;
@@ -790,6 +943,8 @@
         }
         .roles-field::placeholder { color: var(--muted); }
         .roles-field:focus { border-color: var(--accent); }
+        /* Поле правки плана задачи (модалка «План задачи»): многострочное. */
+        .plan-field { resize: vertical; min-height: 120px; line-height: 1.45; }
         .modal-actions {
             display: flex;
             gap: 10px;
@@ -967,7 +1122,7 @@
         .agent-table td:not(:first-child) { text-align: center; color: var(--text); }
         /* Общий блок итогов («Весь диалог» + «из них суммаризация»): фон и
            рамка объединяют эти строки в один блок — в отличие от строки
-           «Текущий запрос», которая показывает только сам ответ модели. */
+           «Ответ шага», которая показывает только сам ответ модели. */
         .agent-table tbody.agent-total-block td {
             background: rgba(0, 255, 157, 0.05);
             padding-top: 6px;
@@ -1100,8 +1255,8 @@
 <body>
     <div class="layout">
         <!-- Боковая панель. В обычном/экспертном режимах — история введённых
-             данных юзером; в режиме «AI-агент» — Workspace: текущая задача,
-             её диалоги (сессии) и кнопка нового диалога. -->
+             данных юзером; в режиме «AI-агент» — Workspace: текущий проект,
+             его задачи и кнопка новой задачи. -->
         <aside class="sidebar">
             <!-- Иконка профиля и заголовок панели на одном уровне: иконка
                  СЛЕВА от заголовка, клик по ней выдвигает слева меню профиля
@@ -1112,29 +1267,29 @@
                 <h2 id="sidebar-title">🕘 История введённых данных</h2>
             </div>
             <!-- Workspace режима агента: пояснение «Текущая задача», выпадающий
-                 список задач на всю ширину панели, переименование/удаление
-                 задачи и кнопка «Новая задача». -->
+                 список проектов на всю ширину панели, переименование/удаление
+                 проекта и кнопка «Новый проект». -->
             <div class="task-block" id="task-block" hidden>
                 <div class="task-head">
-                    <span>Текущая задача</span>
+                    <span>Текущий проект</span>
                     <span class="task-actions">
-                        <button type="button" class="icon-btn" id="task-rename" title="Переименовать задачу">✏️</button>
-                        <button type="button" class="icon-btn" id="task-delete" title="Удалить задачу">🗑</button>
+                        <button type="button" class="icon-btn" id="task-rename" title="Переименовать проект">✏️</button>
+                        <button type="button" class="icon-btn" id="task-delete" title="Удалить проект">🗑</button>
                     </span>
                 </div>
-                <select class="task-select" id="task-select" title="Текущая задача: у каждой задачи своя история диалогов">
-                    <option value="">— задачи нет —</option>
+                <select class="task-select" id="task-select" title="Текущий проект: у каждого проекта своя история задач">
+                    <option value="">— проекта нет —</option>
                 </select>
-                <button type="button" class="task-new" id="task-new">Новая задача</button>
+                <button type="button" class="task-new" id="task-new">Новый проект</button>
             </div>
             <div id="history" class="user-history">
                 <div class="history-empty">Здесь появится, что вы вводили</div>
             </div>
-            <!-- История диалогов задачи (только в режиме агента): элементы
-                 кликабельны — переход в диалог; карандаш переименовывает,
+            <!-- История задач проекта (только в режиме агента): элементы
+                 кликабельны — переход в задачу; карандаш переименовывает,
                  корзина удаляет. -->
             <div id="sessions" class="user-history" hidden></div>
-            <button type="button" class="session-new" id="session-new" hidden>Новая сессия</button>
+            <button type="button" class="session-new" id="session-new" hidden>Новая задача</button>
         </aside>
 
         <!-- Основное окно чата -->
@@ -1177,6 +1332,41 @@
                         </div>
                     </div>
                 </div>
+            </div>
+
+            <!-- Полоса состояния задачи (Task State Machine): конечный автомат
+                 режима «AI-агент» — planning → execution → validation → done.
+                 Блоки этапов соединены стрелками и занимают всю ширину чата,
+                 текущий этап подсвечен; крайний правый блок — кнопка
+                 «Пауза»/«Продолжить» (стрелки к ней нет). Рисуется из
+                 состояния с сервера (renderTaskMachine). -->
+            <div class="task-machine" id="task-machine" hidden>
+                <div class="tm-row">
+                    <div class="tm-track" id="tm-track"></div>
+                    <div class="tm-actions">
+                        <button type="button" id="tm-edit" title="Задать шаги плана вручную" hidden>✎ План</button>
+                        <button type="button" class="tm-confirm" id="tm-confirm"
+                                title="Подтвердить план и перейти к выполнению" hidden>Подтвердить план</button>
+                        <button type="button" class="tm-cancel" id="tm-cancel"
+                                title="Отменить задачу: прогресс по плану сбросится, сама задача останется"
+                                hidden>Отменить</button>
+                        <button type="button" class="tm-pause" id="tm-pause"
+                                title="Остановить или продолжить задачу">Пауза</button>
+                    </div>
+                </div>
+                <div class="tm-meta">
+                    <span class="tm-step" id="tm-step">задача не создана</span>
+                    <span class="tm-expected" id="tm-expected"></span>
+                    <!-- Доработки по требованию проверки: «доработка 1 из 2». -->
+                    <span class="tm-redo" id="tm-redo" hidden></span>
+                    <!-- Команда «Пауза»/«Отменить» принята во время шага:
+                         применится, как только модель ответит. -->
+                    <span class="tm-pending" id="tm-pending" hidden></span>
+                    <!-- Задача в работе, но шаги не выполняются (авто-прогон
+                         остановлен переключением диалога): кнопка «продолжить». -->
+                    <button type="button" class="tm-idle" id="tm-idle" hidden></button>
+                </div>
+                <div class="tm-plan" id="tm-plan"></div>
             </div>
 
             <div class="modal-overlay" id="group-modal" hidden>
@@ -1234,7 +1424,7 @@
                  «закрыть» — ничего не меняется, «ок» — применяет введённое имя. -->
             <div class="modal-overlay" id="name-modal" hidden>
                 <div class="modal-box">
-                    <h3 id="name-modal-title">Новая задача</h3>
+                    <h3 id="name-modal-title">Новый проект</h3>
                     <input class="roles-field" id="name-modal-input" placeholder="Название" autocomplete="off">
                     <div class="modal-actions">
                         <button type="button" class="clear" id="name-modal-close">закрыть</button>
@@ -1244,6 +1434,19 @@
             </div>
 
             <!-- Модалка подтверждения удаления задачи или диалога. -->
+            <div class="modal-overlay" id="plan-modal" hidden>
+                <div class="modal-box">
+                    <h3>План задачи</h3>
+                    <p class="modal-hint">Каждый шаг — с новой строки. После сохранения задача снова ждёт подтверждения плана.</p>
+                    <textarea class="roles-field plan-field" id="plan-input" rows="6"
+                              placeholder="1. Собрать данные&#10;2. Написать код" autocomplete="off"></textarea>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="plan-modal-close">закрыть</button>
+                        <button type="button" class="accept" id="plan-modal-ok">ок</button>
+                    </div>
+                </div>
+            </div>
+
             <div class="modal-overlay" id="confirm-modal" hidden>
                 <div class="modal-box">
                     <h3 id="confirm-modal-title">Удаление</h3>
@@ -1264,7 +1467,7 @@
             <div class="input-row">
                 <input id="input" type="text" placeholder="Введите сообщение..." autocomplete="off">
                 <button id="send">Отправить</button>
-                <button id="agent-clear" class="clear-btn" type="button" title="Очистить историю диалога AI-агента" hidden>🗑 Очистить историю</button>
+                <button id="agent-clear" class="clear-btn" type="button" title="Очистить историю задачи AI-агента" hidden>🗑 Очистить историю</button>
                 <button id="params-btn" class="gear-btn" type="button" title="Параметры">⚙️</button>
             </div>
         </main>
@@ -1278,10 +1481,10 @@
             </table>
         </aside>
         <!-- Панель режима «AI-агент»: диаграмма расхода токенов по запросам
-             диалога + таблица «текущий запрос / весь диалог». Место и размер
+             задачи + таблица «ответ шага / вся задача». Место и размер
              те же, что у панели статистики в экспертном режиме. -->
         <aside class="stats" id="agent-panel" hidden>
-            <h2 id="agent-panel-title">Токены диалога</h2>
+            <h2 id="agent-panel-title">Токены задачи</h2>
             <!-- Переключатель вида панели: статистика по токенам (по умолчанию)
                  или состояние памяти агента (рабочая + долговременная). -->
             <button type="button" class="agent-view-toggle" id="agent-view-toggle"
@@ -1303,7 +1506,7 @@
                             <th>Сумма токенов</th>
                         </tr>
                     </thead>
-                    <!-- Строка «Текущий запрос» — ТОЛЬКО сам ответ модели, без
+                    <!-- Строка «Ответ шага» — ТОЛЬКО сам ответ модели, без
                          служебных вызовов сжатия памяти (суммаризации). -->
                     <tbody id="agent-stats-body"></tbody>
                     <!-- Общий блок: итог по всей переписке («Весь диалог») и вклад
@@ -1311,7 +1514,7 @@
                          блок (см. .agent-total-block). -->
                     <tbody id="agent-total-body" class="agent-total-block"></tbody>
                 </table>
-                <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса. Строка «Текущий запрос» — только сам ответ модели (без служебных вызовов: сжатия памяти, блока фактов, плана ветвления); «Весь диалог» и «из них служебные вызовы» — общий итог переписки вместе со служебными вызовами и их вклад в него.</div>
+                <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса. Строка «Ответ шага» — только сам ответ модели по текущему шагу; «Вся задача» — итог всей задачи, «из них служебные вызовы» — вклад вспомогательных вызовов: план задачи, проверка результата, сжатие памяти («summary»), блок фактов (sticky facts), план ветвления (branching). Служебный здесь значит ВСПОМОГАТЕЛЬНЫЙ: его результат не является ответом пользователю. Шаги плана выполняет автомат, но вызовы шагов считаются ответами — по ним пользователь и получает работу.</div>
             </div>
             <!-- Вид «Состояние памяти»: рабочая память текущей задачи и
                  долговременная (глобальная) — отдельными разбивками. Оба слоя
@@ -1319,14 +1522,14 @@
                  управления контекстом они не подчиняются. -->
             <div class="agent-view" id="agent-memory-view" hidden>
                 <div class="memory-section">
-                    <h3>Рабочая память <span class="memory-scope">текущая задача: <b id="memory-task-name">—</b></span></h3>
+                    <h3>Рабочая память <span class="memory-scope">текущий проект: <b id="memory-task-name">—</b></span></h3>
                     <div class="memory-list" id="memory-work-list"></div>
                 </div>
                 <div class="memory-section">
                     <h3>Долговременная память <span class="memory-scope">глобальная база знаний</span></h3>
                     <div class="memory-list" id="memory-long-list"></div>
                 </div>
-                <div class="agent-hint">Эти слои памяти не подчиняются стратегиям управления контекстом: их записи уходят в модель в каждом запросе целиком (окно и резюме их не сокращают). Пополняются кнопками «добавить в рабочую память» и «добавить в долговременную память» под сообщениями — и своими, и агента. Краткосрочная память — текущий диалог; её расход виден на вкладке «Токены диалога».</div>
+                <div class="agent-hint">Эти слои памяти не подчиняются стратегиям управления контекстом: их записи уходят в модель в каждом запросе целиком (окно и резюме их не сокращают). Пополняются кнопками «добавить в рабочую память» и «добавить в долговременную память» под сообщениями — и своими, и агента. Краткосрочная память — текущая задача; её расход виден на вкладке «Токены задачи».</div>
             </div>
             <!-- Стратегия работы агента с контекстом диалога: выпадающий список
                  и поля выбранной стратегии. Поля показываются только у той
@@ -1394,7 +1597,7 @@
                     <span>Текущий профиль</span>
                 </div>
                 <select class="profile-select" id="profile-select"
-                        title="Переключение профилей: задачи и диалоги у каждого профиля свои"></select>
+                        title="Переключение профилей: проекты и задачи у каждого профиля свои"></select>
                 <button type="button" class="profile-create" id="profile-create">Создать профиль</button>
                 <button type="button" class="profile-delete" id="profile-delete">Удалить профиль</button>
             </div>
@@ -1608,7 +1811,7 @@
         const agentChart = document.getElementById('agent-chart');
         const agentStatsBody = document.getElementById('agent-stats-body');
         // Второй tbody таблицы — общий блок «Весь диалог» + «из них служебные
-        // вызовы» (строка «Текущий запрос» рисуется в первом).
+        // вызовы» (строка «Ответ шага» рисуется в первом).
         const agentTotalBody = document.getElementById('agent-total-body');
         // Виды панели агента: статистика по токенам (по умолчанию) и состояние
         // памяти (рабочая + долговременная). Переключаются одной кнопкой.
@@ -1659,7 +1862,7 @@
         function setAgentPanelView(view) {
             agentPanelView = (view === 'memory') ? 'memory' : 'tokens';
             const memory = agentPanelView === 'memory';
-            agentPanelTitle.textContent = memory ? 'Состояние памяти' : 'Токены диалога';
+            agentPanelTitle.textContent = memory ? 'Состояние памяти' : 'Токены задачи';
             agentViewToggle.textContent = memory ? 'Показать статистику по токенам'
                 : 'Показать состояние памяти';
             agentTokensView.hidden = memory;
@@ -1845,7 +2048,7 @@
             renderAgentStats();
         }
 
-        // Таблица под диаграммой. Строка «Текущий запрос» показывает ТОЛЬКО сам
+        // Таблица под диаграммой. Строка «Ответ шага» показывает ТОЛЬКО сам
         // ответ модели — служебные вызовы (сжатие памяти, блок фактов, план
         // ветвления) в неё не входят, поэтому их токены и вызовы вычитаются из
         // полного замера. «Весь диалог» (итог по всей переписке вместе со
@@ -1863,9 +2066,13 @@
             let sumRequests = 0;
             let sumInput = 0;
             let sumOutput = 0;
+            // Обращения к модели, а не записи: один HTTP-запрос (шаг плана) может
+            // содержать два вызова — сам ответ и проверку результата.
+            let allRequests = 0;
             agentUsage.forEach(u => {
                 input += Number(u.input) || 0;
                 output += Number(u.output) || 0;
+                allRequests += Number(u.requests) || 0;
                 sumRequests += Number(u.summary_requests) || 0;
                 sumInput += Number(u.summary_input) || 0;
                 sumOutput += Number(u.summary_output) || 0;
@@ -1886,17 +2093,31 @@
             };
             draw(agentStatsBody, [
                 {
-                    label: 'Текущий запрос',
+                    label: 'Ответ шага',
                     requests: last ? Math.max(0, (Number(last.requests) || 1) - lastSumReq) : 0,
                     input: last ? Math.max(0, (Number(last.input) || 0) - lastSumIn) : 0,
                     output: last ? Math.max(0, (Number(last.output) || 0) - lastSumOut) : 0,
-                    title: 'Только сам ответ модели: служебные вызовы (сжатие памяти, блок фактов, план ветвления) не учитываются'
+                    title: 'Только сам ответ модели по текущему шагу: служебные вызовы (план задачи, проверка результата, сжатие памяти, блок фактов, план ветвления) не учитываются'
                 }
             ]);
             draw(agentTotalBody, [
-                { label: 'Весь диалог', requests: agentUsage.length, input: input, output: output },
+                {
+                    label: 'Вся задача',
+                    // Столбец называется «Количество запросов» — это обращения к
+                    // модели: план, ответы по шагам, проверка (шаг = отдельное
+                    // обращение, поэтому у задачи из трёх шагов их четыре).
+                    requests: allRequests,
+                    title: 'Обращения к модели за всю задачу: план, ответ по каждому '
+                        + 'шагу, проверка результата. Один шаг плана = один запрос '
+                        + '(автомат выполняет шаги сам)',
+                    input: input,
+                    output: output
+                },
                 {
                     label: 'из них служебные вызовы',
+                    title: 'Вспомогательные вызовы, результат которых не является '
+                        + 'ответом пользователю: план задачи, проверка результата, '
+                        + 'сжатие памяти, блок фактов, план ветвления',
                     requests: sumRequests,
                     input: sumInput,
                     output: sumOutput,
@@ -2033,7 +2254,43 @@
         // Идёт запрос к агенту: пока он отвечает, задачу и диалог менять нельзя —
         // сервер обрабатывает запрос под блокировкой, и ответ лёг бы не в тот
         // диалог. Кнопки на это время блокируются.
-        let requestBusy = false;
+        // Задачи, для которых идёт «видимый» запрос (сообщение пользователя или
+        // шаг их прогона). Множество, а не флаг: задачи работают параллельно, и
+        // запрос одной не должен блокировать другую.
+        const foregroundRequests = new Set();
+        // Авто-прогон шагов плана (см. runStepChain в секции автомата задачи):
+        // chains — прогоны шагов по задачам, noChainFor — задачи, где прогон
+        // или выключил режим агента.
+        // Прогоны шагов — ПО ЗАДАЧАМ: у каждой задачи своя цепочка, они не ждут
+        // друг друга (сервер тоже держит блокировку на задачу, а не на процесс).
+        // Ключ — id задачи, значение — {stop} для запроса остановки.
+        const chains = new Map();
+        // Задачи, для которых прогон останавливали: пока пользователь явно не
+        // нажмёт «Продолжить», шаги автоматически не возобновляем.
+        const noChainFor = new Set();
+        // Сколько запросов выполняется для НЕ открытых задач: поле ввода
+        // открытой задачи при этом остаётся свободным.
+        let bgRequests = 0;
+        // Запрос идёт ИМЕННО у открытой задачи.
+        function requestBusyHere() {
+            return foregroundRequests.has(workspace.active_session);
+        }
+        // Идёт переключение задачи/диалога (мгновенное, но асинхронное).
+        let switching = false;
+        // Локально отправленная команда остановки ('pause'|'cancel'): нужна, чтобы
+        // понять, применилась ли она. Состояние с сервера пометку `pending` может
+        // затереть (финальное событие шага приходит уже без неё), поэтому факт
+        // «команда отправлена, но не подтверждена» храним отдельно и доводим до
+        // конца в reconcilePendingStop().
+        // {session, action} — команда остановки и ЗАДАЧА, к которой она относится:
+        // без привязки команда, отправленная в одной задаче, досылалась в другую
+        // (открытую в момент сверки) и ставила её на паузу «сама».
+        let stopRequest = null;
+        // «Поколение вида»: увеличивается при каждом переключении задачи/диалога.
+        // Поток ответа запоминает своё поколение и, если вид успел смениться,
+        // НЕ рисует свои события — иначе ответ и debug чужой задачи попадали бы
+        // в открытый диалог (и полоса показывала бы чужое состояние).
+        let viewEpoch = 0;
 
         function agentModeOn() {            return agentToggle.classList.contains('active');
         }
@@ -2075,8 +2332,12 @@
         // Показывает/прячет блоки панели и рисует задачи и диалоги.
         function renderWorkspace() {
             const agentOn = agentModeOn();
-            // Заголовок панели: в режиме агента — Workspace.
-            sidebarTitle.textContent = agentOn ? 'Workspace' : '🕘 История введённых данных';
+            // Заголовок панели: в режиме агента — Workspace; если что-то
+            // выполняется прямо сейчас, показываем сколько задач в работе.
+            const runningNow = agentOn ? chains.size : 0;
+            sidebarTitle.textContent = agentOn
+                ? (runningNow ? `Workspace · ⏳ ${runningNow} в работе` : 'Workspace')
+                : '🕘 История введённых данных';
             taskBlock.hidden = !agentOn;
             sessionNewBtn.hidden = !agentOn;
             historyEl.hidden = agentOn;
@@ -2100,9 +2361,9 @@
                 // История диалогов текущей задачи.
                 sessionsEl.innerHTML = '';
                 if (!workspace.active_task) {
-                    sessionsEl.innerHTML = '<div class="history-empty">Создайте задачу — кнопка «Новая задача»</div>';
+                    sessionsEl.innerHTML = '<div class="history-empty">Создайте проект — кнопка «Новый проект»</div>';
                 } else if (!workspace.sessions.length) {
-                    sessionsEl.innerHTML = '<div class="history-empty">Диалогов пока нет</div>';
+                    sessionsEl.innerHTML = '<div class="history-empty">Задач пока нет</div>';
                 }
                 workspace.sessions.forEach(session => {
                     sessionsEl.appendChild(sessionItem(session));
@@ -2116,27 +2377,105 @@
                 profiles = workspace.profile;
                 renderProfiles();
             }
+            // Полоса состояния зависит от наличия задачи (без неё диалог не
+            // начать) — перерисовываем её вместе с панелью.
+            renderTaskMachine();
             updateComposerState();
         }
 
         // Доступность поля ввода и кнопок: диалог в режиме агента возможен
         // только когда задача создана.
+        // Индикатор «AI-агент думает» относится к КОНКРЕТНОЙ задаче: если
+        // пользователь переключился, в открытой задаче он не показывается.
+        function updateTyping() {
+            // Пока идёт переключение, окно уже относится к новой задаче — старый
+            // индикатор в нём тоже не показываем.
+            const here = !switching && requestBusyHere();
+            typingEl.textContent = here ? 'AI-агент думает...' : '';
+        }
+
         function updateComposerState() {
             const agentOn = agentModeOn();
             const needTask = agentOn && !workspace.active_task;
-            input.disabled = needTask;
-            input.placeholder = needTask
-                ? 'Сначала создайте задачу — кнопка «Новая задача»'
-                : 'Введите сообщение...';
-            sendBtn.disabled = needTask || requestBusy;
-            agentClearBtn.disabled = requestBusy;
+            // Задача на паузе («Пауза» в полосе состояния): шаг не выполняется,
+            // пока не нажата «Продолжить» — поле ввода тоже блокируем.
+            const paused = agentOn && !!(taskMachineState && taskMachineState.paused);
+            // Авто-прогон шагов плана: автомат работает сам, поле ввода занято —
+            // сообщение пользователю понадобится, только когда автомат
+            // остановится (пауза, ожидание плана, ошибка).
+            // Занятость: запрос ОТКРЫТОЙ задачи + фоновая работа другой задачи.
+            const busy = foregroundRequests.size > 0 || bgRequests > 0 || chains.size > 0;
+            // Прогон идёт ИМЕННО у открытой задачи: только тогда поле ввода занято.
+            const chainHere = chains.has(workspace.active_session);
+            // Запрос идёт ИМЕННО у открытой задачи (см. requestBusyHere): иначе
+            // шаг прогона, запущенный пока задача была открыта, гасил кнопки и
+            // поле ввода в ДРУГОЙ задаче — на это и была жалоба.
+            const requestHere = requestBusyHere();
+            const openBusy = requestHere || switching || chainHere;
+            input.disabled = needTask || paused || chainHere || switching || requestHere;
+            // Задача завершена или отменена: следующее сообщение начнёт новую —
+            // подсказываем это в поле ввода.
+            const closed = agentOn && taskMachineState && taskMachineState.terminal;
+            input.placeholder = switching
+                ? 'Переключаю диалог…'
+                : needTask
+                ? 'Сначала создайте проект — кнопка «Новый проект»'
+                : (paused
+                    ? 'Задача на паузе — нажмите «Продолжить»'
+                    : (chainHere
+                        ? 'Автомат выполняет шаги плана… «Пауза» остановит его'
+                        : (closed
+                            ? (taskMachineState.stage === 'cancelled'
+                                ? 'Задача отменена — новое сообщение начнёт новую задачу'
+                                : 'Задача завершена — новое сообщение начнёт новую задачу')
+                            : (agentOn && taskMachineState
+                                && taskMachineState.stage === 'validation' && !chainHere
+                                ? 'Проверка результата не выполнена — нажмите '
+                                  + '«▶ выполнить проверку» в полосе состояния'
+                                : (agentOn && taskMachineState
+                                    && taskMachineState.stage === 'execution' && !chainHere
+                                    ? `Задача в работе: шаг ${taskMachineState.step_number} из `
+                                      + `${taskMachineState.steps_total} — отправьте сообщение, `
+                                      + 'чтобы выполнить его'
+                                    : 'Введите сообщение...')))));
+            // «Отправить» зависит от занятости ОТКРЫТОЙ задачи (openBusy), а не
+            // от того, что где-то в фоне считаются другие задачи.
+            sendBtn.disabled = needTask || paused || openBusy;
+            // «Очистить историю» относится к открытой задаче: чужие прогоны её
+            // не блокируют (свою очередь «Очистить» ждёт — она стирает диалог).
+            agentClearBtn.disabled = openBusy;
             if (agentOn) {
-                taskSelect.disabled = requestBusy || !workspace.tasks.length;
-                taskRenameBtn.disabled = requestBusy || !workspace.active_task;
-                taskDeleteBtn.disabled = requestBusy || !workspace.active_task;
-                sessionNewBtn.disabled = requestBusy || !workspace.active_task;
+                // Переключение задач/диалогов НЕ блокируем во время ответа: выбор
+                // мгновенный (см. selectSession/selectTask). Блокируем только
+                // разрушительные операции, которым нужна согласованность.
+                taskSelect.disabled = !workspace.tasks.length;
+                // Переименование — безопасная правка (сервер отвечает сразу).
+                taskRenameBtn.disabled = switching || !workspace.active_task;
+                // Удаление задачи блокируем только на время работы С НЕЙ же:
+                // чужие прогоны в других задачах не помеха.
+                taskDeleteBtn.disabled = openBusy || !workspace.active_task;
+                // «Новая задача» НЕ блокируем на время работы автомата: создание
+                // безопасно, отвечает сразу (создание на сервере не ждёт шага), а
+                // шаг продолжает писаться в СВОЮ задачу. Раньше кнопка гасла,
+                // пока дорабатывал шаг после «Паузы».
+                sessionNewBtn.disabled = switching || !workspace.active_task;
             }
-            sessionsEl.classList.toggle('busy', requestBusy);
+            sessionsEl.classList.toggle('busy', busy || switching);
+            // Кнопки полосы состояния. «Пауза» остаётся доступной и во время
+            // авто-прогона: её нажатие останавливает цепочку шагов (текущий шаг
+            // дорабатывает, следующие не начинаются). Правка плана и
+            // подтверждение — только когда автомат ждёт пользователя.
+            tmPauseBtn.disabled = !taskMachineState || !!taskMachineState.terminal || needTask;
+            // «Отменить» доступна и во время авто-прогона: клик останавливает
+            // цепочку шагов и отменяет задачу (после текущего шага).
+            tmCancelBtn.disabled = !taskMachineState || !!taskMachineState.terminal || needTask;
+            // Занятость ОТКРЫТОЙ задачи: её запрос или её же прогон. Прогоны
+            // ДРУГИХ задач не должны блокировать работу с этой (сервер ведёт
+            // задачи параллельно, и запускать их можно сколько угодно).
+            tmIdle.disabled = openBusy || needTask;
+            tmConfirmBtn.disabled = openBusy;
+            tmEditBtn.disabled = openBusy;
+            updateTyping();
         }
 
         function iconButton(label, title, handler) {
@@ -2156,18 +2495,21 @@
         // пользователя или своё, после переименования) + карандаш и корзина.
         function sessionItem(session) {
             const item = document.createElement('div');
-            const title = session.title || 'Новый диалог';
+            const title = session.title || 'Новая задача';
             item.className = 'history-item session-item'
                 + (session.id === workspace.active_session ? ' active' : '');
             const label = document.createElement('span');
             label.className = 'session-title';
-            label.textContent = title;
-            label.title = title;
+            // Задача, у которой прямо сейчас идут шаги, помечена — иначе не видно,
+            // что работа идёт (в том числе когда открыта другая задача).
+            const running = chains.has(session.id);
+            label.textContent = (running ? '⏳ ' : '') + title;
+            label.title = running ? title + ' — выполняются шаги' : title;
             item.appendChild(label);
             const actions = document.createElement('span');
             actions.className = 'session-actions';
-            actions.appendChild(iconButton('✏️', 'Переименовать диалог', () => renameSession(session)));
-            actions.appendChild(iconButton('🗑', 'Удалить диалог', () => deleteSession(session)));
+            actions.appendChild(iconButton('✏️', 'Переименовать задачу', () => renameSession(session)));
+            actions.appendChild(iconButton('🗑', 'Удалить задачу', () => deleteSession(session)));
             item.appendChild(actions);
             item.addEventListener('click', () => selectSession(session.id));
             return item;
@@ -2175,46 +2517,117 @@
 
         // Переключение диалога: сервер делает сессию текущей, после чего окно
         // чата перерисовывается диалогом этой сессии.
+        // Переключение диалога РАЗРЕШЕНО и во время ответа агента: выбор и чтение
+        // диалога на сервере не ждут блокировки, поэтому переход мгновенный, а
+        // ответ дописывается в СВОЙ диалог (сервер запоминает сессию при старте
+        // шага). Авто-прогон шагов при переключении останавливается — иначе он
+        // пошёл бы по шагам уже другого диалога.
         async function selectSession(sessionId) {
-            if (requestBusy || !sessionId || sessionId === workspace.active_session) return;
-            const data = await workspaceRequest(
-                '/api/agent/sessions/' + encodeURIComponent(sessionId) + '/select', jsonOptions('POST'));
-            if (!data) return;
-            workspace = data;
-            renderWorkspace();
-            await loadActiveDialog();
+            if (!sessionId || sessionId === workspace.active_session) return;
+            // Цепочку НЕ останавливаем: задача продолжает работать фоном (её
+            // запросы несут свой session_id), а открытая задача свободна.
+            setSwitching(true);
+            try {
+                const data = await workspaceRequest(
+                    '/api/agent/sessions/' + encodeURIComponent(sessionId) + '/select', jsonOptions('POST'));
+                if (!data) return;
+                workspace = data;
+                renderWorkspace();
+                await loadActiveDialog();
+            } finally {
+                setSwitching(false);
+            }
+        }
+
+        // Пустое окно чата с подсказкой: используется при смене задачи, пока
+        // грузится её диалог (иначе видно текст прежней задачи).
+        function clearAgentView(hint) {
+            messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
+            agentRootMessages = [];
+            agentUsage = [];
+            renderAgentPanel();
+            tmPending.hidden = true;
+            const placeholder = document.createElement('div');
+            placeholder.className = 'msg debug';
+            placeholder.setAttribute('data-agent', '1');
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.textContent = hint || 'Загружаю задачу…';
+            placeholder.appendChild(bubble);
+            messagesEl.appendChild(placeholder);
+            greetingMsg.hidden = true;
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        // Смена вида: старые потоки перестают рисовать (см. viewEpoch). Вызывается
+        // при любом изменении состава/выбора задач и проектов.
+        function bumpView() {
+            viewEpoch += 1;
+            renderTaskMachine();
+        }
+
+        function setSwitching(on) {
+            switching = !!on;
+            bumpView();
+            // Сразу убираем из окна диалог ПРЕЖНЕЙ задачи: пока грузится новый,
+            // содержимое закрытого диалога мелькать не должно. Заодно чистим поле
+            // ввода — набранный, но не отправленный текст относится к прежней
+            // задаче и в новую переезжать не должен.
+            if (on) {
+                clearAgentView('Загружаю задачу…');
+                input.value = '';
+            }
+            sessionsEl.classList.toggle('busy', switching
+                || foregroundRequests.size > 0 || bgRequests > 0 || chains.size > 0);
+            updateComposerState();
         }
 
         // Переключение задачи: у каждой задачи своя история диалогов, поэтому
         // после переключения подтягиваем диалог её текущей сессии.
         async function selectTask(taskId) {
-            if (requestBusy || !taskId || taskId === workspace.active_task) return;
-            const data = await workspaceRequest(
-                '/api/agent/tasks/' + encodeURIComponent(taskId) + '/select', jsonOptions('POST'));
-            if (!data) return;
-            workspace = data;
-            renderWorkspace();
-            await loadActiveDialog();
+            if (!taskId || taskId === workspace.active_task) return;
+            setSwitching(true);
+            try {
+                const data = await workspaceRequest(
+                    '/api/agent/tasks/' + encodeURIComponent(taskId) + '/select', jsonOptions('POST'));
+                if (!data) return;
+                workspace = data;
+                renderWorkspace();
+                await loadActiveDialog();
+            } finally {
+                setSwitching(false);
+            }
         }
 
         // Новый диалог в текущей задаче (кнопка «Новая сессия»): сессия пустая,
         // название подтянется по первому запросу.
         async function createSession() {
-            if (requestBusy || !workspace.active_task) return;
-            const data = await workspaceRequest('/api/agent/sessions', jsonOptions('POST'));
-            if (!data) return;
-            workspace = data;
-            renderWorkspace();
-            await loadActiveDialog();
+            if (switching || !workspace.active_task) return;
+            setSwitching(true);
+            try {
+                const data = await workspaceRequest('/api/agent/sessions', jsonOptions('POST'));
+                if (!data) return;
+                workspace = data;
+                renderWorkspace();
+                await loadActiveDialog();
+            } finally {
+                setSwitching(false);
+            }
             input.focus();
         }
 
         async function createTask(name) {
-            const data = await workspaceRequest('/api/agent/tasks', jsonOptions('POST', { name: name }));
-            if (!data) return;
-            workspace = data;
-            renderWorkspace();
-            await loadActiveDialog();
+            setSwitching(true);
+            try {
+                const data = await workspaceRequest(
+                    '/api/agent/tasks', jsonOptions('POST', { name: name }));
+                if (!data) return;
+                workspace = data;
+                renderWorkspace();
+                await loadActiveDialog();
+            } finally {
+                setSwitching(false);
+            }
             input.focus();
         }
 
@@ -2224,8 +2637,8 @@
 
         function renameTask() {
             const task = currentTask();
-            if (!task || requestBusy) return;
-            openNameModal('Переименовать задачу', task.name, async (name) => {
+            if (!task || requestBusyHere() || switching) return;
+            openNameModal('Переименовать проект', task.name, async (name) => {
                 const data = await workspaceRequest(
                     '/api/agent/tasks/' + encodeURIComponent(task.id), jsonOptions('PUT', { name: name }));
                 if (!data) return;
@@ -2236,10 +2649,10 @@
 
         function deleteTask() {
             const task = currentTask();
-            if (!task || requestBusy) return;
+            if (!task || requestBusyHere() || switching) return;
             openConfirmModal(
-                'Удалить задачу?',
-                'Задача «' + task.name + '» будет удалена вместе со всеми её диалогами.',
+                'Удалить проект?',
+                'Проект «' + task.name + '» будет удалён вместе со всеми его задачами.',
                 async () => {
                     const data = await workspaceRequest(
                         '/api/agent/tasks/' + encodeURIComponent(task.id), { method: 'DELETE' });
@@ -2251,9 +2664,9 @@
         }
 
         function renameSession(session) {
-            if (requestBusy) return;
-            const title = session.title || 'Новый диалог';
-            openNameModal('Переименовать диалог', title === 'Новый диалог' ? '' : title, async (name) => {
+            if (requestBusyHere() || switching) return;
+            const title = session.title || 'Новая задача';
+            openNameModal('Переименовать задачу', title === 'Новая задача' ? '' : title, async (name) => {
                 const data = await workspaceRequest(
                     '/api/agent/sessions/' + encodeURIComponent(session.id), jsonOptions('PUT', { name: name }));
                 if (!data) return;
@@ -2263,10 +2676,10 @@
         }
 
         function deleteSession(session) {
-            if (requestBusy) return;
+            if (requestBusyHere() || switching) return;
             openConfirmModal(
-                'Удалить диалог?',
-                'Диалог «' + (session.title || 'Новый диалог') + '» будет удалён вместе с его историей и расходом токенов.',
+                'Удалить задачу?',
+                'Задача «' + (session.title || 'Новая задача') + '» будет удалена вместе с её историей и расходом токенов.',
                 async () => {
                     const data = await workspaceRequest(
                         '/api/agent/sessions/' + encodeURIComponent(session.id), { method: 'DELETE' });
@@ -2606,13 +3019,495 @@
         });
 
         taskNewBtn.addEventListener('click', () => {
-            if (requestBusy) return;
-            openNameModal('Новая задача', '', createTask);
+            if (switching) return;
+            openNameModal('Новый проект', '', createTask);
         });
         taskRenameBtn.addEventListener('click', renameTask);
         taskDeleteBtn.addEventListener('click', deleteTask);
         sessionNewBtn.addEventListener('click', createSession);
         taskSelect.addEventListener('change', () => selectTask(taskSelect.value));
+
+        // ---------- Полоса состояния задачи (Task State Machine) ----------
+        // Конечный автомат задачи ведёт СЕРВЕР (этап → текущий шаг → ожидаемое
+        // действие, см. app/ai/task_state.py): фронт только показывает состояние
+        // (блоки этапов со стрелками над окном чата) и меняет его кнопками
+        // «Пауза»/«Продолжить», «Подтвердить план» и правкой плана. Состояние
+        // приходит снимком в GET /api/agent/state и в GET /api/agent/history, а
+        // в потоке ответа — событиями {"type": "state"}.
+        const taskMachine = document.getElementById('task-machine');
+        const tmTrack = document.getElementById('tm-track');
+        const tmStep = document.getElementById('tm-step');
+        const tmExpected = document.getElementById('tm-expected');
+        const tmPlan = document.getElementById('tm-plan');
+        const tmPauseBtn = document.getElementById('tm-pause');
+        const tmConfirmBtn = document.getElementById('tm-confirm');
+        const tmEditBtn = document.getElementById('tm-edit');
+        const tmCancelBtn = document.getElementById('tm-cancel');
+        const tmRedo = document.getElementById('tm-redo');
+        const tmPending = document.getElementById('tm-pending');
+        const tmIdle = document.getElementById('tm-idle');
+        // Базовые этапы автомата (в порядке перехода) и подписи в полосе.
+        const TM_BASE = [
+            { id: 'planning', label: 'Планирование' },
+            { id: 'execution', label: 'Выполнение' },
+            { id: 'validation', label: 'Проверка' },
+            { id: 'done', label: 'Готово' }
+        ];
+        // Текущее состояние автомата (снимок с сервера); null — ещё не получено.
+        let taskMachineState = null;
+
+        function tmBlock(label, className, title) {
+            const block = document.createElement('div');
+            block.className = 'tm-block' + (className ? ' ' + className : '');
+            block.textContent = label;
+            if (title) block.title = title;
+            return block;
+        }
+
+        function tmArrow() {
+            const arrow = document.createElement('span');
+            arrow.className = 'tm-arrow';
+            arrow.textContent = '→';   // стрелка между блоками этапов
+            return arrow;
+        }
+
+        function tmChip(text, className, title) {
+            const chip = document.createElement('span');
+            chip.className = 'tm-chip' + (className ? ' ' + className : '');
+            chip.textContent = text;
+            if (title) chip.title = title;
+            return chip;
+        }
+
+        // Рисует полосу: этапы со стрелками, текущий шаг, план и кнопки.
+        function renderTaskMachine() {
+            const state = taskMachineState;
+            const hasTask = !!workspace.active_task;
+            // Подсвечиваем место в БАЗОВОЙ цепочке (base_stage с сервера): у
+            // расширений (awaiting_user/failed) оно своё, а сам расширенный этап
+            // рисуется отдельным блоком перед кнопкой.
+            const stage = (state && state.base_stage) || 'planning';
+            const stageIndex = TM_BASE.findIndex(stageItem => stageItem.id === stage);
+
+            tmTrack.innerHTML = '';
+            TM_BASE.forEach((stageItem, index) => {
+                if (index) tmTrack.appendChild(tmArrow());
+                let className = '';
+                if (stageItem.id === stage) {
+                    className = 'active';
+                } else if (stageIndex >= 0 && index < stageIndex) {
+                    className = 'visited';   // этап уже пройден
+                }
+                tmTrack.appendChild(tmBlock(stageItem.label, className, stageItem.id));
+            });
+            // Расширенные этапы (awaiting_user / failed / cancelled) — отдельным
+            // блоком ПЕРЕД кнопкой: стрелка ведёт к нему от базовой цепочки.
+            if (state && state.extra_stage) {
+                tmTrack.appendChild(tmArrow());
+                tmTrack.appendChild(tmBlock(state.extra_stage.label, 'extra', state.extra_stage.id));
+            }
+
+            if (!hasTask) {
+                tmStep.textContent = 'проект не создан';
+                tmExpected.textContent = 'создайте проект кнопкой «Новый проект» в панели слева';
+            } else if (!state) {
+                tmStep.textContent = 'состояние загружается…';
+                tmExpected.textContent = '';
+            } else if (state.terminal) {
+                // Терминальные этапы: шаг и ожидание очищены (done/cancelled).
+                tmStep.textContent = state.stage === 'cancelled'
+                    ? 'задача отменена'
+                    : 'задача завершена';
+                tmExpected.textContent = '';
+            } else {
+                const parts = [];
+                if (state.steps_total) {
+                    parts.push(`${state.current_step || 'шаг'} (шаг ${state.step_number} из ${state.steps_total})`);
+                } else if (state.current_step) {
+                    parts.push(state.current_step);
+                }
+                tmStep.textContent = parts.join(' · ') || 'шаг не выбран';
+                tmExpected.textContent = state.expected_action
+                    ? 'ожидается: ' + state.expected_action
+                    : '';
+            }
+
+            // Шаги плана — чипами: текущий подсвечен, пройденные приглушены.
+            tmPlan.innerHTML = '';
+            const steps = (state && state.steps) || [];
+            if (hasTask && !steps.length) {
+                tmPlan.appendChild(tmChip('план появится после первого запроса', 'extra'));
+            }
+            steps.forEach(step => {
+                const className = step.active ? 'active' : (step.done ? 'done' : '');
+                tmPlan.appendChild(tmChip(`${step.number}) ${step.text}`, className, step.text));
+            });
+
+            // Кнопки: «Править план» и «Подтвердить план» — только на этапе
+            // планирования; «Отменить» — пока задача не завершена; крайняя
+            // правая кнопка — «Пауза»/«Продолжить» (стрелки к ней нет).
+            const canConfirm = !!(hasTask && state && state.can_confirm);
+            tmConfirmBtn.hidden = !canConfirm;
+            tmEditBtn.hidden = !canConfirm;
+            tmCancelBtn.hidden = !(hasTask && state && state.can_cancel);
+
+            // Доработки по требованию проверки: «доработка 1 из 2» (видно, что
+            // автомат уже возвращался на шаг из-за проверки результата).
+            const redos = (state && Number(state.redo_count)) || 0;
+            if (redos > 0 && !state.terminal) {
+                tmRedo.hidden = false;
+                tmRedo.textContent = `доработка ${redos} из ${state.max_redo || 2}`;
+                tmRedo.title = state.can_redo
+                    ? 'Проверка вернула задачу на доработку; после исчерпания лимита задача уйдёт в «ошибку»'
+                    : 'Лимит доработок исчерпан: следующая неудачная проверка переведёт задачу в «ошибку»';
+            } else {
+                tmRedo.hidden = true;
+                tmRedo.textContent = '';
+            }
+
+            // Команда «Пауза»/«Отменить» принята, но применится после текущего
+            // шага (сервер отвечает мгновенно, а шаг дорабатывает): показываем
+            // это явно, чтобы нажатие не выглядело «зависшим».
+            const pending = state && state.pending;
+            if (pending) {
+                tmPending.hidden = false;
+                tmPending.textContent = pending === 'cancel'
+                    ? '⏳ отменю после текущего шага'
+                    : '⏳ остановлю после текущего шага';
+                tmPending.title = 'Команда принята: модель ещё дописывает ответ текущего шага';
+            } else {
+                tmPending.hidden = true;
+                tmPending.textContent = '';
+            }
+
+            // Задача в работе (этап execution), но шаги никто не выполняет:
+            // авто-прогон останавливается, если пользователь переключил диалог
+            // или нажал «Пауза». Раньше это выглядело как «задача просто
+            // встала» — теперь видно и запускается одним кликом.
+            const chainHereNow = chains.has(workspace.active_session);
+            // Не выполненная работа: следующий шаг (execution) или отложенная
+            // проверка результата (validation).
+            const checkPending = !!state && state.stage === 'validation';
+            const idle = hasTask && state && !state.paused && !state.pending && !chainHereNow
+                && (checkPending || (state.stage === 'execution' && state.step_number > 0));
+            if (idle) {
+                tmIdle.hidden = false;
+                tmIdle.textContent = checkPending
+                    ? '▶ выполнить проверку'
+                    : `▶ продолжить: шаг ${state.step_number} из ${state.steps_total}`;
+                tmIdle.title = checkPending
+                    ? 'Проверка результата отложена («Пауза» на последнем шаге) — нажмите, чтобы выполнить'
+                    : 'Прогон шагов этой задачи не идёт — нажмите, чтобы выполнить шаг';
+            } else {
+                tmIdle.hidden = true;
+                tmIdle.textContent = '';
+            }
+            if (state && state.paused) {
+                tmPauseBtn.textContent = 'Продолжить';
+                tmPauseBtn.classList.add('paused');
+            } else {
+                tmPauseBtn.textContent = 'Пауза';
+                tmPauseBtn.classList.remove('paused');
+            }
+            tmPauseBtn.title = (state && state.terminal)
+                ? 'Задача завершена — пауза не нужна'
+                : (state && state.paused
+                    ? 'Продолжить работу с текущего шага'
+                    : 'Остановить автомат на текущем шаге');
+        }
+
+        // Новое состояние с сервера: полоса и доступность поля ввода.
+        function applyTaskState(state) {
+            if (!state) return;
+            // Команда «Пауза» принята, но ещё не применена (pending): держим
+            // оптимистичное «на паузе», чтобы кнопка («Продолжить») и чип
+            // («остановлю после текущего шага») не противоречили друг другу.
+            if (state.pending === 'pause' && stopRequest
+                    && stopRequest.action === 'pause') {
+                state.paused = true;
+            }
+            taskMachineState = state;
+            // Команда остановки ПОДТВЕРЖДЕНА, только если в снимке нет пометки
+            // pending: с pending сервер лишь принял команду (применит после шага),
+            // а состояние с ней — оптимистичное, ещё не факт.
+            if (!state.pending
+                    && (state.paused || state.stage === 'cancelled' || state.terminal)) {
+                stopRequest = null;
+            }
+            renderTaskMachine();
+            updateComposerState();
+        }
+
+        // Снимок состояния применяем ТОЛЬКО если открыта та же задача и вид не
+        // сменился: ответ маршрута может прийти уже после переключения, и тогда
+        // чужая задача выглядела бы «поставленной на паузу» или «выполненной».
+        function sameView(epoch, sessionId) {
+            return epoch === viewEpoch
+                && (sessionId === undefined || sessionId === workspace.active_session);
+        }
+
+        async function loadTaskState() {
+            const epoch = viewEpoch;
+            const sessionId = workspace.active_session;
+            try {
+                const res = await fetch('/api/agent/state');
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && data.state && sameView(epoch, sessionId)) {
+                        applyTaskState(data.state);
+                    }
+                }
+            } catch (e) {
+                // Состояние недоступно — полоса остаётся в прежнем виде.
+            }
+        }
+
+        // Действие над автоматом (пауза/продолжить/подтверждение/правка плана):
+        // сервер возвращает новый снимок состояния, им и перерисовываем полосу.
+        async function taskStateAction(url, options) {
+            const epoch = viewEpoch;
+            const sessionId = workspace.active_session;
+            const data = await workspaceRequest(url, options || jsonOptions('POST'));
+            if (!data || !data.state) return null;
+            if (!sameView(epoch, sessionId)) {
+                // Пока команда шла, пользователь переключил задачу: её снимок к
+                // открытой задаче не применяем (состояние открытой подтянет
+                // loadActiveDialog/reconcilePendingStop).
+                return null;
+            }
+            // Ответ сервера про КОНКРЕТНУЮ задачу: запоминаем, к какой — по этому
+            // id потом сверяется неотработанная команда остановки.
+            if (data.session && data.session.id) {
+                taskMachineState.session_id = data.session.id;
+            }
+            applyTaskState(data.state);
+            return data.state;
+        }
+
+        // Оптимистичная реакция на команду: интерфейс меняется СРАЗУ (кнопка,
+        // чип «остановлю после текущего шага»), а не после ответа сервера —
+        // иначе нажатие выглядело зависшим, пока модель дописывает шаг.
+        function markPending(action) {
+            stopRequest = action ? { session: workspace.active_session, action: action } : null;
+            if (!taskMachineState) return;
+            taskMachineState.pending = action;
+            if (action === 'pause') {
+                taskMachineState.paused = true;
+            }
+            renderTaskMachine();
+            updateComposerState();
+        }
+
+        tmPauseBtn.addEventListener('click', async () => {
+            const paused = !!(taskMachineState && taskMachineState.paused);
+            if (!paused) {
+                // «Пауза» останавливает авто-прогон ШАГОВ ЭТОЙ задачи: текущий шаг
+                // дорабатывает, следующие не начинаются. Фоновая задача другой
+                // задачи продолжает работать (см. stopChainFor).
+                stopChainFor(workspace.active_session);
+                markPending('pause');
+            } else {
+                noChainFor.delete(workspace.active_session);
+                stopRequest = null;
+                markPending('');
+                taskMachineState.paused = false;
+            }
+            await taskStateAction(paused ? '/api/agent/state/resume' : '/api/agent/state/pause');
+            if (paused) {
+                // «Продолжить»: если задача была в работе — продолжаем шаги.
+                runStepChain();
+            }
+        });
+
+        tmConfirmBtn.addEventListener('click', async () => {
+            if (chains.has(workspace.active_session)) return;
+            const state = await taskStateAction('/api/agent/state/confirm');
+            if (!state) return;
+            addMessage('bot', `✅ План подтверждён — выполняю шаги (${state.steps_total}). `
+                + 'Остановить автомат можно кнопкой «Пауза»: текущий шаг доработает, '
+                + 'следующие не начнутся.', true);
+            // Шаги выполняются ПОДРЯД, без «придумайте сообщение» от пользователя.
+            runStepChain();
+        });
+
+        // Правка плана (модалка «План задачи»): шаги — по строке на шаг.
+        const planModal = document.getElementById('plan-modal');
+        const planInput = document.getElementById('plan-input');
+
+        function openPlanModal() {
+            const state = taskMachineState;
+            if (!state) return;
+            planInput.value = (state.steps || []).map(step => step.text).join('\n');
+            planModal.hidden = false;
+            planInput.focus();
+        }
+
+        function closePlanModal() {
+            planModal.hidden = true;
+        }
+
+        async function submitPlanModal() {
+            const steps = planInput.value.split('\n').map(line => line.trim()).filter(Boolean);
+            if (!steps.length) {
+                planInput.focus();   // пустой план не сохраняем
+                return;
+            }
+            closePlanModal();
+            const state = await taskStateAction('/api/agent/state/plan', jsonOptions('PUT', { steps }));
+            if (state) {
+                addMessage('bot', '✎ План обновлён — подтвердите его кнопкой «Подтвердить план» '
+                    + 'или словом «ок».', true);
+            }
+        }
+
+        tmCancelBtn.addEventListener('click', () => {
+            const state = taskMachineState;
+            if (!state || state.terminal) return;
+            // Отмена необратима для прогресса по плану — спрашиваем подтверждение
+            // (та же модалка, что при удалении задач/диалогов).
+            openConfirmModal(
+                'Отмена задачи',
+                'Задача будет отменена: план, текущий шаг и доработки сбросятся, '
+                + 'диалог и память останутся. Следующее сообщение начнёт новую задачу.',
+                requestTaskCancel
+            );
+        });
+
+        async function requestTaskCancel() {
+            // Отмена останавливает и авто-прогон шагов; интерфейс реагирует сразу
+            // (чип «отменю после текущего шага»), а отмена применяется, как
+            // только модель допишет текущий шаг.
+            stopChainFor(workspace.active_session);
+            const wasBusy = requestBusyHere() || chains.size > 0;
+            if (wasBusy) markPending('cancel');
+            const state = await taskStateAction('/api/agent/state/cancel');
+            if (state) {
+                addMessage('bot', '⛔ Задача отменена. Следующее сообщение начнёт новую задачу.', true);
+            }
+        }
+
+        tmIdle.addEventListener('click', () => {
+            const session = workspace.active_session;
+            if (!session || chains.has(session)) return;
+            // Пользователь сам просит продолжить — снимаем прежнюю остановку.
+            noChainFor.delete(session);
+            runStepChain(session);
+        });
+
+        tmEditBtn.addEventListener('click', openPlanModal);
+        document.getElementById('plan-modal-ok').addEventListener('click', submitPlanModal);
+        document.getElementById('plan-modal-close').addEventListener('click', closePlanModal);
+        planModal.addEventListener('click', (e) => {
+            if (e.target === planModal) closePlanModal();
+        });
+        planInput.addEventListener('keydown', (e) => {
+            // Enter переносит строку (шаги пишутся построчно); Ctrl+Enter — «ок».
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                submitPlanModal();
+            }
+        });
+
+        // ---------- Авто-прогон шагов плана ----------
+        // Автомат задачи выполняет шаги ПОДРЯД: один HTTP-запрос на шаг (у
+        // каждого свой поток событий, полоса состояния обновляется сразу).
+        // Цепочка идёт, пока задача в этапе execution и не нажата «Пауза»;
+        // завершается на done, ошибке (failed) и ожидании пользователя
+        // (awaiting_user). Предохранитель TM_CHAIN_LIMIT совпадает с пределом
+        // шагов плана (task_state.MAX_STEPS): защита от зацикливания, а не
+        // рабочее ограничение.
+        const TM_CHAIN_LIMIT = 20;
+
+        // Тело запроса «выполни текущий шаг»: сообщения пользователя нет,
+        // вместо него флаг continue_step (сервер сам подставит текст шага).
+        function agentStepBody(sessionId) {
+            let maxTokens = null;
+            const rawLength = maxLengthInput.value.trim();
+            if (rawLength !== '' && /^\d+$/.test(rawLength)) maxTokens = Number(rawLength);
+            const settings = agentStrategySettings();
+            return Object.assign({
+                content: '',
+                continue_step: true,
+                // Задача, в которой выполнять шаг: явно, иначе запрос ушёл бы в
+                // ОТКРЫТУЮ задачу и выполнил её шаг (фон ломался бы).
+                session_id: sessionId || workspace.active_session || null,
+                format: formatSelect.value,
+                max_tokens: maxTokens,
+                stop: stopInput.value.trim() || null
+            }, settings.error ? {} : settings.body);
+        }
+
+        // Прогон шагов ОДНОЙ задачи. Задача указывается явно (session_id в
+        // запросе), поэтому прогоны РАЗНЫХ задач идут независимо: у каждой своя
+        // запись в `chains`, свой флаг остановки и своя блокировка на сервере.
+        // Состояние для решения «продолжать ли» берём из ответа СВОЕЙ задачи, а
+        // не из taskMachineState: тот описывает ОТКРЫТУЮ задачу.
+        async function runStepChain(sessionId) {
+            const target = sessionId || workspace.active_session;
+            if (!target || !agentModeOn()) return;
+            // У этой задачи уже идёт прогон (шаги одной задачи — по одному).
+            // Других задач это не касается.
+            if (chains.has(target)) return;
+            // Остановку снимает только явное «Продолжить» или повторное включение
+            // режима агента: иначе «Пауза», нажатая в момент запуска, терялась бы.
+            if (noChainFor.has(target)) return;
+            const chain = { stop: false };
+            chains.set(target, chain);
+            updateComposerState();
+            renderTaskMachine();     // полоса знает, что шаги идут
+            renderWorkspace();       // в списке задач — метка «⏳ идут шаги»
+            let steps = 0;
+            // Для ОТКРЫТОЙ задачи стартовое состояние известно; для остальных
+            // первый запрос просто попробует выполнить шаг, а решение
+            // «продолжать» придёт из ответа ЕГО задачи.
+            let state = (target === workspace.active_session) ? taskMachineState : null;
+            try {
+                while (!chain.stop && !noChainFor.has(target) && agentModeOn()
+                        && steps < TM_CHAIN_LIMIT) {
+                    // Работа автомата — это шаг (execution) ИЛИ отложенная
+                    // проверка результата (validation: «Пауза» была на последнем
+                    // шаге). Всё остальное — ожидание пользователя.
+                    if (state && (state.paused
+                                  || (state.stage !== 'execution'
+                                      && state.stage !== 'validation'))) break;
+                    steps += 1;
+                    const background = target !== workspace.active_session;
+                    const result = await sendAgentRequest(agentStepBody(target), background);
+                    state = (result && result.state) || null;
+                    if (!state) break;
+                }
+                if (steps >= TM_CHAIN_LIMIT && target === workspace.active_session) {
+                    addMessage('bot', `⚠️ Автомат выполнил ${steps} шагов подряд и остановился `
+                        + '(предохранитель). Отправьте сообщение, чтобы продолжить.', true);
+                }
+            } finally {
+                chains.delete(target);
+                updateComposerState();
+                renderTaskMachine();
+                // После прогона освежаем панель (у новой задачи заголовок по
+                // первому запросу) и открытый диалог с состоянием, а неотработанную
+                // команду остановки доводим до конца (см. reconcilePendingStop).
+                await refreshWorkspace();
+                await reconcilePendingStop();
+            }
+        }
+
+        // Остановка прогона ИМЕННО этой задачи: «Пауза» в открытой задаче не
+        // глушит работу остальных (и наоборот). Задача попадает в `noChainFor`,
+        // поэтому прогон не запустится и после текущего шага.
+        function stopChainFor(sessionId) {
+            noChainFor.add(sessionId);
+            const chain = chains.get(sessionId);
+            if (chain) chain.stop = true;
+        }
+
+        // Выключение режима агента останавливает ВСЕ прогоны.
+        function stopAllChains() {
+            chains.forEach((chain, session) => {
+                chain.stop = true;
+                noChainFor.add(session);
+            });
+        }
 
         // ---------- Режим «AI-агент» ----------
         // Включается отдельной кнопкой в шапке. Агент сам ведёт историю диалога,
@@ -2623,6 +3518,9 @@
             // Панель «Токены диалога» — только в режиме агента (то же место и
             // размер, что у панели статистики в экспертном режиме).
             agentPanel.hidden = !on;
+            // Полоса состояния задачи (Task State Machine) — тоже только в
+            // режиме агента: в обычном/экспертном режимах автомата нет.
+            taskMachine.hidden = !on;
             // Настройки «Параметры» (температура/тест моделей) в этом режиме
             // не действуют — скрываем шестерёнку, пока агент включён.
             paramsBtn.hidden = !!on;
@@ -2634,15 +3532,22 @@
                 // панель возвращаем к «Истории введённых данных» (workspace
                 // остаётся на сервере и вернётся при следующем включении агента).
                 // Данные панели (токены, ветви плана) тоже сбрасываются, а вот
-                // настройки стратегии и её полей остаются как есть.
+                // настройки стратегии и её полей остаются как есть. Состояние
+                // автомата задачи тоже сбрасываем — в обычном режиме его нет.
                 agentUsage = [];
                 renderAgentPanel();
                 resetAgentDialogs();
                 removeAgentConversation();
+                taskMachineState = null;
+                stopAllChains();    // выключили агента — все прогоны шагов стоп
+                renderTaskMachine();
                 renderWorkspace();
                 return;
             }
             setExpertMode(false);  // агент несовместим с экспертным режимом
+            // Включение режима — новое действие пользователя: снимаем след
+            // прежних остановок прогонов (они ставятся при выключении).
+            noChainFor.clear();
             // Задачи и диалоги (workspace) подтягиваем ТОЛЬКО при включении
             // агента: в обычном режиме модель не помнит контекст переписки,
             // поэтому показывать там прошлые реплики нельзя.
@@ -2967,6 +3872,8 @@
         // задачи или диалога — окно чата перерисовывается целиком. Задачи нет
         // или диалогов нет — окно остаётся пустым (только приветствие).
         async function loadActiveDialog() {
+            const epoch = viewEpoch;
+            const sessionId = workspace.active_session;
             let data = null;
             try {
                 const res = await fetch('/api/agent/history');
@@ -2974,11 +3881,14 @@
             } catch (e) {
                 data = null;   // история недоступна — просто пустой чат
             }
+            if (!sameView(epoch, sessionId)) return;   // переключились — не рисуем
             const msgs = (data && Array.isArray(data.messages)) ? data.messages : [];
             // Расход токенов по запросам — для панели «Токены диалога»: он свой
             // у каждого диалога.
             agentUsage = (data && Array.isArray(data.usage)) ? data.usage : [];
             renderAgentPanel();
+            // Состояние автомата задачи этой сессии — полоса этапов над чатом.
+            applyTaskState(data && data.state);
             // Ветви плана и их независимые диалоги (стратегия «branching»).
             const branches = (data && data.branches && typeof data.branches === 'object') ? data.branches : {};
             agentBranchMessages = {};
@@ -2994,9 +3904,24 @@
             agentActiveBranch = (data && data.active_branch) || null;
             agentView = '';
             agentAnalysis = null;
-            agentRootMessages = msgs
-                .filter(m => m && m.content)
-                .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', text: m.content }));
+            // Журнал чата (data.log) — что пользователь ВИДЕЛ в окне: его
+            // реплики, ответы, показанный план и служебные debug/error-строки, в
+            // порядке появления. По нему диалог восстанавливается целиком (в
+            // память messages debug не попадает, а текст запроса при построении
+            // плана в неё раньше не сохранялся — из-за этого при переключении
+            // сессии «пропадали» сообщения и весь вывод агента).
+            const log = (data && Array.isArray(data.log)) ? data.log : [];
+            const roleOf = kind => (kind === 'assistant' ? 'assistant'
+                : kind === 'debug' ? 'debug'
+                : kind === 'error' ? 'error' : 'user');
+            agentRootMessages = (log.length ? log : msgs.map(m => ({
+                // Старые диалоги (журнала ещё нет): собираем из памяти диалога.
+                kind: m && m.source === 'machine' ? 'debug'
+                    : (m && m.role === 'user' ? 'user' : 'assistant'),
+                text: m && m.content
+            })))
+                .filter(item => item && item.text)
+                .map(item => ({ role: roleOf(item.kind), text: item.text }));
             renderBranchSelect();
             // Ветви есть — список «Стратегия» переключаем на branching, иначе
             // ветки было бы не выбрать.
@@ -3005,6 +3930,10 @@
             }
             showAgentStrategyRows();
             renderAgentDialog();
+            // Вернулись в задачу с неотработанной командой остановки — доводим её.
+            if (stopRequest && stopRequest.session === workspace.active_session) {
+                reconcilePendingStop();
+            }
         }
 
         // Снимок workspace + диалог текущей сессии: включение режима агента,
@@ -3049,6 +3978,9 @@
             agentUsage = [];
             renderAgentPanel();
             resetAgentDialogs();
+            // Автомат задачи начинается заново (этап planning, план пуст):
+            // очищенный диалог — это новая задача.
+            await loadTaskState();
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
@@ -3154,12 +4086,31 @@
         // Отправка в режиме «AI-агент»: сервер отвечает NDJSON-потоком событий.
         // Каждое debug-событие показываем отдельным сообщением по мере прихода,
         // затем — финальный ответ (bot). Событие 'done' служебное — не рисуем.
-        async function sendAgentRequest(body) {
-            typingEl.textContent = 'AI-агент думает...';
-            // Пока агент отвечает, смену задачи/диалога и очистку истории
-            // блокируем — иначе реплики потока перемешались бы с удалением или
-            // попали бы не в тот диалог.
-            requestBusy = true;
+        async function sendAgentRequest(body, background) {
+            // Поколение вида фиксируем ДО запроса: ответ относится к диалогу,
+            // который открыт сейчас. Если пользователь успеет переключиться, пока
+            // модель отвечает, поток дочитываем (сервер сохранит ответ), но в окно
+            // чата ничего не рисуем — иначе ответ и debug попадали бы в чужую
+            // задачу, а полоса показывала бы чужое состояние.
+            const streamEpoch = viewEpoch;
+            // Задача, к которой относится ответ: рисуем события ТОЛЬКО пока она
+            // открыта. Без этого фоновый шаг (у которого streamEpoch свежий)
+            // сыпался бы в окно только что открытой пустой задачи.
+            const streamSession = (body && body.session_id) || workspace.active_session;
+            // Состояние СВОЕЙ задачи из этого потока: нужно цепочке, чтобы решить,
+            // продолжать ли шаги (события фоновой задачи в интерфейс не рисуются,
+            // но состояние из них читается).
+            let finalState = null;
+            if (background) {
+                // Шаг НЕ открытой задачи: поле ввода открытой остаётся свободным.
+                bgRequests += 1;
+            } else {
+                // Запрос ОТКРЫТОЙ задачи: индикатор показываем только её задаче
+                // (см. updateTyping), а ввод блокируем, чтобы реплики не
+                // перемешались с удалением и не попали не в тот диалог.
+                foregroundRequests.add(body && body.session_id
+                    ? body.session_id : workspace.active_session);
+            }
             updateComposerState();
             try {
                 const res = await fetch('/api/agent/chat', {
@@ -3169,12 +4120,18 @@
                 });
                 if (!res.ok) {
                     const text = await res.text();
-                    addMessage('bot', '⚠️ ' + (text || 'Ошибка сервера.'), true);
-                    return;
+                    // Сообщение об ошибке — только для открытой задачи (фоновая
+                    // работает молча, её состояние видно при переключении).
+                    if (!background) addMessage('bot', '⚠️ ' + (text || 'Ошибка сервера.'), true);
+                    return null;
                 }
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
                 let buf = '';
+                // Замер токенов ТЕКУЩЕГО запроса уже добавлен в agentUsage:
+                // событие usage (уточнение после служебной проверки) заменяет
+                // его, а не добавляет второй записи.
+                let usagePushed = false;
                 for (;;) {
                     const { done, value } = await reader.read();
                     if (done) break;
@@ -3186,12 +4143,20 @@
                         if (!line) continue;
                         let ev;
                         try { ev = JSON.parse(line); } catch (e) { continue; }
-                        // Режим агента выключили во время ответа — события не
-                        // рисуем (агентский диалог уже убран из окна), но поток
-                        // дочитываем, чтобы сервер завершил сохранение истории.
-                        if (!agentModeOn()) continue;
+                        // Состояние запоминаем ДО проверки вида: оно относится к
+                        // задаче этого запроса и нужно цепочке шагов.
+                        if (ev.state) finalState = ev.state;
+                        // Режим агента выключили или открыта ДРУГАЯ задача —
+                        // события не рисуем (они относятся к своей задаче), но
+                        // поток дочитываем, чтобы сервер завершил сохранение.
+                        if (!agentModeOn() || streamEpoch !== viewEpoch
+                                || streamSession !== workspace.active_session) continue;
                         if (ev.type === 'debug') {
                             pushAgentNode('debug', ev.text);
+                        } else if (ev.type === 'state') {
+                            // Состояние конечного автомата задачи: полоса этапов
+                            // над окном чата (этап, шаг, ожидаемое действие).
+                            applyTaskState(ev.state);
                         } else if (ev.type === 'branches') {
                             // План ветвления (стратегия «branching»): блок плана в
                             // корневом диалоге + список веток для переключения.
@@ -3200,10 +4165,34 @@
                             pushAgentNode('assistant', ev.text);
                         } else if (ev.type === 'error') {
                             pushAgentNode('error', ev.text);
+                        } else if (ev.type === 'usage') {
+                            // Уточнённый расход запроса: после ответа автомат
+                            // может сделать служебный вызов (содержательная
+                            // проверка результата) — замер ЗАМЕНЯЕТ прежний, а
+                            // не добавляет второй, иначе панель «Токены диалога»
+                            // посчитала бы один запрос дважды.
+                            if (ev.usage) {
+                                if (usagePushed) {
+                                    agentUsage[agentUsage.length - 1] = ev.usage;
+                                } else {
+                                    agentUsage.push(ev.usage);
+                                    usagePushed = true;
+                                }
+                                renderAgentPanel();
+                            }
                         } else if (ev.type === 'done') {
+                            if (ev.state) {
+                                // Итоговое состояние запроса (после переходов).
+                                applyTaskState(ev.state);
+                            }
                             if (ev.usage) {
                                 // Замер токенов запроса — панель «Токены диалога».
-                                agentUsage.push(ev.usage);
+                                if (usagePushed) {
+                                    agentUsage[agentUsage.length - 1] = ev.usage;
+                                } else {
+                                    agentUsage.push(ev.usage);
+                                    usagePushed = true;
+                                }
                                 renderAgentPanel();
                             }
                             // Состояние стратегии с сервера: список веток и
@@ -3224,21 +4213,61 @@
                 // первого запроса), у существующего мог смениться.
                 await loadWorkspace();
             } catch (e) {
-                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+                if (!background) {
+                    addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+                }
             } finally {
-                typingEl.textContent = '';
-                requestBusy = false;
+                if (background) {
+                    bgRequests = Math.max(0, bgRequests - 1);
+                } else {
+                    foregroundRequests.delete(streamSession);
+                }
                 updateComposerState();
-                input.focus();
+                if (streamEpoch !== viewEpoch) {
+                    // Пока шаг выполнялся, пользователь переключил задачу: события
+                    // мы не рисовали, но ответ лёг в СВОЙ диалог. Освежаем
+                    // открытую задачу, иначе доработанный шаг выглядел бы
+                    // «не выведенным», хотя задача уже ушла вперёд.
+                    await refreshWorkspace();
+                }
+                // Команда «Пауза»/«Отменить» могла прийти в самом конце шага и не
+                // примениться: сверяемся с сервером и, если она не сработала,
+                // повторяем — блокировка уже свободна и переход пройдёт сразу.
+                await reconcilePendingStop();
+                if (!background) input.focus();
             }
+            return { state: finalState };
+        }
+
+        // Пометку «остановлю после текущего шага» не оставляем висеть: после
+        // ответа состояние перечитываем у сервера (маршрут отдаёт его мгновенно,
+        // без блокировки) и завершаем команду, если она не применилась.
+        async function reconcilePendingStop() {
+            const request = stopRequest;
+            if (!request || !agentModeOn()) return;
+            // Команда относится к конкретной задаче: пока открыта другая, ничего
+            // не досылаем (иначе пауза «сама» ставилась бы открытой задаче).
+            if (request.session !== workspace.active_session) return;
+            await loadTaskState();
+            const state = taskMachineState;
+            if (!state || state.paused || state.terminal || state.pending) return;
+            // Сервер команду не применил (она пришла в самом конце шага) —
+            // повторяем: блокировка свободна, переход пройдёт сразу.
+            await taskStateAction(request.action === 'cancel'
+                ? '/api/agent/state/cancel'
+                : '/api/agent/state/pause');
         }
 
         async function send() {
             const content = input.value.trim();
             if (!content) return;
-            // Пока идёт запрос, второй не отправляем (Enter мимо заблокированной
-            // кнопки): ответы иначе перемешались бы в одном диалоге.
-            if (requestBusy) return;
+            // Второй запрос не отправляем, пока идёт запрос открытой задачи или
+            // её же авто-прогон. Фоновая работа ДРУГОЙ задачи не мешает: её
+            // запросы несут свой session_id.
+            // Второй запрос не отправляем, только если идёт запрос ИЛИ прогон
+            // ЭТОЙ задачи: чужие задачи не помеха (они на своих блокировках).
+            if (requestBusyHere()) return;
+            if (chains.has(workspace.active_session)) return;
 
             // Режим «AI-агент»: длина проверяется как обычно; эксперт/параметры
             // не участвуют, ответ приходит потоком debug-сообщений агента.
@@ -3246,7 +4275,7 @@
                 // Диалог нельзя начать без задачи: у каждой задачи своя история
                 // диалогов, а внутри задачи можно переключаться между сессиями.
                 if (!workspace.active_task) {
-                    addMessage('bot', '⚠️ Сначала создайте задачу — кнопка «Новая задача» в панели слева.', true);
+                    addMessage('bot', '⚠️ Сначала создайте проект — кнопка «Новый проект» в панели слева.', true);
                     return;
                 }
                 let maxTokens = null;
@@ -3281,7 +4310,9 @@
                     await loadActiveDialog();
                 }
                 input.value = '';
-                requestBusy = true;
+                // Запрос относится к ЭТОЙ задаче (шаг её прогона или сообщение
+                // пользователя): другие задачи на своих блокировках.
+                foregroundRequests.add(workspace.active_session);
                 updateComposerState();
                 // Реплика юзера — в диалог текущего представления (корень или
                 // выбранная ветка плана): у каждой ветки своя история.
@@ -3293,6 +4324,9 @@
                     max_tokens: maxTokens,
                     stop: stopInput.value.trim() || null
                 }, strategySettings.body));
+                // Ответ мог подтвердить план («ок») и выполнить первый шаг:
+                // оставшиеся шаги автомат проходит сам, без новых сообщений.
+                runStepChain();
                 return;
             }
 
@@ -3356,7 +4390,7 @@
             }
 
             input.value = '';
-            requestBusy = true;
+            foregroundRequests.add(workspace.active_session || '');
             updateComposerState();
 
             addMessage('user', content);
@@ -3404,7 +4438,7 @@
                 addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.');
             } finally {
                 typingEl.textContent = '';
-                requestBusy = false;
+                foregroundRequests.delete(workspace.active_session);
                 updateComposerState();
                 input.focus();
             }

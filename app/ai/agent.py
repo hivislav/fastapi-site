@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from app import config
-from app.ai import client, demo, json_utils
+from app.ai import client, demo, json_utils, task_state
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +182,59 @@ FACTS_HEADER = (
 # Пределы блока фактов (защита от разрастания контекста и файла истории).
 MAX_FACTS = 40
 FACTS_VALUE_LIMIT = 600
+
+# --- Конечный автомат задачи (Task State Machine) ---------------------------
+# Состояние задачи (этап → текущий шаг → ожидаемое действие, см.
+# app/ai/task_state.py) ведёт веб-слой: он же владеет переходами. Агент знает о
+# состоянии ровно одно — системный блок состояния (Agent.task_state), который
+# уходит в модель вместе с профилем и слоями памяти и говорит, какой шаг плана
+# выполняется СЕЙЧАС. Плюс на этапе planning агент строит сам план задачи
+# служебным вызовом (build_plan) — по образцу плана ветвления.
+PLAN_PROMPT = (
+    "Ты — планировщик задач. Тебе дают историю диалога и текущий запрос "
+    "пользователя. Разбей работу по этому запросу на последовательные шаги.\n"
+    "ПРАВИЛА: 1) простой запрос — 1–2 шага, сложный — до 6; 2) каждый шаг — "
+    "законченное действие с понятным результатом, шаги идут по порядку "
+    "выполнения и не пересекаются; 3) каждый шаг — одна короткая строка не "
+    "длиннее 15 слов; 4) уточняющие вопросы в план не включай; 5) ничего не "
+    "выдумывай сверх запроса пользователя; 6) никаких пояснений, markdown и "
+    "текста вне JSON.\n\n"
+    "ОТВЕТ — ТОЛЬКО один JSON-объект, без markdown и пояснений:\n"
+    '{"steps": ["шаг 1", "шаг 2"]}'
+)
+# Служебный вызов плана: явный лимит вывода, чтобы JSON не обрезался, и свой
+# таймаут (план короче плана ветвления — минуты не нужны).
+PLAN_MAX_TOKENS = 1500
+PLAN_TIMEOUT = 90.0
+
+# Содержательная проверка результата (этап validation): ОДИН служебный вызов на
+# завершённую задачу. Локальная самопроверка (см. _self_check в chat.py) ловит
+# только технические сбои, а этот вызов отвечает на вопрос «результат вообще
+# соответствует запросу и плану или шаг нужно переделать».
+REVIEW_PROMPT = (
+    "Ты — приёмщик работы ассистента. Тебе дают исходный запрос пользователя, "
+    "план работы (шаги) и результат — последние реплики диалога, в которых "
+    "ассистент выполнял план.\n"
+    "Проверь, соответствует ли результат запросу и плану: все ли шаги реально "
+    "закрыты, нет ли пропущенного пункта, противоречий, обрывочного или пустого "
+    "ответа вместо дела.\n"
+    "ПРАВИЛА: 1) verdict \"redo\" — только если результат реально не покрывает "
+    "план или запрос (шаг пропущен, сделан не тот шаг, ответ противоречит плану, "
+    "вместо результата — обещания); 2) стилистические придирки, пожелания "
+    "«можно было бы подробнее» и новые требования, которых не было в запросе, — "
+    "НЕ повод для \"redo\"; 3) если результат в целом соответствует — \"ok\".\n\n"
+    "ОТВЕТ — ТОЛЬКО один JSON-объект, без markdown и пояснений:\n"
+    '{"verdict": "ok" | "redo", "step": 0, "comment": "коротко: что не так или что подтверждено"}'
+)
+# Вывод короткий (вердикт + пояснение), но с запасом, чтобы JSON не обрезался.
+REVIEW_MAX_TOKENS = 700
+REVIEW_TIMEOUT = 90.0
+# Сколько символов результата уходит на проверку (последние реплики диалога).
+REVIEW_RESULT_CHARS = 6000
+# Значения verdict, которые считаем «принято» / «на доработку».
+REVIEW_OK = ("ok", "ок", "accept", "accepted", "принято", "да")
+REVIEW_REDO = ("redo", "переделать", "revise", "нет", "no")
+
 
 # --- Стратегия branching ----------------------------------------------------
 # Ветви с итоговым скором ниже порога отсеиваются (шаг 4 алгоритма), а из
@@ -424,6 +477,13 @@ class Agent:
         # системным сообщением в любой стратегии; пустая строка — профиль не
         # заполнен, данных профиля нет и блока нет.
         self.profile: str = ""
+        # Состояние конечного автомата задачи (TaskState, см.
+        # app/ai/task_state.py): этап, текущий шаг плана и ожидаемое действие.
+        # Приходит из веб-слоя на каждый запрос (он же владеет переходами) и
+        # уходит в модель отдельным системным блоком — агент видит план и
+        # понимает, какой шаг выполняется сейчас. None — состояния нет (обычные
+        # вызовы агента вне автомата), тогда блока тоже нет.
+        self.task_state: Optional["task_state.TaskState"] = None
         # Последние использованные параметры генерации (для generate()).
         self.last_params: Dict[str, Any] = {}
         # Сколько резюме составлено в ТЕКУЩЕМ запросе (обнуляется в начале
@@ -468,6 +528,7 @@ class Agent:
         working_memory: Optional[List[str]] = None,
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
+        state: Optional["task_state.TaskState"] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
@@ -487,6 +548,10 @@ class Agent:
         profile — готовый текстовый блок профиля пользователя (системный промпт
         сессии): сведения о пользователе и требования к ответу; None — профиль
         не передан, используется прежний (self.profile).
+        state — состояние конечного автомата задачи (task_state.TaskState): этап,
+        план и текущий шаг. Уходит в модель системным блоком (см. _memory_blocks),
+        поэтому агент видит, какой шаг плана выполняется сейчас; None — состояния
+        нет, блока тоже нет.
 
         Собирает все debug-события в result.debug — пригодится, когда
         показывать их по одному не нужно (например, в API-ответах).
@@ -498,7 +563,7 @@ class Agent:
 
         await self._process(
             user_message, history, sink, summary, facts, branches, branch, covered,
-            working_memory, long_term_memory, profile,
+            working_memory, long_term_memory, profile, state,
         )
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
@@ -523,6 +588,7 @@ class Agent:
         working_memory: Optional[List[str]] = None,
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
+        state: Optional["task_state.TaskState"] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -541,6 +607,9 @@ class Agent:
         подчиняются (см. WORKING_MEMORY_HEADER).
         profile — готовый блок профиля пользователя (см. Agent.profile):
         системный промпт сессии, уходит в модель первым системным сообщением.
+        state — состояние конечного автомата задачи (см. Agent.task_state): его
+        системный блок говорит модели, на каком этапе задача и какой шаг плана
+        выполняется сейчас (см. app/ai/task_state.py).
         """
         queue: asyncio.Queue = asyncio.Queue()
 
@@ -550,7 +619,7 @@ class Agent:
         runner = asyncio.create_task(
             self._process(
                 user_message, history, sink, summary, facts, branches, branch, covered,
-                working_memory, long_term_memory, profile,
+                working_memory, long_term_memory, profile, state,
             )
         )
         try:
@@ -583,6 +652,7 @@ class Agent:
         working_memory: Optional[List[str]] = None,
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
+        state: Optional["task_state.TaskState"] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -616,6 +686,11 @@ class Agent:
             # веб-слоя готовым текстом, см. app/ai/profiles.py).
             if profile is not None:
                 self.profile = str(profile).strip()
+            # Состояние автомата задачи (Task State Machine): этап, план и шаг,
+            # который выполняется сейчас. Уходит в модель системным блоком
+            # (см. _memory_blocks), а переходы ведёт веб-слой.
+            if state is not None:
+                self.task_state = state
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
@@ -633,6 +708,17 @@ class Agent:
                     f"(текущая задача), долговременная: {len(self.long_term_memory)} записей "
                     "(глобальная база знаний). Оба слоя уходят в модель всегда, "
                     "стратегиям управления контекстом они не подчиняются.",
+                ))
+            if self.task_state is not None:
+                # Коротко и без повтора: этап, шаг и ожидаемое действие уже
+                # объявил вызывающий код (контроллер автомата) строкой выше —
+                # здесь важно только, что блок состояния ушёл в модель.
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: блок состояния задачи уходит в модель системным "
+                    f"сообщением (этап {self.task_state.stage}"
+                    f" — {task_state.STAGE_LABELS.get(self.task_state.stage, '')}, "
+                    f"{self.task_state.step_label() if self.task_state.steps else 'план пуст'}).",
                 ))
 
             # Пустой запрос — уточняем, LLM не трогаем.
@@ -707,9 +793,15 @@ class Agent:
             await self._report_answer(emit, content, metrics, elapsed)
 
             # 7. Пустой ответ (сбой/нет ключа) — понятное сообщение вместо
-            #    технического стека или пустоты.
+            #    технического стека или пустоты. Запасной ответ помечаем
+            #    fallback=True: конечный автомат задачи по этой пометке видит,
+            #    что шаг НЕ выполнен (execution → failed), а не считает такой
+            #    ответ результатом работы. В демо-режиме (ключа нет) пометки
+            #    нет: демо-ответ — штатный режим работы, а не сбой.
+            failed_answer = False
             if not content:
                 content = self._fallback_text(text)
+                failed_answer = bool(config.LLM_API_KEY)
                 await emit(self._step(
                     "debug",
                     f"{self.name}: "
@@ -723,7 +815,7 @@ class Agent:
             self.memory.append({"role": "assistant", "content": content})
             self._trim_memory()
 
-            await emit(self._step("bot", content))
+            await emit(self._step("bot", content, {"fallback": True} if failed_answer else None))
 
             # 9. Лимит токенов превышен — отдельным сообщением с ошибкой
             #    (сам ответ пользователь уже получил выше).
@@ -772,6 +864,201 @@ class Agent:
                 # панель «Токены диалога».
                 "usage": dict(self.last_usage),
             }))
+
+    # ------------------------------------------------------------------
+    # Конечный автомат задачи: план на этапе planning
+    # ------------------------------------------------------------------
+    async def build_plan(
+        self,
+        user_message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        working_memory: Optional[List[str]] = None,
+        long_term_memory: Optional[List[str]] = None,
+        profile: Optional[str] = None,
+    ) -> List[str]:
+        """Строит план задачи (шаги) служебным вызовом LLM — этап planning.
+
+        Один вызов с PLAN_PROMPT: модель получает историю диалога, слои памяти,
+        профиль пользователя и текущий запрос, а возвращает JSON
+        {"steps": [...]}. Сбой (нет ключа, таймаут,
+        пустой или неразобранный ответ) не оставляет задачу без плана — шаги
+        выделяются локально (task_state.fallback_steps), а причина пишется в лог.
+
+        Расход токенов вызова копится в self.last_usage как служебный
+        (service=True): веб-слой складывает его с расходом самого ответа
+        (см. merge_usage). Переходы автомата здесь НЕ выполняются — план строит
+        агент, а состояние меняет веб-слой (app/routers/chat.py).
+        """
+        text = (user_message or "").strip()
+        if history is not None:
+            self.memory = self._normalize_history(history)
+        # Слои памяти и профиль — тоже часть контекста планирования: план должен
+        # учитывать данные задачи, глобальные знания и требования к ответу.
+        if working_memory is not None:
+            self.working_memory = self._normalize_memory_layer(working_memory)
+        if long_term_memory is not None:
+            self.long_term_memory = self._normalize_memory_layer(long_term_memory)
+        if profile is not None:
+            self.profile = str(profile).strip()
+        # Пустой запрос планировать нечего — один шаг «уточнить запрос».
+        if not text:
+            return ["Уточнить у пользователя, что именно нужно сделать"]
+        rendered = "\n".join(
+            f"{'Пользователь' if msg['role'] == 'user' else 'Ассистент'}: {msg['content']}"
+            for msg in self.memory
+        ) or "(история чата пуста)"
+        payload = f"История чата:\n{rendered}\n\nТекущий запрос пользователя:\n{text}"
+        memory_text = self._memory_text()
+        if memory_text:
+            payload = memory_text + "\n\n" + payload
+
+        content, metrics = await client.call_llm_async(
+            user_text=payload,
+            model=self.config.model or config.LLM_MODEL,
+            disable_thinking=True,   # служебный вызов — без reasoning
+            max_tokens=PLAN_MAX_TOKENS,  # JSON не должен обрезаться провайдером
+            messages=[
+                {"role": "system", "content": PLAN_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+            timeout=PLAN_TIMEOUT,
+        )
+        self._track_usage(metrics, service=True)  # служебный вызов (панель токенов)
+        steps = self._parse_plan(content) if content else []
+        if steps:
+            logger.info("Агент %s: план задачи из %d шагов (LLM)", self.name, len(steps))
+            return steps
+        steps = task_state.fallback_steps(text)
+        logger.warning(
+            "Агент %s: модель не дала план (%s) — шаги выделены локально: %d",
+            self.name, "пустой ответ" if not content else "ответ не разобран", len(steps),
+        )
+        return steps
+
+    @classmethod
+    def _parse_plan(cls, content: str) -> List[str]:
+        """Разбирает ответ модели в шаги плана (пусто — не получилось).
+
+        Ожидается {"steps": [...]}; принимаем и голый список строк — модель
+        иногда отвечает им вместо объекта.
+        """
+        payload = _load_json_object(content)
+        raw: Any = None
+        if isinstance(payload, dict):
+            raw = payload.get("steps") or payload.get("plan") or payload.get("шаги")
+        elif isinstance(payload, list):
+            raw = payload
+        if raw is None:
+            # Ответ без JSON: разбираем его текст как список шагов.
+            return task_state.clean_steps(task_state.fallback_steps(content))
+        return task_state.clean_steps(raw)
+
+    # ------------------------------------------------------------------
+    # Конечный автомат задачи: содержательная проверка результата
+    # ------------------------------------------------------------------
+    async def review_result(
+        self,
+        user_request: str,
+        plan: Optional[List[str]] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        working_memory: Optional[List[str]] = None,
+        long_term_memory: Optional[List[str]] = None,
+        profile: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Содержательная проверка результата (этап validation) — служебный вызов.
+
+        Возвращает {"ok": bool, "step": int (1-based, 0 — шаг не указан),
+        "comment": str} либо None, если проверить не удалось (нет ключа, таймаут,
+        пустой или неразобранный ответ). None — НЕ провал задачи: автомат
+        остаётся на локальной самопроверке и завершает задачу как обычно, а
+        причина пишется в лог.
+
+        Расход вызова копится в self.last_usage как служебный (service=True) и
+        складывается с расходом ответа веб-слоем (см. merge_usage): панель
+        «Токены диалога» показывает его в строке «из них служебные вызовы».
+        Переходы автомата выполняет веб-слой (app/routers/chat.py).
+        """
+        if history is not None:
+            self.memory = self._normalize_history(history)
+        if working_memory is not None:
+            self.working_memory = self._normalize_memory_layer(working_memory)
+        if long_term_memory is not None:
+            self.long_term_memory = self._normalize_memory_layer(long_term_memory)
+        if profile is not None:
+            self.profile = str(profile).strip()
+        # Проверять нечего: пустая история — нечего и оценивать.
+        if not self.memory:
+            return None
+        steps = task_state.clean_steps(plan or [])
+        plan_text = ("\n".join(f"{i}) {step}" for i, step in enumerate(steps, 1))
+                     if steps else "(план пуст)")
+        # Результат — последние реплики диалога (в них и есть работа ассистента).
+        result_lines: List[str] = []
+        total = 0
+        for message in reversed(self.memory):
+            line = (f"{'Пользователь' if message['role'] == 'user' else 'Ассистент'}: "
+                    f"{message['content']}")
+            total += len(line)
+            result_lines.append(line)
+            if total >= REVIEW_RESULT_CHARS:
+                break
+        result_text = "\n\n".join(reversed(result_lines))[-REVIEW_RESULT_CHARS:]
+        payload = (
+            f"Исходный запрос пользователя:\n{(user_request or '').strip() or '(не задан)'}\n\n"
+            f"План работы (шаги):\n{plan_text}\n\n"
+            f"Результат (последние реплики диалога):\n{result_text}"
+        )
+        memory_text = self._memory_text()
+        if memory_text:
+            payload = memory_text + "\n\n" + payload
+
+        content, metrics = await client.call_llm_async(
+            user_text=payload,
+            model=self.config.model or config.LLM_MODEL,
+            disable_thinking=True,      # служебный вызов — без reasoning
+            max_tokens=REVIEW_MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": REVIEW_PROMPT},
+                {"role": "user", "content": payload},
+            ],
+            timeout=REVIEW_TIMEOUT,
+        )
+        self._track_usage(metrics, service=True)  # служебный вызов (панель токенов)
+        review = self._parse_review_json(content) if content else None
+        if review is None:
+            logger.warning(
+                "Агент %s: содержательная проверка не получена (%s) — опираюсь на самопроверку",
+                self.name, "пустой ответ" if not content else "ответ не разобран",
+            )
+        return review
+
+    @classmethod
+    def _parse_review_json(cls, content: str) -> Optional[Dict[str, Any]]:
+        """Разбирает вердикт проверки: {"verdict", "step", "comment"}.
+
+        None — ответ не разобран или verdict неизвестен (тогда проверка просто
+        не учитывается). Неизвестный шаг приводится к 0 — «шаг не указан».
+        """
+        payload = _load_json_object(content)
+        if not isinstance(payload, dict):
+            return None
+        verdict = " ".join(str(payload.get("verdict") or payload.get("result") or "").split()).lower()
+        if verdict in REVIEW_OK:
+            ok = True
+        elif verdict in REVIEW_REDO:
+            ok = False
+        else:
+            return None
+        try:
+            step = int(payload.get("step") or 0)
+        except (TypeError, ValueError):
+            step = 0
+        comment = " ".join(str(payload.get("comment") or payload.get("reason") or "").split())
+        return {
+            "ok": ok,
+            "step": max(0, step),
+            "comment": comment[:600] or ("принято" if ok else "не принято"),
+        }
 
     # ------------------------------------------------------------------
     # Вспомогательные шаги
@@ -864,19 +1151,23 @@ class Agent:
         return out[-MAX_MEMORY_ENTRIES:]
 
     def _memory_blocks(self) -> List[Dict[str, str]]:
-        """Системные блоки профиля пользователя и слоёв памяти.
+        """Системные блоки профиля пользователя, состояния задачи и слоёв памяти.
 
         Идут ПЕРВЫМИ в контексте и присутствуют в ЛЮБОЙ стратегии (summary,
         sliding window, sticky facts, branching, ветка плана, обычный ответ):
         слои памяти пользователя стратегиям не подчиняются, поэтому их текст
         не сокращается и не вытесняется окном или резюме. Порядок: сначала блок
         профиля (системный промпт сессии — кто пользователь и каким хочет видеть
-        ответ), затем глобальные знания (долговременная память), затем данные
-        текущей задачи (рабочая память) — она ближе к запросу.
+        ответ), затем состояние задачи (Task State Machine: этап, план и шаг,
+        который выполняется сейчас), затем глобальные знания (долговременная
+        память), затем данные текущей задачи (рабочая память) — она ближе к
+        запросу.
         """
         blocks: List[Dict[str, str]] = []
         if self.profile:
             blocks.append({"role": "system", "content": self.profile})
+        if self.task_state is not None:
+            blocks.append({"role": "system", "content": task_state.state_block(self.task_state)})
         if self.long_term_memory:
             body = "\n".join(f"{i}) {item}" for i, item in enumerate(self.long_term_memory, 1))
             blocks.append({"role": "system", "content": LONG_TERM_MEMORY_HEADER + "\n" + body})
@@ -1274,8 +1565,10 @@ class Agent:
         overflow = self._is_limit_exceeded(metrics, params.get("max_tokens"))
         self.last_usage["overflow"] = overflow
         await self._report_answer(emit, content, metrics, elapsed)
+        failed_answer = False
         if not content:
             content = self._fallback_text(text)
+            failed_answer = bool(config.LLM_API_KEY)
             await emit(self._step(
                 "debug",
                 f"{self.name}: "
@@ -1285,7 +1578,7 @@ class Agent:
             ))
         branch_messages.append({"role": "user", "content": text})
         branch_messages.append({"role": "assistant", "content": content})
-        await emit(self._step("bot", content))
+        await emit(self._step("bot", content, {"fallback": True} if failed_answer else None))
         if overflow and metrics:
             await emit(self._step(
                 "error",
@@ -1801,6 +2094,29 @@ class Agent:
 # ---------------------------------------------------------------------------
 # Разбор JSON-ответов модели (служебные вызовы: факты, план ветвления)
 # ---------------------------------------------------------------------------
+def merge_usage(base: Optional[Dict[str, Any]],
+                extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Складывает два замера расхода токенов (служебный вызов + ответ).
+
+    Нужен конечному автомату задачи: план на этапе planning строит отдельный
+    агент (Agent.build_plan переиспользует один и тот же Agent, см.
+    app/routers/chat.py), и его токены должны попасть в общий замер запроса —
+    в том числе в отдельные поля служебных вызовов (summary_requests/…), чтобы
+    строка «Текущий запрос» в панели токенов осталась про сам ответ.
+    """
+    result = dict(base or {})
+    other = dict(extra or {})
+    for key in ("requests", "input", "output", "summary_requests",
+                "summary_input", "summary_output"):
+        result[key] = int(result.get(key) or 0) + int(other.get(key) or 0)
+    # Лимит и признак переполнения — от самого ответа (у плана лимит не тот).
+    if "limit" in other and other.get("limit") is not None:
+        result["limit"] = other["limit"]
+    result["overflow"] = bool(result.get("overflow")) or bool(other.get("overflow"))
+    result.setdefault("limit", None)
+    return result
+
+
 def _strip_code_fences(text: str) -> str:
     """Убирает markdown-обёртку ```json ... ``` вокруг ответа модели."""
     value = (text or "").strip()
