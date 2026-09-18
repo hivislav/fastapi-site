@@ -17,6 +17,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -29,9 +30,12 @@ os.environ["AGENT_WORKSPACE_FILE"] = os.path.join(_TMP, "workspace.json")
 os.environ["AGENT_MEMORY_FILE"] = os.path.join(_TMP, "agent_memory.json")
 os.environ["AGENT_PROFILES_FILE"] = os.path.join(_TMP, "profiles.json")
 
-from app.ai import client, task_state, workspace as workspace_store  # noqa: E402
+from app.ai import client, invariants as invariants_store  # noqa: E402
+from app.ai import task_state, workspace as workspace_store  # noqa: E402
 from app.routers import chat  # noqa: E402
-from app.schemas import ChatMessage, PlanUpdate  # noqa: E402
+from app.schemas import (  # noqa: E402
+    ChatMessage, InvariantCreate, InvariantPick, InvariantResolve, PlanUpdate,
+)
 
 FAILURES = []
 
@@ -55,6 +59,9 @@ ANSWER = "Ответ модели по текущему шагу."
 # локальной самопроверке.
 REVIEW = {"verdict": "ok", "step": 0, "comment": "результат соответствует плану"}
 CALLS = []
+# Сами сообщения последнего вызова: по ним проверяем, что в контекст агента
+# уходит системный блок инвариантов (а в диалог они не пишутся).
+LAST_MESSAGES = []
 # «Медленный» ответ модели: шаг «в полёте», пока тест не отпустит событие
 # (проверяем мгновенную реакцию «Паузы»/«Отмены» и переключение сессии).
 SLOW_ANSWER = None
@@ -64,6 +71,43 @@ SLOW_QUEUE = []
 # Медленное ПОСТРОЕНИЕ ПЛАНА (служебный вызов планировщика): нужен, чтобы
 # проверить паузу, нажатую во время планирования.
 SLOW_PLAN = None
+# Очередь планов: пока непуста, i-й вызов планировщика берёт i-й список шагов
+# (нужно код-гейту плана: первый план нарушает правила, второй — нет).
+PLAN_QUEUE = []
+# Вердикты проверки инвариантов (служебный вызов «Ты проверяешь ИНВАРИАНТЫ»):
+# номер пары (строкой) -> вердикт. Пустой словарь — «проверка не удалась»:
+# так проверяем, что пары остаются НЕпроверенными, а не «совместимыми».
+INVARIANTS_VERDICTS = {"1": {"вердикт": "conflict", "причина": "СУБД разная"}}
+# Разбор ЗАПРОСА на соответствие инвариантам (служебный вызов «Ты — арбитр
+# инвариантов», до планирования): вердикт + варианты решения. По умолчанию —
+# "clear" (нарушений нет), чтобы прочие проверки работали как раньше.
+INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+ANALYSIS_CALLS = 0
+# Очередь разборов: пока непуста, i-й вызов арбитра берёт i-й элемент (дальше —
+# снова INVARIANTS_ANALYSIS). Нужна, чтобы проверить ПОВТОРНЫЙ запрос вариантов:
+# первый разбор даёт мало пригодных вариантов, второй — другие.
+ANALYSIS_QUEUE = []
+# Вердикты ПРОВЕРКИ ВАРИАНТОВ (служебный вызов «Ты — арбитр инвариантов:
+# проверка ВАРИАНТОВ»): номер варианта (строкой) -> вердикт; не указан — берётся
+# SUGGESTIONS_DEFAULT. None — «проверка не удалась» (пустой ответ): тогда
+# варианты показывать нельзя.
+SUGGESTIONS_VERDICTS = {}
+SUGGESTIONS_DEFAULT = "clear"
+# Очередь вердиктов проверки: пока непуста, i-я проверка берёт i-й словарь.
+SUGGESTIONS_QUEUE = []
+SUGGESTION_CALLS = 0
+# Вердикты КОД-ГЕЙТА ПЛАНА (служебный вызов «Ты — арбитр инвариантов: проверка
+# ШАГОВ ПЛАНА»): номер шага (строкой) -> вердикт; не указан — PLAN_DEFAULT.
+# None — «проверка не удалась»: тогда план не принимается.
+PLAN_VERDICTS = {}
+PLAN_DEFAULT = "clear"
+# Слова шага, по которым заглушка считает шаг нарушающим (если вердикт не задан
+# явно): так проверяется гейт по СМЫСЛУ шага, а не по его номеру.
+PLAN_VIOLATION_WORDS = ("kmp", "ios", "мультиплатформ", "обе платформ", "веб")
+PLAN_CALLS = 0
+# Последние user-части ВСЕХ вызовов: по ним видно, что уходит модели (в CALLS
+# лежат только системные префиксы).
+LAST_USER_TEXTS = []
 
 
 def _metrics(prompt=20, completion=10):
@@ -77,16 +121,79 @@ async def fake_call_llm_async(*args, **kwargs):
     system = str(messages[0].get("content") or "") if messages else ""
     CALLS.append({"system": system[:40], "messages": len(messages),
                   "user_text": kwargs.get("user_text")})
+    if messages:
+        LAST_USER_TEXTS.append(str(messages[-1].get("content") or ""))
+    if system.startswith("Ты — планировщик"):
+        LAST_MESSAGES.clear()
+        LAST_MESSAGES.extend(messages)
     if system.startswith("Ты — планировщик"):
         if SLOW_PLAN is not None:
             await asyncio.wait_for(SLOW_PLAN.wait(), timeout=10)
-        if not PLAN_STEPS:
+        preset = PLAN_QUEUE.pop(0) if PLAN_QUEUE else PLAN_STEPS
+        if not preset:
             return "", _metrics()
-        return json.dumps({"steps": list(PLAN_STEPS)}, ensure_ascii=False), _metrics(30, 15)
+        return json.dumps({"steps": list(preset)}, ensure_ascii=False), _metrics(30, 15)
     if system.startswith("Ты — приёмщик"):
         if REVIEW is None:
             return "", _metrics()
         return json.dumps(REVIEW, ensure_ascii=False), _metrics(40, 8)
+    if system.startswith("Ты — арбитр инвариантов: проверка ШАГОВ ПЛАНА"):
+        # КОД-ГЕЙТ ПЛАНА: префикс проверяем ДО общего «Ты — арбитр инвариантов».
+        global PLAN_CALLS
+        PLAN_CALLS += 1
+        if PLAN_VERDICTS is None:
+            return "", _metrics()   # «проверка не удалась» — план не принимается
+        user = str(messages[-1].get("content") or "") if messages else ""
+        tail = user.split("ШАГИ ПЛАНА (проверь")[-1]
+        steps = re.findall(r"^\d+\) (.*)$", tail, re.M) or ["?"]
+        verdicts = {}
+        for number, step in enumerate(steps, 1):
+            preset = PLAN_VERDICTS.get(str(number)) if PLAN_VERDICTS else None
+            if preset is not None:
+                verdicts[str(number)] = dict(preset)
+                continue
+            # Без явного вердикта — по СОДЕРЖАНИЮ шага: запрещённые технологии
+            # в тексте шага = нарушение (как это делает живая модель).
+            bad = any(word in step.lower() for word in PLAN_VIOLATION_WORDS)
+            verdicts[str(number)] = {"вердикт": "violation" if bad else PLAN_DEFAULT,
+                                     "причина": "запрещённая технология" if bad else ""}
+        return json.dumps(verdicts, ensure_ascii=False), _metrics(30, 12)
+    if system.startswith("Ты — арбитр инвариантов: проверка ВАРИАНТОВ"):
+        # ПРОВЕРКА вариантов-альтернатив: этот префикс проверяем ДО общего
+        # «Ты — арбитр инвариантов», иначе проверка получила бы вердикт запроса.
+        global SUGGESTION_CALLS
+        SUGGESTION_CALLS += 1
+        preset = SUGGESTIONS_QUEUE.pop(0) if SUGGESTIONS_QUEUE else SUGGESTIONS_VERDICTS
+        if preset is None:
+            return "", _metrics()   # «проверка не удалась»
+        user = str(messages[-1].get("content") or "") if messages else ""
+        count = len(re.findall(r"^\d+\) ", user.split("ВАРИАНТЫ (проверь")[-1], re.M)) or 1
+        verdicts = {}
+        for number in range(1, count + 1):
+            verdicts[str(number)] = dict(
+                preset.get(str(number))
+                or {"вердикт": SUGGESTIONS_DEFAULT, "причина": ""})
+        return json.dumps(verdicts, ensure_ascii=False), _metrics(25, 10)
+    if system.startswith("Ты — арбитр инвариантов"):
+        global ANALYSIS_CALLS
+        ANALYSIS_CALLS += 1
+        preset = ANALYSIS_QUEUE.pop(0) if ANALYSIS_QUEUE else INVARIANTS_ANALYSIS
+        if preset is None:
+            return "", _metrics()   # «разбор не удался»
+        return json.dumps(preset, ensure_ascii=False), _metrics(35, 20)
+    if system.startswith("Ты проверяешь ИНВАРИАНТЫ"):
+        if not INVARIANTS_VERDICTS:
+            return "", _metrics()   # «проверка не удалась»
+        # Пар в запросе может быть больше, чем заготовленных вердиктов: считаем
+        # их по тексту запроса (строки «N) Инвариант проекта: ...») и отвечаем на
+        # все, иначе часть пар осталась бы «не проверенной».
+        user = str(messages[-1].get("content") or "") if messages else ""
+        count = len(re.findall(r"^\d+\) Инвариант проекта:", user, re.M)) or 1
+        verdicts = {}
+        for number in range(1, count + 1):
+            verdicts[str(number)] = dict(INVARIANTS_VERDICTS.get(str(number))
+                                         or {"вердикт": "clear", "причина": ""})
+        return json.dumps(verdicts, ensure_ascii=False), _metrics(20, 6)
     if SLOW_QUEUE:
         await asyncio.wait_for(SLOW_QUEUE.pop(0).wait(), timeout=10)
     elif SLOW_ANSWER is not None:
@@ -122,6 +229,9 @@ def stage_of(events):
 
 def texts(events, kind):
     return [e.get("text", "") for e in events if e.get("type") == kind]
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -945,11 +1055,960 @@ async def test_routes():
     check("перезапуск распознан", chat._wants_restart("перезапусти задачу"))
 
 
+# ---------------------------------------------------------------------------
+# 4. Инварианты: правила, которые агент не имеет права нарушить
+# ---------------------------------------------------------------------------
+def _invariants_of(container):
+    return workspace_store.invariants(container)
+
+
+def _inv_texts(items):
+    return [entry["text"] for entry in items]
+
+
+async def test_invariants():
+    print("\n[4] Инварианты: хранение отдельно от диалога, контекст, противоречие")
+    global PLAN_STEPS, INVARIANTS_VERDICTS, ANSWER, INVARIANTS_ANALYSIS
+    PLAN_STEPS = ["Собрать данные"]
+    ANSWER = "Ответ модели."
+    INVARIANTS_VERDICTS = {"1": {"вердикт": "conflict", "причина": "СУБД разная"}}
+
+    await chat.task_create(chat.TaskCreate(name="Проект с инвариантами"))
+    task = chat._current_task()
+    await chat.session_create()
+    session = chat._current_session()
+    # Чистим правила «прошлых» проверок этого файла (задача новая, но диалог
+    # мог остаться от прежних шагов).
+    task["invariants"] = []
+    session["dialog"]["invariants"] = []
+    session["dialog"]["conflicts"] = []
+    session["dialog"]["unchecked"] = []
+
+    # 4.1 Инвариант проекта: хранится в проекте, в диалоге его нет.
+    view = await chat.invariant_create(InvariantCreate(text="Только PostgreSQL", scope="project"))
+    check("инвариант проекта сохранён", _inv_texts(_invariants_of(task)) == ["Только PostgreSQL"])
+    check("инвариант проекта НЕ попал в диалог", _invariants_of(session["dialog"]) == [])
+    check("в диалог (messages) инвариант не пишется", session["dialog"]["messages"] == [])
+    check("вызова LLM на проверку нет, пока правила только с одной стороны",
+          not any(c["system"].startswith("Ты проверяешь ИНВАРИАНТЫ") for c in CALLS))
+
+    # 4.2 Инварианты уходят агенту системным блоком (план — тоже контекст агента).
+    await run_chat("Сделай API")
+    # У служебного вызова плана контекст-блоки идут в user-части (system там —
+    # сам промпт планировщика), у ответа агента — отдельным system-сообщением.
+    planner_text = "\n\n".join(m["content"] for m in LAST_MESSAGES
+                               if m.get("role") == "user")
+    # Блок инвариантов идёт ПЕРВЫМ системным блоком (перед ним может быть только
+    # профиль пользователя, если он заполнен), поэтому ищем его в тексте контекста.
+    block = planner_text[planner_text.index("ИНВАРИАНТЫ"):] if "ИНВАРИАНТЫ" in planner_text else ""
+    check("блок инвариантов ушёл в контекст агента", bool(block))
+    check("в блоке есть правило проекта", "Только PostgreSQL" in block)
+    check("в блоке есть требование не нарушать правила", "нарушать нельзя" in block)
+    check("в блоке есть отказ от нарушающих решений", "не предлагай решений" in block)
+    check("в блоке сказано, что правило проекта главнее",
+          "правило ПРОЕКТА всегда главнее" in block)
+    check("в блоке сказано, что противоречащее правило задачи не действует",
+          "НЕ ДЕЙСТВУЕТ" in block and "не применяй" in block)
+
+    # 4.3 Инвариант задачи: пишется БЕЗ обращения к модели (правило — это данные).
+    calls_before = len(CALLS)
+    view = await chat.invariant_create(InvariantCreate(text="Только MongoDB", scope="task"))
+    check("инвариант задачи сохранён (в диалоге, не в проекте)",
+          _inv_texts(_invariants_of(session["dialog"])) == ["Только MongoDB"]
+          and _inv_texts(_invariants_of(task)) == ["Только PostgreSQL"])
+    check("при записи правил обращений к модели НЕТ",
+          len(CALLS) == calls_before,
+          f"вызовов LLM при записи: {len(CALLS) - calls_before}")
+    check("проверок пар в снимке модалки нет",
+          "checks" not in view and view["has_conflict"] is False, str(sorted(view))[:120])
+
+    # 4.4 Запрос, нарушающий правило, разбирается в диалоге (до планирования).
+    # Диалог начинаем с чистого листа: в 4.2 задача уже получила план, а проверяем
+    # именно то, что нарушающий запрос НЕ доводит дело до плана.
+    session = chat._current_session()
+    session["dialog"] = workspace_store.empty_dialog(session["id"])
+    task = chat._current_task()
+    calls_before = len(CALLS)
+    INVARIANTS_ANALYSIS = {
+        "вердикт": "violation",
+        "объяснение": "Веб-приложение нарушает инвариант: разрешён только Kotlin.",
+        "варианты": [{"заголовок": "Нативное Android-приложение",
+                      "пояснение": "В стеке", "запрос": "Сделай Android-приложение"},
+                     {"заголовок": "План экранов Android на Compose",
+                      "пояснение": "Только Android, MVVM + Compose",
+                      "запрос": "Спланируй экраны Android-приложения на Compose"}],
+    }
+    events = await run_chat("сделай веб-приложение")
+    check("разбор запроса вызван в диалоге",
+          len(CALLS) > calls_before
+          and any(c["system"].startswith("Ты — арбитр инвариантов") for c in CALLS[calls_before:]))
+    blocked = [e["analysis"] for e in events if e.get("type") == "suggestions"]
+    check("отказ с вариантами показан", bool(blocked))
+    check("план при нарушении не строится",
+          not (stage_of(events) or {}).get("steps"),
+          str((stage_of(events) or {}).get("steps")))
+
+    # 4.5 КОНФЛИКТ правила задачи с правилом ПРОЕКТА: приоритет всегда у проекта.
+    #     Агент поступает так же, как с запрещённым запросом: отказывается и даёт
+    #     альтернативы. Выбора «какое правило главнее» пользователю не даём.
+    session["dialog"]["analysis"] = None   # свежий вердикт (кэш не переиспользуем)
+    INVARIANTS_ANALYSIS = {
+        "вердикт": "violation",
+        "объяснение": "Правило проекта требует нативную платформу Android (Kotlin), "
+                      "а правило задачи просит веб-сайт — действует правило проекта.",
+        "варианты": [
+            {"заголовок": "Нативное Android-приложение",
+             "пояснение": "Укладывается в стек проекта: Kotlin + Compose.",
+             "запрос": "Сделай нативное Android-приложение погоды на Kotlin"},
+            {"заголовок": "Экраны Android-приложения",
+             "пояснение": "Только Android, MVVM + Compose.",
+             "запрос": "Спланируй экраны Android-приложения на Compose"},
+        ],
+    }
+    events = await run_chat("сделай веб-сайт погоды")
+    blocked = [e["analysis"] for e in events if e.get("type") == "suggestions"]
+    check("конфликт правил показан как нарушение с альтернативами", bool(blocked))
+    analysis = blocked[0] if blocked else {}
+    check("вердикт — нарушение (не «выбор приоритета»)",
+          analysis.get("verdict") == "violation", str(analysis.get("verdict")))
+    check("выбора «главнее проект/задача» больше не предлагается",
+          not analysis.get("resolutions") and "resolution" not in analysis,
+          str(sorted(analysis.keys())))
+    check("предложены альтернативы, ни одна не нарушает правила",
+          len(analysis.get("suggestions") or []) >= 2
+          and all("веб" not in (item["send"] or "").lower()
+                  for item in analysis.get("suggestions") or []),
+          str(analysis.get("suggestions")))
+    check("в объяснении сказано про приоритет правила проекта",
+          "проекта" in str(analysis.get("explanation") or "").lower(),
+          str(analysis.get("explanation"))[:120])
+    check("план при конфликте правил не строится",
+          not any("План задачи" in text for text in texts(events, "bot")))
+
+    # 4.6 Клик по альтернативе: сервер отдаёт её текст, страница отправляет запрос.
+    picked = await chat.invariant_choose(InvariantPick(index=0))
+    check("выбор альтернативы — действие «отправить»", picked.get("action") == "send",
+          str(picked.get("action")))
+    check("текст альтернативы пришёл с сервера",
+          "Kotlin" in (picked.get("text") or ""), str(picked.get("text"))[:60])
+    check("альтернатива не нарушает правила проекта",
+          "веб" not in (picked.get("text") or "").lower())
+    check("«главнее задача» больше не принимается",
+          await _raises(lambda: chat.invariant_resolve(
+              InvariantResolve(key="any", winner="task")), status=409))
+
+    # 4.7 Запрос по альтернативе: правила соблюдены — план строится.
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+    events = await run_chat(picked["text"])
+    check("по альтернативе план строится",
+          any("План задачи" in text for text in texts(events, "bot")),
+          str(texts(events, "bot"))[:140])
+    check("шаги плана в состоянии",
+          [s["text"] for s in (stage_of(events) or {}).get("steps", [])] == PLAN_STEPS)
+
+    # 4.8 Удаление правила: решения по его парам больше не хранятся.
+    project_id = chat._invariants_view(task, session)["project"][0]["id"]
+    view = await chat.invariant_delete("project", project_id)
+    check("правило проекта удалено", _inv_texts(_invariants_of(task)) == [])
+    check("решения по удалённому правилу не остаются",
+          view["exceptions"] == [], str(view["exceptions"]))
+    check("повторный разбор не показывает противоречий",
+          view["has_conflict"] is False)
+
+    # 4.9 Профильная изоляция: чужие правила не видны (новый профиль — свои данные).
+    task2 = await chat.task_create(chat.TaskCreate(name="Другой проект"))
+    session2 = chat._current_session()
+    check("у нового проекта своих правил нет",
+          chat._invariants_view(chat._current_task(), session2)["counts"]["project"] == 0)
+    check("снимок инвариантов без проекта пуст",
+          chat._invariants_view(None, None)["counts"]
+          == {"project": 0, "task": 0, "conflict": 0, "exceptions": 0},
+          str(chat._invariants_view(None, None)["counts"]))
+
+
+# ---------------------------------------------------------------------------
+# 5. Разбор запроса на соответствие инвариантам (ДО планирования)
+# ---------------------------------------------------------------------------
+def _suggestions_events(events):
+    return [e["analysis"] for e in events if e.get("type") == "suggestions"]
+
+
+async def test_request_compliance():
+    print("\n[5] Разбор запроса: отказ при нарушении и варианты решения")
+    global PLAN_STEPS, INVARIANTS_VERDICTS, INVARIANTS_ANALYSIS, ANALYSIS_CALLS
+    PLAN_STEPS = ["Собрать требования", "Написать код"]
+    INVARIANTS_VERDICTS = {"1": {"вердикт": "clear", "причина": ""}}
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+
+    await chat.task_create(chat.TaskCreate(name="Проект погоды"))
+    await chat.session_create()          # диалог нужен для журнала и разбора
+    task = chat._current_task()
+    session = chat._current_session()
+    task["invariants"] = []
+    session["dialog"]["invariants"] = []
+    session["dialog"]["conflicts"] = []
+    session["dialog"]["analysis"] = None
+    await chat.invariant_create(InvariantCreate(
+        text="Только Kotlin под Android: никакого веба и мультиплатформы", scope="project"))
+
+    # 5.1 Запрос нарушает инвариант: агент ОТКАЗЫВАЕТСЯ и предлагает варианты.
+    ANALYSIS_CALLS = 0
+    INVARIANTS_ANALYSIS = {
+        "вердикт": "violation",
+        "объяснение": "Веб-приложение нарушает инвариант: разрешён только Kotlin/Android.",
+        "варианты": [
+            {"заголовок": "Нативное Android-приложение на Kotlin",
+             "пояснение": "Укладывается в стек: Kotlin + Compose.",
+             "запрос": "Сделай нативное Android-приложение погоды на Kotlin и Compose"},
+            {"заголовок": "Экраны Android-приложения",
+             "пояснение": "Только Android, MVVM + Compose.",
+             "запрос": "Спланируй экраны Android-приложения на Compose"},
+        ],
+    }
+    plan_calls_before = len(CALLS)
+    events = await run_chat("нужно веб-приложение погоды, открывается в браузере")
+    analyses = _suggestions_events(events)
+    check("разбор запроса вызван ДО планирования", ANALYSIS_CALLS == 1,
+          f"вызовов разбора: {ANALYSIS_CALLS}")
+    check("событие с вариантами отправлено", len(analyses) == 1)
+    analysis = analyses[0] if analyses else {}
+    check("вердикт — нарушение требования инварианта",
+          analysis.get("verdict") == "violation", str(analysis.get("verdict")))
+    check("предложено не меньше двух вариантов",
+          len(analysis.get("suggestions") or []) >= 2,
+          f"вариантов: {len(analysis.get('suggestions') or [])}")
+    check("у каждого варианта есть заголовок и текст запроса",
+          all(item["title"] and item["send"] for item in analysis.get("suggestions") or []))
+    check("среди вариантов нет нарушающего правила (веб-приложения)",
+          not any("веб" in (item["send"] or "").lower()
+                  for item in analysis.get("suggestions") or []))
+    check("объяснение, почему требование невозможно, показано",
+          "нарушает инвариант" in str(analysis.get("explanation") or ""))
+    check("план НЕ построен — шагов нет",
+          not (stage_of(events) or {}).get("steps"),
+          str((stage_of(events) or {}).get("steps")))
+    check("планировщик не вызывался (запрос отсечён до планирования)",
+          not any(c["system"].startswith("Ты — планировщик") for c in CALLS[plan_calls_before:]),
+          str([c["system"][:20] for c in CALLS[plan_calls_before:]]))
+    check("задача ждёт решения пользователя",
+          (stage_of(events) or {}).get("stage") == "awaiting_user",
+          str((stage_of(events) or {}).get("stage")))
+    check("отказ виден пользователю (текст сообщения с вариантами)",
+          any("нарушает инвариант" in t for t in texts(events, "suggestions")),
+          str(texts(events, "suggestions"))[:120])
+    check("текст отказа сохранён в журнале чата",
+          any("нарушает инвариант" in item["text"] for item in
+              (await chat.agent_history())["log"]))
+
+    # 5.2 Варианты и объяснение переживают переключение задачи (журнал чата).
+    history = await chat.agent_history()
+    logged = [item for item in history["log"] if item.get("kind") == "suggestions"]
+    check("варианты сохранены в журнале чата", len(logged) == 1)
+    check("в журнале есть сами варианты и объяснение",
+          len(logged[0].get("analysis", {}).get("suggestions") or []) >= 2
+          and "нарушает инвариант" in logged[0]["text"])
+
+    # 5.3 Повторный разбор того же запроса не тратит вызов LLM (кэш по подписи).
+    ANALYSIS_CALLS = 0
+    events = await run_chat("нужно веб-приложение погоды, открывается в браузере")
+    check("тот же запрос при тех же правилах не разбирается повторно",
+          ANALYSIS_CALLS == 0, f"вызовов разбора: {ANALYSIS_CALLS}")
+    check("отказ повторяется из кэша", bool(_suggestions_events(events)))
+
+    # 5.4 Клик по варианту-запросу: сервер отдаёт текст варианта (не фронт).
+    picked = await chat.invariant_choose(InvariantPick(index=0))
+    check("выбор варианта — действие «отправить запрос»",
+          picked.get("action") == "send", str(picked.get("action")))
+    check("текст варианта пришёл с сервера",
+          "Kotlin" in (picked.get("text") or ""), str(picked.get("text"))[:60])
+    check("варианты с фронта не подменяются (номер вне списка — 404)",
+          await _raises(lambda: chat.invariant_choose(InvariantPick(index=9))))
+
+    # 5.5 Пользователь отправил предложенный вариант: он УЖЕ проверен по правилам,
+    #     поэтому повторного разбора нет (иначе выбор варианта снова упирался бы в
+    #     отказ) — агент сразу строит план.
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+    ANALYSIS_CALLS = 0
+    events = await run_chat(picked["text"])
+    check("проверенный вариант разбора НЕ требует",
+          ANALYSIS_CALLS == 0, f"вызовов разбора: {ANALYSIS_CALLS}")
+    check("нарушений нет — отказа не было",
+          not _suggestions_events(events))
+    check("план построен по совместимому запросу",
+          any("План задачи" in t for t in texts(events, "bot")),
+          str(texts(events, "bot"))[:120])
+    check("шаги плана в состоянии",
+          [s["text"] for s in (stage_of(events) or {}).get("steps", [])] == PLAN_STEPS)
+    check("после ответа задача ждёт подтверждения плана",
+          (stage_of(events) or {}).get("stage") == "awaiting_user")
+    # 5.5б Новый (не из вариантов) запрос по-прежнему разбирается моделью.
+    session["dialog"]["analysis"] = None
+    ANALYSIS_CALLS = 0
+    events = await run_chat("теперь опиши тестирование")
+    check("новый запрос разбирается заново",
+          ANALYSIS_CALLS == 1, f"вызовов разбора: {ANALYSIS_CALLS}")
+
+    # 5.6 Конфликт правила задачи с правилом ПРОЕКТА: приоритет у проекта,
+    #     агент отказывается и даёт альтернативы (как при запрещённом запросе).
+    await chat.invariant_create(InvariantCreate(
+        text="Только нативная платформа Android (Kotlin)", scope="project"))
+    await chat.invariant_create(InvariantCreate(
+        text="Разрешить веб-приложение для этой задачи", scope="task"))
+    view_rules = chat._invariants_view(chat._current_task(), chat._current_session())
+    project_texts = [item["text"] for item in view_rules["project"]]
+    task_texts = [item["text"] for item in view_rules["task"]]
+    check("правила обеих областей на месте (есть что сравнивать)",
+          any("Android" in text for text in project_texts)
+          and any("веб" in text for text in task_texts),
+          f"проект: {project_texts}, задача: {task_texts}")
+    INVARIANTS_ANALYSIS = {
+        "вердикт": "violation",
+        "объяснение": "Правило проекта запрещает веб и мультиплатформу, а правило "
+                      "задачи просит веб — действует правило проекта.",
+        "варианты": [
+            {"заголовок": "Нативное Android-приложение",
+             "пояснение": "Укладывается в правило проекта.", "запрос": "Сделай Android-приложение на Kotlin"},
+            {"заголовок": "План экранов Android",
+             "пояснение": "Только Android, MVVM.", "запрос": "Спланируй экраны Android-приложения"},
+        ],
+    }
+    chat._current_session()["dialog"]["analysis"] = None   # свежий вердикт
+    events = await run_chat("сделай теперь веб-версию")
+    analyses = _suggestions_events(events)
+    check("конфликт правил показан вариантами-альтернативами", bool(analyses))
+    analysis = analyses[0] if analyses else {}
+    check("вердикт — нарушение правила проекта, а не «выбор приоритета»",
+          analysis.get("verdict") == "violation", str(analysis.get("verdict")))
+    check("вариантов-альтернатив не меньше двух",
+          len(analysis.get("suggestions") or []) >= 2, str(analysis.get("suggestions")))
+    check("ни один вариант не нарушает правило проекта (нет веба)",
+          all("веб" not in (item.get("send") or "").lower()
+              for item in analysis.get("suggestions") or []))
+    check("при конфликте план не строится",
+          not any("План задачи" in text for text in texts(events, "bot")),
+          str(texts(events, "bot"))[:120])
+
+    # 5.7 Альтернатива уходит обычным запросом и правила не нарушает.
+    picked = await chat.invariant_choose(InvariantPick(index=0))
+    check("выбор альтернативы — действие «send»", picked.get("action") == "send")
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+    events = await run_chat(picked["text"])
+    check("по альтернативе план строится",
+          any("План задачи" in text for text in texts(events, "bot")),
+          str(texts(events, "bot"))[:140])
+
+    # 5.8 Сбой разбора не выдумывает нарушение: агент работает как раньше.
+    INVARIANTS_ANALYSIS = None
+    chat._current_session()["dialog"]["analysis"] = None
+    events = await run_chat("сделай что-нибудь по погоде")
+    check("без вердикта отказа нет", not _suggestions_events(events))
+    check("без вердикта план строится",
+          any("План задачи" in t for t in texts(events, "bot")),
+          str(texts(events, "bot"))[:100])
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+
+
+# ---------------------------------------------------------------------------
+# 6. Варианты-альтернативы: проверка по правилам, повтор, расход
+# ---------------------------------------------------------------------------
+def _sends(analysis):
+    return [str(item.get("send") or "").lower()
+            for item in (analysis or {}).get("suggestions") or []]
+
+
+async def test_suggestion_verification():
+    print("\n[6] Варианты-альтернативы: проверка по правилам, повтор, расход")
+    global INVARIANTS_ANALYSIS, SUGGESTIONS_VERDICTS, ANALYSIS_CALLS
+    global SUGGESTION_CALLS, ANALYSIS_QUEUE, PLAN_STEPS
+    global SUGGESTIONS_QUEUE, SUGGESTIONS_DEFAULT
+
+    # Чистые функции проверки вариантов: вердикты по номерам.
+    check("неразобранный ответ проверки — СБОЙ, а не «совместимо»",
+          invariants_store.parse_suggestion_verdicts("не json", 2) is None)
+    check("нет вердикта по варианту — вариант НЕ подтверждён",
+          invariants_store.parse_suggestion_verdicts(
+              '{"1": {"вердикт": "clear"}}', 2) == [True, False])
+    check("лишние ключи ответа проверке не мешают",
+          invariants_store.parse_suggestion_verdicts(
+              '{"1": {"вердикт": "violation"}, "2": {"вердикт": "clear"}, "3": {}}',
+              2) == [False, True])
+
+    PLAN_STEPS = ["Собрать требования", "Написать код"]
+    ANALYSIS_QUEUE = []
+    await chat.task_create(chat.TaskCreate(name="Проект с проверкой вариантов"))
+    await chat.session_create()
+    task = chat._current_task()
+    session = chat._current_session()
+    task["invariants"] = []
+    session["dialog"]["invariants"] = []
+    session["dialog"]["conflicts"] = []
+    session["dialog"]["analysis"] = None
+    await chat.invariant_create(InvariantCreate(text="язык только kotlin", scope="project"))
+    await chat.invariant_create(InvariantCreate(
+        text="только нативная платформа, никакой мультиплатформы", scope="project"))
+
+    # 6.1 Модель предложила нарушающий вариант (iOS + Swift): он НЕ показывается.
+    INVARIANTS_ANALYSIS = {
+        "вердикт": "violation",
+        "объяснение": "Веб-сайт нарушает правило проекта о нативной платформе.",
+        "варианты": [
+            {"заголовок": "Нативное приложение для Android",
+             "пояснение": "Только Kotlin + Compose.",
+             "запрос": "Составь план нативного Android-приложения на Kotlin с MVVM и Compose"},
+            {"заголовок": "Нативное приложение для обеих платформ отдельно",
+             "пояснение": "Kotlin для Android, Swift для iOS.",
+             "запрос": "Составь план двух приложений: Android (Kotlin + Compose) "
+                       "и iOS (Swift + MVVM)"},
+            {"заголовок": "План экранов Android-приложения",
+             "пояснение": "Только Android, MVVM + Compose.",
+             "запрос": "Спланируй экраны Android-приложения на Compose"},
+        ],
+    }
+    SUGGESTIONS_VERDICTS = {
+        "1": {"вердикт": "clear", "причина": ""},
+        "2": {"вердикт": "violation", "причина": "язык только kotlin"},
+        "3": {"вердикт": "clear", "причина": ""},
+    }
+    SUGGESTION_CALLS = 0
+    ANALYSIS_CALLS = 0
+    events = await run_chat("нужен план разработки веб сайта для просмотра прогноза погоды")
+    analyses = _suggestions_events(events)
+    check("отказ с вариантами показан", bool(analyses))
+    analysis = analyses[0] if analyses else {}
+    sends = _sends(analysis)
+    check("варианты проверены отдельным служебным вызовом",
+          SUGGESTION_CALLS == 1, f"вызовов проверки: {SUGGESTION_CALLS}")
+    check("нарушающий вариант отброшен (нет Swift/iOS)",
+          len(sends) == 2 and not any("swift" in s or "ios" in s for s in sends),
+          str(sends))
+    check("совместимые варианты остались",
+          all(item.get("title") and item.get("send")
+              for item in analysis.get("suggestions") or []))
+    check("в разборе отмечено, что варианты проверены",
+          analysis.get("suggestions_checked") is True,
+          str(analysis.get("suggestions_checked")))
+    check("повторный запрос вариантов не понадобился",
+          ANALYSIS_CALLS == 1, f"вызовов разбора: {ANALYSIS_CALLS}")
+    check("сообщение обещает проверенные варианты",
+          "проверен" in str(analysis.get("message") or "").lower(),
+          str(analysis.get("message"))[-120:])
+    check("план не построен", not (stage_of(events) or {}).get("steps"))
+    check("в дебаге видно, что варианты проверены",
+          any("варианты проверены" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[:160])
+    check("расход проверки учтён как служебный",
+          any((e.get("usage") or {}).get("summary_requests", 0) >= 2
+              for e in events if e.get("type") == "done"),
+          str([e.get("usage") for e in events if e.get("type") == "done"])[:200])
+    history = await chat.agent_history()
+    logged = [item for item in history["log"] if item.get("kind") == "suggestions"]
+    check("отметка проверки переживает журнал и перезагрузку",
+          bool(logged) and logged[-1]["analysis"].get("suggestions_checked") is True
+          and all("swift" not in (item.get("send") or "").lower()
+                  for item in logged[-1]["analysis"].get("suggestions") or []),
+          str(logged[-1]["analysis"].get("suggestions_checked")) if logged else "нет узла")
+
+    # 6.2 Пригодных вариантов меньше нормы — одна попытка попросить ДРУГИЕ,
+    #     и только ПРОВЕРЕННЫЕ из них попадают в сообщение.
+    INVARIANTS_ANALYSIS = None      # очередь ниже подменяет ответ по порядку
+    ANALYSIS_QUEUE[:] = [
+        {"вердикт": "violation", "объяснение": "Правило проекта: только Kotlin/Android.",
+         "варианты": [
+             {"заголовок": "Нативное Android-приложение",
+              "пояснение": "В стеке.", "запрос": "Сделай Android-приложение на Kotlin"},
+             {"заголовок": "iOS на Swift",
+              "пояснение": "Другая платформа.", "запрос": "Сделай iOS-приложение на Swift"},
+         ]},
+        {"вердикт": "violation", "объяснение": "Правило проекта: только Kotlin/Android.",
+         "варианты": [
+             {"заголовок": "Экраны Android на Compose",
+              "пояснение": "Только Android.", "запрос": "Спланируй экраны Android на Compose"},
+             {"заголовок": "Данные и репозиторий Android",
+              "пояснение": "Только Android.", "запрос": "Спланируй слой данных Android на Kotlin"},
+         ]},
+    ]
+    SUGGESTIONS_VERDICTS = {"2": {"вердикт": "violation", "причина": "язык только kotlin"}}
+    SUGGESTIONS_QUEUE[:] = [SUGGESTIONS_VERDICTS, {}]
+    SUGGESTION_CALLS = 0
+    ANALYSIS_CALLS = 0
+    LAST_USER_TEXTS.clear()
+    chat._current_session()["dialog"]["analysis"] = None
+    events = await run_chat("сделай веб-версию приложения")
+    analysis = (_suggestions_events(events) or [{}])[0]
+    sends = _sends(analysis)
+    check("повторный запрос вариантов сделан (их было меньше нормы)",
+          ANALYSIS_CALLS == 2, f"вызовов разбора: {ANALYSIS_CALLS}")
+    check("проверены оба набора вариантов",
+          SUGGESTION_CALLS == 2, f"вызовов проверки: {SUGGESTION_CALLS}")
+    check("в сообщении только проверенные варианты (3 штуки)",
+          len(sends) == 3 and "swift" not in " ".join(sends), str(sends))
+    check("в повторном запросе перечислены отклонённые варианты",
+          any("ОТКЛОНЕНО" in text for text in LAST_USER_TEXTS),
+          "отклонённый вариант должен уйти модели в повторном запросе")
+
+    # 6.3 Повтор не бесконечный: снова ничего пригодного — вариантов нет, но
+    #     сообщение честно говорит, что подходящих вариантов не нашлось.
+    ANALYSIS_QUEUE[:] = [
+        {"вердикт": "violation", "объяснение": "Только Kotlin/Android.",
+         "варианты": [{"заголовок": "iOS на Swift", "пояснение": "Другая ОС.",
+                       "запрос": "Сделай iOS-приложение на Swift"}]},
+        {"вердикт": "violation", "объяснение": "Только Kotlin/Android.",
+         "варианты": [{"заголовок": "Веб на React", "пояснение": "Веб запрещён.",
+                       "запрос": "Сделай веб-сайт на React"}]},
+    ]
+    SUGGESTIONS_QUEUE[:] = []
+    SUGGESTIONS_VERDICTS = {}
+    SUGGESTIONS_DEFAULT = "violation"   # проверка работает, но ВСЕ варианты нарушают
+    SUGGESTION_CALLS = 0
+    ANALYSIS_CALLS = 0
+    chat._current_session()["dialog"]["analysis"] = None
+    events = await run_chat("сделай веб-сайт на React")
+    analysis = (_suggestions_events(events) or [{}])[0]
+    check("попытка ровно одна (без цикла)",
+          ANALYSIS_CALLS == 2 and SUGGESTION_CALLS == 2,
+          f"разбор: {ANALYSIS_CALLS}, проверка: {SUGGESTION_CALLS}")
+    check("нарушающие варианты в сообщение не попали",
+          _sends(analysis) == [], str(_sends(analysis)))
+    check("сообщение не обещает вариантов",
+          "не нашлось" in str(analysis.get("message") or "").lower(),
+          str(analysis.get("message"))[-140:])
+
+    # 6.4 Сбой проверки вариантов не выглядит как «варианты совместимы».
+    ANALYSIS_QUEUE[:] = []
+    SUGGESTIONS_DEFAULT = "clear"
+    INVARIANTS_ANALYSIS = {
+        "вердикт": "violation", "объяснение": "Только Kotlin/Android.",
+        "варианты": [{"заголовок": "Нативное Android-приложение", "пояснение": "В стеке.",
+                      "запрос": "Сделай Android-приложение на Kotlin"}],
+    }
+    SUGGESTIONS_VERDICTS = None      # «проверка не удалась»
+    chat._current_session()["dialog"]["analysis"] = None
+    events = await run_chat("сделай веб-сайт погоды")
+    analysis = (_suggestions_events(events) or [{}])[0]
+    check("при сбое проверки варианты не показываются",
+          _sends(analysis) == [] and analysis.get("suggestions_checked") is False,
+          str(analysis.get("suggestions")))
+    check("сообщение объясняет, что проверка не удалась",
+          "не удалась" in str(analysis.get("message") or "").lower(),
+          str(analysis.get("message"))[-160:])
+    check("в дебаге видно сбой проверки вариантов",
+          any("варианты не проверены" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[:160])
+
+    # 6.5 Запись журнала БЕЗ отметки проверки (старые данные): клик возможен, но
+    #     текст уходит ОБЫЧНЫМ разбором — «не проверено» ≠ «разрешено». А
+    #     проверенный вариант разбора не требует вовсе (см. раздел [7]).
+    workspace_store.add_log_event(
+        chat._current_session()["dialog"], workspace_store.LOG_SUGGESTIONS,
+        "⛔ Запрос нарушает инвариант", {
+            "verdict": "violation", "kind": "violation", "message": "старая запись",
+            "suggestions": [{"title": "iOS на Swift", "details": "Другая ОС.",
+                             "send": "Сделай iOS-приложение на Swift", "kind": "suggestion"}],
+        })
+    picked = await chat.invariant_choose(InvariantPick(index=0))
+    check("старый вариант отправляется как обычный запрос",
+          picked.get("action") == "send" and "Swift" in picked.get("text", ""),
+          str(picked)[:80])
+    SUGGESTIONS_VERDICTS = {}
+    SUGGESTIONS_DEFAULT = "clear"
+    INVARIANTS_ANALYSIS = {
+        "вердикт": "violation", "объяснение": "Правило проекта: только Kotlin/Android.",
+        "варианты": [{"заголовок": "Нативное Android-приложение", "пояснение": "В стеке.",
+                      "запрос": "Сделай Android-приложение на Kotlin"},
+                     {"заголовок": "Экраны Android на Compose", "пояснение": "В стеке.",
+                      "запрос": "Спланируй экраны Android на Compose"}]}
+    ANALYSIS_CALLS = 0
+    events = await run_chat(picked["text"])
+    check("текст из старой записи разбирается разбором",
+          ANALYSIS_CALLS == 1, f"вызовов разбора: {ANALYSIS_CALLS}")
+    check("нарушающий текст получает отказ",
+          bool(_suggestions_events(events)), str(texts(events, "suggestions"))[:80])
+    workspace_store.add_log_event(
+        chat._current_session()["dialog"], workspace_store.LOG_SUGGESTIONS,
+        "⛔ Запрос нарушает инвариант", {
+            "verdict": "violation", "kind": "violation", "message": "проверенная запись",
+            "suggestions_checked": True,
+            "suggestions": [{"title": "Нативное Android-приложение", "details": "В стеке.",
+                             "send": "Сделай Android-приложение на Kotlin", "kind": "suggestion"}],
+        })
+    picked = await chat.invariant_choose(InvariantPick(index=0))
+    check("проверенный вариант отправляется",
+          picked.get("action") == "send" and "Kotlin" in picked.get("text", ""),
+          str(picked)[:80])
+
+    ANALYSIS_QUEUE[:] = []
+    SUGGESTIONS_QUEUE[:] = []
+    SUGGESTIONS_VERDICTS = {}
+    SUGGESTIONS_DEFAULT = "clear"
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+
+
+# ---------------------------------------------------------------------------
+# 7. Выбранный вариант: повторного отказа быть не может
+# ---------------------------------------------------------------------------
+async def test_chosen_alternative():
+    print("\n[7] Выбранный вариант проходит без повторного разбора")
+    global INVARIANTS_ANALYSIS, SUGGESTIONS_VERDICTS, SUGGESTIONS_DEFAULT
+    global ANALYSIS_CALLS, SUGGESTION_CALLS, ANALYSIS_QUEUE, SUGGESTIONS_QUEUE, PLAN_STEPS
+
+    check("в промпте разбора противоречие правила задачи — НЕ нарушение запроса",
+          "тоже нарушение правила проекта" not in invariants_store.ANALYSIS_PROMPT
+          and "НЕ ДЕЙСТВУЕТ" in invariants_store.ANALYSIS_PROMPT)
+    check("проверка вариантов смотрит на технологии, а не на заверения варианта",
+          "НА ВЕРУ не принимай" in invariants_store.SUGGESTIONS_PROMPT)
+
+    PLAN_STEPS = ["Собрать требования", "Написать код"]
+    ANALYSIS_QUEUE = []
+    SUGGESTIONS_QUEUE[:] = []
+    SUGGESTIONS_VERDICTS = {}
+    SUGGESTIONS_DEFAULT = "clear"
+    await chat.task_create(chat.TaskCreate(name="Проект: только Android"))
+    await chat.session_create()
+    task = chat._current_task()
+    session = chat._current_session()
+    task["invariants"] = []
+    session["dialog"]["invariants"] = []
+    session["dialog"]["conflicts"] = []
+    session["dialog"]["analysis"] = None
+    await chat.invariant_create(InvariantCreate(text="язык только kotlin", scope="project"))
+    await chat.invariant_create(InvariantCreate(
+        text="только нативная платформа, никакой мультиплатформы", scope="project"))
+    # Правило задачи, ПРОТИВОРЕЧАЩЕЕ правилу проекта: из-за него агент раньше
+    # отказывался от ЛЮБОГО запроса, включая свой же проверенный вариант.
+    await chat.invariant_create(InvariantCreate(
+        text="пишем только под мультиплатформу (iOS + Android)", scope="task"))
+
+    REFUSAL = {
+        "вердикт": "violation",
+        "объяснение": "Запрос требует мультиплатформу, а правило проекта — только "
+                      "нативную платформу: действует правило проекта.",
+        "варианты": [
+            {"заголовок": "Нативное Android-приложение",
+             "пояснение": "Только Android, Kotlin + Compose.",
+             "запрос": "Нужен план разработки нативного Android-приложения для "
+                       "просмотра прогноза погоды на Kotlin с MVVM и Compose."},
+            {"заголовок": "Экраны Android-приложения",
+             "пояснение": "Только Android, MVVM + Compose.",
+             "запрос": "Спланируй экраны Android-приложения на Kotlin и Compose."},
+        ],
+    }
+
+    # 7.1 Отказ по конфликту правил → выбор варианта → план, БЕЗ нового отказа.
+    INVARIANTS_ANALYSIS = REFUSAL
+    ANALYSIS_CALLS = 0
+    SUGGESTION_CALLS = 0
+    events = await run_chat("нужен план разработки приложения просмотра прогноза погоды")
+    analyses = _suggestions_events(events)
+    check("отказ при конфликте правил показан", bool(analyses))
+    check("варианты проверены", (analyses or [{}])[0].get("suggestions_checked") is True,
+          str((analyses or [{}])[0].get("suggestions_checked")))
+    picked = await chat.invariant_choose(InvariantPick(index=0))
+    check("сервер отдал текст выбранного варианта",
+          picked.get("action") == "send" and "Android" in picked.get("text", ""),
+          str(picked)[:80])
+    ANALYSIS_CALLS = 0
+    events = await run_chat(picked["text"])
+    check("выбранный вариант больше НЕ разбирается (нет вызова LLM)",
+          ANALYSIS_CALLS == 0, f"вызовов разбора: {ANALYSIS_CALLS}")
+    check("повторного отказа нет", not _suggestions_events(events))
+    check("по выбранному варианту строится план",
+          any("План задачи" in text for text in texts(events, "bot")),
+          str(texts(events, "bot"))[:140])
+    check("в дебаге объяснено, почему разбора не было",
+          any("проверенный вариант-альтернатива" in text for text in texts(events, "debug")),
+          str(texts(events, "debug"))[:160])
+
+    # 7.2 Правила изменились после проверки — тот же текст разбирается заново
+    #     (отметка rules_signature не даёт считать старую проверку актуальной).
+    session["dialog"]["analysis"] = None
+    INVARIANTS_ANALYSIS = REFUSAL
+    events = await run_chat("сделай веб-сайт прогноза погоды")
+    check("отказ получен снова (есть узел с вариантами)", bool(_suggestions_events(events)))
+    picked = await chat.invariant_choose(InvariantPick(index=0))
+    await chat.invariant_create(InvariantCreate(text="тесты только на JUnit", scope="project"))
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+    ANALYSIS_CALLS = 0
+    events = await run_chat(picked["text"])
+    check("после правки правил вариант разбирается заново",
+          ANALYSIS_CALLS == 1, f"вызовов разбора: {ANALYSIS_CALLS}")
+    check("план по нему строится",
+          any("План задачи" in text for text in texts(events, "bot")),
+          str(texts(events, "bot"))[:120])
+
+    # 7.3 Посторонний текст рядом с узлом вариантов проверку НЕ отменяет.
+    session["dialog"]["analysis"] = None
+    INVARIANTS_ANALYSIS = REFUSAL
+    events = await run_chat("сделай веб-версию")
+    check("отказ получен (узел с вариантами есть)", bool(_suggestions_events(events)))
+    ANALYSIS_CALLS = 0
+    events = await run_chat("придумай что-нибудь про погоду")
+    check("посторонний текст разбирается разбором",
+          ANALYSIS_CALLS == 1, f"вызовов разбора: {ANALYSIS_CALLS}")
+
+    SUGGESTIONS_QUEUE[:] = []
+    SUGGESTIONS_VERDICTS = {}
+    SUGGESTIONS_DEFAULT = "clear"
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+
+
+# ---------------------------------------------------------------------------
+# 8. Запрет проекта не обходится требованием задачи
+# ---------------------------------------------------------------------------
+async def test_project_ban_wins():
+    print("\n[8] Правило задачи, противоречащее проекту, помечается НЕДЕЙСТВУЮЩИМ")
+    global INVARIANTS_ANALYSIS, PLAN_STEPS, SUGGESTIONS_VERDICTS, SUGGESTIONS_DEFAULT
+
+    # Чистые функции: номера правил задачи из разбора -> тексты для блока.
+    task_rules = [{"id": "t1", "text": "пишем под мультиплатформу (android + iOS)"},
+                  {"id": "t2", "text": "отвечает только на русском"}]
+    check("номера недействующих правил разворачиваются в тексты",
+          invariants_store.overridden_texts(task_rules, [1])
+          == ["пишем под мультиплатформу (android + iOS)"])
+    check("номер вне списка правил игнорируется",
+          invariants_store.overridden_texts(task_rules, [7]) == [])
+    check("номера-строки из ответа модели принимаются",
+          invariants_store.overridden_texts(task_rules, ["1", "2"])
+          == ["пишем под мультиплатформу (android + iOS)", "отвечает только на русском"])
+    check("разбор понимает поле «недействующие»",
+          invariants_store.parse_analysis(
+              '{"вердикт": "clear", "объяснение": "", "недействующие": ["1"], '
+              '"варианты": []}')["overridden"] == [1])
+    check("без анализа блок всё равно называет правило проекта главным",
+          "правило ПРОЕКТА всегда главнее"
+          in invariants_store.invariants_block([{"id": "p1", "text": "только Android"}],
+                                               [{"id": "t1", "text": "мультиплатформа"}]))
+
+    PLAN_STEPS = ["Спроектируй архитектуру MVVM", "Разработай UI на Compose"]
+    SUGGESTIONS_VERDICTS = {}
+    SUGGESTIONS_DEFAULT = "clear"
+    check("промпт разбора требует сообщать о противоречии правил",
+          "вердикт — violation" in invariants_store.ANALYSIS_PROMPT
+          and "СКРЫВАТЬ НЕЛЬЗЯ" in invariants_store.ANALYSIS_PROMPT,
+          "иначе правило задачи снова будет молча проигнорировано")
+    await chat.task_create(chat.TaskCreate(name="Проект: только Android"))
+    await chat.session_create()
+    task = chat._current_task()
+    session = chat._current_session()
+    task["invariants"] = []
+    session["dialog"]["invariants"] = []
+    session["dialog"]["conflicts"] = []
+    session["dialog"]["analysis"] = None
+    await chat.invariant_create(InvariantCreate(
+        text="только нативная платформа android, никакой мультиплатформы", scope="project"))
+    await chat.invariant_create(InvariantCreate(text="язык только kotlin", scope="project"))
+    await chat.invariant_create(InvariantCreate(
+        text="пишем только под iOS", scope="task"))
+    await chat.invariant_create(InvariantCreate(
+        text="отвечает только на русском", scope="task"))
+
+    # Нейтральный запрос в задаче, чьё правило противоречит правилам проекта:
+    # агент ОБЯЗАН предупредить о противоречии и дать варианты по правилам
+    # проекта (молчаливое «сделаю по-своему» и есть тот самый баг).
+    INVARIANTS_ANALYSIS = {
+        "вердикт": "violation",
+        "объяснение": "Правило задачи №1 «пишем только под iOS» противоречит "
+                      "правилам проекта «только нативная платформа android, никакой "
+                      "мультиплатформы» и «язык только kotlin»: действует правило "
+                      "проекта, поэтому iOS-приложение сделать нельзя.",
+        "недействующие": [1],
+        "варианты": [
+            {"заголовок": "Нативное Android-приложение",
+             "пояснение": "Только Android, Kotlin + Compose.",
+             "запрос": "Нужен план нативного Android-приложения погоды на Kotlin "
+                       "с MVVM и Compose."},
+            {"заголовок": "Экраны Android-приложения",
+             "пояснение": "Только Android, MVVM + Compose.",
+             "запрос": "Спланируй экраны Android-приложения погоды на Compose."},
+        ],
+    }
+    ANALYSIS_CALLS = 0
+    SUGGESTION_CALLS = 0
+    events = await run_chat("нужен план разработки приложения для просмотра погоды")
+    analyses = _suggestions_events(events)
+    check("о противоречии правил сообщено (отказ с вариантами)", bool(analyses))
+    analysis = analyses[0] if analyses else {}
+    check("в объяснении названы оба правила",
+          "iOS" in str(analysis.get("explanation") or "")
+          and "проекта" in str(analysis.get("explanation") or "").lower(),
+          str(analysis.get("explanation"))[:160])
+    check("варианты проверены по правилам и не нарушают их",
+          analysis.get("suggestions_checked") is True
+          and len(_sends(analysis)) >= 2
+          and not any("ios" in s for s in _sends(analysis)),
+          str(_sends(analysis)))
+    check("в сообщении сказано, что правило задачи не действует и где его поправить",
+          "не действуют" in str(analysis.get("message") or "")
+          and "Инварианты" in str(analysis.get("message") or ""),
+          str(analysis.get("message"))[-200:])
+    check("план не построен, пока пользователь не выбрал вариант",
+          not (stage_of(events) or {}).get("steps"),
+          str((stage_of(events) or {}).get("steps")))
+
+    # Выбранный вариант: работа идёт по правилам ПРОЕКТА, а правило задачи
+    # остаётся помеченным НЕДЕЙСТВУЮЩИМ в блоке, который видит планировщик.
+    picked = await chat.invariant_choose(InvariantPick(index=0))
+    LAST_MESSAGES.clear()
+    events = await run_chat(picked["text"])
+    planner_text = "\n\n".join(m["content"] for m in LAST_MESSAGES
+                               if m.get("role") == "user")
+    block = planner_text[planner_text.index("ИНВАРИАНТЫ"):] \
+        if "ИНВАРИАНТЫ" in planner_text else ""
+    check("по проверенному варианту план строится",
+          bool((stage_of(events) or {}).get("steps")),
+          str((stage_of(events) or {}).get("steps")))
+    check("в блоке правило проекта названо главным",
+          "правило ПРОЕКТА всегда главнее" in block)
+    check("недействующее правило задачи ушло в блок отдельным разделом",
+          "НЕ ДЕЙСТВУЮТ" in block
+          and block.index("НЕ ДЕЙСТВУЮТ") < block.index("пишем только под iOS"),
+          block[:240])
+    check("действующее правило задачи осталось в списке «нарушать нельзя»",
+          "отвечает только на русском" in block
+          and block.index("отвечает только на русском")
+          < block.index("пишем только под iOS"),
+          block[:240])
+    check("блок запрещает переносить требование задачи в план",
+          "НЕ переноси требование" in block or "НЕ выполняй" in block,
+          block[:240])
+
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+
+
+# ---------------------------------------------------------------------------
+# 9. Код-гейт плана: шаги проверяются по правилам
+# ---------------------------------------------------------------------------
+async def test_plan_gate():
+    print("\n[9] Код-гейт плана: нарушающие шаги в работу не уходят")
+    global INVARIANTS_ANALYSIS, PLAN_STEPS, PLAN_QUEUE, PLAN_VERDICTS, PLAN_DEFAULT
+    global PLAN_CALLS, ANALYSIS_CALLS, SUGGESTIONS_VERDICTS, SUGGESTIONS_DEFAULT
+
+    BAD = ["Реализуй сетевой слой в KMP", "Собери приложение под Android и iOS"]
+    GOOD = ["Спроектируй архитектуру MVVM", "Собери и протестируй под Android"]
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+    SUGGESTIONS_VERDICTS = {}
+    SUGGESTIONS_DEFAULT = "clear"
+    PLAN_STEPS = list(GOOD)
+    PLAN_QUEUE[:] = []
+    PLAN_VERDICTS = {}
+    PLAN_DEFAULT = "clear"
+
+    async def fresh_task() -> None:
+        """Новая задача с правилом проекта: под каждый случай планирования.
+
+        Переиспользовать одну задачу нельзя: после принятого плана следующее
+        сообщение — уже правка/подтверждение плана, а не новое планирование.
+        """
+        await chat.task_create(chat.TaskCreate(name="Проект: только Android"))
+        await chat.session_create()
+        task_now = chat._current_task()
+        session_now = chat._current_session()
+        task_now["invariants"] = []
+        session_now["dialog"]["invariants"] = []
+        session_now["dialog"]["conflicts"] = []
+        session_now["dialog"]["analysis"] = None
+        await chat.invariant_create(InvariantCreate(
+            text="только нативная платформа android, никакой мультиплатформы",
+            scope="project"))
+
+    # 9.1 Чистый план принимается, проверка видна в дебаге.
+    await fresh_task()
+    PLAN_QUEUE[:] = [GOOD]
+    PLAN_CALLS = 0
+    events = await run_chat("нужен план приложения погоды")
+    check("план проверен код-гейтом", PLAN_CALLS == 1, f"вызовов проверки: {PLAN_CALLS}")
+    check("чистый план принят",
+          [s["text"] for s in (stage_of(events) or {}).get("steps", [])] == GOOD,
+          str((stage_of(events) or {}).get("steps")))
+    check("в дебаге видно, что шаги проверены",
+          any("шаги плана проверены по инвариантам" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[-160:])
+    check("расход проверки учтён как служебный",
+          any((e.get("usage") or {}).get("summary_requests", 0) >= 2
+              for e in events if e.get("type") == "done"),
+          str([e.get("usage") for e in events if e.get("type") == "done"])[:160])
+
+    # 9.2 План нарушает правило — перепланирование, в пометке запрещённые шаги.
+    await fresh_task()
+    PLAN_QUEUE[:] = [BAD, GOOD]
+    PLAN_VERDICTS = {}
+    PLAN_CALLS = 0
+    LAST_MESSAGES.clear()
+    events = await run_chat("сделай план мультиплатформенного приложения")
+    check("нарушающий план отправлен на перепланирование",
+          PLAN_CALLS == 2, f"вызовов проверки: {PLAN_CALLS}")
+    planner_text = "\n\n".join(m["content"] for m in LAST_MESSAGES
+                               if m.get("role") == "user")
+    check("в перепланировании перечислены запрещённые шаги",
+          "ОТКЛОНИЛА" in planner_text and BAD[0] in planner_text,
+          planner_text[-200:])
+    check("принят план после перепланирования",
+          [s["text"] for s in (stage_of(events) or {}).get("steps", [])] == GOOD,
+          str((stage_of(events) or {}).get("steps")))
+    check("в чат не ушло ошибки",
+          not texts(events, "error"), str(texts(events, "error"))[:120])
+
+    # 9.3 Нарушения остались после попытки — план НЕ принят, задача остановлена.
+    await fresh_task()
+    PLAN_QUEUE[:] = [BAD, BAD]
+    PLAN_VERDICTS = {}
+    PLAN_CALLS = 0
+    events = await run_chat("сделай план под обе платформы")
+    check("попытка ровно одна (перепланирование вызвано один раз)",
+          PLAN_CALLS == 2, f"вызовов проверки: {PLAN_CALLS}")
+    check("план не принят — шагов нет",
+          not (stage_of(events) or {}).get("steps"),
+          str((stage_of(events) or {}).get("steps")))
+    check("в чате объяснено, какие шаги нарушают правила",
+          any("нарушает инварианты" in t and BAD[0] in t for t in texts(events, "error")),
+          str(texts(events, "error"))[:200])
+    check("плана в диалоге нет",
+          not any("План задачи" in t for t in texts(events, "bot")),
+          str(texts(events, "bot"))[:120])
+    check("задача ждёт пользователя (не выполняется)",
+          (stage_of(events) or {}).get("stage") == "awaiting_user",
+          str((stage_of(events) or {}).get("stage")))
+
+    # 9.4 Сбой проверки плана не выглядит как «нарушений нет».
+    await fresh_task()
+    PLAN_QUEUE[:] = [GOOD]
+    PLAN_VERDICTS = None      # «проверка не удалась»
+    PLAN_CALLS = 0
+    events = await run_chat("сделай план приложения погоды ещё раз")
+    check("проверка плана вызвана", PLAN_CALLS == 1, f"вызовов проверки: {PLAN_CALLS}")
+    check("при сбое проверки план не принимается",
+          not (stage_of(events) or {}).get("steps"),
+          str((stage_of(events) or {}).get("steps")))
+    check("сообщение говорит, что проверить план не удалось",
+          any("не удалось проверить шаги" in t for t in texts(events, "error")),
+          str(texts(events, "error"))[:200])
+
+    PLAN_QUEUE[:] = []
+    PLAN_VERDICTS = {}
+    PLAN_DEFAULT = "clear"
+    PLAN_STEPS = ["Собрать данные", "Написать код"]
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+
+
+async def _raises(coro_fn, status=404):
+    """True, если вызов бросил HTTPException с ожидаемым кодом."""
+    try:
+        await coro_fn()
+    except Exception as exc:  # noqa: BLE001
+        return getattr(exc, "status_code", None) == status
+    return False
+
+
 def main():
     print("Проверка Task State Machine (без сети и LLM)")
     test_core()
     test_workspace()
     asyncio.get_event_loop().run_until_complete(test_routes())
+    asyncio.get_event_loop().run_until_complete(test_invariants())
+    asyncio.get_event_loop().run_until_complete(test_request_compliance())
+    asyncio.get_event_loop().run_until_complete(test_suggestion_verification())
+    asyncio.get_event_loop().run_until_complete(test_chosen_alternative())
+    asyncio.get_event_loop().run_until_complete(test_project_ban_wins())
+    asyncio.get_event_loop().run_until_complete(test_plan_gate())
     print("\nИтог: " + (f"ПРОВАЛЕНО проверок: {len(FAILURES)} → {FAILURES}"
                        if FAILURES else "все проверки пройдены"))
     return 1 if FAILURES else 0

@@ -33,7 +33,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.ai import client as llm_client
 from app.ai import service
+from app.ai import invariants as invariants_store
 from app.ai import profiles as profile_store
 from app.ai import task_state
 from app.ai import workspace as workspace_store
@@ -41,8 +43,9 @@ from app.ai.agent import (
     Agent, AgentConfig, DEFAULT_SUMMARY_SIZE, DEFAULT_WINDOW_SIZE, merge_usage,
 )
 from app.schemas import (
-    ChatMessage, MemoryEntryCreate, NameUpdate, PlanUpdate, ProfileCreate,
-    ProfileFields, TaskCreate,
+    ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
+    MemoryEntryCreate, NameUpdate, PlanUpdate, ProfileCreate, ProfileFields,
+    TaskCreate,
 )
 
 logger = logging.getLogger(__name__)
@@ -985,6 +988,605 @@ async def memory_delete(layer: str, entry_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Инварианты: правила, которые агент не имеет права нарушить
+# ---------------------------------------------------------------------------
+# Инвариант — короткое текстовое правило (выбранная архитектура, принятые
+# технические решения, ограничения стека, бизнес-правила). Хранятся ОТДЕЛЬНО ОТ
+# ДИАЛОГА: у ПРОЕКТА (задача workspace) свои правила, у ЗАДАЧИ-диалога (сессия)
+# свои; в messages они не пишутся. Агент получает их на каждый запрос и уводит в
+# модель отдельным системным блоком (см. app/ai/invariants.py), поэтому правила
+# действуют в любой стратегии контекста. Правка — по кнопке «Инварианты» в шапке
+# чата (одно текстовое поле = один инвариант).
+#
+# ЗАПИСЬ ПРАВИЛ ОБРАЩЕНИЙ К МОДЕЛИ НЕ ДЕЛАЕТ: инвариант — это данные. Всё
+# взаимодействие с LLM идёт В ДИАЛОГЕ: по новому запросу пользователя агент
+# разбирает его на соответствие правилам ДО планирования (см.
+# _preflight_invariants). ПРИОРИТЕТ ВСЕГДА У ПРАВИЛА ПРОЕКТА: если правило задачи
+# просит то, что проект запрещает, это нарушение правила проекта — агент
+# отказывается от запроса и предлагает альтернативы (никакого выбора «какое
+# правило главнее» пользователю не даём).
+def _invariants_session(session_id: str = "") -> Tuple[Optional[Dict[str, Any]],
+                                                       Optional[Dict[str, Any]]]:
+    """(проект, задача-диалог) для операций с инвариантами.
+
+    Область «project» живёт в проекте, область «task» — в диалоге задачи.
+    Задача-диалог при необходимости создаётся (как при первом запросе к агенту).
+    """
+    if session_id:
+        return _find_session_anywhere(session_id)
+    task = _current_task()
+    if task is None:
+        return None, None
+    session = workspace_store.active_session(_workspace, task)
+    if session is None:
+        session = workspace_store.create_session(task)
+    return task, session
+
+
+def _invariants_snapshot(task: Optional[Dict[str, Any]],
+                         session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Снимок инвариантов для агента: правила проекта, правила задачи, исключения.
+
+    Исключения — решения пользователя «главнее инвариант задачи»: они снимают
+    противоречие, поэтому уходят в контекст отдельным списком.
+
+    `overridden` — правила ЗАДАЧИ, НЕ ДЕЙСТВУЮЩИЕ из-за противоречия правилам
+    проекта: их номера вернул разбор запроса (`недействующие`), а в блок правил
+    уходят тексты, чтобы агент видел, какое именно требование задачи выполнять
+    нельзя. Без этого блок называл противоречащее правило задачи «нарушать
+    нельзя», и план строился по нему (запрет проекта не срабатывал).
+    """
+    dialog = (session or {}).get("dialog") or {}
+    task_items = [dict(entry) for entry in
+                  (workspace_store.invariants(dialog) if dialog else [])]
+    analysis = dialog.get("analysis") if isinstance(dialog.get("analysis"), dict) else {}
+    return {
+        "project": [dict(entry) for entry in
+                    (workspace_store.invariants(task) if task else [])],
+        "task": task_items,
+        # Решений «главнее задача» больше не бывает: правило проекта всегда в
+        # силе. Поле оставлено пустым для совместимости формата снимка.
+        "exceptions": [],
+        "overridden": invariants_store.overridden_texts(
+            task_items, (analysis or {}).get("overridden")),
+    }
+
+
+def _invariants_view(task: Optional[Dict[str, Any]],
+                     session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Снимок инвариантов для интерфейса (модалка «Инварианты»).
+
+    Отдаёт правила проекта и задачи, утверждённые решения по противоречиям
+    (`exceptions`) и счётчики для шестерёнок. Проверок пар правил здесь НЕТ:
+    инварианты записываются без обращения к модели, а противоречия выявляются в
+    диалоге (см. _preflight_invariants).
+    """
+    dialog = (session or {}).get("dialog") or {}
+    project = [dict(entry) for entry in (workspace_store.invariants(task) if task else [])]
+    task_items = [dict(entry) for entry in
+                  (workspace_store.invariants(dialog) if dialog else [])]
+    return {
+        "project": project,
+        "task": task_items,
+        "task_id": (session or {}).get("id"),
+        "project_id": (task or {}).get("id"),
+        "pairs": len(invariants_store.pairs(project, task_items)),
+        "exceptions": [],
+        "has_conflict": False,
+        "counts": {"project": len(project), "task": len(task_items),
+                   "conflict": 0, "exceptions": 0},
+    }
+
+def _flat(text: Any) -> str:
+    """Текст в одну строку без краевых пробелов (сверка текстов вариантов)."""
+    return " ".join(str(text or "").split())
+
+
+def _verified_choice(dialog: Optional[Dict[str, Any]], text: str,
+                     snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Разбор с проверенным вариантом, если это сообщение — ОН САМ (иначе None).
+
+    Варианты под сообщением об отказе прошли проверку по правилам
+    (`invariants_store.check_suggestions`), поэтому повторно «судить» свой же
+    проверенный текст нельзя: иначе пользователь выбирает вариант и снова
+    получает отказ — цикл, в котором задача не выполняется никогда. Сверяем
+    текст варианта И набор правил (`rules_signature`): правила изменились —
+    разбор делаем заново, обычным порядком.
+
+    Возвращает найденный разбор (из него вызывающий забирает `overridden` —
+    пометку о недействующих правилах задачи, которая нужна блоку правил).
+
+    Берём только ПОСЛЕДНИЙ узел с вариантами, и только если между ним и текущим
+    запросом нет других содержательных узлов (ответа агента, плана): старая
+    запись журнала не должна отменять проверку нового запроса.
+    """
+    log = list((dialog or {}).get("log") or [])
+    index = len(log) - 1
+    # Реплика пользователя и строка дебага ЭТОГО запроса уже записаны в журнал
+    # (дебаг «сверяю запрос с инвариантами» уходит до вызова разбора): ищем
+    # последний СОДЕРЖАТЕЛЬНЫЙ узел, пропуская служебные записи текущего запроса.
+    while index >= 0 and log[index].get("kind") in (workspace_store.LOG_USER,
+                                                    workspace_store.LOG_DEBUG):
+        index -= 1
+    if index < 0 or log[index].get("kind") != workspace_store.LOG_SUGGESTIONS:
+        return None
+    data = invariants_store.normalize_analysis(log[index].get("analysis"))
+    if not data["suggestions_checked"] or not data["suggestions"]:
+        return None
+    if data["rules_signature"] != invariants_store.rules_signature(snapshot):
+        return None
+    wanted = _flat(text)
+    if any(_flat(item.get("send")) == wanted for item in data["suggestions"]):
+        return data
+    return None
+
+
+async def _preflight_invariants(task: Dict[str, Any], session: Dict[str, Any],
+                                text: str, analyzer: Agent,
+                                snapshot_now: Optional[Dict[str, Any]] = None
+                                ) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
+    """Сверяет запрос пользователя с инвариантами ДО планирования.
+
+    Возвращает (разбор, расход служебного вызова, выбран_проверенный_вариант).
+    Разбор кладётся в dialog["analysis"]: по подписи (запрос + действующие
+    правила) видно, что он ещё актуален — тот же запрос при тех же правилах
+    повторно модель не спрашивает. Правил нет вовсе — вызова LLM нет.
+
+    Отдельный случай — пользователь отправил вариант, который агент САМ показал
+    под отказом и проверил по правилам (см. `_verified_choice`): такой текст уже
+    проверен при тех же правилах, поэтому служебного вызова нет и отказа быть не
+    может — иначе выбор варианта приводил бы к новому отказу.
+    """
+    dialog = session["dialog"]
+    snapshot = snapshot_now if snapshot_now is not None else _invariants_snapshot(task, session)
+    choice = _verified_choice(dialog, text, snapshot)
+    if choice is not None:
+        analysis = dict(invariants_store.empty_analysis())
+        analysis["verdict"] = invariants_store.COMPLIANCE_CLEAR
+        analysis["kind"] = invariants_store.COMPLIANCE_CLEAR
+        analysis["request"] = str(text or "")
+        # Пометка о недействующих правилах задачи переносится из разбора, по
+        # которому вариант и был предложен: иначе блок правил для планировщика
+        # снова назвал бы противоречащее правило задачи обязательным.
+        analysis["overridden"] = list(choice.get("overridden") or [])
+        analysis["signature"] = invariants_store.analysis_signature(text, snapshot)
+        analysis["rules_signature"] = invariants_store.rules_signature(snapshot)
+        dialog["analysis"] = dict(analysis)
+        return analysis, {}, True
+    if not invariants_store.has_rules(snapshot):
+        dialog["analysis"] = dict(invariants_store.empty_analysis())
+        return dict(dialog["analysis"]), {}, False
+    signature = invariants_store.analysis_signature(text, snapshot)
+    saved = dialog.get("analysis")
+    if isinstance(saved, dict) and saved.get("signature") == signature:
+        return invariants_store.normalize_analysis(saved), {}, False
+    analysis = await analyzer.check_invariants(text, snapshot)
+    dialog["analysis"] = dict(analysis)
+    return analysis, dict(analyzer.last_usage or {}), False
+
+
+def _analysis_view(analysis: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Разбор для интерфейса: сообщение отказа и варианты-альтернативы.
+
+    Варианты — готовые тексты запросов, которые правила НЕ нарушают: каждый
+    прошёл служебную проверку (`check_suggestions`) перед показом, а непроверенные
+    варианты в интерфейс не попадают. Страница отправляет выбранный как новое
+    сообщение пользователя. Выбора «какое правило главнее» нет: правило проекта
+    всегда в силе, поэтому конфликт правила задачи с правилом проекта — обычное
+    нарушение с альтернативами.
+    """
+    data = invariants_store.normalize_analysis(analysis)
+    return {
+        "verdict": data["verdict"],
+        "kind": data["kind"],
+        "message": _analysis_message(data),
+        "explanation": data["explanation"],
+        "suggestions": list(data["suggestions"]),
+        "suggestions_checked": data["suggestions_checked"],
+        "overridden": list(data["overridden"]),
+        "rules_signature": data["rules_signature"],
+    }
+
+
+def _analysis_message(analysis: Dict[str, Any]) -> str:
+    """Текст сообщения агента: какое правило нарушено и что делать дальше.
+
+    Хвост про варианты зависит от того, что реально показано: обещать «варианты,
+    которые правила не нарушают» можно ТОЛЬКО когда они прошли проверку
+    (`suggestions_checked`), иначе пользователь будет выбирать из нарушающих.
+    Правило задачи, противоречащее правилам проекта, в объяснении названо
+    недействующим — и это видно пользователю (иначе правило выглядит молча
+    проигнорированным).
+    """
+    data = invariants_store.normalize_analysis(analysis)
+    explanation = str(data.get("explanation") or "").strip()
+    head = ("⛔ Запрос нарушает инвариант (правило, которое нарушать нельзя) — "
+            "выполнять его не буду. Инвариант проекта всегда главнее правила "
+            "задачи: если задача просит то, что проект запрещает, действует "
+            "запрет проекта.")
+    if explanation:
+        head += "\n\n" + explanation
+    return head + _analysis_tail(data)
+
+
+def _analysis_tail(data: Dict[str, Any]) -> str:
+    """Хвост сообщения отказа: что показано вместо запрещённого требования."""
+    variants = list(data.get("suggestions") or [])
+    checked = bool(data.get("suggestions_checked"))
+    overridden = list(data.get("overridden") or [])
+    rules_hint = ""
+    if overridden:
+        rules_hint = ("\n\nПравила задачи, противоречащие правилам проекта, не "
+                      "действуют. Если правило задачи устарело — поправьте или "
+                      "удалите его в «Инварианты» (⚙️ у задачи).")
+    if variants and checked:
+        return ("\n\nНиже — варианты, которые правила не нарушают (каждый проверен "
+                "по правилам). Выберите вариант, и я продолжу по нему."
+                + rules_hint)
+    if variants:
+        return ("\n\n⚠️ Варианты не проверены: служебная проверка не подтвердила, "
+                "что они укладываются в правила." + rules_hint)
+    if not checked:
+        return ("\n\nПодходящих вариантов не показываю: служебная проверка не "
+                "удалась, а непроверенные варианты предлагать нельзя. "
+                "Сформулируйте требование иначе." + rules_hint)
+    return ("\n\nВариантов, не нарушающих правила, не нашлось — сформулируйте "
+            "требование иначе." + rules_hint)
+
+
+def _analysis_debug(analysis: Dict[str, Any]) -> str:
+    """Строка дебага: вердикт разбора и число проверенных вариантов."""
+    data = invariants_store.normalize_analysis(analysis)
+    names = {"violation": "запрос нарушает инвариант",
+             "clear": "нарушений нет"}
+    kind = data["kind"] or data["verdict"] or "без вердикта"
+    number = len(data["suggestions"])
+    if data["verdict"] == "violation":
+        note = " (варианты проверены по правилам)" if data["suggestions_checked"] \
+            else " (варианты не проверены — проверка не дала вердикта)"
+    else:
+        note = ""
+    return (
+        f"разбор до планирования: {names.get(kind, kind)} — "
+        f"вариантов-альтернатив: {number}{note}. "
+        "План в этом случае не строится."
+    )
+
+
+async def _plan_gate(steps: List[str], analyzer: Agent, snapshot: Dict[str, Any],
+                     replan: Any) -> Dict[str, Any]:
+    """КОД-ГЕЙТ ПЛАНА: шаги проверяются по правилам, нарушающие не принимаются.
+
+    Блок правил в контексте планировщика — ПРОСЬБА, а не гарантия: при правиле
+    проекта «только нативная платформа android, никакой мультиплатформы» план
+    приходил с шагами «UI на Compose для обоих платформ» и «сетевой слой в KMP»,
+    и задача выполнялась в обход запрета. Поэтому готовые шаги уходят арбитру
+    отдельным служебным вызовом (`analyzer.check_plan`), и:
+
+      * нарушений нет — план принимается;
+      * есть нарушающие шаги — ОДНА попытка перепланирования (`replan`): в
+        пометке перечислены шаги, которые повторять нельзя; новый план
+        проверяется так же;
+      * проверка не удалась (`None`) — план НЕ принимается: «не проверено» не
+        значит «совместимо» (как у вариантов-альтернатив);
+      * после попытки нарушения остались — план НЕ принимается.
+
+    Возвращает {"steps", "usage", "lines", "error"}: steps — принятые шаги (пусто,
+    если план не принят), lines — строки дебага, error — текст ошибки для чата.
+    """
+    usage: Dict[str, Any] = {}
+    lines: List[str] = []
+    result: Dict[str, Any] = {"steps": [], "usage": usage, "lines": lines,
+                              "error": None}
+    if not steps or not invariants_store.has_rules(snapshot):
+        result["steps"] = list(steps or [])
+        return result
+    attempt = 0
+    while True:
+        keep = await analyzer.check_plan(steps, snapshot)
+        usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+        if keep is None:
+            lines.append("проверка шагов плана по инвариантам не удалась "
+                         "(служебный вызов не дал вердикта) — план не принимаю.")
+            result["error"] = (
+                "⚠️ План не принят: не удалось проверить шаги по инвариантам "
+                "(служебная проверка не дала вердикта). Повторите запрос — "
+                "выполнять непроверенный план нельзя."
+            )
+            result["usage"] = usage
+            return result
+        kept = set(keep)
+        bad = [step for index, step in enumerate(steps) if index not in kept]
+        if not bad:
+            lines.append("шаги плана проверены по инвариантам — нарушений нет."
+                         if attempt == 0 else
+                         "новый план проверен по инвариантам — нарушений нет.")
+            result["steps"] = list(steps)
+            result["usage"] = usage
+            return result
+        lines.append("план нарушает инварианты — шаги: " + "; ".join(bad[:3]) + ".")
+        if attempt >= invariants_store.PLAN_RETRIES:
+            result["error"] = (
+                "⚠️ План нарушает инварианты — выполнять его нельзя. Шаги, "
+                "которые требуют запрещённого: " + "; ".join(bad[:4]) + ". "
+                "Задача остановлена: переформулируйте запрос или поправьте "
+                "правила в «Инварианты»."
+            )
+            result["usage"] = usage
+            return result
+        attempt += 1
+        steps, more = await replan(bad)
+        usage = merge_usage(usage, more)
+        if not steps:
+            lines.append("перепланирование не дало шагов — план не принимаю.")
+            result["error"] = (
+                "⚠️ План не принят: перепланирование по правилам не дало шагов. "
+                "Повторите запрос."
+            )
+            result["usage"] = usage
+            return result
+
+
+def _last_analysis(dialog: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Последний разбор инвариантов из журнала чата задачи (None — разбора нет)."""
+    for item in reversed((dialog or {}).get("log") or []):
+        if item.get("kind") == workspace_store.LOG_SUGGESTIONS and item.get("analysis"):
+            return dict(item["analysis"])
+    return None
+
+
+@router.post("/agent/invariants/choose")
+async def invariant_choose(payload: InvariantPick) -> dict:
+    """Клик по варианту-альтернативе под сообщением агента (разбор инвариантов).
+
+    Вариант берётся из ПОСЛЕДНЕГО разбора в журнале чата задачи по номеру: с
+    фронта приходит только номер, поэтому подменить текст нельзя. Сервер
+    возвращает готовый текст запроса, а страница отправляет его как новое
+    сообщение пользователя — правила он не нарушает, поэтому агент продолжит
+    работу (план и шаги).
+
+    Непроверенный вариант (запись журнала до появления проверки) тоже можно
+    отправить: его текст уйдёт ОБЫЧНЫМ разбором инвариантов, как любой другой
+    запрос — «не проверено» не значит «разрешено». А вот ПРОВЕРЕННЫЙ вариант
+    разбора не требует вовсе (`_verified_choice`): правила менять не успели,
+    поэтому отказ по нему был бы циклом.
+
+    Выбора «какое правило главнее» здесь нет: правило проекта всегда в силе.
+    """
+    task, session = _invariants_session(str(payload.session_id or "").strip())
+    if task is None or session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    data = invariants_store.normalize_analysis(_last_analysis(session["dialog"]))
+    suggestions = list(data["suggestions"])
+    index = int(payload.index or 0)
+    if index < 0 or index >= len(suggestions):
+        raise HTTPException(status_code=404, detail="Вариант не найден — обновите сообщение")
+    text = str(suggestions[index].get("send") or "").strip()
+    if not text:
+        raise HTTPException(status_code=404, detail="Вариант не найден — обновите сообщение")
+    return {"action": "send", "text": text, "resume": False}
+
+
+def _last_analysis(dialog: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Последний разбор инвариантов из журнала чата задачи (None — разбора нет)."""
+    for item in reversed((dialog or {}).get("log") or []):
+        if item.get("kind") == workspace_store.LOG_SUGGESTIONS and item.get("analysis"):
+            return dict(item["analysis"])
+    return None
+
+
+async def invariants_get(session_id: str = "") -> dict:
+    """Инварианты проекта и задачи для модалки (шестерёнки ⚙️).
+
+    Отдаёт {"project": [{"id", "text", "created"}, ...], "task": [...],
+    "pairs": N, "counts": {"project", "task"}, "project_id": ..., "task_id": ...}.
+    Проверок пар здесь НЕТ: правила записываются без обращений к модели, а
+    нарушения и противоречия выясняются в диалоге разбором запроса (§5.10).
+
+    session_id задан — снимок по КОНКРЕТНОЙ задаче (шестерёнка в списке задач:
+    правила правятся, даже если диалог не открыт). Чужая/неизвестная задача —
+    404, как и у прочих маршрутов задач.
+    """
+    if session_id:
+        task, session = _find_session_anywhere(session_id)
+        if task is None or session is None:
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+        return _invariants_view(task, session)
+    task = _current_task()
+    session = workspace_store.active_session(_workspace, task) if task else None
+    return _invariants_view(task, session)
+
+
+async def invariant_create(payload: InvariantCreate) -> dict:
+    """Добавляет инвариант (одно поле — один инвариант) и проверяет противоречия.
+
+    scope="project" — правило всего проекта (все его задачи-диалоги),
+    scope="task" — правило конкретной задачи-диалога. После добавления пары
+    «инвариант проекта × инвариант задачи» проверяются служебным вызовом LLM:
+    противоречие пользователь видит сразу и решает, какое правило главнее
+    (см. POST /api/agent/invariants/conflicts/resolve).
+    """
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Нечего добавлять: инвариант пуст")
+    session_id = str(payload.session_id or "").strip()
+    task, session = _invariants_session(session_id)
+    if task is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Сначала создайте проект — инварианты привязаны к проекту",
+        )
+    if payload.scope == "task" and session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    async with _workspace_lock:
+        container = task if payload.scope == "project" else session["dialog"]
+        workspace_store.add_invariant(container, text)
+        # Никаких обращений к модели при записи правил: инвариант — это данные.
+        # Противоречия и нарушения выясняются в диалоге (разбор запроса).
+        await _persist()
+        return _invariants_view(task, session)
+
+
+async def invariant_delete(scope: str, invariant_id: str,
+                           session_id: str = "") -> dict:
+    """Удаляет инвариант (корзина рядом с правилом в модалке «Инварианты»).
+
+    Обращений к модели нет: правило — это данные. Разбор запроса сбрасывается —
+    правила изменились, следующий запрос сверяется заново.
+    """
+    scope = str(scope or "").strip().lower()
+    if scope not in invariants_store.SCOPES:
+        raise HTTPException(status_code=400, detail="Неизвестная область инварианта")
+    task, session = _invariants_session(session_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    if scope == "task" and session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    async with _workspace_lock:
+        container = task if scope == "project" else session["dialog"]
+        if not workspace_store.delete_invariant(container, invariant_id):
+            raise HTTPException(status_code=404, detail="Инвариант не найден")
+        # Правила изменились — сохранённый разбор запроса больше не актуален.
+        dialog = session["dialog"]
+        dialog["analysis"] = dict(invariants_store.empty_analysis())
+        await _persist()
+        return _invariants_view(task, session)
+
+
+async def invariant_resolve(payload: InvariantResolve) -> dict:
+    """Устаревший маршрут решения противоречия (оставлен для совместимости).
+
+    Приоритет всегда у правила ПРОЕКТА, поэтому «главнее задача» больше не
+    принимается: такой выбор означал бы работу вопреки правилу проекта. Ответ —
+    409 с объяснением; интерфейс этот маршрут не использует (конфликт правила
+    задачи с правилом проекта — обычное нарушение с альтернативами).
+    """
+    task, session = _invariants_session()
+    if task is None or session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if str(payload.winner or "").strip().lower() == invariants_store.WINNER_TASK:
+        # «Главнее задача» означало бы работу вопреки правилу проекта.
+        raise HTTPException(
+            status_code=409,
+            detail="Инвариант проекта всегда главнее: выберите один из предложенных "
+                   "вариантов, которые правила не нарушают",
+        )
+    # Правило проекта и так в силе — состояние не меняем, просто сбрасываем разбор.
+    async with _workspace_lock:
+        session["dialog"]["analysis"] = dict(invariants_store.empty_analysis())
+        await _persist()
+        return _invariants_view(task, session)
+
+
+@router.get("/agent/invariants")
+async def invariants_get(session_id: str = "") -> dict:
+    """Инварианты проекта и задачи + проверки на противоречие.
+
+    Отдаёт {"project": [{"id", "text", "created"}, ...],
+    "task": [...], "pairs": N, "checks": [...], "has_conflict": bool,
+    "counts": {"project", "task", "conflict"},
+    "project_id": ..., "task_id": ...} — этим снимком живут шестерёнки
+    инвариантов (у проекта и у каждой задачи) и сама модалка.
+
+    session_id задан — снимок по КОНКРЕТНОЙ задаче (шестерёнка в списке задач:
+    правила правятся, даже если диалог не открыт). Чужая/неизвестная задача —
+    404, как и у прочих маршрутов задач.
+    """
+    if session_id:
+        task, session = _find_session_anywhere(session_id)
+        if task is None or session is None:
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+        return _invariants_view(task, session)
+    task = _current_task()
+    session = workspace_store.active_session(_workspace, task) if task else None
+    return _invariants_view(task, session)
+
+
+@router.post("/agent/invariants")
+async def invariant_create(payload: InvariantCreate) -> dict:
+    """Добавляет инвариант (одно поле — один инвариант) и проверяет противоречия.
+
+    scope="project" — правило всего проекта (все его задачи-диалоги),
+    scope="task" — правило конкретной задачи-диалога. После добавления пары
+    «инвариант проекта × инвариант задачи» проверяются служебным вызовом LLM:
+    противоречие пользователь видит сразу и решает, какое правило главнее
+    (см. POST /api/agent/invariants/conflicts/resolve).
+    """
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Нечего добавлять: инвариант пуст")
+    session_id = str(payload.session_id or "").strip()
+    task, session = _invariants_session(session_id)
+    if task is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Сначала создайте проект — инварианты привязаны к проекту",
+        )
+    if payload.scope == "task" and session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    async with _workspace_lock:
+        container = task if payload.scope == "project" else session["dialog"]
+        workspace_store.add_invariant(container, text)
+        # Никаких обращений к модели при записи правил: инвариант — это данные.
+        # Противоречия и нарушения выясняются в диалоге (разбор запроса).
+        await _persist()
+        return _invariants_view(task, session)
+
+
+@router.delete("/agent/invariants/{scope}/{invariant_id}")
+async def invariant_delete(scope: str, invariant_id: str,
+                           session_id: str = "") -> dict:
+    """Удаляет инвариант (корзина рядом с правилом в модалке «Инварианты»).
+
+    Обращений к модели нет: правило — это данные. Разбор запроса сбрасывается —
+    правила изменились, следующий запрос сверяется заново.
+    """
+    scope = str(scope or "").strip().lower()
+    if scope not in invariants_store.SCOPES:
+        raise HTTPException(status_code=400, detail="Неизвестная область инварианта")
+    task, session = _invariants_session(session_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    if scope == "task" and session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    async with _workspace_lock:
+        container = task if scope == "project" else session["dialog"]
+        if not workspace_store.delete_invariant(container, invariant_id):
+            raise HTTPException(status_code=404, detail="Инвариант не найден")
+        # Правила изменились — сохранённый разбор запроса больше не актуален.
+        dialog = session["dialog"]
+        dialog["analysis"] = dict(invariants_store.empty_analysis())
+        await _persist()
+        return _invariants_view(task, session)
+
+
+@router.post("/agent/invariants/conflicts/resolve")
+async def invariant_resolve(payload: InvariantResolve) -> dict:
+    """Устаревший маршрут решения противоречия (только «главнее проект»).
+
+    Приоритет ВСЕГДА у правила проекта, поэтому выбор «главнее задача» не
+    принимается (409): он означал бы работу вопреки правилу проекта. Интерфейс
+    этот маршрут не использует — конфликт правила задачи с правилом проекта
+    обрабатывается как обычное нарушение с альтернативами (см. §5.10).
+    """
+    task = _current_task()
+    session = workspace_store.active_session(_workspace, task) if task else None
+    if task is None or session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if str(payload.winner or "").strip().lower() == invariants_store.WINNER_TASK:
+        raise HTTPException(
+            status_code=409,
+            detail="Инвариант проекта всегда главнее: выберите один из предложенных "
+                   "вариантов, которые правила не нарушают",
+        )
+    # Правило проекта и так в силе — состояние не меняем, сбрасываем только разбор.
+    async with _workspace_lock:
+        session["dialog"]["analysis"] = dict(invariants_store.empty_analysis())
+        await _persist()
+        return _invariants_view(task, session)
+
+
+# ---------------------------------------------------------------------------
 # Профиль пользователя: сведения о юзере уходят в системный промпт сессии
 # ---------------------------------------------------------------------------
 def _profile_fields(payload: ProfileFields) -> Dict[str, Any]:
@@ -1190,6 +1792,11 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         summary_size=msg.summary or DEFAULT_SUMMARY_SIZE,
         window_size=msg.window or DEFAULT_WINDOW_SIZE,
     )
+    # Инварианты (правила, которые агент не имеет права нарушить): снимок
+    # проекта и диалога + утверждённые исключения. Собирается ДО потока:
+    # значения читаются генератором при каждом шаге, а диалог за время ответа
+    # мог быть переключён.
+    invariants_now = _invariants_snapshot(task, session)
     agent = Agent(AgentConfig(**agent_settings))
     # Планировщик — отдельный агент с теми же настройками: он делает служебный
     # вызов плана (Agent.build_plan), и его токены складываются с токенами
@@ -1199,6 +1806,11 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
     # validation (Agent.review_result): один служебный вызов на завершённую
     # задачу, токены так же складываются в общий замер запроса.
     reviewer = Agent(AgentConfig(**agent_settings))
+    # Арбитр инвариантов — ещё один агент для служебного разбора ЗАПРОСА до
+    # планирования (Agent.check_invariants): нарушает ли запрос правило проекта
+    # или задачи и не противоречат ли правила друг другу. Его токены тоже
+    # складываются в общий замер запроса.
+    analyzer = Agent(AgentConfig(**agent_settings))
 
     # Диалог текущей сессии для журнала чата: заполняется внутри потока, когда
     # сессия разрешена под блокировкой. Через него encode() пишет в журнал все
@@ -1297,6 +1909,11 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                     yield encode({"type": "done", "usage": {}, "state": task_state.snapshot(state)})
                     return
 
+                # 1а. ИНВАРИАНТЫ. Правило проекта и правило задачи могут
+                #     противоречить друг другу: выбор («главнее проект» или
+                #     «главнее задача») делает пользователь, и пока решения нет,
+                #     агент не работает — иначе он молча нарушил бы одно из
+                #     правил. Проверка и решение — в модалке «Инварианты».
                 # 2. ЭТАП: смотрим, где задача, и что означает это сообщение.
                 confirmed = _is_plan_confirmation(text)
                 autonomous = _wants_autonomous(text)
@@ -1329,6 +1946,55 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 if autonomous:
                     state.autonomous = True
                 yield encode(_state_event(state))
+
+                # 1б. ИНВАРИАНТЫ И ЗАПРОС. Самое первое, что делает агент, —
+                #     сверяет ЗАПРОС пользователя с правилами, которые нарушать
+                #     нельзя (правила проекта + правила задачи), ДО планирования.
+                #     Нарушение требования или противоречие правил — агент
+                #     ОТКАЗЫВАЕТСЯ работать по этому запросу и показывает варианты
+                #     решения: варианты ПРОВЕРЕНЫ по правилам (нарушающие
+                #     отброшены, см. invariants_store.check_suggestions), они
+                #     кликабельные (событие suggestions, рисуется под сообщением).
+                #     Плана в этом случае нет — задача остаётся на этапе
+                #     планирования.
+                if text and not machine_step and not confirmed and not autonomous:
+                    yield encode({"type": "debug", "text": (
+                        f"{_MACHINE}: сверяю запрос с инвариантами (правила проекта "
+                        "и задачи) до планирования."
+                    )})
+                    analysis, pre_usage, preverified = await _preflight_invariants(
+                        task_now, session_now, text, analyzer, invariants_now)
+                    if pre_usage:
+                        usage = merge_usage(usage, pre_usage)
+                    if preverified:
+                        # Текст — вариант, который агент сам показал и проверил по
+                        # правилам: повторный разбор не нужен (и отказа быть не
+                        # может, иначе выбор варианта зацикливал бы пользователя).
+                        yield encode({"type": "debug", "text": (
+                            f"{_MACHINE}: запрос — проверенный вариант-альтернатива "
+                            "(правила не менялись): разбор не нужен, строю план."
+                        )})
+                    if invariants_store.blocks(analysis):
+                        yield encode({"type": "debug", "text": (
+                            f"{_MACHINE}: " + _analysis_debug(analysis)
+                        )})
+                        # Варианты и объяснение — в журнал чата: по нему окно
+                        # восстанавливается вместе с кликабельными вариантами.
+                        view = _analysis_view(analysis)
+                        workspace_store.add_log_event(
+                            dialog_now, workspace_store.LOG_SUGGESTIONS,
+                            view["message"], view)
+                        yield encode({"type": "suggestions", "analysis": view,
+                                      "text": view["message"]})
+                        # Задача ждёт выбора: план не строим, шаги не выполняем.
+                        if state.stage == "planning" and not state.steps:
+                            task_state.await_confirmation(
+                                state, [],
+                                "запрос нарушает инварианты — жду решения пользователя")
+                        yield encode(_state_event(state))
+                        yield encode({"type": "done", "usage": dict(usage),
+                                      "state": task_state.snapshot(state)})
+                        return
 
                 async def run_validation(answered_step: bool, step_errors: List[str],
                                          stored_exchange: bool, resumed: bool):
@@ -1379,6 +2045,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             working_memory=working_memory,
                             long_term_memory=long_term_memory,
                             profile=profile,
+                            invariants=_invariants_snapshot(task_now, session_now),
                         )
                         if reviewer.last_usage:
                             usage = merge_usage(usage, reviewer.last_usage)
@@ -1447,8 +2114,63 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             working_memory=working_memory,
                             long_term_memory=long_term_memory,
                             profile=profile,
+                            # Снимок берём СВЕЖИЙ: разбор запроса уже мог
+                            # пометить правило задачи недействующим (см.
+                            # `overridden` в _invariants_snapshot), и планировщик
+                            # обязан это видеть — иначе он строит план по
+                            # требованию задачи в обход правила проекта.
+                            invariants=_invariants_snapshot(task_now, session_now),
                         )
                         plan_usage = dict(planner.last_usage or {})
+
+                        # КОД-ГЕЙТ ПЛАНА. Промпт-блок правил — просьба; гарантию
+                        # даёт проверка шагов арбитром: нарушающие шаги в работу
+                        # не уходят, при нарушении — одна попытка перепланирования.
+                        async def replan(bad_steps: List[str]) -> Any:
+                            """Перепланирование с пометкой «эти шаги повторять нельзя»."""
+                            fresh = await planner.build_plan(
+                                text,
+                                history=dialog_now["messages"],
+                                working_memory=working_memory,
+                                long_term_memory=long_term_memory,
+                                profile=profile,
+                                invariants=_invariants_snapshot(task_now, session_now),
+                                note=(
+                                    "ПРОВЕРКА ПО ПРАВИЛАМ ОТКЛОНИЛА предыдущий план. "
+                                    "Эти шаги нарушают правила, повторять их НЕЛЬЗЯ:\n"
+                                    + "\n".join(f"- {step}" for step in bad_steps)
+                                    + "\nДай ДРУГОЙ план (шаги), который не нарушает "
+                                      "правила: запрещённое требование выполнять нельзя."
+                                ),
+                            )
+                            return fresh, dict(planner.last_usage or {})
+
+                        gate = await _plan_gate(
+                            steps, planner, _invariants_snapshot(task_now, session_now),
+                            replan)
+                        # Расход проверки — в тот же замер, что и построение плана:
+                        # обе траты этого запроса уходят в панель строкой
+                        # «из них служебные вызовы» (kind="plan").
+                        plan_usage = merge_usage(plan_usage, gate["usage"])
+                        for line in gate["lines"]:
+                            yield encode({"type": "debug", "text": f"{_MACHINE}: {line}"})
+                        if gate["error"]:
+                            # План не принят: шаги не выполняем, задача ждёт
+                            # пользователя (переформулировать запрос/поправить
+                            # правила), плана в состоянии нет.
+                            yield encode({"type": "error", "text": gate["error"]})
+                            if state.stage == "planning" and not state.steps:
+                                task_state.await_confirmation(
+                                    state, [],
+                                    "план не прошёл проверку по инвариантам")
+                            dialog_now.setdefault("usage", []).append(
+                                dict(plan_usage, kind="plan"))
+                            yield encode(_state_event(state))
+                            yield encode({"type": "done", "usage": dict(plan_usage),
+                                          "state": task_state.snapshot(state)})
+                            return
+                        usage = merge_usage(usage, gate["usage"])
+                        steps = gate["steps"]
                         state.steps = steps
                         # Исходный запрос задачи — в состоянии: по нему проверка
                         # результата сверяет работу (последнее сообщение может
@@ -1541,6 +2263,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         long_term_memory=long_term_memory,
                         profile=profile,
                         state=state,
+                        invariants=_invariants_snapshot(task_now, session_now),
                     ):
                         # Событие "done" несёт расход токенов текущего запроса.
                         kind = event.get("type")

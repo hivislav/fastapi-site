@@ -60,6 +60,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app import config
+from app.ai import invariants as invariants_store
 from app.ai import task_state
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,14 @@ LOG_USER = "user"
 LOG_ASSISTANT = "assistant"
 LOG_DEBUG = "debug"
 LOG_ERROR = "error"
-LOG_KINDS = (LOG_USER, LOG_ASSISTANT, LOG_DEBUG, LOG_ERROR)
+# Показ разбора инвариантов: текст объяснения + КЛИКАБЕЛЬНЫЕ варианты решения
+# (анализ запроса: нарушение требования инвариантом или конфликт правил). Отдельный
+# вид узла, потому что у него есть структура, а не только текст.
+LOG_SUGGESTIONS = "suggestions"
+LOG_KINDS = (LOG_USER, LOG_ASSISTANT, LOG_DEBUG, LOG_ERROR, LOG_SUGGESTIONS)
+# Разбор инвариантов в журнале: сколько вариантов и полей храним.
+_MAX_SUGGESTIONS = 4
+_SUGGESTION_TEXT = 600
 
 # Сколько символов первого запроса пользователя попадает в заголовок сессии.
 _TITLE_CHARS = 120
@@ -111,6 +119,17 @@ MEMORY_ENTRY_LIMIT = 4000
 # Ключи слоёв памяти (совпадают с именами в API: "work" | "long").
 MEMORY_WORKING = "working"
 MEMORY_LONG_TERM = "long_term"
+
+# Инварианты (правила, которые агент не имеет права нарушить) — см.
+# app/ai/invariants.py. Хранятся ОТДЕЛЬНО от диалога: у ПРОЕКТА (задача
+# workspace) свои правила — поле "invariants" задачи, у ЗАДАЧИ-диалога (сессия)
+# свои — поле "invariants" диалога. В переписку (messages) они не попадают.
+MAX_INVARIANTS = 50
+INVARIANT_ENTRY_LIMIT = 1000
+# Проверки пар «инвариант проекта × инвариант задачи» и оставшиеся без проверки
+# пары — в диалоге задачи (см. app/ai/invariants.py).
+_MAX_CONFLICTS = 250
+_MAX_UNCHECKED = 250
 
 # Заголовок пустой сессии (пока пользователь не отправил ни одного запроса).
 EMPTY_SESSION_TITLE = "Новая задача"
@@ -144,6 +163,14 @@ def empty_dialog(task_id: str = "") -> Dict[str, Any]:
         "active_branch": None,
         # Журнал чата (см. _MAX_LOG): порядок узлов окна чата этой сессии.
         "log": [],
+        # Инварианты ЗАДАЧИ (правила этого диалога) и проверки их на
+        # противоречие с инвариантами проекта: см. app/ai/invariants.py.
+        "invariants": [],
+        # Решения пользователя по противоречиям правил («главнее проект/задача»),
+        # принятые В ДИАЛОГЕ: {"key", "project_id", "task_id", "winner"}.
+        "exceptions": [],
+        "conflicts": [],
+        "unchecked": [],
         # Конечный автомат задачи: этап → шаг → ожидаемое действие + история
         # переходов. Живёт В СЕССИИ: у каждого диалога свой ход автомата.
         "state": task_state.to_dict(task_state.new_state(task_id)),
@@ -235,14 +262,17 @@ def _clean_facts(raw: Any) -> Dict[str, str]:
     return facts
 
 
-def _clean_log(raw: Any) -> List[Dict[str, str]]:
-    """Приводит журнал чата сессии к списку {"kind", "text"}.
+def _clean_log(raw: Any) -> List[Dict[str, Any]]:
+    """Приводит журнал чата сессии к списку записей журнала.
 
-    kind — user | assistant | debug | error (LOG_KINDS). Пустые записи
-    отбрасываются, длинные тексты обрезаются, старые вытесняются
-    (_MAX_LOG записей и _MAX_LOG_CHARS символов).
+
+    kind — user | assistant | debug | error | suggestions (LOG_KINDS). Пустые
+    записи отбрасываются, длинные тексты обрезаются, старые вытесняются
+    (_MAX_LOG записей и _MAX_LOG_CHARS символов). У узла suggestions дополнительно
+    лежит разбор инвариантов (объяснение + варианты решения), по нему интерфейс
+    рисует кликабельные варианты — в том числе после перезагрузки страницы.
     """
-    clean: List[Dict[str, str]] = []
+    clean: List[Dict[str, Any]] = []
     for item in (raw if isinstance(raw, list) else []):
         if not isinstance(item, dict):
             continue
@@ -250,7 +280,15 @@ def _clean_log(raw: Any) -> List[Dict[str, str]]:
         text = str(item.get("text") or "").strip()
         if kind not in LOG_KINDS or not text:
             continue
-        clean.append({"kind": kind, "text": text[:_MAX_LOG_TEXT]})
+        entry: Dict[str, Any] = {"kind": kind, "text": text[:_MAX_LOG_TEXT]}
+        if kind == LOG_SUGGESTIONS:
+            # Узел разбора хранится вместе с текстом сообщения: даже если вариантов
+            # нет (старая запись без analysis или разбор без альтернатив), текст
+            # сообщения агента терять нельзя — он уже показан пользователю.
+            analysis = _clean_analysis(item.get("analysis"))
+            if analysis["suggestions"] or analysis["explanation"]:
+                entry["analysis"] = analysis
+        clean.append(entry)
     if len(clean) > _MAX_LOG:
         clean = clean[-_MAX_LOG:]
     total = sum(len(item["text"]) for item in clean)
@@ -278,6 +316,64 @@ def add_log(dialog: Dict[str, Any], kind: str, text: str) -> None:
     while total > _MAX_LOG_CHARS and len(log) > 1:
         total -= len(log[0].get("text") or "")
         log.pop(0)
+
+
+def add_log_event(dialog: Dict[str, Any], kind: str, text: str,
+                  analysis: Any = None) -> None:
+    """Добавляет в журнал узел со структурой (разбор инвариантов).
+
+    Отличается от add_log() только тем, что вместе с текстом сохраняет сам
+    разбор: по нему интерфейс рисует кликабельные варианты решения и после
+    переключения задачи/перезагрузки страницы.
+    """
+    add_log(dialog, kind, text)
+    log = dialog.get("log") or []
+    if kind != LOG_SUGGESTIONS or not log:
+        return
+    clean = _clean_analysis(analysis)
+    if clean["suggestions"] or clean["explanation"]:
+        log[-1]["analysis"] = clean
+
+
+def _clean_analysis(raw: Any) -> Dict[str, Any]:
+    """Разбор инвариантов для журнала: объяснение + варианты решения."""
+    from app.ai import invariants as invariants_store
+
+    data = invariants_store.normalize_analysis(raw)
+    suggestions: List[Dict[str, Any]] = []
+    for item in (data.get("suggestions") or [])[:_MAX_SUGGESTIONS]:
+        title = str(item.get("title") or "").strip()[:_SUGGESTION_TEXT]
+        send = str(item.get("send") or "").strip()[:_SUGGESTION_TEXT]
+        if not title or not send:
+            continue
+        suggestions.append({
+            "title": title,
+            "details": str(item.get("details") or "").strip()[:_SUGGESTION_TEXT],
+            "send": send,
+        })
+    explanation = str(data.get("explanation") or "").strip()
+    return {
+        "kind": str(data.get("kind") or "").strip().lower()[:20],
+        "explanation": explanation[:_MAX_LOG_TEXT],
+        # Текст сообщения агента: у снимка для фронта он в поле message, у
+        # «сырого» разбора его нет — тогда повторяем объяснение.
+        "message": (str(data.get("message") or "").strip() or explanation)[:_MAX_LOG_TEXT],
+        "suggestions": suggestions,
+        # Отметка, что варианты ПРОВЕРЕНЫ по правилам (см. invariants.analyze):
+        # без неё клик по варианту после перезагрузки считался бы непроверенным
+        # (см. POST /api/agent/invariants/choose). Пустой разбор проверять нечего.
+        "suggestions_checked": (bool(data.get("suggestions_checked"))
+                                if suggestions else True),
+        # Номера правил задачи, противоречащих правилам проекта (не действуют):
+        # по ним текст отказа говорит, что правило задачи поправляется в
+        # «Инварианты», а снимок инвариантов помечает его недействующим.
+        "overridden": [int(number) for number in (data.get("overridden") or [])
+                       if str(number).strip().isdigit()][:invariants_store.MAX_OVERRIDDEN],
+        # Подпись ПРАВИЛ, при которых варианты проверены: если правила не
+        # менялись, повторно судить выбранный вариант не нужно (см.
+        # `_verified_choice` в chat.py).
+        "rules_signature": str(data.get("rules_signature") or "")[:64],
+    }
 
 
 def _clean_branches(raw: Any) -> Dict[str, Dict[str, Any]]:
@@ -316,6 +412,16 @@ def normalize_dialog(raw: Any, task_id: str = "") -> Dict[str, Any]:
     # (этап planning) — диалог без автомата работать не должен.
     dialog["state"] = task_state.to_dict(task_state.from_dict(raw.get("state"), task_id))
     dialog["log"] = _clean_log(raw.get("log"))
+    # Инварианты ЗАДАЧИ (правила этого диалога) и проверки их на противоречие с
+    # инвариантами проекта: живут отдельно от переписки (см. app/ai/invariants.py).
+    dialog["invariants"] = _normalize_invariants(raw.get("invariants"))
+    dialog["conflicts"] = _clean_conflicts(raw.get("conflicts"))
+    dialog["unchecked"] = _clean_unchecked(raw.get("unchecked"))
+    # Решения по противоречиям правил: пишутся, когда пользователь выбрал в
+    # диалоге, чьё правило главнее (проверок правил при их записи нет).
+    decisions = invariants_store.merge_exceptions(
+        raw.get("conflicts"), raw.get("exceptions"))
+    dialog["exceptions"] = [dict(item) for item in decisions]
     return dialog
 
 
@@ -385,6 +491,113 @@ def _normalize_entries(raw: Any) -> List[Dict[str, Any]]:
             "source": source,
         })
     return entries[-MAX_MEMORY_ENTRIES:]
+
+
+def _normalize_invariants(raw: Any) -> List[Dict[str, Any]]:
+    """Приводит список инвариантов к записям {id, text, created}.
+
+    Инварианты проекта лежат в задаче ("invariants"), инварианты задачи-диалога —
+    в её диалоге. Принимаются и голые строки (ручная правка файла), пустые
+    отбрасываются, слишком длинные обрезаются, число записей ограничено
+    MAX_INVARIANTS (старые вытесняются).
+    """
+    entries: List[Dict[str, Any]] = []
+    for item in (raw if isinstance(raw, list) else []):
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            entry_id = str(item.get("id") or "").strip()
+            created = str(item.get("created") or "")
+        else:
+            text = str(item or "").strip()
+            entry_id, created = "", ""
+        if not text:
+            continue
+        entries.append({
+            "id": entry_id or new_id("i"),
+            "text": text[:INVARIANT_ENTRY_LIMIT],
+            "created": created or _now(),
+        })
+    return entries[-MAX_INVARIANTS:]
+
+
+def exceptions(dialog: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Решения пользователя по противоречиям правил (нормализует поле на месте).
+
+    Контейнер — диалог задачи. Запись: {"key", "project_id", "task_id", "winner"}.
+    """
+    if not isinstance(dialog.get("exceptions"), list):
+        dialog["exceptions"] = [
+            dict(item) for item in invariants_store.clean_exceptions(dialog.get("exceptions"))]
+    return dialog["exceptions"]
+
+
+def add_exception(dialog: Dict[str, Any], key: str, winner: str) -> Dict[str, Any]:
+    """Фиксирует решение по противоречию: чьё правило главнее в этой задаче."""
+    entry = invariants_store.clean_exceptions([{"key": key, "winner": winner}])
+    if not entry:
+        return {}
+    item = entry[0]
+    items = [existing for existing in exceptions(dialog)
+             if existing.get("key") != item["key"]]
+    items.append(item)
+    dialog["exceptions"] = items
+    return item
+
+
+def _clean_conflicts(raw: Any) -> List[Dict[str, Any]]:
+    """Проверки пар «инвариант проекта × инвариант задачи» (dialog["conflicts"])."""
+    records = invariants_store.clean_records(raw)
+    return records[-_MAX_CONFLICTS:]
+
+
+def _clean_unchecked(raw: Any) -> List[str]:
+    """Пары, которые проверить не удалось: их перепроверяют при следующем шансе."""
+    if not isinstance(raw, list):
+        return []
+    keys: List[str] = []
+    for item in raw:
+        key = str(item or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys[-_MAX_UNCHECKED:]
+
+
+def invariants(container: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Записи инвариантов контейнера (задача-проект или диалог задачи).
+
+    Нормализует поле на месте, если его нет или оно повреждено, — как memory().
+    Контейнером может быть как задача workspace (инварианты ПРОЕКТА), так и её
+    диалог (инварианты ЗАДАЧИ-диалога).
+    """
+    if not isinstance(container.get("invariants"), list):
+        container["invariants"] = _normalize_invariants(container.get("invariants"))
+    return container["invariants"]
+
+
+def invariants_texts(container: Dict[str, Any]) -> List[str]:
+    """Тексты инвариантов контейнера — в таком виде их получает агент."""
+    return [entry["text"] for entry in invariants(container)]
+
+
+def add_invariant(container: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Добавляет инвариант (одно поле — один инвариант) и возвращает запись."""
+    entries = invariants(container)
+    entry = {"id": new_id("i"), "text": str(text or "").strip()[:INVARIANT_ENTRY_LIMIT],
+             "created": _now()}
+    entries.append(entry)
+    if len(entries) > MAX_INVARIANTS:
+        del entries[:len(entries) - MAX_INVARIANTS]
+    return entry
+
+
+def delete_invariant(container: Dict[str, Any], entry_id: str) -> bool:
+    """Удаляет инвариант по id (False — такого инварианта нет)."""
+    entries = invariants(container)
+    for index, entry in enumerate(entries):
+        if entry["id"] == entry_id:
+            del entries[index]
+            return True
+    return False
 
 
 def memory(container: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
@@ -556,6 +769,9 @@ def _normalize_task(raw: Any) -> Optional[Dict[str, Any]]:
         # Рабочая память задачи — записи, добавленные пользователем вручную
         # (кнопка «добавить в рабочую память»); стратегиям контекста не подчиняется.
         "working": _normalize_entries(raw.get("working")),
+        # Инварианты ПРОЕКТА (в терминах интерфейса «проект» — это задача):
+        # правила, действующие во всех задачах-диалогах этого проекта.
+        "invariants": _normalize_invariants(raw.get("invariants")),
     }
 
 

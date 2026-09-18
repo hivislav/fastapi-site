@@ -101,6 +101,60 @@ const logs = {
     { kind: 'assistant', text: 'Классический рецепт борща с бульоном.' },
   ],
 };
+// Инварианты (правила, которые агент не должен нарушать): у проекта и у
+// задачи-диалога свои списки + проверка пар «проект × задача». Заглушка
+// повторяет поведение сервера: POST добавляет правило и (если правила есть с
+// обеих сторон) возвращает противоречие; DELETE убирает правило и его проверки;
+// resolve фиксирует решение пользователя.
+let INV = {
+  project: [{ id: 'i-p1', text: 'Только PostgreSQL' }],
+  task: [{ id: 'i-t1', text: 'Только MongoDB' }],
+  tasks: { 's-1': [{ id: 'i-t1', text: 'Только MongoDB' }], 's-2': [] },
+  conflict: true,
+  resolved: {},   // ключ пары -> 'project'|'task' (решение пользователя)
+};
+function invPairs() {
+  const task = (workspace.active_session && INV.tasks[workspace.active_session]) || [];
+  const pairs = [];
+  INV.project.forEach(p => task.forEach(t => pairs.push({ p, t })));
+  return pairs;
+}
+function invChecks() {
+  // Вердикт проверки НЕ меняется от решения пользователя: конфликт остаётся
+  // конфликтом, добавляется лишь отметка «решено, главнее X» — так же ведёт
+  // себя сервер.
+  return invPairs().map(({ p, t }) => {
+    const key = p.id + '|' + t.id;
+    const winner = INV.resolved[key] || '';
+    return {
+      key: key, project_id: p.id, task_id: t.id,
+      verdict: INV.conflict ? 'conflict' : 'clear',
+      reason: INV.conflict ? 'СУБД разная' : '',
+      resolved: !!winner, winner: winner,
+      checked_ok: true, project_text: p.text, task_text: t.text,
+    };
+  });
+}
+function invPayload(sessionId) {
+  const session = sessionId || workspace.active_session;
+  const list = invChecks();
+  return {
+    project: INV.project,
+    task: (session && INV.tasks[session]) || [],
+    project_id: workspace.active_task, task_id: session,
+    pairs: list.length, checks: list,
+    has_conflict: list.some(c => c.verdict === 'conflict' && !c.resolved),
+    counts: {
+      project: INV.project.length,
+      task: ((session && INV.tasks[session]) || []).length,
+      conflict: list.filter(c => c.verdict === 'conflict' && !c.resolved).length,
+    },
+  };
+}
+
+// Последний разбор запроса на соответствие инвариантам (заглушка арбитра).
+let LAST_ANALYSIS = { verdict: '', kind: '', explanation: '', suggestions: [] };
+
 // Шаг «в полёте»: нужен, чтобы проверить мгновенную реакцию «Паузы».
 let stepInFlight = false;
 // Задержка ответа на переключение задачи: нужна, чтобы проверить, что окно чата
@@ -202,6 +256,56 @@ function makeFetch() {
       session: { id: workspace.active_session, title: 'Диалог' }, state: snapshot(),
     });
     if (url === '/api/agent/profiles') return jsonResponse(workspace.profile);
+    if (url.indexOf('/api/agent/invariants') === 0 && url.indexOf('?') > 0
+        && method !== 'DELETE') {
+      // Снимок правил КОНКРЕТНОЙ задачи (шестерёнка задачи в списке задач):
+      // правило правится, даже если её диалог не открыт.
+      const sessionId = decodeURIComponent(url.split('session_id=')[1] || '');
+      return jsonResponse(invPayload(sessionId));
+    }
+    if (url === '/api/agent/invariants') {
+      if (method === 'POST') {
+        INV.newId = (INV.newId || 0) + 1;
+        const entry = { id: 'i-new' + INV.newId, text: body.text };
+        if (body.scope === 'task') {
+          const session = workspace.active_session;
+          INV.tasks[session] = (INV.tasks[session] || []).concat([entry]);
+        } else {
+          INV.project = INV.project.concat([entry]);
+        }
+        // Правила есть с обеих сторон — сервер проверяет пары и находит
+        // противоречие (в заглушке — всегда, если INV.conflict).
+        return jsonResponse(invPayload());
+      }
+      return jsonResponse(invPayload());
+    }
+    if (url === '/api/agent/invariants/choose' && method === 'POST') {
+      // Выбор варианта из разбора: как сервер — берём вариант ПО НОМЕРУ из
+      // последнего разбора (текст с фронта не принимаем).
+      const item = (LAST_ANALYSIS.suggestions || [])[body.index] || {};
+      return jsonResponse({ action: 'send', text: item.send || '' });
+    }
+    if (url === '/api/agent/invariants/check') return jsonResponse(invPayload());
+    if (url === '/api/agent/invariants/conflicts/resolve') {
+      INV.resolved[body.key] = body.winner;
+      return jsonResponse(invPayload());
+    }
+    if (url.indexOf('/api/agent/invariants/') === 0 && method === 'DELETE') {
+      const parts = url.split('?')[0].split('/');
+      const scope = parts[4];
+      const id = decodeURIComponent(parts[5]);
+      // Задача может быть названа явно (?session_id=…): шестерёнка в списке
+      // задач правит СВОЮ задачу, даже если её диалог не открыт.
+      const explicit = url.indexOf('session_id=') > 0
+        ? decodeURIComponent(url.split('session_id=')[1]) : '';
+      if (scope === 'project') {
+        INV.project = INV.project.filter(e => e.id !== id);
+      } else {
+        const session = explicit || workspace.active_session;
+        INV.tasks[session] = (INV.tasks[session] || []).filter(e => e.id !== id);
+      }
+      return jsonResponse(invPayload(explicit || undefined));
+    }
     if (url === '/api/agent/memory') {
       return jsonResponse({ task: { id: 't-1', name: 'Задача' }, working: [], long_term: [] });
     }
@@ -274,6 +378,46 @@ function makeFetch() {
     }
     if (url === '/api/agent/chat') {
       chatBodies.push(body);
+      // Журнал чата задачи — как на сервере: реплика пользователя и всё, что
+      // агент показал, попадают в dialog["log"]. Без этого перерисовка диалога
+      // после запроса (loadActiveDialog) вернула бы СТАРЫЙ журнал и стёрла бы
+      // только что показанные кликабельные варианты.
+      const logSession = (body && body.session_id) || workspace.active_session;
+      logs[logSession] = logs[logSession] || [];
+      // РАЗБОР ЗАПРОСА ДО ПЛАНИРОВАНИЯ (как на сервере): если запрос требует
+      // нарушить инвариант («веб»), агент отказывается и показывает варианты —
+      // плана нет, шаги не выполняются.
+      const requestText = String((body && body.content) || '');
+      if (requestText && !body.continue_step) {
+        logs[logSession].push({ kind: 'user', text: requestText });
+      }
+      if (!body.continue_step && /веб/i.test(requestText)) {
+        LAST_ANALYSIS = {
+          verdict: 'violation', kind: 'violation',
+          message: '⛔ Запрос нарушает инвариант (правило, которое нарушать нельзя) — '
+            + 'выполнять его не буду.\n\nВеб-приложение нарушает инвариант: разрешён '
+            + 'только Kotlin и Android.',
+          explanation: 'Веб-приложение нарушает инвариант: разрешён только Kotlin и Android.',
+          suggestions: [
+            { title: 'Нативное Android-приложение на Kotlin',
+              details: 'Укладывается в стек: Kotlin + Compose.',
+              send: 'Сделай нативное Android-приложение погоды на Kotlin', resolve: '' },
+            { title: 'Kotlin Multiplatform с Android-таргетом',
+              details: 'Общий код на Kotlin, нативный UI.',
+              send: 'Сделай погодное приложение на Kotlin Multiplatform', resolve: '' },
+          ],
+        };
+        logs[logSession].push({
+          kind: 'suggestions', text: LAST_ANALYSIS.message, analysis: LAST_ANALYSIS,
+        });
+        return streamResponse([
+          { type: 'state', state: snapshot() },
+          { type: 'suggestions', text: LAST_ANALYSIS.message, analysis: LAST_ANALYSIS },
+          { type: 'state', state: snapshot() },
+          { type: 'done', usage: usage(), state: snapshot() },
+        ]);
+      }
+      LAST_ANALYSIS = { verdict: '', kind: '', explanation: '', suggestions: [] };
       // Как на сервере: задача запроса — из session_id (шаг фоновой задачи),
       // иначе открытая.
       requestSession = (body && body.session_id) || workspace.active_session;
@@ -317,6 +461,28 @@ function makeFetch() {
   };
 }
 
+const TRACE_HTML = HTML
+  .replace(`            const list = (analysis.suggestions || []).filter(item => item && item.title);`,
+    `            const list = (analysis.suggestions || []).filter(item => item && item.title);
+            console.log("OPTIONS list=" + list.length + " raw=" + (analysis.suggestions || []).length + " wrap=" + (wrap ? wrap.className : "NULL"));`)
+  .replace(`                box.appendChild(btn);`, `                box.appendChild(btn);
+                console.log("OPT button appended", box.children.length);`)
+  .replace(`            wrap.appendChild(box);`, `            console.log("BEFORE APPEND box.children=" + box.children.length + " forEachLen=" + list.length);
+            wrap.appendChild(box);
+            console.log("APPENDED box", wrap.querySelectorAll('.inv-option').length, wrap.className);`)
+  .replace('let agentRootMessages = [];',
+    'let agentRootMessages = [];\n        window.__trace = function (w) { console.log("ROOT@" + w, agentRootMessages.length); };')
+  .replace('        function renderAgentDialog() {',
+    '        function renderAgentDialog() { window.__trace("render");')
+  .replace('        function drawAgentNode(role, text, analysis) {',
+    '        function drawAgentNode(role, text, analysis) { if (analysis) console.log("DRAW analysis suggestions=" + (analysis.suggestions || []).length);')
+  .replace('            } else {\n                const wrap = addMessage(\'bot\', text, true, true);',
+    '            } else {\n                const wrap = addMessage(\'bot\', text, true, true); console.log("DRAW BOT inDom=" + document.body.contains(wrap) + " opts=" + wrap.querySelectorAll(".inv-option").length + " parent=" + (wrap.parentNode ? wrap.parentNode.className : "none"));')
+  .replace('            agentRootMessages = (log.length ? log : msgs.map(m => ({',
+    '            window.__trace("before set log=" + log.length + " msgs=" + msgs.length);\n            agentRootMessages = (log.length ? log : msgs.map(m => ({')
+  .replace('                await loadWorkspace();\n            } catch (e) {',
+    '                window.__trace("before loadWorkspace");\n                await loadWorkspace();\n                window.__trace("after loadWorkspace");\n            } catch (e) {');
+
 const dom = new JSDOM(HTML, {
   runScripts: 'dangerously',
   url: 'http://localhost/',
@@ -337,13 +503,67 @@ const chatCalls = () => calls.filter(c => c === 'POST /api/agent/chat').length;
 const stepCalls = () => chatBodies.filter(b => b && b.continue_step === true).length;
 const wait = (ms) => new Promise(r => dom.window.setTimeout(r, ms));
 
+// Значение CSS-свойства по каскаду: среди подходящих правил берём самое
+// специфичное (при равенстве — последнее по порядку), как это делает браузер.
+// Нужен потому, что jsdom возвращает по getComputedStyle значение базового
+// правила (.modal-box), не разрешая каскад двух классов.
+function selectorWeight(selector) {
+  const classes = (selector.match(/\.[\w-]+/g) || []).length;
+  const ids = (selector.match(/#[\w-]+/g) || []).length;
+  const parts = (selector.match(/\[[^\]]+\]|:[\w-]+/g) || []).length;
+  return ids * 100 + (classes + parts) * 10;
+}
+
+// Текст пояснения модалки инвариантов (первый .modal-hint самой модалки).
+function invHintText() {
+  const hints = $('invariants-modal').querySelectorAll('.modal-hint');
+  // Переносы строк в разметке схлопываем: проверяем смысл, а не форматирование.
+  return hints.length ? hints[0].textContent.replace(/\s+/g, ' ') : '';
+}
+
+// Секция модалки скрыта: атрибут hidden + поддержка в CSS ([hidden] снимаем
+// display у grid-элемента) — проверяем оба условия (jsdom не всегда разрешает
+// display для [hidden], поэтому стиль читаем из правил).
+function sectionHidden(el) {
+  if (el.hidden !== true) return false;
+  const rule = declaredStyle(el, 'display');
+  return rule === 'none';
+}
+
+function expectedWidthWins(el) {
+  return parseFloat((declaredStyle(el, 'width') || '0').replace('px', '')) || 0;
+}
+
+function declaredStyle(el, prop) {
+  let best = null;
+  const sheets = dom.window.document.styleSheets;
+  for (let i = 0; i < sheets.length; i++) {
+    let rules;
+    try { rules = sheets[i].cssRules; } catch (e) { continue; }
+    for (let j = 0; j < rules.length; j++) {
+      const rule = rules[j];
+      if (!rule.selectorText || !rule.style) continue;
+      const value = rule.style.getPropertyValue(prop);
+      if (!value) continue;
+      let matches = false;
+      try { matches = el.matches(rule.selectorText); } catch (e) { matches = false; }
+      if (!matches) continue;
+      const weight = selectorWeight(rule.selectorText);
+      if (best === null || weight > best.weight) best = { weight: weight, value: value };
+    }
+  }
+  return best ? best.value : '';
+}
+
 async function click(el, ms) {
   el.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
   await wait(ms === undefined ? 30 : ms);
 }
 
-// Запрос пользователя прямо через страницу (как будто ввели текст и нажали «Отправить»).
-async function sendText(text, ms) {
+// Запрос пользователя прямо через страницу (как будто ввели текст и нажали
+// «Отправить»). Имя отличается от одноимённого помощника СТРАНИЦЫ (sendUserText),
+// который используют варианты решения инвариантов.
+async function sendRequest(text, ms) {
   $('input').value = text;
   $('input').dispatchEvent(new dom.window.Event('input', { bubbles: true }));
   await click($('send'), ms === undefined ? 60 : ms);
@@ -366,7 +586,7 @@ async function run() {
   check('«Подтвердить план» скрыта без плана', $('tm-confirm').hidden === true);
 
   console.log('\n[B] Запрос пользователя: план и ожидание подтверждения');
-  await sendText('Сделай отчёт');
+  await sendRequest('Сделай отчёт');
   check('появился блок «Ждём пользователя»',
     blocks().some(b => b.classList.contains('extra') && b.textContent === 'Ждём пользователя'));
   check('текущий этап — планирование', activeBlock() && activeBlock().textContent === 'Планирование');
@@ -393,7 +613,7 @@ async function run() {
   console.log('\n[D] «Подтвердить план» запускает авто-прогон шагов');
   PLAN = ['Первый', 'Второй', 'Третий'];
   STEP_DELAY = 5;
-  await sendText('Сделай отчёт из трёх шагов');
+  await sendRequest('Сделай отчёт из трёх шагов');
   const before = stepCalls();
   // Реплик пользователя на этот момент: дальше автомат работает сам, и новых
   // сообщений от пользователя быть не должно.
@@ -425,7 +645,7 @@ async function run() {
   console.log('\n[E] «Пауза» останавливает авто-прогон');
   PLAN = ['Шаг A', 'Шаг B', 'Шаг C', 'Шаг D'];
   STEP_DELAY = 150;
-  await sendText('Длинная задача на четыре шага');
+  await sendRequest('Длинная задача на четыре шага');
   await click($('tm-confirm'), 10);
   await wait(60);   // «Пауза» приходит ВНУТРИ первого шага (шаг идёт 150 мс)
   const stepsBeforePause = stepCalls();
@@ -459,7 +679,7 @@ async function run() {
   check('после «Продолжить» автомат доработал план', state.stage === 'done', state.stage);
 
   console.log('\n[G] Переключение диалога: журнал чата восстанавливается');
-  await sendText('Отчёт по продажам');   // уводим задачу из done (новая задача)
+  await sendRequest('Отчёт по продажам');   // уводим задачу из done (новая задача)
   const sessionItems = () => q('#sessions .session-item');
   check('в панели две сессии', sessionItems().length === 2, String(sessionItems().length));
   const secondSession = sessionItems().find(item => item.textContent.includes('Рецепт борща'));
@@ -476,9 +696,12 @@ async function run() {
   await click(firstSession, 80);
   check('возврат в первый диалог показывает его журнал',
     dom.window.document.getElementById('messages').textContent.includes('Сделай отчёт по продажам'));
-  // Журнал рисуется по kind, а не по роли в памяти: служебные строки — debug.
+  // Журнал рисуется по kind, а не по роли в памяти: служебные строки — debug,
+  // и они не превращаются в реплики пользователя (в т.ч. узел разбора инвариантов
+  // «suggestions» — это сообщение АГЕНТА).
   check('служебные строки рисуются как debug, а не как реплики пользователя',
-    q('#messages .msg.debug').length >= 1 && q('#messages .msg.user').length === 1,
+    q('#messages .msg.debug').some(el => el.textContent.includes('этап planning'))
+    && !q('#messages .msg.user').some(el => el.textContent.includes('этап planning')),
     `(debug: ${q('#messages .msg.debug').length}, user: ${q('#messages .msg.user').length})`);
 
   console.log('\n[H] Изоляция потока: события чужого диалога не рисуются');
@@ -810,7 +1033,7 @@ async function run() {
   dom.window.eval('applyTaskState(' + JSON.stringify(snapshot()) + ')');
   await wait(20);
   const chatBefore = chatBodies.length;
-  await sendText('моё сообщение в открытой задаче', 120);
+  await sendRequest('моё сообщение в открытой задаче', 120);
   const newBodies = chatBodies.slice(chatBefore);
   check('сообщение из другой задачи ушло на сервер',
     newBodies.some(b => b && !b.continue_step && (b.content || '').includes('моё сообщение')),
@@ -1047,6 +1270,302 @@ async function run() {
   check('кнопка «Пауза» недоступна без проекта', $('tm-pause').disabled === true);
   check('поле ввода подсказывает создать проект',
     $('input').placeholder.toLowerCase().includes('создайте проект'), $('input').placeholder);
+
+  console.log('\n[L] Инварианты: шестерёнки проекта и задачи, модалка, противоречие');
+  // Возвращаем проект и активный диалог: в разделе [K] workspace опустошали.
+  workspace = {
+    tasks: [{ id: 't-1', name: 'Задача' }], active_task: 't-1',
+    sessions: [{ id: 's-1', title: 'Отчёт' }, { id: 's-2', title: 'Рецепт' }],
+    active_session: 's-1',
+    profile: workspace.profile,
+  };
+  INV.project = [{ id: 'i-p1', text: 'Только PostgreSQL' }];
+  INV.tasks = { 's-1': [{ id: 'i-t1', text: 'Только MongoDB' }], 's-2': [] };
+  INV.conflict = true;
+  INV.resolved = {};
+  setState({});
+  await dom.window.eval('loadWorkspace()');
+  await wait(40);
+
+  // Шестерёнки: у проекта — рядом с карандашом и корзиной проекта, у каждой
+  // задачи — рядом с её карандашом и корзиной (отдельной кнопки «Инварианты» нет).
+  check('шестерёнка у проекта стоит среди иконок проекта',
+    $('project-invariants').closest('.task-actions') !== null);
+  // Она должна быть ВИДНА: атрибут hidden или display:none сделали бы настройку
+  // недоступной (видимостью управляет только #task-block в обычном режиме).
+  check('шестерёнка проекта действительно отрисована и видна',
+    $('project-invariants').hidden === false
+    && dom.window.getComputedStyle($('project-invariants')).display !== 'none'
+    && $('project-invariants').className.indexOf('icon-btn') === 0,
+    'display=' + dom.window.getComputedStyle($('project-invariants')).display
+      + ', hidden=' + $('project-invariants').hidden
+      + ', class=' + $('project-invariants').className);
+  check('порядок иконок проекта: шестерёнка, карандаш, корзина',
+    (function () {
+      const actions = $('project-invariants').closest('.task-actions');
+      return actions.children.length === 3
+        && actions.children[0] === $('project-invariants')
+        && actions.children[1] === $('task-rename')
+        && actions.children[2] === $('task-delete');
+    })());
+  check('отдельной кнопки «Инварианты» больше нет',
+    dom.window.document.getElementById('invariants-btn') === null);
+  check('у каждой задачи своя шестерёнка инвариантов',
+    q('.session-item').length === 2
+    && q('.session-item .session-invariants').length === 2,
+    'шестерёнок задач: ' + q('.session-item .session-invariants').length);
+  check('шестерёнка задачи стоит рядом с карандашом и корзиной',
+    (function () {
+      const actions = q('.session-item')[0].querySelector('.session-actions');
+      return actions && actions.firstElementChild ===
+        q('.session-item')[0].querySelector('.session-invariants')
+        && actions.children.length === 3;
+    })());
+  // Тревожных меток от «проверок пар» больше нет: инварианты пишутся без
+  // обращения к модели, противоречия выясняются в диалоге.
+  check('шестерёнки без тревожных меток при записи правил',
+    !$('project-invariants').classList.contains('conflict')
+    && q('.session-item .session-invariants.conflict').length === 0);
+
+  // Шестерёнка ЗАДАЧИ другой задачи: правила правятся, даже если диалог не открыт.
+  await click(q('.session-item')[1].querySelector('.session-invariants'), 60);
+  check('модалка открылась на правилах задачи', $('invariants-modal').hidden === false
+    && $('inv-title').textContent === 'Инварианты задачи', $('inv-title').textContent);
+  check('шестерёнка задачи запросила СВОЮ задачу',
+    calls.some(c => c.indexOf('GET /api/agent/invariants?session_id=s-2') === 0),
+    calls.slice(-2).join(' | '));
+  check('правила этой задачи пусты',
+    $('inv-task-list').textContent.includes('Правил задачи пока нет'),
+    $('inv-task-list').textContent.slice(0, 80));
+  // Области РАЗДЕЛЕНЫ: в модалке задачи секции проекта быть не должно.
+  check('в модалке задачи нет секции правил проекта',
+    sectionHidden($('inv-project-section')) && $('inv-project-list').textContent === '',
+    'project-секция: hidden=' + $('inv-project-section').hidden
+      + ', текст=' + JSON.stringify($('inv-project-list').textContent.slice(0, 40)));
+  check('в модалке задачи правила проекта не упоминаются как редактируемые',
+    $('inv-task-input').disabled === false && $('inv-task-add').disabled === false);
+  check('модалка задачи — одна колонка правил',
+    dom.window.getComputedStyle($('inv-cols')).gridTemplateColumns.split(' ').length === 1,
+    dom.window.getComputedStyle($('inv-cols')).gridTemplateColumns);
+  check('пояснение про инварианты есть в модалке задачи',
+    $('inv-reminder').hidden === false
+    && $('inv-reminder').textContent.includes('ЗАДАЧИ')
+    && $('inv-reminder').textContent.includes('правила всего проекта задаются'));
+  await click($('inv-close'), 40);
+
+  // Шестерёнка ПРОЕКТА: правила всего проекта, правило задачи — только справка.
+  await click($('project-invariants'), 60);
+  check('модалка открылась на правилах проекта',
+    $('inv-title').textContent === 'Инварианты проекта', $('inv-title').textContent);
+  check('правила проекта перечислены',
+    q('#inv-project-list .inv-item').length === 1
+    && $('inv-project-list').textContent.includes('Только PostgreSQL'));
+  // В модалке проекта секции правил задачи быть не должно.
+  check('в модалке проекта нет секции правил задачи',
+    sectionHidden($('inv-task-section')) && $('inv-task-list').textContent === '',
+    'task-секция: hidden=' + $('inv-task-section').hidden
+      + ', текст=' + JSON.stringify($('inv-task-list').textContent.slice(0, 40)));
+  check('модалка проекта — одна колонка правил',
+    dom.window.getComputedStyle($('inv-cols')).gridTemplateColumns.split(' ').length === 1,
+    dom.window.getComputedStyle($('inv-cols')).gridTemplateColumns);
+  check('пояснение объясняет, где правятся правила задачи',
+    $('inv-reminder').textContent.includes('ПРОЕКТА')
+    && $('inv-reminder').textContent.includes('шестерёнкой в списке задач'));
+  // Пояснение должно быть в самой модалке (а не только в подсказке шестерёнки):
+  // при открытых инвариантах задачи — какая это задача, при проекте — что здесь
+  // правятся правила проекта.
+  check('в модалке есть пояснение, что такое инварианты',
+    invHintText().includes('не имеет права нарушить')
+    && invHintText().includes('Одно поле — один инвариант')
+    && invHintText().includes('бизнес-правила'),
+    invHintText().slice(0, 90));
+  check('в модалке нет блока «проверок пар» (их не существует)',
+    dom.window.document.getElementById('inv-check') === null);
+
+  // Модалка крупная: шире обычной и с двумя колонками правил.
+  const modalBox = $('invariants-modal').querySelector('.inv-modal');
+  const declaredWidth = parseFloat(
+    (declaredStyle(modalBox, 'width') || '0').replace('px', '')) || 0;
+  const plainWidth = parseFloat(
+    (declaredStyle($('confirm-modal').querySelector('.modal-box'), 'width') || '0')
+      .replace('px', '')) || 0;
+  check('модалка инвариантов заметно больше обычной',
+    declaredWidth >= plainWidth * 1.5, `ширина: ${declaredWidth} против ${plainWidth}`);
+  check('ширина модалки важнее базовой ширины .modal-box',
+    expectedWidthWins(modalBox) === declaredWidth,
+    'каскад: ' + expectedWidthWins(modalBox));
+  check('правила в модалке выводятся сеткой (своя область на всю ширину)',
+    dom.window.getComputedStyle(modalBox.querySelector('.inv-cols')).display === 'grid');
+
+  // Панель Workspace стала в полтора раза шире (260px → 390px).
+  const layout = dom.window.getComputedStyle(dom.window.document.querySelector('.layout'));
+  check('панель Workspace в полтора раза шире',
+    layout.gridTemplateColumns.indexOf('390px') === 0, layout.gridTemplateColumns);
+
+  check('запись правил не дёргает модель (счётчик вызовов не вырос)',
+    !calls.some(c => c.indexOf('POST /api/agent/invariants/conflicts/resolve') === 0));
+
+  // Добавление правила проекта из его шестерёнки.
+  $('inv-project-input').value = 'Python 3.9';
+  await click($('inv-project-add'), 60);
+  check('правило проекта добавлено и поле очищено',
+    $('inv-project-input').value === '' && INV.project.length === 2,
+    'правил проекта: ' + INV.project.length);
+  check('введённое правило видно в списке',
+    $('inv-project-list').textContent.includes('Python 3.9'));
+
+  // Правила задачи правятся из шестерёнки САМОЙ задачи (диалог может быть не открыт).
+  await click($('inv-close'), 30);
+  await click(q('.session-item')[0].querySelector('.session-invariants'), 60);
+  check('в модалке задачи поле ввода доступно именно для правил задачи',
+    $('inv-task-section').hidden === false && $('inv-task-input').disabled === false
+    && $('inv-project-section').hidden === true);
+  $('inv-task-input').value = 'Ответы только на русском';
+  await click($('inv-task-add'), 60);
+  check('правило добавлено в правила ЗАДАЧИ',
+    (INV.tasks['s-1'] || []).length === 2
+    && $('inv-task-list').textContent.includes('Ответы только на русском'),
+    'правил задачи: ' + (INV.tasks['s-1'] || []).length);
+
+  // Удаление правила (корзина рядом с правилом).
+  const delButtons = q('#inv-task-list .inv-del');
+  const taskBefore = (INV.tasks['s-1'] || []).length;
+  await click(delButtons[0], 60);
+  check('правило задачи удалено', (INV.tasks['s-1'] || []).length === taskBefore - 1,
+    'правил задачи: ' + (INV.tasks['s-1'] || []).length);
+  check('модалка осталась открытой после правки', $('invariants-modal').hidden === false);
+  await click($('inv-close'), 40);
+  check('модалка закрылась', $('invariants-modal').hidden === true);
+
+  // Выключение агента: модалка закрывается, панель (и шестерёнки) убираются.
+  await dom.window.eval('setAgentMode(false)');
+  await wait(40);
+  check('в обычном режиме панель Workspace скрыта', $('task-block').hidden === true);
+  check('модалка инвариантов закрыта', $('invariants-modal').hidden === true);
+  await dom.window.eval('setAgentMode(true)');
+  await wait(60);
+  check('при возврате в режим агента панель с шестерёнками снова видна',
+    $('task-block').hidden === false);
+
+  console.log('\n[M] Разбор запроса: отказ и кликабельные варианты');
+  // Возвращаем проект и задачу: раздел [K] их опустошал.
+  workspace = {
+    tasks: [{ id: 't-1', name: 'Проект' }], active_task: 't-1',
+    sessions: [{ id: 's-1', title: 'Погода' }], active_session: 's-1',
+    profile: workspace.profile,
+  };
+  INV.project = [{ id: 'i-p1', text: 'Только Kotlin и Android, без веба' }];
+  INV.tasks = { 's-1': [] };
+  INV.conflict = false;
+  INV.resolved = {};
+  logs['s-1'] = [];                    // журнал этой задачи — как у новой задачи
+  setState({});                        // планирование, без плана
+  dom.window.eval('viewEpoch += 1');   // как при переключении задачи
+  await dom.window.eval('loadWorkspace()');
+  await wait(40);
+  const optionsTsx = () => q('#messages .inv-options .inv-option');
+  const lastOptions = () => {
+    const boxes = q('#messages .inv-options');
+    return boxes.length ? Array.from(boxes[boxes.length - 1].querySelectorAll('.inv-option')) : [];
+  };
+
+  // Запрос, который нарушает инвариант: агент отказывается и показывает варианты.
+  await sendRequest('нужно веб-приложение погоды, открывается в браузере', 120);
+  check('под сообщением появились кликабельные варианты', lastOptions().length === 2,
+    'вариантов: ' + lastOptions().length);
+  check('в отказе объяснено, что нарушено',
+    q('#messages .msg.bot').slice(-1)[0].textContent.includes('нарушает инвариант'),
+    q('#messages .msg.bot').slice(-1)[0].textContent.slice(0, 80));
+  check('у варианта видно, какой запрос уйдёт при клике',
+    lastOptions()[0].textContent.includes('отправить как запрос')
+    && lastOptions()[0].textContent.includes('Kotlin'),
+    lastOptions()[0].textContent.slice(0, 100));
+  check('среди вариантов нет нарушающего правила',
+    !lastOptions().some(btn => /веб-приложение/i.test(btn.textContent)),
+    lastOptions().map(b => b.textContent.slice(0, 30)).join(' | '));
+  check('варианты помечены как узлы диалога агента (убираются при выключении)',
+    q('#messages .inv-options').every(box => box.closest('[data-agent]') !== null));
+  // Отказ приходит ДО планирования: шагов в состоянии нет и автомат их не гонит.
+  check('план при отказе не строится и шаги не идут',
+    !(dom.window.eval('taskMachineState && taskMachineState.steps') || []).length,
+    JSON.stringify(dom.window.eval('taskMachineState && taskMachineState.steps')));
+
+  // Клик по варианту: текст берётся у сервера и уходит как новый запрос.
+  const bodiesBefore = chatBodies.length;
+  await click(lastOptions()[0], 200);
+  check('клик по варианту спросил сервер, что делать с вариантом',
+    calls.includes('POST /api/agent/invariants/choose'));
+  const sentVariant = chatBodies.slice(bodiesBefore).some(
+    b => b.continue_step !== true && String(b.content || '').includes('нативное Android-приложение'));
+  check('вариант отправлен как запрос пользователя (обычным сообщением)', sentVariant,
+    JSON.stringify(chatBodies.slice(bodiesBefore).map(
+      b => ({ text: String(b.content || '').slice(0, 30), cs: b.continue_step }))));
+  await wait(150);
+  check('текст варианта виден в диалоге как реплика пользователя',
+    q('#messages .msg.user').some(el => el.textContent.includes('нативное Android-приложение')),
+    q('#messages .msg.user').map(el => el.textContent.slice(0, 30)).join(' | '));
+
+  // Варианты переживают переключение диалога: они лежат в журнале чата.
+  dom.window.eval('resetAgentDialogs()');
+  logs['s-1'] = [{
+    kind: 'suggestions',
+    text: '⛔ Запрос нарушает инвариант — выполнять его не буду.',
+    analysis: {
+      kind: 'violation', explanation: 'Веб запрещён',
+      suggestions: [
+        { title: 'Нативное Android-приложение', details: 'В стеке',
+          send: 'Сделай Android-приложение', resolve: '' },
+        { title: 'Kotlin Multiplatform', details: 'Общий код',
+          send: 'Сделай на Kotlin MPP', resolve: '' },
+      ],
+    },
+  }];
+  await dom.window.eval('loadActiveDialog()');
+  await wait(60);
+  check('после перерисовки диалога варианты снова кликабельны', lastOptions().length === 2,
+    'вариантов: ' + lastOptions().length);
+
+  // Конфликт правила задачи с правилом проекта: приоритет у проекта, агент
+  // отказывается и даёт альтернативы — выбора «какое правило главнее» нет.
+  INV.conflict = true;
+  INV.resolved = {};
+  LAST_ANALYSIS = {
+    verdict: 'violation', kind: 'violation',
+    message: '⛔ Запрос нарушает инвариант проекта — выполняю его не буду.',
+    explanation: 'Правило проекта запрещает веб, правило задачи его просит: '
+      + 'действует правило проекта.',
+    suggestions: [
+      { title: 'Нативное Android-приложение', details: 'В стеке проекта',
+        send: 'Сделай Android-приложение погоды на Kotlin' },
+      { title: 'План без веба', details: 'Только Android',
+        send: 'Спланируй Android-приложение погоды' },
+    ],
+  };
+  // Такой разбор приходит в журнале задачи — рисуем диалог из него.
+  logs['s-1'] = [{
+    kind: 'suggestions',
+    text: LAST_ANALYSIS.message,
+    analysis: LAST_ANALYSIS,
+  }];
+  await dom.window.eval('loadActiveDialog()');
+  await wait(60);
+  check('варианты-альтернативы показаны кликабельными',
+    lastOptions().length === 2, 'вариантов: ' + lastOptions().length);
+  check('выбора «главнее проект/задача» в интерфейсе нет',
+    q('#messages .inv-option.resolve').length === 0);
+  check('у альтернативы подписан запрос, который уйдёт',
+    lastOptions()[0].textContent.includes('отправить как запрос')
+    && lastOptions()[0].textContent.includes('Android'),
+    lastOptions()[0].textContent.slice(0, 90));
+
+  // Клик по альтернативе: обычный запрос, который правила не нарушает.
+  const bodiesBeforeAlt = chatBodies.length;
+  await click(lastOptions()[0], 200);
+  await wait(150);
+  check('альтернатива отправлена как запрос пользователя',
+    chatBodies.slice(bodiesBeforeAlt).some(b => !b.continue_step
+      && String(b.content || '').includes('Android-приложение')),
+    JSON.stringify(chatBodies.slice(bodiesBeforeAlt).map(b => String(b.content || '').slice(0, 30))));
 
   console.log('\nИтог: ' + (failures ? 'ПРОВАЛЕНО проверок: ' + failures : 'все проверки пройдены'));
   dom.window.close();

@@ -76,13 +76,14 @@
         }
         /* Страница занимает ВСЁ окно браузера: панель истории (в режиме агента —
            Workspace с задачами и диалогами) прижата к левому краю, окно чата
-           идёт сразу за ней и растягивается на всё свободное место. Ширина
+           идёт сразу за ней и растягивается на всё свободное место (панель —
+           390px: в ней живут проекты, задачи, их правила и профиль). Ширина
            колонки под панели статистики (эксперт/AI-агент) зарезервирована в
            правилах body.expert-mode / body.agent-mode ниже — чат занимает
            остаток, поэтому ничего не перекрывается. */
         .layout {
             display: grid;
-            grid-template-columns: 260px 1fr;
+            grid-template-columns: 390px 1fr;
             gap: 16px;
             height: 100vh;
             width: 100%;
@@ -329,6 +330,7 @@
             line-height: 1;
             cursor: pointer;
         }
+        .icon-btn[hidden] { display: none; }
         .icon-btn:hover { background: var(--surface-3); }
         .icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .task-select,
@@ -387,6 +389,7 @@
         .session-item:hover .session-actions,
         .session-item.active .session-actions { opacity: 1; }
         .session-actions .icon-btn { width: 22px; height: 22px; font-size: 0.72rem; }
+        .session-actions { gap: 3px; }
         /* Переключатель вида панели агента: «токены диалога» (по умолчанию) /
            «состояние памяти» (рабочая и долговременная память). */
         .agent-view-toggle {
@@ -909,6 +912,135 @@
             cursor: pointer;
         }
         .group-settings:hover { background: var(--surface-3); }
+        /* Варианты решения под сообщением агента (разбор инвариантов):
+           кликабельные элементы, ни один из них правила не нарушает. */
+        .inv-options {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .inv-option {
+            display: block;
+            width: 100%;
+            text-align: left;
+            padding: 10px 12px;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: var(--surface-2);
+            color: var(--text);
+            font-family: inherit;
+            font-size: 0.88rem;
+            line-height: 1.45;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+        }
+        .inv-option:hover {
+            background: var(--surface-3);
+            border-color: var(--accent);
+            box-shadow: 0 0 14px rgba(34, 211, 238, 0.16);
+        }
+        .inv-option .inv-option-title { color: var(--accent); font-weight: 600; }
+        .inv-option .inv-option-details {
+            display: block;
+            margin-top: 4px;
+            font-size: 0.82rem;
+            color: var(--text-dim);
+        }
+        .inv-option .inv-option-send {
+            display: block;
+            margin-top: 6px;
+            font-size: 0.8rem;
+            color: var(--muted);
+            font-family: var(--mono);
+        }
+        /* Инварианты режима «AI-агент» (кнопка в панели Workspace): правила,
+           которые агент не имеет права нарушить. Правила проекта и правила
+           задачи — отдельные списки, поэтому модалка «рабочая»: 940px (обычная
+           320px), почти вся высота окна и две колонки. */
+        /* Составной селектор + !important: базовое правило .modal-box {width:
+           320px} иначе перебивает ширину — модалка оставалась узкой, и в неё
+           ничего не влезало. */
+        .modal-box.inv-modal {
+            width: 940px !important;
+            max-width: 94vw;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 26px 28px;
+            box-sizing: border-box;
+        }
+        .inv-modal h3 { font-size: 1.25rem; margin-bottom: 10px; }
+        .inv-modal .modal-hint { font-size: 0.85rem; line-height: 1.55; }
+        .inv-cols {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 22px;
+            align-items: start;
+            margin-top: 16px;
+        }
+        /* Показывается только своя область (проект ИЛИ задача) — одна колонка на
+           всю ширину модалки, чтобы правило читалось целиком. */
+        .inv-cols.single { grid-template-columns: 1fr; }
+        .inv-section { margin-bottom: 18px; }
+        .inv-section[hidden] { display: none; }
+        /* Секция-справка: в модалке ПРОЕКТА правила задачи только показываются
+           (правятся шестерёнкой у самой задачи). */
+        .inv-section.readonly { opacity: 0.72; }
+        .inv-section.readonly #inv-task-list .inv-del { display: none; }
+        .inv-section h4 {
+            margin: 0 0 5px;
+            font-size: 1.02rem;
+            color: var(--accent);
+            letter-spacing: 0.02em;
+        }
+        .inv-note { margin: 0 0 12px; font-size: 0.84rem; color: var(--text-dim); line-height: 1.5; }
+        .inv-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 11px 13px;
+            margin-bottom: 9px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--surface-2);
+            font-size: 0.96rem;
+            line-height: 1.5;
+        }
+        .inv-item .inv-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
+        .inv-item .inv-del {
+            flex: 0 0 auto;
+            background: none;
+            border: none;
+            color: var(--danger);
+            cursor: pointer;
+            font-size: 1.05rem;
+            line-height: 1;
+            padding: 2px 5px;
+        }
+        .inv-item .inv-del:hover { color: var(--warn); }
+        .inv-empty {
+            font-size: 0.86rem;
+            color: var(--muted);
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            border: 1px dashed var(--line);
+            border-radius: 10px;
+        }
+        .inv-add { display: flex; gap: 10px; }
+        .inv-add input { flex: 1; margin-bottom: 0; font-size: 0.95rem; padding: 11px 13px; }
+        .inv-add button {
+            flex: 0 0 auto;
+            padding: 11px 20px;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: rgba(34, 211, 238, 0.12);
+            color: var(--accent);
+            font-size: 0.94rem;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .inv-add button:hover { background: rgba(34, 211, 238, 0.2); }
+        .inv-add button:disabled { opacity: 0.4; cursor: not-allowed; }
         .modal-overlay {
             position: fixed;
             inset: 0;
@@ -1033,7 +1165,7 @@
            окно браузера, но под панель зарезервировано 520px: окно чата
            растягивается на остаток ширины, а сама панель занимает свою колонку. */
         body.expert-mode .layout {
-            grid-template-columns: 260px 1fr 520px;
+            grid-template-columns: 390px 1fr 520px;
             max-width: none;
         }
         .stats {
@@ -1069,7 +1201,7 @@
         /* Занимает ровно то же место и тот же размер, что панель статистики
            в экспертном режиме: третья колонка справа (520px). */
         body.agent-mode .layout {
-            grid-template-columns: 260px 1fr 520px;
+            grid-template-columns: 390px 1fr 520px;
             max-width: none;
         }
         /* Диаграмма не влезала в 50vh как у статистики: в режиме агента панель
@@ -1273,6 +1405,11 @@
                 <div class="task-head">
                     <span>Текущий проект</span>
                     <span class="task-actions">
+                        <!-- Инварианты ПРОЕКТА: правила, которые агент не имеет
+                             права нарушить в любой задаче проекта (архитектура,
+                             принятые решения, ограничения стека, бизнес-правила). -->
+                        <button type="button" class="icon-btn" id="project-invariants"
+                                title="Инварианты проекта: правила, которые агент не имеет права нарушить">⚙️</button>
                         <button type="button" class="icon-btn" id="task-rename" title="Переименовать проект">✏️</button>
                         <button type="button" class="icon-btn" id="task-delete" title="Удалить проект">🗑</button>
                     </span>
@@ -1443,6 +1580,54 @@
                     <div class="modal-actions">
                         <button type="button" class="clear" id="plan-modal-close">закрыть</button>
                         <button type="button" class="accept" id="plan-modal-ok">ок</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Инварианты (шестерёнка ⚙️ у проекта и у каждой задачи в панели
+                 Workspace). Правила, которые агент не имеет права нарушить:
+                 архитектура, принятые решения, ограничения стека, бизнес-правила.
+                 Хранятся отдельно от диалога и уходят в модель системным блоком в
+                 каждом запросе; одно текстовое поле — один инвариант. Правила
+                 бывают двух областей: ПРОЕКТА (действуют во всех его задачах) и
+                 ЗАДАЧИ-диалога. Из шестерёнки проекта правишь только правила
+                 проекта, из шестерёнки задачи — правила этой задачи (правила
+                 проекта видны для справки), а если они противоречат друг другу —
+                 выбираешь, чьё правило главнее. Два одинаковых блока разметки:
+                 один для проекта, второй для задачи. -->
+            <div class="modal-overlay" id="invariants-modal" hidden>
+                <div class="modal-box inv-modal">
+                    <h3 id="inv-title">Инварианты проекта</h3>
+                    <p class="modal-hint">Инварианты — правила, которые агент не
+                        имеет права нарушить: выбранная архитектура, принятые
+                        технические решения, ограничения по стеку, бизнес-правила.
+                        Агент учитывает их в каждом ответе и не предлагает решения,
+                        которые их нарушают. Одно поле — один инвариант.</p>
+                    <p class="modal-hint inv-reminder" id="inv-reminder" hidden></p>
+                    <div class="inv-cols" id="inv-cols">
+                        <div class="inv-section" id="inv-project-section">
+                            <h4>Инварианты проекта</h4>
+                            <p class="inv-note">Действуют во всех задачах проекта.</p>
+                            <div id="inv-project-list"></div>
+                            <div class="inv-add">
+                                <input class="roles-field" id="inv-project-input" autocomplete="off"
+                                       placeholder="напр. «Только PostgreSQL, без MongoDB»">
+                                <button type="button" id="inv-project-add">добавить</button>
+                            </div>
+                        </div>
+                        <div class="inv-section" id="inv-task-section" hidden>
+                            <h4>Инварианты задачи</h4>
+                            <p class="inv-note" id="inv-task-note">Действуют только в этом диалоге.</p>
+                            <div id="inv-task-list"></div>
+                            <div class="inv-add">
+                                <input class="roles-field" id="inv-task-input" autocomplete="off"
+                                       placeholder="напр. «Ответы только на русском»">
+                                <button type="button" id="inv-task-add">добавить</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="accept" id="inv-close">закрыть</button>
                     </div>
                 </div>
             </div>
@@ -2368,6 +2553,10 @@
                 workspace.sessions.forEach(session => {
                     sessionsEl.appendChild(sessionItem(session));
                 });
+                // Шестерёнки инвариантов создаются здесь — метку «есть
+                // неразрешённое противоречие» ставим сразу после отрисовки (по
+                // последнему снимку; свежий подтянет refreshInvariants).
+                renderInvariantsMarks();
                 // Срезы памяти тоже привязаны к задаче — держим их свежими.
                 loadMemory();
             }
@@ -2498,6 +2687,9 @@
             const title = session.title || 'Новая задача';
             item.className = 'history-item session-item'
                 + (session.id === workspace.active_session ? ' active' : '');
+            // По data-session шестерёнка задачи находит СВОЮ задачу, когда надо
+            // пометить её правилами с неразрешённым противоречием.
+            item.dataset.session = session.id;
             const label = document.createElement('span');
             label.className = 'session-title';
             // Задача, у которой прямо сейчас идут шаги, помечена — иначе не видно,
@@ -2508,6 +2700,12 @@
             item.appendChild(label);
             const actions = document.createElement('span');
             actions.className = 'session-actions';
+            // Инварианты ЗАДАЧИ: правила конкретного диалога — открываются
+            // шестерёнкой этой задачи, даже если её диалог сейчас не открыт.
+            const invGear = iconButton('⚙️', 'Инварианты задачи: правила, которые агент '
+                + 'не имеет права нарушить', () => openInvariantsModal('task', session.id));
+            invGear.classList.add('session-invariants');
+            actions.appendChild(invGear);
             actions.appendChild(iconButton('✏️', 'Переименовать задачу', () => renameSession(session)));
             actions.appendChild(iconButton('🗑', 'Удалить задачу', () => deleteSession(session)));
             item.appendChild(actions);
@@ -2995,6 +3193,37 @@
         const confirmModalTitle = document.getElementById('confirm-modal-title');
         const confirmModalText = document.getElementById('confirm-modal-text');
         let confirmModalSubmit = null;
+
+        // ---------- Инварианты (шестерёнка ⚙️ у проекта и у задачи) ----------
+        // Правила, которые агент не имеет права нарушить: хранятся ОТДЕЛЬНО от
+        // диалога, у ПРОЕКТА свои, у ЗАДАЧИ-диалога свои, и уходят в модель
+        // системным блоком в каждом запросе. Модалка — один текстовый ввод на
+        // инвариант; противоречие «проект × задача» решает пользователь.
+        // Открывается из двух мест: шестерёнка ПРОЕКТА (правила всего проекта) и
+        // шестерёнка ЗАДАЧИ в списке задач (правила конкретного диалога).
+        const projectInvariantsBtn = document.getElementById('project-invariants');
+        const invariantsModal = document.getElementById('invariants-modal');
+        const invTitle = document.getElementById('inv-title');
+        const invReminder = document.getElementById('inv-reminder');
+        const invProjectSection = document.getElementById('inv-project-section');
+        const invTaskSection = document.getElementById('inv-task-section');
+        const invTaskNote = document.getElementById('inv-task-note');
+        const invColsEl = document.getElementById('inv-cols');
+        const invProjectList = document.getElementById('inv-project-list');
+        const invTaskList = document.getElementById('inv-task-list');
+        const invProjectInput = document.getElementById('inv-project-input');
+        const invTaskInput = document.getElementById('inv-task-input');
+        // Последний снимок инвариантов с сервера (правила + проверки).
+        let invariantsData = {
+            project: [], task: [], exceptions: [],
+            counts: { project: 0, task: 0, conflict: 0, exceptions: 0 }
+        };
+        // Что открыто модалкой: scope — чья шестерёнка нажата ("project" —
+        // правила проекта, "task" — правила конкретной задачи), sessionId —
+        // какая именно задача (её список правим). По scope модалка показывает
+        // либо только правила проекта, либо правила задачи вместе с правилами
+        // проекта (по ним считается противоречие).
+        let invModal = { scope: 'project', sessionId: null };
 
         function openConfirmModal(title, text, onSubmit) {
             confirmModalTitle.textContent = title;
@@ -3526,6 +3755,9 @@
             paramsBtn.hidden = !!on;
             // Кнопка «Очистить историю» видна только в режиме агента.
             agentClearBtn.hidden = !on;
+            // Кнопка «Инварианты» живёт в панели Workspace (блок проекта) и
+            // скрывается вместе с ней — отдельно прятать её не нужно.
+            if (!on) closeInvariantsModal();
             if (!on) {
                 // Обычный режим контекст не хранит: убираем агентский диалог
                 // (восстановленный + реплики сеанса агента) из окна чата, а
@@ -3749,7 +3981,7 @@
         // (сессии), поэтому в историю введённых данных реплики не пишутся.
         // Под сообщением пользователя и под ответом агента — кнопки добавления
         // этого текста в рабочую/долговременную память.
-        function drawAgentNode(role, text) {
+        function drawAgentNode(role, text, analysis) {
             if (role === 'user') {
                 addMessage('user', text, true, true);
             } else if (role === 'debug') {
@@ -3757,14 +3989,82 @@
             } else if (role === 'error') {
                 addMessage('bot', '⚠️ ' + text, true);
             } else {
-                addMessage('bot', text, true, true);
+                const wrap = addMessage('bot', text, true, true);
+                // Разбор инвариантов: под сообщением — кликабельные варианты
+                // решения (ни один не нарушает правила).
+                if (analysis && analysis.suggestions) drawInvariantOptions(wrap, analysis);
             }
         }
 
+        // Кликабельные варианты решения под сообщением агента. Клик отправляет
+        // вариант как запрос пользователя (или снимает противоречие правил, если
+        // вариант — решение «главнее проект/задача»).
+        function drawInvariantOptions(wrap, analysis) {
+            const list = (analysis.suggestions || []).filter(item => item && item.title);
+            if (!list.length) return;
+            const box = document.createElement('div');
+            box.className = 'inv-options';
+            list.forEach((item, index) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'inv-option';
+                const title = document.createElement('span');
+                title.className = 'inv-option-title';
+                title.textContent = item.title;
+                btn.appendChild(title);
+                if (item.details) {
+                    const details = document.createElement('span');
+                    details.className = 'inv-option-details';
+                    details.textContent = item.details;
+                    btn.appendChild(details);
+                }
+                const note = document.createElement('span');
+                note.className = 'inv-option-send';
+                note.textContent = 'отправить как запрос: «' + (item.send || '') + '»';
+                btn.appendChild(note);
+                btn.addEventListener('click', () => pickInvariantOption(index));
+                box.appendChild(btn);
+            });
+            wrap.appendChild(box);
+        }
+
+        // Отправляет текст как новое сообщение пользователя: вариант-альтернатива —
+        // это ГОТОВЫЙ запрос (правила он не нарушает), поэтому агент продолжит
+        // работу: сверка инвариантов пройдёт, план построится, шаги пойдут сами.
+        async function sendUserText(text) {
+            input.value = text;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            await send();
+            // Ответ дожидаемся внутри send(): он возвращает состояние запроса.
+        }
+
+        // Клик по варианту: спрашиваем сервер, что делать с ЭТИМ номером
+        // (текст варианта с фронта не отправляем — подменить решение нельзя).
+        async function pickInvariantOption(index) {
+            const sessionId = workspace.active_session || null;
+            const data = await invariantRequest('/api/agent/invariants/choose',
+                jsonOptions('POST', { index: index, session_id: sessionId }));
+            if (!data) return;
+            if (data.action === 'resolve') {
+                if (data.invariants) {
+                    invariantsData = data.invariants;
+                    renderInvariantsMarks();
+                }
+                addMessage('bot', '✅ Противоречие инвариантов решено: главнее '
+                    + (data.winner === 'task' ? 'правило задачи (для этой задачи действует исключение).'
+                                              : 'правило проекта.')
+                    + ' Отправьте запрос ещё раз — сверю его с правилами.', true);
+                return;
+            }
+            const text = (data.text || '').trim();
+            if (!text) return;
+            await sendUserText(text);
+        }
+
         // Добавляет реплику в текущее представление и сразу рисует её.
-        function pushAgentNode(role, text) {
-            agentViewMessages().push({ role: role, text: text });
-            drawAgentNode(role, text);
+        function pushAgentNode(role, text, analysis) {
+            agentViewMessages().push({ role: role, text: text, analysis: analysis || null });
+            drawAgentNode(role, text, analysis);
         }
 
         // Полная перерисовка окна чата для текущего представления (после
@@ -3772,7 +4072,7 @@
         // Заглушка-приветствие видна только в пустом диалоге.
         function renderAgentDialog() {
             messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
-            agentViewMessages().forEach(m => drawAgentNode(m.role, m.text));
+            agentViewMessages().forEach(m => drawAgentNode(m.role, m.text, m.analysis));
             // План ветвления показываем в корневом диалоге (он относится к нему).
             if (!agentView && agentAnalysis) renderBranchPlan(agentAnalysis);
             greetingMsg.hidden = !!messagesEl.querySelector('[data-agent]');
@@ -3913,7 +4213,10 @@
             const log = (data && Array.isArray(data.log)) ? data.log : [];
             const roleOf = kind => (kind === 'assistant' ? 'assistant'
                 : kind === 'debug' ? 'debug'
-                : kind === 'error' ? 'error' : 'user');
+                : kind === 'error' ? 'error'
+                // Узел с разбором инвариантов — это сообщение АГЕНТА (отказ и
+                // варианты), а не реплика пользователя.
+                : kind === 'suggestions' ? 'assistant' : 'user');
             agentRootMessages = (log.length ? log : msgs.map(m => ({
                 // Старые диалоги (журнала ещё нет): собираем из памяти диалога.
                 kind: m && m.source === 'machine' ? 'debug'
@@ -3921,7 +4224,12 @@
                 text: m && m.content
             })))
                 .filter(item => item && item.text)
-                .map(item => ({ role: roleOf(item.kind), text: item.text }));
+                .map(item => ({
+                    role: roleOf(item.kind), text: item.text,
+                    // Разбор инвариантов хранит варианты решения — их рисуем
+                    // заново (кликабельными) после переключения задачи.
+                    analysis: item.analysis || null
+                }));
             renderBranchSelect();
             // Ветви есть — список «Стратегия» переключаем на branching, иначе
             // ветки было бы не выбрать.
@@ -3930,11 +4238,283 @@
             }
             showAgentStrategyRows();
             renderAgentDialog();
+            // Инварианты проекта и этой задачи (счётчик на кнопке и метка
+            // конфликта) — у каждого диалога свой набор правил.
+            await refreshInvariants();
             // Вернулись в задачу с неотработанной командой остановки — доводим её.
             if (stopRequest && stopRequest.session === workspace.active_session) {
                 reconcilePendingStop();
             }
         }
+
+        // ---------- Инварианты: шестерёнка ⚙️ проекта и задачи ----------
+        // Серверный снимок инвариантов проекта и задачи + проверки их на
+        // противоречие. Обновляется при переключении проекта/диалога и после
+        // каждой правки: метки конфликта на шестерёнках должны быть верными до
+        // открытия модалки.
+        async function refreshInvariants() {
+            if (!agentModeOn()) { renderInvariantsMarks(); return; }
+            try {
+                const res = await fetch('/api/agent/invariants');
+                if (!res.ok) { renderInvariantsMarks(); return; }
+                invariantsData = await res.json();
+            } catch (e) {
+                // Эндпоинта нет (старый сервер) — просто не помечаем шестерёнки.
+                invariantsData = null;
+            }
+            renderInvariantsMarks();
+            // Модалка открыта — перерисовываем и её: правила задачи у каждого
+            // диалога свои, а проект/задачу могли переключить из-под модалки.
+            if (!invariantsModal.hidden) renderInvariants();
+        }
+
+        // Помечает шестерёнки: у проекта — своя, у каждой задачи в списке — своя.
+        // Красная шестерёнка = неразрешённое противоречие правил проекта и задачи
+        // (агент ждёт решения пользователя и запросы не выполняет).
+        function renderInvariantsMarks() {
+            const data = invariantsData || {};
+            const counts = data.counts || {};
+            const total = Number(counts.project || 0) + Number(counts.task || 0);
+            const exceptions = Number(counts.exceptions || 0);
+            // Тревожной метки «нерешённое противоречие» больше нет: проверок при
+            // записи правил не делается, противоречие выясняется в диалоге.
+            projectInvariantsBtn.classList.remove('conflict');
+            projectInvariantsBtn.title = 'Инварианты проекта: правила, которые агент '
+                + 'не имеет права нарушить' + (total ? ` (всего правил: ${total})` : '')
+                + (exceptions ? `. Утверждённых решений: ${exceptions}` : '');
+            document.querySelectorAll('.session-item').forEach(item => {
+                const gear = item.querySelector('.session-invariants');
+                if (!gear) return;
+                gear.classList.remove('conflict');
+                gear.title = 'Инварианты задачи: правила, которые агент не имеет '
+                    + 'права нарушить';
+            });
+        }
+
+        // Пояснение в модалке: чьи правила тут правятся и что делать дальше.
+        // Утверждённые решения по противоречиям правил: показываем в модалке,
+        // чтобы пользователь видел, какое правило здесь главнее.
+        function renderInvariantExceptions(items) {
+            const list = Array.isArray(items) ? items : [];
+            if (!list.length) return '';
+            const lines = list.map(item => item.key
+                ? '• действует правило задачи (' + String(item.key).split('|').length
+                  + ' правило(а) пары)'
+                : '• действует правило задачи');
+            return 'Утверждённые решения по противоречиям: ' + lines.join(' ');
+        }
+
+        function invReminderText() {
+            if (!workspace.active_task) {
+                return 'Проект ещё не создан: сначала создайте проект — правила '
+                    + 'привязываются к проекту и его задачам.';
+            }
+            if (invModal.scope === 'project') {
+                return 'Это инварианты ПРОЕКТА «' + activeTaskName() + '». Здесь только '
+                    + 'правила всего проекта — они действуют во всех его задачах. '
+                    + 'Правила конкретной задачи задаются её шестерёнкой в списке задач.';
+            }
+            if (!taskTitle(invModal.sessionId)) {
+                return 'Диалог ещё не создан: правила задачи появятся после первого '
+                    + 'запроса — они действуют только в этом диалоге.';
+            }
+            return 'Это инварианты ЗАДАЧИ «' + taskTitle(invModal.sessionId) + '». Здесь '
+                + 'только правила этого диалога; правила всего проекта задаются '
+                + 'шестерёнкой у проекта.';
+        }
+
+        // Название задачи из списка (в модалке может правиться задача, которая
+        // сейчас не открыта).
+        function taskTitle(sessionId) {
+            const session = (workspace.sessions || []).find(item => item.id === sessionId);
+            return session ? (session.title || 'Новая задача') : '';
+        }
+
+        function activeTaskName(fallback) {
+            const task = (workspace.tasks || []).find(item => item.id === workspace.active_task);
+            return task ? task.name : (fallback === undefined ? 'без названия' : fallback);
+        }
+
+        function invItemNode(entry, scope) {
+            const row = document.createElement('div');
+            row.className = 'inv-item';
+            const text = document.createElement('div');
+            text.className = 'inv-text';
+            text.textContent = entry.text;
+            const del = document.createElement('button');
+            del.type = 'button';
+            del.className = 'inv-del';
+            del.title = 'Удалить инвариант';
+            del.textContent = '🗑';
+            del.addEventListener('click', () => deleteInvariant(scope, entry.id));
+            row.appendChild(text);
+            row.appendChild(del);
+            return row;
+        }
+
+        function renderInvariantList(target, items, scope, emptyText) {
+            target.innerHTML = '';
+            if (!items.length) {
+                const empty = document.createElement('div');
+                empty.className = 'inv-empty';
+                empty.textContent = emptyText;
+                target.appendChild(empty);
+                return;
+            }
+            items.forEach(entry => target.appendChild(invItemNode(entry, scope)));
+        }
+
+        function renderInvariants() {
+            const data = invariantsData || { project: [], task: [], checks: [] };
+            // Области РАЗДЕЛЕНЫ: шестерёнка проекта показывает только правила
+            // проекта, шестерёнка задачи — только правила этой задачи. Чужая
+            // область в модалке не показывается вовсе (иначе непонятно, что
+            // именно правишь).
+            const projectModal = invModal.scope === 'project';
+            invTitle.textContent = projectModal ? 'Инварианты проекта' : 'Инварианты задачи';
+            const exceptionsNote = renderInvariantExceptions(data.exceptions);
+            invReminder.textContent = invReminderText()
+                + (exceptionsNote ? ' ' + exceptionsNote : '');
+            invReminder.hidden = false;
+            invProjectSection.hidden = !projectModal;
+            invTaskSection.hidden = projectModal;
+            // В модалке всегда ОДНА область, значит и одна колонка: вторая
+            // оставляла бы пустое место и путала, что здесь правится.
+            invColsEl.classList.add('single');
+            // Рисуем ТОЛЬКО свою область: скрытый список очищаем, иначе в нём
+            // оставались правила другой области (в DOM и в поиске по странице).
+            if (projectModal) {
+                renderInvariantList(invProjectList, data.project || [], 'project',
+                    'Правил проекта пока нет.');
+                invTaskList.innerHTML = '';
+            } else {
+                renderInvariantList(invTaskList, data.task || [], 'task',
+                    data.task_id ? 'Правил задачи пока нет.'
+                                 : 'Диалог ещё не создан — правила задачи появятся после первого запроса.');
+                invProjectList.innerHTML = '';
+            }
+            // Правки уходят только в свою область.
+            const taskEditable = !projectModal && !!data.task_id;
+            invTaskInput.disabled = !taskEditable;
+            document.getElementById('inv-task-add').disabled = !taskEditable;
+            const projectEditable = projectModal && !!data.project_id;
+            invProjectInput.disabled = !projectEditable;
+            document.getElementById('inv-project-add').disabled = !projectEditable;
+            // Проверки на противоречие касаются обеих областей сразу, поэтому
+            // показываются в любой модалке (это состояние ПАРЫ правил).
+            renderInvariantsMarks();
+        }
+
+        // Запрос к API инвариантов: сервер возвращает новый снимок — им и
+        // перерисовываем модалку (как панель workspace одним ответом).
+        async function invariantRequest(url, options) {
+            try {
+                const res = await fetch(url, options);
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    addMessage('bot', '⚠️ ' + (detail || 'Не удалось изменить инварианты.'), true);
+                    return null;
+                }
+                return await res.json();
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+                return null;
+            }
+        }
+
+        // Открывает инварианты: scope — чья шестерёнка нажата, sessionId — какая
+        // задача (для шестерёнки задачи она может быть НЕ открытой сейчас: список
+        // задач показывает их все).
+        async function openInvariantsModal(scope, sessionId) {
+            invModal = { scope: scope === 'task' ? 'task' : 'project',
+                         sessionId: sessionId || null };
+            // Показываем ТОЛЬКО свою область: чужой список очищаем сразу, чтобы
+            // правила другой области не мелькали до прихода снимка.
+            const projectModal = invModal.scope === 'project';
+            invProjectSection.hidden = !projectModal;
+            invTaskSection.hidden = projectModal;
+            (projectModal ? invTaskList : invProjectList).innerHTML = '';
+            invariantsModal.hidden = false;
+            const query = invModal.sessionId
+                ? ('?session_id=' + encodeURIComponent(invModal.sessionId)) : '';
+            try {
+                const res = await fetch('/api/agent/invariants' + query);
+                if (res.ok) invariantsData = await res.json();
+            } catch (e) { /* покажем то, что уже есть */ }
+            renderInvariants();
+        }
+
+        function closeInvariantsModal() {
+            invariantsModal.hidden = true;
+        }
+
+        // После любой правки правил обновляем и модалку, и МЕТКИ на шестерёнках
+        // (снимок тот же — лишнего запроса не нужно): красная шестерёнка должна
+        // гаснуть сразу после того, как пользователь принял решение.
+        function applyInvariantsSnapshot(data) {
+            invariantsData = data;
+            renderInvariants();
+            renderInvariantsMarks();
+        }
+
+        // Правки уходят в область, которую правит ОТКРЫТАЯ модалка: шестерёнка
+        // проекта — правила проекта, шестерёнка задачи — правила этой задачи.
+        async function addInvariant(scope) {
+            const input = scope === 'project' ? invProjectInput : invTaskInput;
+            const text = input.value.trim();
+            if (!text) return;
+            const body = { text: text, scope: scope };
+            if (scope === 'task') {
+                const sessionId = invModal.sessionId || workspace.active_session;
+                if (sessionId) body.session_id = sessionId;
+                if (!sessionId) {
+                    addMessage('bot', '⚠️ Сначала создайте задачу — правила задачи '
+                        + 'привязаны к диалогу.', true);
+                    return;
+                }
+            }
+            const data = await invariantRequest('/api/agent/invariants', jsonOptions('POST', body));
+            if (!data) return;
+            input.value = '';
+            applyInvariantsSnapshot(data);
+        }
+
+        async function deleteInvariant(scope, invariantId) {
+            const sessionId = invModal.sessionId || workspace.active_session || '';
+            const url = '/api/agent/invariants/' + encodeURIComponent(scope) + '/'
+                + encodeURIComponent(invariantId)
+                + (sessionId ? ('?session_id=' + encodeURIComponent(sessionId)) : '');
+            const data = await invariantRequest(url, { method: 'DELETE' });
+            if (!data) return;
+            applyInvariantsSnapshot(data);
+        }
+
+        async function resolveInvariant(key, winner) {
+            const data = await invariantRequest('/api/agent/invariants/conflicts/resolve',
+                jsonOptions('POST', { key: key, winner: winner }));
+            if (!data) return;
+            applyInvariantsSnapshot(data);
+            addMessage('bot', '✅ Противоречие инвариантов решено: главнее '
+                + (winner === 'task' ? 'правило задачи (для этой задачи действует исключение).'
+                                     : 'правило проекта.'), true);
+        }
+
+        projectInvariantsBtn.addEventListener('click', () => openInvariantsModal('project'));
+        document.getElementById('inv-close').addEventListener('click', closeInvariantsModal);
+        invariantsModal.addEventListener('click', (e) => {
+            if (e.target === invariantsModal) closeInvariantsModal();
+        });
+        document.getElementById('inv-project-add').addEventListener('click', () => addInvariant('project'));
+        document.getElementById('inv-task-add').addEventListener('click', () => addInvariant('task'));
+        [invProjectInput, invTaskInput].forEach(input => {
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    addInvariant(input === invProjectInput ? 'project' : 'task');
+                }
+            });
+        });
 
         // Снимок workspace + диалог текущей сессии: включение режима агента,
         // смена задачи или диалога.
@@ -4161,6 +4741,11 @@
                             // План ветвления (стратегия «branching»): блок плана в
                             // корневом диалоге + список веток для переключения.
                             applyBranchesEvent(ev);
+                        } else if (ev.type === 'suggestions') {
+                            // Разбор инвариантов: отказ по запросу + варианты
+                            // решения. План в этом случае не строится — задача
+                            // ждёт выбора пользователя.
+                            pushAgentNode('assistant', ev.text, ev.analysis);
                         } else if (ev.type === 'bot') {
                             pushAgentNode('assistant', ev.text);
                         } else if (ev.type === 'error') {

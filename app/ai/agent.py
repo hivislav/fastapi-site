@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from app import config
-from app.ai import client, demo, json_utils, task_state
+from app.ai import client, demo, invariants as invariants_store, json_utils, task_state
 
 logger = logging.getLogger(__name__)
 
@@ -471,6 +471,14 @@ class Agent:
         # модель всегда — отдельными системными блоками.
         self.working_memory: List[str] = []
         self.long_term_memory: List[str] = []
+        # ИНВАРИАНТЫ — правила, которые агент НЕ имеет права нарушить: снимок
+        # инвариантов ПРОЕКТА (задача workspace) и ЗАДАЧИ-диалога (сессия) плюс
+        # утверждённые пользователем исключения. Собирается веб-слоем на каждый
+        # запрос, хранится ОТДЕЛЬНО от диалога (в messages инварианты не пишутся)
+        # и уходит в модель СВОИМ системным блоком (см. _memory_blocks) в любой
+        # стратегии: выбранная архитектура, принятые решения, ограничения стека и
+        # бизнес-правила должны быть видны модели явно, а не «где-то в истории».
+        self.invariants: Dict[str, Any] = invariants_store.snapshot()
         # Профиль пользователя — СИСТЕМНЫЙ ПРОМПТ СЕССИИ: готовый текстовый блок
         # (что пользователь рассказал о себе и каким хочет видеть ответ), собранный
         # веб-слоем из app/ai/profiles.py для ТЕКУЩЕГО профиля. Идёт первым
@@ -529,6 +537,7 @@ class Agent:
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
         state: Optional["task_state.TaskState"] = None,
+        invariants: Optional[Dict[str, Any]] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
@@ -563,7 +572,7 @@ class Agent:
 
         await self._process(
             user_message, history, sink, summary, facts, branches, branch, covered,
-            working_memory, long_term_memory, profile, state,
+            working_memory, long_term_memory, profile, state, invariants,
         )
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
@@ -589,6 +598,7 @@ class Agent:
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
         state: Optional["task_state.TaskState"] = None,
+        invariants: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -619,7 +629,7 @@ class Agent:
         runner = asyncio.create_task(
             self._process(
                 user_message, history, sink, summary, facts, branches, branch, covered,
-                working_memory, long_term_memory, profile, state,
+                working_memory, long_term_memory, profile, state, invariants,
             )
         )
         try:
@@ -653,6 +663,7 @@ class Agent:
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
         state: Optional["task_state.TaskState"] = None,
+        invariants: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -691,6 +702,10 @@ class Agent:
             # (см. _memory_blocks), а переходы ведёт веб-слой.
             if state is not None:
                 self.task_state = state
+            # Инварианты проекта/задачи и утверждённые исключения (см.
+            # app/ai/invariants.py): уходят в модель отдельным системным блоком.
+            if invariants is not None:
+                self.invariants = invariants_store.normalize(invariants)
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
@@ -708,6 +723,11 @@ class Agent:
                     f"(текущая задача), долговременная: {len(self.long_term_memory)} записей "
                     "(глобальная база знаний). Оба слоя уходят в модель всегда, "
                     "стратегиям управления контекстом они не подчиняются.",
+                ))
+            if invariants_store.has_rules(self.invariants):
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: " + invariants_store.rules_note(self.invariants),
                 ))
             if self.task_state is not None:
                 # Коротко и без повтора: этап, шаг и ожидаемое действие уже
@@ -875,6 +895,8 @@ class Agent:
         working_memory: Optional[List[str]] = None,
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
+        invariants: Optional[Dict[str, Any]] = None,
+        note: Optional[str] = None,
     ) -> List[str]:
         """Строит план задачи (шаги) служебным вызовом LLM — этап planning.
 
@@ -883,6 +905,10 @@ class Agent:
         {"steps": [...]}. Сбой (нет ключа, таймаут,
         пустой или неразобранный ответ) не оставляет задачу без плана — шаги
         выделяются локально (task_state.fallback_steps), а причина пишется в лог.
+
+        note — пометка ПЕРЕПЛАНИРОВАНИЯ (код-гейт плана, см. `check_plan` и
+        `_plan_gate` в chat.py): предыдущий план отклонён проверкой по правилам,
+        и в пометке перечислены шаги, которые повторять нельзя.
 
         Расход токенов вызова копится в self.last_usage как служебный
         (service=True): веб-слой складывает его с расходом самого ответа
@@ -900,6 +926,10 @@ class Agent:
             self.long_term_memory = self._normalize_memory_layer(long_term_memory)
         if profile is not None:
             self.profile = str(profile).strip()
+        # Инварианты — тоже часть контекста планирования: шаг плана, нарушающий
+        # правило проекта или задачи, не должен появиться в плане вообще.
+        if invariants is not None:
+            self.invariants = invariants_store.normalize(invariants)
         # Пустой запрос планировать нечего — один шаг «уточнить запрос».
         if not text:
             return ["Уточнить у пользователя, что именно нужно сделать"]
@@ -911,6 +941,10 @@ class Agent:
         memory_text = self._memory_text()
         if memory_text:
             payload = memory_text + "\n\n" + payload
+        if note:
+            # Пометка перепланирования: предыдущие шаги отклонены ПРОВЕРКОЙ по
+            # правилам (код-гейт плана) — повторять их нельзя.
+            payload = payload + "\n\n" + str(note).strip()
 
         content, metrics = await client.call_llm_async(
             user_text=payload,
@@ -956,6 +990,69 @@ class Agent:
     # ------------------------------------------------------------------
     # Конечный автомат задачи: содержательная проверка результата
     # ------------------------------------------------------------------
+    def _tracked_call(self) -> Any:
+        """Обёртка вызова клиента: расход копится как СЛУЖЕБНЫЙ (service=True).
+
+        Нужна служебным проверкам инвариантов: разбор запроса, проверка вариантов
+        и код-гейт плана делают НЕСКОЛЬКО вызовов, и каждый должен попасть в
+        панель токенов строкой «из них служебные вызовы».
+        """
+        async def tracked(*args: Any, **kwargs: Any) -> Any:
+            content, metrics = await client.call_llm_async(*args, **kwargs)
+            self._track_usage(metrics, service=True)
+            return content, metrics
+
+        return tracked
+
+    async def check_plan(
+        self,
+        steps: Optional[List[str]],
+        invariants: Optional[Dict[str, Any]] = None,
+    ) -> Optional[List[int]]:
+        """КОД-ГЕЙТ ПЛАНА: номера шагов, которые правил НЕ нарушают.
+
+        Служебный вызов LLM к тому же арбитру (PLAN_PROMPT): каждый шаг плана
+        получает вердикт «нарушает / не нарушает» действующие правила. Нужен
+        потому, что блок правил в контексте планировщика — ПРОСЬБА, а не
+        гарантия: шаг «реализуй сетевой слой в KMP» появлялся в плане при
+        правиле проекта «только нативная платформа android, никакой
+        мультиплатформы».
+
+        None — проверка не удалась (нет ответа / ответ не разобран): шаги НЕ
+        подтверждены (см. `_plan_gate` в chat.py — план в этом случае не
+        принимается). Пустой список шагов проверять нечего — [].
+        """
+        if invariants is not None:
+            self.invariants = invariants_store.normalize(invariants)
+        return await invariants_store.check_steps(
+            steps, self.invariants, self._tracked_call())
+
+    async def check_invariants(
+        self,
+        user_message: str,
+        invariants: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Разбор ЗАПРОСА на соответствие инвариантам — ДО этапа планирования.
+
+        Служебный вызов LLM: модель получает запрос пользователя и правила
+        (проекта и задачи) и возвращает вердикт: запрос совместим с правилами
+        либо требует нарушить инвариант (тогда агент ОТКАЗЫВАЕТСЯ работать и
+        предлагает 2–4 варианта, каждый из которых ПРОВЕРЕН по правилам — см.
+        invariants_store.analyze). Результат — словарь
+        invariants_store.normalize_analysis(...).
+
+        Вызовов может быть несколько (вердикт + проверка вариантов + повторный
+        запрос вариантов), поэтому расход считает обёртка: КАЖДЫЙ вызов копится
+        в self.last_usage как служебный (service=True), а веб-слой складывает его
+        с расходом ответа и плана (см. merge_usage). Пустой разбор означает
+        «вердикта нет» — агент работает как раньше: нарушение не выдумываем,
+        но и не подтверждаем.
+        """
+        if invariants is not None:
+            self.invariants = invariants_store.normalize(invariants)
+        return await invariants_store.analyze(
+            user_message, self.invariants, self._tracked_call())
+
     async def review_result(
         self,
         user_request: str,
@@ -964,6 +1061,7 @@ class Agent:
         working_memory: Optional[List[str]] = None,
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
+        invariants: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Содержательная проверка результата (этап validation) — служебный вызов.
 
@@ -986,6 +1084,10 @@ class Agent:
             self.long_term_memory = self._normalize_memory_layer(long_term_memory)
         if profile is not None:
             self.profile = str(profile).strip()
+        # Инварианты уходят и в проверку результата: она должна видеть те же
+        # правила, что и сам ответ (см. _memory_text).
+        if invariants is not None:
+            self.invariants = invariants_store.normalize(invariants)
         # Проверять нечего: пустая история — нечего и оценивать.
         if not self.memory:
             return None
@@ -1166,6 +1268,9 @@ class Agent:
         blocks: List[Dict[str, str]] = []
         if self.profile:
             blocks.append({"role": "system", "content": self.profile})
+        invariants_block = invariants_store.block(self.invariants)
+        if invariants_block:
+            blocks.append({"role": "system", "content": invariants_block})
         if self.task_state is not None:
             blocks.append({"role": "system", "content": task_state.state_block(self.task_state)})
         if self.long_term_memory:
