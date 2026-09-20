@@ -54,10 +54,15 @@ def check(name, condition, detail=""):
 # ---------------------------------------------------------------------------
 PLAN_STEPS = ["Собрать данные", "Написать код"]
 ANSWER = "Ответ модели по текущему шагу."
-# Вердикт содержательной проверки (этап validation): {"verdict", "step", "comment"}.
-# None — «модель не ответила»: проверка недоступна, задача завершается по
-# локальной самопроверке.
+# Вердикт содержательной проверки (этап validation):
+# {"verdict", "steps": [{"n", "ok", "comment"}], "step", "comment"}.
+# None — «модель не ответила»: проверку выполнить НЕ удалось, задача остаётся на
+# этапе validation с признаком check_blocked и ждёт решения пользователя.
+# Строка — «сырой» ответ модели (например обрезанный лимитом токенов JSON).
 REVIEW = {"verdict": "ok", "step": 0, "comment": "результат соответствует плану"}
+# Последняя user-часть вызова проверки: по ней видно, что уходит приёмщику
+# (исходный запрос + план + решение модели по шагам).
+REVIEW_PAYLOAD = []
 CALLS = []
 # Сами сообщения последнего вызова: по ним проверяем, что в контекст агента
 # уходит системный блок инвариантов (а в диалог они не пишутся).
@@ -134,8 +139,14 @@ async def fake_call_llm_async(*args, **kwargs):
             return "", _metrics()
         return json.dumps({"steps": list(preset)}, ensure_ascii=False), _metrics(30, 15)
     if system.startswith("Ты — приёмщик"):
+        REVIEW_PAYLOAD.clear()
+        if messages:
+            REVIEW_PAYLOAD.append(str(messages[-1].get("content") or ""))
         if REVIEW is None:
             return "", _metrics()
+        if isinstance(REVIEW, str):
+            # «Сырой» ответ: так проверяется обрезанный лимитом токенов JSON.
+            return REVIEW, _metrics(40, 8)
         return json.dumps(REVIEW, ensure_ascii=False), _metrics(40, 8)
     if system.startswith("Ты — арбитр инвариантов: проверка ШАГОВ ПЛАНА"):
         # КОД-ГЕЙТ ПЛАНА: префикс проверяем ДО общего «Ты — арбитр инвариантов».
@@ -655,20 +666,119 @@ async def test_routes():
           state and any(r["from"] == "failed" and r["to"] == "planning"
                         for r in state["history"]))
 
-    # Проверка недоступна: задача завершается по локальной самопроверке.
+    # Проверка НЕДОСТУПНА: задача готовой НЕ объявляется (ни «принято», ни
+    # «не принято»), стоит на этапе validation с признаком check_blocked и ждёт
+    # решения пользователя: повторить проверку или принять результат вручную.
     REVIEW = None
     await chat.agent_history_clear()
     await run_chat("Сделай отчёт")
     events = await run_chat("ок")
     state = stage_of(events)
-    check("недоступная проверка не мешает завершить задачу",
-          state and state["stage"] == "done", state and state["stage"])
-    check("об этом сказано в дебаге",
+    check("недоступная проверка НЕ завершает задачу",
+          state and state["stage"] == "validation", state and state["stage"])
+    check("в снимке выставлен признак «проверка не выполнена»",
+          state and state["check_blocked"] is True and state["can_accept"] is True,
+          str({k: (state or {}).get(k) for k in ("check_blocked", "can_accept")}))
+    check("о сбое проверки сказано в дебаге",
           any("содержательная проверка не получена" in t for t in texts(events, "debug")))
+    check("пользователю предложено повторить проверку или принять вручную",
+          any("Принять вручную" in t for t in texts(events, "error")),
+          str(texts(events, "error")))
+    saved = (await chat.state_get())["state"]
+    check("признак переживает перезагрузку (сохранён в состоянии)",
+          saved["check_blocked"] is True and saved["stage"] == "validation", str(saved["stage"]))
+    check("доработки сбоем проверки НЕ тратятся",
+          not saved["redo_count"], str(saved["redo_count"]))
+    # «▶ повторить проверку»: признак снимается и проверка выполняется заново.
+    REVIEW = {"verdict": "ok", "step": 0, "comment": "теперь всё закрыто"}
+    events = await run_chat("", continue_step=True)
+    state = stage_of(events)
+    check("повторная проверка снимает признак и завершает задачу",
+          state and state["stage"] == "done" and state["check_blocked"] is False,
+          f"({state and state['stage']}, blocked={state and state['check_blocked']})")
+    # Принимать вручную нечего, когда задача закрыта проверкой.
+    try:
+        await chat.state_accept()
+        refused = False
+    except Exception as exc:                      # HTTPException
+        refused = getattr(exc, "status_code", None) == 400
+    check("принимать вручную нечего — маршрут отвечает 400", refused)
+    # Сбой проверки снова: задача ждёт решения, и его можно принять вручную.
+    REVIEW = None
+    await chat.agent_history_clear()
+    await run_chat("Ещё отчёт")
+    await run_chat("ок")
+    accepted = await chat.state_accept()
+    check("«Принять вручную» завершает задачу",
+          accepted["state"]["stage"] == "done" and accepted["state"]["check_blocked"] is False,
+          str(accepted["state"]["stage"]))
+    check("в истории перехода сказано, что принято вручную",
+          any("принят пользователем вручную" in r["reason"]
+              for r in accepted["state"]["history"]),
+          str([r["reason"] for r in accepted["state"]["history"]][-2:]))
+    REVIEW = {"verdict": "ok", "step": 0, "comment": "ок"}
+
+    # Разбор ПО КАЖДОМУ шагу: несоответствие отдельного шага возвращает задачу на
+    # ВЫПОЛНЕНИЕ, начиная с ПЕРВОГО непринятого шага — даже если общий verdict «ok».
+    PLAN_QUEUE.append(["Собрать данные", "Посчитать итоги", "Написать отчёт"])
+    REVIEW = {
+        "verdict": "ok", "step": 0, "comment": "в целом похоже на правду",
+        "steps": [
+            {"n": 1, "ok": True, "comment": "данные собраны"},
+            {"n": 2, "ok": False, "comment": "итоги не посчитаны"},
+            {"n": 3, "ok": True, "comment": "отчёт написан"},
+        ],
+    }
+    await chat.agent_history_clear()
+    await run_chat("Сделай отчёт по продажам")        # план из трёх шагов
+    await run_chat("ок")                              # подтверждение + шаг 1
+    await run_chat("", continue_step=True)            # шаг 2
+    events = await run_chat("", continue_step=True)   # шаг 3 → validation → проверка
+    state = stage_of(events)
+    check("непринятый шаг возвращает задачу в execution",
+          state and state["stage"] == "execution" and state["redo_count"] == 1,
+          f"({state and state['stage']}, redo={state and state['redo_count']})")
+    check("возврат идёт на ПЕРВЫЙ непринятый шаг, а не на последний",
+          state and state["step_number"] == 2 and state["steps_total"] == 3,
+          f"(шаг {state and state['step_number']} из {state and state['steps_total']})")
+    check("в причине назван непринятый шаг и объяснение модели",
+          any("не приняты — шаг 2: итоги не посчитаны" in r["reason"]
+              for r in state["history"]),
+          str([r["reason"] for r in state["history"]][-1:]))
+    check("разбор по шагам показан пользователю",
+          any("шаг 2: НЕ принят" in t for t in texts(events, "debug")),
+          str([t for t in texts(events, "debug") if "разбор по шагам" in t]))
+    # Что именно уходит приёмщику: изначальная задача + план + решение модели.
+    payload = REVIEW_PAYLOAD[0] if REVIEW_PAYLOAD else ""
+    check("в проверку уходит ИЗНАЧАЛЬНАЯ задача пользователя",
+          "Исходный запрос пользователя:" in payload
+          and "Сделай отчёт по продажам" in payload,
+          payload[:200])
+    check("в проверку уходит план модели",
+          "План работы (шаги):" in payload and "Посчитать итоги" in payload)
+    check("в проверку уходит решение модели ПО ШАГАМ (а не хвост диалога)",
+          "Решение модели (ответы по шагам" in payload
+          and "Шаг 1 (Собрать данные)" in payload
+          and "Шаг 3 (Написать отчёт)" in payload,
+          payload[-400:])
+    # ОБРЕЗАННЫЙ ответ проверки (лимит токенов): вердикт и целые записи шагов всё
+    # равно учитываются — сбой разбора JSON не должен выглядеть как «проверку
+    # выполнить не удалось» и не должен превращаться в accepted-по-умолчанию.
+    REVIEW = ('{"verdict": "ok", "steps": [{"n": 1, "ok": true, "comment": "ок"}, '
+              '{"n": 2, "ok": false, "comment": "итоги не посч')
+    events = await run_chat("", continue_step=True)   # доработка шага 2
+    events = await run_chat("", continue_step=True)   # шаг 3 → снова проверка
+    state = stage_of(events)
+    check("обрезанный ответ проверки разобран, а не потерян",
+          state and state["stage"] == "execution" and state["redo_count"] == 2,
+          f"({state and state['stage']}, redo={state and state['redo_count']})")
+    check("возврат и по обрезанному ответу — на непринятый шаг",
+          state and state["step_number"] == 2
+          and any("не приняты — шаг 2" in r["reason"] for r in state["history"]),
+          f"(шаг {state and state['step_number']})")
     REVIEW = {"verdict": "ok", "step": 0, "comment": "ок"}
 
     # 3.13 Отмена задачи кнопкой «Отменить»: cancelled — терминальный этап.
-    REVIEW = {"verdict": "ok", "step": 0, "comment": "ок"}
     await chat.agent_history_clear()
     await run_chat("Сделай отчёт")
     state = (await chat.state_get())["state"]
@@ -727,7 +837,9 @@ async def test_routes():
     check("в журнале есть показанный план",
           any(i["kind"] == "assistant" and "План задачи" in i["text"] for i in log))
     check("в журнале есть debug-строки агента", "debug" in kinds)
-    messages = history["messages"]
+    # Память диалога: маршрут отдаёт messages только для диалогов без журнала
+    # чата (иначе ответ дублировал бы одно и то же), поэтому смотрим её в сессии.
+    messages = chat._current_session()["dialog"]["messages"]
     check("запрос пользователя сохранён и в памяти диалога",
           any(m["role"] == "user" and "рецепт борща" in m["content"] for m in messages),
           str([m["content"][:40] for m in messages]))
@@ -743,7 +855,8 @@ async def test_routes():
     history = await chat.agent_history()
     check("журнал не теряется между шагами и растёт",
           len(history["log"]) > len(log), f"({len(history['log'])} против {len(log)})")
-    machine = [m for m in history["messages"] if m.get("source") == "machine"]
+    machine = [m for m in chat._current_session()["dialog"]["messages"]
+               if m.get("source") == "machine"]
     check("пометка source=machine переживает следующие запросы",
           len(machine) >= 2, f"(размечено: {len(machine)})")
     check("в состоянии сохранён исходный запрос задачи",
@@ -957,7 +1070,8 @@ async def test_routes():
           any("Ответ модели" in i["text"] for i in history_bg["log"]),
           str([i["kind"] for i in history_bg["log"]][-3:]))
     check("шаг помечен как реплика автомата",
-          any(m.get("source") == "machine" for m in history_bg["messages"]))
+          any(m.get("source") == "machine"
+              for m in chat._current_session()["dialog"]["messages"]))
 
     # Пауза в задаче, к которой обратились по id, соблюдается.
     await chat.state_pause()
@@ -1953,8 +2067,13 @@ async def test_plan_gate():
     PLAN_VERDICTS = {}
     PLAN_CALLS = 0
     events = await run_chat("сделай план под обе платформы")
-    check("попытка ровно одна (перепланирование вызвано один раз)",
-          PLAN_CALLS == 2, f"вызовов проверки: {PLAN_CALLS}")
+    # Перепланирование вызвано ровно один раз, но ПОВТОРНАЯ проверка тех же самых
+    # шагов не оплачивается: вердикт по ним уже получен в этом же запросе
+    # (кэш живёт внутри одного _plan_gate). Поэтому проверка вызвана один раз.
+    check("перепланирование вызвано ровно один раз, повторная проверка тех же шагов "
+          "не оплачивается",
+          PLAN_CALLS == 1 and any("ОТКЛОНИЛА" in text for text in LAST_USER_TEXTS),
+          f"вызовов проверки: {PLAN_CALLS}")
     check("план не принят — шагов нет",
           not (stage_of(events) or {}).get("steps"),
           str((stage_of(events) or {}).get("steps")))

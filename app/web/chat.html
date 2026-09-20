@@ -667,6 +667,14 @@
             box-shadow: 0 0 12px rgba(0, 255, 157, 0.2);
         }
         .tm-confirm { border-color: var(--accent-2); color: var(--accent-2); }
+        /* «Принять вручную»: видна, только когда проверку выполнить не удалось
+           и решение за пользователем (этап «Проверка» + check_blocked). */
+        .tm-accept { border-color: var(--warn); color: var(--warn); }
+        .tm-accept:hover:not(:disabled) {
+            color: var(--warn) !important;
+            border-color: var(--warn) !important;
+            box-shadow: 0 0 12px rgba(255, 176, 32, 0.2) !important;
+        }
         .tm-cancel { color: var(--danger); border-color: rgba(255, 86, 106, 0.5); }
         .tm-cancel:hover:not(:disabled) {
             color: var(--danger) !important;
@@ -1266,14 +1274,20 @@
             border-left: 3px solid var(--accent);
             padding-left: 6px;
         }
-        /* Строка «из них суммаризация» — вклад служебных вызовов сжатия
-           памяти: часть суммы «Весь диалог», поэтому подписана и приглушена. */
+        /* Строки «из них служебные вызовы» и разбивка по видам — часть суммы
+           «Весь диалог», поэтому подписаны и приглушены. */
         .agent-table tr.agent-subrow td {
             color: var(--text-dim);
             font-style: italic;
             padding-top: 2px;
         }
+        /* Разбивка по видам служебных вызовов — вложеннее строки-итога. */
+        .agent-table tr.agent-kindrow td:first-child { padding-left: 18px; }
+        /* Запрос превысил лимит «Длина»: подсвечиваем значение лимита. */
+        .agent-table td.agent-overflow { color: #ff6b6b; font-weight: 600; }
         .agent-hint { margin-top: 6px; font-size: 0.68rem; color: var(--muted); line-height: 1.25; }
+        /* Стоимость запросов (оценка по тарифам провайдера). */
+        .agent-cost { margin-top: 6px; font-size: 0.72rem; color: var(--accent-2); }
         /* ---------- Стратегия агента (панель режима «AI-агент») ---------- */
         /* Выпадающий список «Стратегия» и поля выбранной стратегии:
            summary — поле «summary» (сколько последних сообщений держать как
@@ -1487,6 +1501,9 @@
                         <button type="button" class="tm-cancel" id="tm-cancel"
                                 title="Отменить задачу: прогресс по плану сбросится, сама задача останется"
                                 hidden>Отменить</button>
+                        <button type="button" class="tm-accept" id="tm-accept"
+                                title="Принять результат как есть: проверку выполнить не удалось, решение за вами"
+                                hidden>Принять вручную</button>
                         <button type="button" class="tm-pause" id="tm-pause"
                                 title="Остановить или продолжить задачу">Пауза</button>
                     </div>
@@ -1689,6 +1706,7 @@
                             <th>Исходящих токенов</th>
                             <th>Входящих токенов</th>
                             <th>Сумма токенов</th>
+                            <th title="Настройка «Длина»: с этим лимитом сравниваются входящие токены запроса">Лимит</th>
                         </tr>
                     </thead>
                     <!-- Строка «Ответ шага» — ТОЛЬКО сам ответ модели, без
@@ -1699,7 +1717,8 @@
                          блок (см. .agent-total-block). -->
                     <tbody id="agent-total-body" class="agent-total-block"></tbody>
                 </table>
-                <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Лимит «Длина» сравнивается с входящими токенами текущего запроса. Строка «Ответ шага» — только сам ответ модели по текущему шагу; «Вся задача» — итог всей задачи, «из них служебные вызовы» — вклад вспомогательных вызовов: план задачи, проверка результата, сжатие памяти («summary»), блок фактов (sticky facts), план ветвления (branching). Служебный здесь значит ВСПОМОГАТЕЛЬНЫЙ: его результат не является ответом пользователю. Шаги плана выполняет автомат, но вызовы шагов считаются ответами — по ним пользователь и получает работу.</div>
+                <div class="agent-cost" id="agent-cost"></div>
+                <div class="agent-hint">Учитываются токены запроса к модели: входящие (промпт с историей) и исходящие (ответ). Строка «Ответ шага» — только сам ответ модели по текущему шагу; «Весь диалог» — итог по всем замерам этого диалога, «из них служебные вызовы» — вклад вспомогательных вызовов, ниже он разложен по видам. Замеры накапливаются по ДИАЛОГУ: новый проект в том же диалоге продолжает тот же итог. Столбец «Лимит» показывает настройку «Длина» текущего запроса (красным — если входящие токены её превысили). Служебный здесь значит ВСПОМОГАТЕЛЬНЫЙ: результат вызова не является ответом пользователю (план задачи, проверка плана по правилам, разбор запроса по инвариантам, проверка результата, сжатие памяти, блок фактов, план ветвления). Строка «сбои» — обращения к модели, которые не удались: расхода по ним нет, но вызов был.</div>
             </div>
             <!-- Вид «Состояние памяти»: рабочая память текущей задачи и
                  долговременная (глобальная) — отдельными разбивками. Оба слоя
@@ -1956,38 +1975,42 @@
         let expertRoles = new Array(roleInputs.length).fill('');
 
         // ---------- Статистика ответов (экспертный режим) ----------
+        // Счётчики живут НА СЕРВЕРЕ, в workspace профиля: вердикт модели
+        // учитывает маршрут /api/chat, а сюда приходит готовый снимок
+        // (workspace.stats). Поэтому статистика не обнуляется при переключении
+        // режима, переходе между задачами и перезагрузке страницы — раньше она
+        // жила в памяти вкладки и терялась при первом же переключении.
         const statsPanel = document.getElementById('stats-panel');
         const statsBody = document.getElementById('stats-body');
         const statModes = [
-            { key: 'direct', label: 'Прямой ответ', correct: 0, incorrect: 0 },
-            { key: 'stepwise', label: 'Пошаговое решение', correct: 0, incorrect: 0 },
-            { key: 'prompt', label: 'Решение через промпт', correct: 0, incorrect: 0 },
-            { key: 'group', label: 'Экспертная группа', correct: 0, incorrect: 0 }
+            { key: 'direct', label: 'Прямой ответ' },
+            { key: 'stepwise', label: 'Пошаговое решение' },
+            { key: 'prompt', label: 'Решение через промпт' },
+            { key: 'group', label: 'Экспертная группа' }
         ];
-        function resetStats() {
-            statModes.forEach(m => { m.correct = 0; m.incorrect = 0; });
-            renderStats();
-        }
+        // Снимок счётчиков с сервера: {режим: {correct, incorrect}}.
+        let expertStats = {};
+
         function renderStats() {
             statsBody.innerHTML = '';
             statModes.forEach(m => {
+                const counters = expertStats[m.key] || {};
                 const tr = document.createElement('tr');
-                const tdName = document.createElement('td');
-                tdName.textContent = m.label;
-                const tdCorrect = document.createElement('td');
-                tdCorrect.textContent = m.correct;
-                const tdIncorrect = document.createElement('td');
-                tdIncorrect.textContent = m.incorrect;
-                tr.appendChild(tdName);
-                tr.appendChild(tdCorrect);
-                tr.appendChild(tdIncorrect);
+                const cells = [m.label, Number(counters.correct) || 0,
+                               Number(counters.incorrect) || 0];
+                cells.forEach(value => {
+                    const td = document.createElement('td');
+                    td.textContent = value;
+                    tr.appendChild(td);
+                });
                 statsBody.appendChild(tr);
             });
         }
-        function updateStats(key, isCorrect) {
-            const m = statModes.find(x => x.key === key);
-            if (!m) return;
-            if (isCorrect) m.correct += 1; else m.incorrect += 1;
+
+        // Новый снимок статистики (из ответа /api/chat или снимка workspace).
+        function applyStats(snapshot) {
+            if (!snapshot || typeof snapshot !== 'object') return;
+            expertStats = snapshot;
             renderStats();
         }
 
@@ -1998,6 +2021,8 @@
         // Второй tbody таблицы — общий блок «Весь диалог» + «из них служебные
         // вызовы» (строка «Ответ шага» рисуется в первом).
         const agentTotalBody = document.getElementById('agent-total-body');
+        // Строка стоимости запросов (оценка по тарифам): «за шаг» и «за диалог».
+        const agentCostEl = document.getElementById('agent-cost');
         // Виды панели агента: статистика по токенам (по умолчанию) и состояние
         // памяти (рабочая + долговременная). Переключаются одной кнопкой.
         const agentPanelTitle = document.getElementById('agent-panel-title');
@@ -2229,6 +2254,10 @@
         }
 
         function renderAgentPanel() {
+            // Панель скрыта (другой режим) или открыт вид «Состояние памяти» —
+            // диаграмму и таблицы не пересобираем: это работа вхолостую на
+            // каждом событии потока.
+            if (agentPanel.hidden || agentPanelView !== 'tokens') return;
             renderAgentChart();
             renderAgentStats();
         }
@@ -2239,10 +2268,63 @@
         // полного замера. «Весь диалог» (итог по всей переписке вместе со
         // служебными вызовами) и «из них служебные вызовы» (их вклад в этот
         // итог) — общий блок (см. .agent-total-block, второй tbody таблицы).
+        // Названия видов служебных вызовов: те же ключи приходят с сервера
+        // (Agent.SERVICE_* — plan/gate/invariants/review/summary/facts/branching).
+        const SERVICE_LABELS = {
+            plan: 'план задачи',
+            gate: 'проверка плана по правилам',
+            invariants: 'разбор запроса (инварианты)',
+            review: 'проверка результата',
+            summary: 'сжатие памяти',
+            facts: 'блок фактов',
+            branching: 'план ветвления',
+            service: 'прочие служебные'
+        };
+
+        function serviceLabel(kind) {
+            return SERVICE_LABELS[kind] || String(kind);
+        }
+
+        // Замер «пустой»: сервер шлёт такие в служебных ветках (пауза, ошибка,
+        // «введите сообщение»). В панель они попадать не должны — иначе в
+        // таблице появлялась строка «1 запрос, 0 токенов», а на диаграмме точка.
+        function usageHasData(u) {
+            if (!u) return false;
+            return ['requests', 'input', 'output', 'summary_requests'].some(
+                key => (Number(u[key]) || 0) > 0);
+        }
+
+        // Число обращений к модели в замере (без «|| 1»: 0 — это ноль).
+        function usageRequests(u) {
+            return Number(u && u.requests) || 0;
+        }
+
+        // Сумма служебных вызовов замера по видам: {вид: {requests, input, output}}.
+        function usageService(u) {
+            const out = {};
+            const service = (u && u.service) || {};
+            Object.keys(service).forEach(kind => {
+                const bucket = service[kind] || {};
+                out[kind] = {
+                    requests: Number(bucket.requests) || 0,
+                    input: Number(bucket.input) || 0,
+                    output: Number(bucket.output) || 0
+                };
+            });
+            return out;
+        }
+
+        // Таблица под диаграммой. Строка «Ответ шага» показывает ТОЛЬКО сам
+        // ответ модели: служебные вызовы (план, гейт, разбор запроса, проверка
+        // результата, сжатие памяти, факты, ветвление) из неё вычитаются.
+        // «Весь диалог» — итог по всем замерам диалога, ниже он разложен по
+        // видам служебных вызовов и по сбоям.
         function renderAgentStats() {
-            const last = agentUsage.length ? agentUsage[agentUsage.length - 1] : null;
-            // Вклад служебных вызовов в последнем замере (у старых замеров
-            // полей summary_* нет — считаются нулями).
+            // Замеры без расхода (пустые) в расчёт не идут: сервер их шлёт в
+            // служебных ветках, и в панели им делать нечего.
+            const measured = agentUsage.filter(usageHasData);
+            const last = measured.length ? measured[measured.length - 1] : null;
+            const lastService = usageService(last);
             const lastSumReq = last ? (Number(last.summary_requests) || 0) : 0;
             const lastSumIn = last ? (Number(last.summary_input) || 0) : 0;
             const lastSumOut = last ? (Number(last.summary_output) || 0) : 0;
@@ -2251,26 +2333,41 @@
             let sumRequests = 0;
             let sumInput = 0;
             let sumOutput = 0;
-            // Обращения к модели, а не записи: один HTTP-запрос (шаг плана) может
-            // содержать два вызова — сам ответ и проверку результата.
             let allRequests = 0;
-            agentUsage.forEach(u => {
+            let failed = 0;
+            const byKind = {};
+            measured.forEach(u => {
                 input += Number(u.input) || 0;
                 output += Number(u.output) || 0;
-                allRequests += Number(u.requests) || 0;
+                allRequests += usageRequests(u);
                 sumRequests += Number(u.summary_requests) || 0;
                 sumInput += Number(u.summary_input) || 0;
                 sumOutput += Number(u.summary_output) || 0;
+                failed += Number(u.failed_requests) || 0;
+                const service = usageService(u);
+                Object.keys(service).forEach(kind => {
+                    const acc = byKind[kind] || { requests: 0, input: 0, output: 0 };
+                    acc.requests += service[kind].requests;
+                    acc.input += service[kind].input;
+                    acc.output += service[kind].output;
+                    byKind[kind] = acc;
+                });
             });
             const draw = (body, rows) => {
                 body.innerHTML = '';
                 rows.forEach(r => {
                     const tr = document.createElement('tr');
                     if (r.sub) tr.className = 'agent-subrow';
+                    if (r.kind) tr.className = 'agent-kindrow';
                     if (r.title) tr.title = r.title;
-                    [r.label, r.requests, r.output, r.input, r.input + r.output].forEach(v => {
+                    [r.label, r.requests, r.output, r.input, r.input + r.output,
+                     r.limit === undefined ? '' : r.limit].forEach((v, index) => {
                         const td = document.createElement('td');
                         td.textContent = v;
+                        if (index === 5 && r.overflow) {
+                            td.className = 'agent-overflow';
+                            td.title = 'Входящие токены запроса превысили лимит «Длина»';
+                        }
                         tr.appendChild(td);
                     });
                     body.appendChild(tr);
@@ -2279,21 +2376,28 @@
             draw(agentStatsBody, [
                 {
                     label: 'Ответ шага',
-                    requests: last ? Math.max(0, (Number(last.requests) || 1) - lastSumReq) : 0,
+                    // Вычитаем служебные вызовы ТОЛЬКО из последнего замера: он и
+                    // есть текущий шаг.
+                    requests: last ? Math.max(0, usageRequests(last) - lastSumReq) : 0,
                     input: last ? Math.max(0, (Number(last.input) || 0) - lastSumIn) : 0,
                     output: last ? Math.max(0, (Number(last.output) || 0) - lastSumOut) : 0,
-                    title: 'Только сам ответ модели по текущему шагу: служебные вызовы (план задачи, проверка результата, сжатие памяти, блок фактов, план ветвления) не учитываются'
+                    limit: last && last.limit !== null && last.limit !== undefined
+                        ? last.limit : '—',
+                    overflow: !!(last && last.overflow),
+                    title: 'Только сам ответ модели по текущему шагу: служебные вызовы '
+                        + '(план задачи, проверка плана, разбор запроса, проверка '
+                        + 'результата, сжатие памяти, блок фактов, план ветвления) не '
+                        + 'учитываются'
                 }
             ]);
-            draw(agentTotalBody, [
+            const totalRows = [
                 {
-                    label: 'Вся задача',
-                    // Столбец называется «Количество запросов» — это обращения к
-                    // модели: план, ответы по шагам, проверка (шаг = отдельное
-                    // обращение, поэтому у задачи из трёх шагов их четыре).
+                    label: 'Весь диалог',
+                    // Столбец «Количество запросов» — обращения к модели: план,
+                    // ответ по каждому шагу, служебные вызовы.
                     requests: allRequests,
-                    title: 'Обращения к модели за всю задачу: план, ответ по каждому '
-                        + 'шагу, проверка результата. Один шаг плана = один запрос '
+                    title: 'Обращения к модели за весь диалог: план, ответ по каждому '
+                        + 'шагу, служебные вызовы. Один шаг плана = одно обращение '
                         + '(автомат выполняет шаги сам)',
                     input: input,
                     output: output
@@ -2301,14 +2405,49 @@
                 {
                     label: 'из них служебные вызовы',
                     title: 'Вспомогательные вызовы, результат которых не является '
-                        + 'ответом пользователю: план задачи, проверка результата, '
-                        + 'сжатие памяти, блок фактов, план ветвления',
+                        + 'ответом пользователю',
                     requests: sumRequests,
                     input: sumInput,
                     output: sumOutput,
                     sub: true
                 }
-            ]);
+            ];
+            // Разбивка служебных вызовов по видам — видно, НА ЧТО ушли токены.
+            Object.keys(byKind).sort((a, b) => byKind[b].requests - byKind[a].requests)
+                .forEach(kind => {
+                    const acc = byKind[kind];
+                    totalRows.push({
+                        label: '· ' + serviceLabel(kind),
+                        title: 'Служебный вызов: ' + serviceLabel(kind),
+                        requests: acc.requests,
+                        input: acc.input,
+                        output: acc.output,
+                        sub: true,
+                        kind: true
+                    });
+                });
+            if (failed) {
+                totalRows.push({
+                    label: '· сбои (расход неизвестен)',
+                    title: 'Обращения к модели, которые не удались: провайдер ответил '
+                        + 'ошибкой или оборвалась связь. Токены по ним неизвестны',
+                    requests: failed,
+                    input: 0,
+                    output: 0,
+                    sub: true,
+                    kind: true
+                });
+            }
+            draw(agentTotalBody, totalRows);
+            // Стоимость — оценка по тарифам провайдера (сервер считает её из
+            // метрик каждого вызова): видно, во что обходится шаг и диалог.
+            const costOf = u => Number(u && u.cost_rub) || 0;
+            const dialogCost = measured.reduce((sum, u) => sum + costOf(u), 0);
+            const stepCost = last ? costOf(last) : 0;
+            agentCostEl.textContent = dialogCost || stepCost
+                ? `Стоимость (оценка по тарифам): ${fmtRub(stepCost)} за шаг · `
+                  + `${fmtRub(dialogCost)} за диалог`
+                : '';
         }
 
         // Диаграмма: по оси X — номера запросов пользователя в истории (шаг 1,
@@ -2330,13 +2469,17 @@
             const outputTotals = [0];
             let accIn = 0;
             let accOut = 0;
-            agentUsage.forEach(u => {
+            // Пустые замеры (служебные ветки без обращения к модели) в график не
+            // попадают: иначе на диаграмме появлялись точки без расхода, а
+            // подпись «запросов» расходилась с таблицей.
+            const measured = agentUsage.filter(usageHasData);
+            measured.forEach(u => {
                 accIn += Number(u.input) || 0;
                 accOut += Number(u.output) || 0;
                 inputTotals.push(accIn);
                 outputTotals.push(accOut);
             });
-            const requests = agentUsage.length;
+            const requests = measured.length;
             const peak = Math.max(accIn, accOut);
 
             // Ось Y: шаг 200 токенов; при большом расходе шаг укрупняется
@@ -2403,7 +2546,7 @@
             expertPanel.hidden = !on;      // радио появляются
             document.body.classList.toggle('expert-mode', !!on);
             statsPanel.hidden = !on;       // панель статистики — только в эксперте
-            resetStats();                  // и при входе, и при выходе — нули
+            renderStats();                 // счётчики с сервера: НЕ обнуляем
             if (!on) {
                 // выключение экспертного режима — роли и выбор радио сбрасываются
                 expertRoles.fill('');
@@ -2557,9 +2700,13 @@
                 // неразрешённое противоречие» ставим сразу после отрисовки (по
                 // последнему снимку; свежий подтянет refreshInvariants).
                 renderInvariantsMarks();
-                // Срезы памяти тоже привязаны к задаче — держим их свежими.
-                loadMemory();
+                // Срезы памяти привязаны к задаче, но нужны только виду
+                // «Состояние памяти»: грузить их при каждом обновлении панели
+                // (а это каждый шаг задачи) — лишний запрос вхолостую.
+                if (agentPanelView === 'memory') loadMemory();
             }
+            // Статистика экспертных режимов профиля — вместе со снимком.
+            if (workspace.stats) applyStats(workspace.stats);
             // Профиль пользователя сервер отдаёт вместе со снимком workspace:
             // обновляем иконку и поля меню тем же ответом.
             if (workspace.profile) {
@@ -2722,6 +2869,9 @@
         // пошёл бы по шагам уже другого диалога.
         async function selectSession(sessionId) {
             if (!sessionId || sessionId === workspace.active_session) return;
+            // Быстрые клики по списку диалогов не должны запускать пачку
+            // параллельных переключений: рисуется всё равно последнее.
+            if (switching) return;
             // Цепочку НЕ останавливаем: задача продолжает работать фоном (её
             // запросы несут свой session_id), а открытая задача свободна.
             setSwitching(true);
@@ -2784,6 +2934,7 @@
         // после переключения подтягиваем диалог её текущей сессии.
         async function selectTask(taskId) {
             if (!taskId || taskId === workspace.active_task) return;
+            if (switching) return;
             setSwitching(true);
             try {
                 const data = await workspaceRequest(
@@ -3275,6 +3426,7 @@
         const tmRedo = document.getElementById('tm-redo');
         const tmPending = document.getElementById('tm-pending');
         const tmIdle = document.getElementById('tm-idle');
+        const tmAcceptBtn = document.getElementById('tm-accept');
         // Базовые этапы автомата (в порядке перехода) и подписи в полосе.
         const TM_BASE = [
             { id: 'planning', label: 'Планирование' },
@@ -3379,11 +3531,20 @@
             tmConfirmBtn.hidden = !canConfirm;
             tmEditBtn.hidden = !canConfirm;
             tmCancelBtn.hidden = !(hasTask && state && state.can_cancel);
+            // «Принять вручную» — только когда проверку выполнить не удалось:
+            // задача не готова и ждёт решения пользователя.
+            tmAcceptBtn.hidden = !(hasTask && state && state.can_accept);
 
             // Доработки по требованию проверки: «доработка 1 из 2» (видно, что
             // автомат уже возвращался на шаг из-за проверки результата).
             const redos = (state && Number(state.redo_count)) || 0;
-            if (redos > 0 && !state.terminal) {
+            if (state && state.check_blocked && !state.terminal) {
+                // Проверка не выполнена: задача не помечается готовой.
+                tmRedo.hidden = false;
+                tmRedo.textContent = 'проверка не выполнена';
+                tmRedo.title = 'Проверку результата выполнить не удалось: '
+                    + 'нажмите «▶ повторить проверку» или «Принять вручную»';
+            } else if (redos > 0 && !state.terminal) {
                 tmRedo.hidden = false;
                 tmRedo.textContent = `доработка ${redos} из ${state.max_redo || 2}`;
                 tmRedo.title = state.can_redo
@@ -3422,10 +3583,12 @@
             if (idle) {
                 tmIdle.hidden = false;
                 tmIdle.textContent = checkPending
-                    ? '▶ выполнить проверку'
+                    ? (state.check_blocked ? '▶ повторить проверку' : '▶ выполнить проверку')
                     : `▶ продолжить: шаг ${state.step_number} из ${state.steps_total}`;
                 tmIdle.title = checkPending
-                    ? 'Проверка результата отложена («Пауза» на последнем шаге) — нажмите, чтобы выполнить'
+                    ? (state.check_blocked
+                        ? 'Проверку выполнить не удалось — нажмите, чтобы проверить снова'
+                        : 'Проверка результата отложена («Пауза» на последнем шаге) — нажмите, чтобы выполнить')
                     : 'Прогон шагов этой задачи не идёт — нажмите, чтобы выполнить шаг';
             } else {
                 tmIdle.hidden = true;
@@ -3446,6 +3609,10 @@
         }
 
         // Новое состояние с сервера: полоса и доступность поля ввода.
+        // Подпись последнего отрисованного состояния: по ней пропускаем
+        // повторные снимки (state-событие и то же состояние в done).
+        let lastStateSignature = '';
+
         function applyTaskState(state) {
             if (!state) return;
             // Команда «Пауза» принята, но ещё не применена (pending): держим
@@ -3456,6 +3623,14 @@
                 state.paused = true;
             }
             taskMachineState = state;
+            // Снимок не изменился (сервер шлёт состояние и в state-, и в done-
+            // событиях одного шага) — полосу и полосу ввода не пересобираем.
+            // Подпись — весь снимок, кроме времени обновления: в нём есть и
+            // этап, и шаг, и число доработок, от которых зависят кнопки.
+            const stateSignature = JSON.stringify(state, (key, value) =>
+                (key === 'updated_at' ? undefined : value));
+            if (stateSignature === lastStateSignature) return;
+            lastStateSignature = stateSignature;
             // Команда остановки ПОДТВЕРЖДЕНА, только если в снимке нет пометки
             // pending: с pending сервер лишь принял команду (применит после шага),
             // а состояние с ней — оптимистичное, ещё не факт.
@@ -3546,6 +3721,16 @@
                 // «Продолжить»: если задача была в работе — продолжаем шаги.
                 runStepChain();
             }
+        });
+
+        tmAcceptBtn.addEventListener('click', async () => {
+            // Принять результат вручную можно только у своей задачи и только
+            // когда проверку выполнить не удалось (сервер проверит то же самое).
+            if (chains.has(workspace.active_session)) return;
+            const state = await taskStateAction('/api/agent/state/accept');
+            if (!state) return;
+            addMessage('bot', '✅ Результат принят вручную — задача завершена '
+                + '(проверка результата не выполнялась).', true);
         });
 
         tmConfirmBtn.addEventListener('click', async () => {
@@ -3690,6 +3875,11 @@
             // первый запрос просто попробует выполнить шаг, а решение
             // «продолжать» придёт из ответа ЕГО задачи.
             let state = (target === workspace.active_session) ? taskMachineState : null;
+            // Одну попытку работы в этом прогоне делаем ВСЕГДА: пользователь мог
+            // нажать «▶ повторить проверку» на задаче, где проверка уже не
+            // удалась (check_blocked). Дальше прогон останавливается, чтобы
+            // повторять проверку по кругу не жгло вызовы LLM.
+            let attempted = false;
             try {
                 while (!chain.stop && !noChainFor.has(target) && agentModeOn()
                         && steps < TM_CHAIN_LIMIT) {
@@ -3697,8 +3887,10 @@
                     // проверка результата (validation: «Пауза» была на последнем
                     // шаге). Всё остальное — ожидание пользователя.
                     if (state && (state.paused
+                                  || (state.check_blocked && attempted)
                                   || (state.stage !== 'execution'
                                       && state.stage !== 'validation'))) break;
+                    attempted = true;
                     steps += 1;
                     const background = target !== workspace.active_session;
                     const result = await sendAgentRequest(agentStepBody(target), background);
@@ -3713,10 +3905,11 @@
                 chains.delete(target);
                 updateComposerState();
                 renderTaskMachine();
-                // После прогона освежаем панель (у новой задачи заголовок по
-                // первому запросу) и открытый диалог с состоянием, а неотработанную
-                // команду остановки доводим до конца (см. reconcilePendingStop).
-                await refreshWorkspace();
+                // После прогона обновляем ТОЛЬКО открытый диалог: снимок панели
+                // уже сделан последним шагом (loadWorkspace), и повторный запрос
+                // дублировал бы его. Неотработанную команду остановки доводим до
+                // конца (см. reconcilePendingStop).
+                await loadWorkspace();
                 await reconcilePendingStop();
             }
         }
@@ -4090,7 +4283,7 @@
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
 
-            let html = '<div class="judge-title">🧭 План ветвления</div>';
+            let html = '<div class="judge-title">🧑‍⚖️ Судья-аналитик</div>';
             const context = analysis.context || [];
             if (context.length) {
                 html += '<div class="branch-part"><b>1. Фиксация контекста</b><ul>';
@@ -4167,6 +4360,10 @@
             renderBranchSelect();
         }
 
+        // Контроллер отмены запроса истории диалога: при быстром переключении
+        // задач/диалогов устаревшие ответы не должны перерисовывать окно.
+        let dialogAbort = null;
+
         // Диалог текущей сессии: реплики, расход токенов, ветви плана.
         // Вызывается при включении режима агента и при каждом переключении
         // задачи или диалога — окно чата перерисовывается целиком. Задачи нет
@@ -4175,11 +4372,16 @@
             const epoch = viewEpoch;
             const sessionId = workspace.active_session;
             let data = null;
+            // Предыдущий запрос истории больше не нужен: пользователь уже
+            // переключился, а его ответ пришёл бы позже свежего.
+            if (dialogAbort) dialogAbort.abort();
+            dialogAbort = new AbortController();
+            const signal = dialogAbort.signal;
             try {
-                const res = await fetch('/api/agent/history');
+                const res = await fetch('/api/agent/history', { signal: signal });
                 if (res.ok) data = await res.json();
             } catch (e) {
-                data = null;   // история недоступна — просто пустой чат
+                data = null;   // история недоступна/запрос отменён — пустой чат
             }
             if (!sameView(epoch, sessionId)) return;   // переключились — не рисуем
             const msgs = (data && Array.isArray(data.messages)) ? data.messages : [];
@@ -4608,31 +4810,35 @@
             return x.toFixed(2).replace('.', ',') + ' руб';
         }
 
-        // Рисует сообщение-аналитику судьи по настройке «Тест моделей».
-        function addAnalyticsTable(rows) {
+        // Рисует таблицу РЕАЛЬНЫХ метрик вызовов модели: время, токены,
+        // стоимость. Используется настройками «Тест моделей» и «Температура»;
+        // служебный вызов судьи идёт в ней отдельной строкой, поэтому расход на
+        // оценку ответов виден.
+        function addAnalyticsTable(rows, firstColumn, title) {
             const wrap = document.createElement('div');
             wrap.className = 'msg bot';
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
 
-            let html = '<div class="judge-title">🧑‍⚖️ Судья-аналитик</div>';
+            let html = `<div class="judge-title">${title || '🧑‍⚖️ Судья-аналитик'}</div>`;
             html += '<table class="judge-table"><thead><tr>';
-            html += '<th>Модель</th><th>Время, с</th><th>Токены на вход</th>'
-                + '<th>Токены на выход</th><th>Стоимость</th>';
+            html += `<th>${firstColumn || 'Модель'}</th><th>Время, с</th>`
+                + '<th>Токены на вход</th><th>Токены на выход</th><th>Стоимость</th>';
             html += '</tr></thead><tbody>';
             rows.forEach(r => {
-                html += `<tr><td>${r.model}</td>`
-                    + `<td>${r.seconds.toFixed(2)}</td>`
+                const label = r.label || r.model || '';
+                html += `<tr><td>${label}</td>`
+                    + `<td>${Number(r.seconds || 0).toFixed(2)}</td>`
                     + `<td>${r.input_tokens}</td>`
                     + `<td>${r.output_tokens}</td>`
-                    + `<td>${fmtRub(r.cost_rub)}</td></tr>`;
+                    + `<td>${fmtRub(Number(r.cost_rub) || 0)}</td></tr>`;
             });
             html += '</tbody></table>';
             // Краткое резюме судьи по каждой модели (скорость, стоимость,
             // ресурсоёмкость, качество) — под таблицей.
             rows.forEach(r => {
                 if (r.summary) {
-                    html += `<div class="judge-summary"><b>${r.model}:</b> ${r.summary}</div>`;
+                    html += `<div class="judge-summary"><b>${r.label || r.model}:</b> ${r.summary}</div>`;
                 }
             });
 
@@ -4754,9 +4960,10 @@
                             // Уточнённый расход запроса: после ответа автомат
                             // может сделать служебный вызов (содержательная
                             // проверка результата) — замер ЗАМЕНЯЕТ прежний, а
-                            // не добавляет второй, иначе панель «Токены диалога»
-                            // посчитала бы один запрос дважды.
-                            if (ev.usage) {
+                            // не добавляет второй, иначе панель «Токены задачи»
+                            // посчитала бы один запрос дважды. Пустой замер
+                            // (например, {} из служебной ветки) не показываем.
+                            if (usageHasData(ev.usage)) {
                                 if (usagePushed) {
                                     agentUsage[agentUsage.length - 1] = ev.usage;
                                 } else {
@@ -4770,8 +4977,11 @@
                                 // Итоговое состояние запроса (после переходов).
                                 applyTaskState(ev.state);
                             }
-                            if (ev.usage) {
-                                // Замер токенов запроса — панель «Токены диалога».
+                            if (usageHasData(ev.usage)) {
+                                // Замер токенов запроса — панель «Токены задачи».
+                                // Это ТОТ ЖЕ замер, что записан сервером: приходи
+                                // он в конце ответа шага, панель не отставала бы
+                                // от файла.
                                 if (usagePushed) {
                                     agentUsage[agentUsage.length - 1] = ev.usage;
                                 } else {
@@ -4795,8 +5005,11 @@
                 }
                 // Обмен завершён и сохранён на сервере: обновляем панель
                 // workspace — у нового диалога появился заголовок (первые слова
-                // первого запроса), у существующего мог смениться.
-                await loadWorkspace();
+                // первого запроса), у существующего мог смениться. Для шага
+                // ЧУЖОЙ (фоновой) задачи панель не трогаем: её снимок всё равно
+                // подтянется при переключении — иначе на каждый фоновый шаг
+                // уходил бы лишний запрос снимка.
+                if (!background) await loadWorkspace();
             } catch (e) {
                 if (!background) {
                     addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
@@ -4996,7 +5209,7 @@
                     });
                     // Аналитика судьи-аналитика (время, токены, стоимость).
                     if (Array.isArray(data.analytics) && data.analytics.length) {
-                        addAnalyticsTable(data.analytics);
+                        addAnalyticsTable(data.analytics, 'Модель', 'Судья-аналитик');
                     }
                 } else if (Array.isArray(data.responses) && data.responses.length) {
                     // Настройка «Температура»: каждый ответ с отдельным значением —
@@ -5004,6 +5217,13 @@
                     data.responses.forEach(r => {
                         addMessage('bot', `Ответ при значении temperature ${r.temperature}.\n\n${r.text}`);
                     });
+                    // Реальные метрики каждого значения температуры (время,
+                    // токены, стоимость) — как в «Тесте моделей»: без них на
+                    // странице статистики были только оценки судьи 1–10.
+                    if (Array.isArray(data.analytics) && data.analytics.length) {
+                        addAnalyticsTable(data.analytics, 'Температура',
+                            'Судья-аналитик и расход запроса');
+                    }
                     if (data.judge) {
                         if (Array.isArray(data.judge) && data.judge.length) {
                             addJudgeTable(data.judge);
@@ -5013,12 +5233,19 @@
                     }
                 } else {
                     addMessage('bot', data.bot);
+                    // Расход запроса (время, токены, стоимость) — включая
+                    // служебный вызов судьи, который выносит вердикт: раньше
+                    // в обычном и экспертном режимах расхода не было видно.
+                    if (Array.isArray(data.analytics) && data.analytics.length) {
+                        addAnalyticsTable(data.analytics, 'Этап',
+                            'Расход запроса (оценка по тарифам)');
+                    }
                 }
                 // Вердикт о верности выносит сама модель; инкрементируем
                 // счётчик активного в данный момент режима.
-                if (expertOn && (data.correct === true || data.correct === false)) {
-                    updateStats(expertMode, data.correct);
-                }
+                // Статистику ведёт сервер: он вернул обновлённый снимок тем же
+                // ответом, поэтому отдельного запроса и локального счётчика нет.
+                if (data.stats) applyStats(data.stats);
             } catch (e) {
                 addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.');
             } finally {

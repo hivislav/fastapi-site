@@ -60,33 +60,6 @@ WINNER_PROJECT = SCOPE_PROJECT
 WINNER_TASK = SCOPE_TASK
 WINNERS = (WINNER_PROJECT, WINNER_TASK)
 
-# ---------------------------------------------------------------------------
-# Служебный вызов LLM: проверка пары правил на противоречие.
-# ---------------------------------------------------------------------------
-# Экономия: пока инвариантов задачи ИЛИ проекта нет, проверять нечего — пары
-# пустые и вызова к модели не происходит вовсе (см. detect).
-INVARIANTS_PROMPT = (
-    "Ты проверяешь ИНВАРИАНТЫ проекта и задачи на противоречие. Инвариант — "
-    "правило, которое исполнитель не имеет права нарушить (архитектура, "
-    "технические решения, ограничения стека, бизнес-правила).\n"
-    "Тебе дают нумерованные пары «инвариант проекта — инвариант задачи». Для "
-    "КАЖДОЙ пары ответь, противоречат ли два правила друг другу: при "
-    "противоречии исполнитель не сможет соблюсти оба сразу.\n"
-    "Противоречие — это несовместимость требований (одно запрещает то, что "
-    "другое требует; заданы взаимоисключающие технологии, форматы, значения или "
-    "порядок действий). Разные темы, дополняющие друг друга правила и уточнения "
-    "противоречием НЕ являются. Если правила об одном и том же и совместимы — "
-    "вердикт clear. Сомневаешься — отвечай conflict и объясни сомнение.\n"
-    "Ответ — ТОЛЬКО JSON без пояснений и markdown, ключ — номер пары строкой:\n"
-    '{"1": {"вердикт": "conflict"|"clear", "причина": "не более 200 символов"}, '
-    '"2": {"вердикт": "clear", "причина": ""}}'
-)
-
-# Ограничения вывода и времени служебного вызова (как у прочих служебных
-# вызовов агента: PLAN_*/REVIEW_*).
-INVARIANTS_MAX_TOKENS = 900
-INVARIANTS_TIMEOUT = 60.0
-# Сколько символов причины противоречия храним (список конфликтов виден в UI).
 REASON_LIMIT = 400
 # Формат вызова LLM: async (messages, **kwargs) -> (текст, метрики|None).
 LlmCall = Callable[..., Any]
@@ -417,7 +390,7 @@ def _clean_numbers(raw: Any) -> List[int]:
     """Номера правил (1, 2, 3…) из ответа модели: строки тоже принимаем.
 
     Нужны для поля «недействующие»: номера правил ТЕКУЩЕЙ задачи, которые
-    противоречат правилам проекта (см. INVARIANTS_PROMPT/ANALYSIS_PROMPT). Всё,
+    противоречат правилам проекта (см. ANALYSIS_PROMPT). Всё,
     что не похоже на номер, отбрасываем: по этим номерам строится блок правил,
     который уходит модели в каждом запросе.
     """
@@ -1321,69 +1294,6 @@ def invariants_block(project_invariants: Any, task_invariants: Any,
     return "\n".join(parts).strip()
 
 
-# ---------------------------------------------------------------------------
-# Служебный вызов LLM: проверка пар на противоречие
-# ---------------------------------------------------------------------------
-def build_query(pair_list: Sequence[Dict[str, str]]) -> str:
-    """Текст запроса к модели: нумерованные пары правил (ключ — номер строкой)."""
-    lines: List[str] = ["Пары инвариантов для проверки:", ""]
-    for index, pair in enumerate(pair_list, 1):
-        lines.append(f"{index}) Инвариант проекта: {pair['project_text']}")
-        lines.append(f"   Инвариант задачи: {pair['task_text']}")
-        lines.append("")
-    lines.append(
-        "Для каждой пары верни вердикт в JSON по номерам выше: conflict — правила "
-        "противоречат друг другу, clear — совместимы. Причина — коротко, чем "
-        "именно противоречат (для clear можно пустую строку)."
-    )
-    return "\n".join(lines)
-
-
-def parse_results(content: str, pair_list: Sequence[Dict[str, str]]) -> Dict[str, Dict[str, Any]]:
-    """Разбирает ответ модели: ключ пары -> {"verdict", "reason"}.
-
-    Понимает markdown-обёртку и обрезанный JSON (тем же репейром, что и прочие
-    служебные вызовы). Пары без разобранного вердикта в результат НЕ попадают —
-    вызывающий код пометит их как непроверенные. Совсем не разобрался — ValueError
-    (проверка не выполнена: конфликт НЕ выдумываем и совместимость не объявляем).
-    """
-    data = _load_object(content)
-    if data is None:
-        raise ValueError("проверка инвариантов: ответ модели не разобран")
-    by_index: Dict[int, Any] = {}
-    if isinstance(data, dict):
-        for key, value in data.items():
-            match = re.search(r"\d+", str(key))
-            if match:
-                by_index[int(match.group())] = value
-    elif isinstance(data, list):
-        for index, value in enumerate(data, 1):
-            by_index[index] = value
-    out: Dict[str, Dict[str, Any]] = {}
-    for index, pair in enumerate(pair_list, 1):
-        value = by_index.get(index)
-        if isinstance(value, str):
-            value = {"verdict": value}
-        if not isinstance(value, dict):
-            continue
-        verdict = ""
-        for key in _VERDICT_KEYS:
-            if value.get(key):
-                verdict = _normalize(value[key])
-                break
-        if verdict not in VERDICTS:
-            continue
-        reason = ""
-        for key in _REASON_KEYS:
-            if value.get(key):
-                reason = str(value[key]).strip()
-                break
-        out[pair["key"]] = {"verdict": verdict, "reason": reason[:REASON_LIMIT]}
-    if not out:
-        raise ValueError("проверка инвариантов: в ответе модели нет вердиктов")
-    return out
-
-
 def _load_object(content: str) -> Any:
     """Разбирает ответ модели в объект: снимает markdown, чинит обрезанный JSON.
 
@@ -1413,47 +1323,5 @@ def _load_object(content: str) -> Any:
     except (ValueError, TypeError):
         return None
     return data if isinstance(data, (dict, list)) else None
-
-
-async def detect(pair_list: Sequence[Dict[str, str]], call: LlmCall) -> Dict[str, Dict[str, Any]]:
-    """Проверяет пары правил служебным вызовом LLM.
-
-    `call` — функция вызова модели вида client.call_llm_async:
-    (user_text, messages, response_format, max_tokens, stop, system_prompt,
-     temperature, model, disable_thinking, timeout) -> (текст, метрики|None).
-    Возвращает {"<ключ пары>": {"verdict", "reason", "checked"}}; сбой вызова или
-    неразобранный ответ — пустой словарь (пары останутся непроверенными и
-    интерфейс предложит повторить проверку).
-    """
-    if not pair_list:
-        return {}
-    messages = [
-        {"role": "system", "content": INVARIANTS_PROMPT},
-        {"role": "user", "content": build_query(pair_list)},
-    ]
-    try:
-        content, _metrics = await call(
-            user_text="",
-            messages=messages,
-            response_format="free",
-            max_tokens=INVARIANTS_MAX_TOKENS,
-            stop=None,
-            system_prompt=None,
-            temperature=None,
-            model=None,
-            disable_thinking=True,
-            timeout=INVARIANTS_TIMEOUT,
-        )
-    except Exception:  # noqa: BLE001 — сбой проверки не должен ломать запрос
-        logger.warning("Проверка инвариантов: вызов модели не удался", exc_info=True)
-        return {}
-    if not content:
-        return {}
-    try:
-        results = parse_results(content, pair_list)
-    except ValueError as exc:
-        logger.warning("Проверка инвариантов: %s", exc)
-        return {}
-    return mark(results, pair_list)
 
 

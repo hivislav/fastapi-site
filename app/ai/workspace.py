@@ -71,6 +71,10 @@ _VERSION = 1
 # Страховочные лимиты на загрузку: срабатывают только для повреждённого или
 # вручную разросшегося файла, обычная работа до них не доходит.
 _MAX_TASKS = 50
+# Режимы экспертной страницы статистики («Статистика ответов»): по каждому
+# копятся верные и неверные ответы. Счётчики живут в workspace ПРОФИЛЯ, поэтому
+# переживают переключение режима, смену задачи и перезапуск приложения.
+EXPERT_MODES = ("direct", "stepwise", "prompt", "group")
 _MAX_SESSIONS = 100
 _MAX_NAME = 120
 _MAX_TITLE = 200
@@ -174,6 +178,11 @@ def empty_dialog(task_id: str = "") -> Dict[str, Any]:
         # Конечный автомат задачи: этап → шаг → ожидаемое действие + история
         # переходов. Живёт В СЕССИИ: у каждого диалога свой ход автомата.
         "state": task_state.to_dict(task_state.new_state(task_id)),
+        # Подпись плана: для какого запроса и при каком наборе правил он
+        # построен. Нужна, чтобы НЕ строить план заново (это платный служебный
+        # вызов) и НЕ проверять его повторно, когда ни запрос, ни правила не
+        # изменились, — например, при перезапуске задачи после ошибки.
+        "plan_signature": {},
     }
 
 
@@ -212,14 +221,18 @@ def _clean_messages(raw: Any, limit: int = _MAX_MESSAGES) -> List[Dict[str, str]
 
 
 def _clean_usage(raw: Any) -> List[Dict[str, Any]]:
-    """Замеры расхода токенов по запросам пользователя (панель токенов)."""
+    """Замеры расхода токенов по запросам пользователя (панель токенов).
+
+    Берём ПОСЛЕДНИЕ замеры (_MAX_USAGE): панель показывает текущий диалог, а
+    срез [:N] отбрасывал бы как раз свежие запросы при длинной переписке.
+    """
     clean: List[Dict[str, Any]] = []
-    for item in (raw if isinstance(raw, list) else [])[:_MAX_USAGE]:
+    for item in (raw if isinstance(raw, list) else [])[-_MAX_USAGE:]:
         if not isinstance(item, dict):
             continue
         record: Dict[str, Any] = {}
         for key in ("requests", "input", "output", "summary_requests", "summary_input",
-                    "summary_output"):
+                    "summary_output", "failed_requests"):
             if key in item:
                 try:
                     record[key] = max(0, int(item.get(key) or 0))
@@ -232,9 +245,34 @@ def _clean_usage(raw: Any) -> List[Dict[str, Any]]:
                 record["limit"] = None
         if "overflow" in item:
             record["overflow"] = item.get("overflow") is True
+        if "cost_rub" in item:
+            try:
+                record["cost_rub"] = round(max(0.0, float(item.get("cost_rub") or 0.0)), 5)
+            except (TypeError, ValueError):
+                record["cost_rub"] = 0.0
+        # Разбивка служебных вызовов по видам (план, гейт, разбор запроса,
+        # проверка результата, сжатие, факты, ветвление): панель показывает
+        # вклад каждого вида отдельной строкой.
+        service = item.get("service")
+        if isinstance(service, dict):
+            buckets: Dict[str, Dict[str, int]] = {}
+            for kind, bucket in service.items():
+                if not isinstance(bucket, dict):
+                    continue
+                clean_bucket: Dict[str, int] = {}
+                for field in ("requests", "input", "output", "failed"):
+                    try:
+                        clean_bucket[field] = max(0, int(bucket.get(field) or 0))
+                    except (TypeError, ValueError):
+                        clean_bucket[field] = 0
+                buckets[str(kind)[:20]] = clean_bucket
+            if buckets:
+                record["service"] = buckets
         # kind="plan" — замер запроса, на котором построен только ПЛАН (ответа
-        # пользователю не было): такие записи не привязаны к реплике диалога и
-        # не отбрасываются при синхронизации замеров (см. _usage_matches_history).
+        # пользователю не было); kind="service" — другой служебный запрос без
+        # ответа (например, отказ по инвариантам). Такие записи не привязаны к
+        # реплике диалога и не отбрасываются при синхронизации замеров
+        # (см. _usage_matches_history в app/routers/chat.py).
         kind = str(item.get("kind") or "").strip().lower()
         if kind:
             record["kind"] = kind[:20]
@@ -422,7 +460,20 @@ def normalize_dialog(raw: Any, task_id: str = "") -> Dict[str, Any]:
     decisions = invariants_store.merge_exceptions(
         raw.get("conflicts"), raw.get("exceptions"))
     dialog["exceptions"] = [dict(item) for item in decisions]
+    dialog["plan_signature"] = _clean_plan_signature(raw.get("plan_signature"))
     return dialog
+
+
+def _clean_plan_signature(raw: Any) -> Dict[str, str]:
+    """Подпись построенного плана: {"request", "rules"} (битое — пусто)."""
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key in ("request", "rules"):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            out[key] = value[:400]
+    return out
 
 
 def _normalize_session(raw: Any) -> Optional[Dict[str, Any]]:
@@ -637,6 +688,88 @@ def _normalize_long_term_by_profile(raw: Any) -> Dict[str, Dict[str, Any]]:
         normalized = _normalize_entries(entries)
         if normalized:
             out[key] = {MEMORY_LONG_TERM: normalized}
+    return out
+
+
+def _normalize_stats_by_profile(raw: Any) -> Dict[str, Dict[str, Dict[str, int]]]:
+    """Приводит статистику экспертных режимов по профилям к безопасному виду.
+
+    Формат: {"<id профиля>": {"direct": {"correct": 0, "incorrect": 0}, …}}.
+    Неизвестные режимы и отрицательные значения отбрасываются.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Dict[str, Dict[str, int]]] = {}
+    for profile_id, modes in list(raw.items())[:_MAX_TASKS]:
+        key = str(profile_id or "").strip()[:_MAX_NAME]
+        if not key or not isinstance(modes, dict):
+            continue
+        clean: Dict[str, Dict[str, int]] = {}
+        for mode in EXPERT_MODES:
+            counters = modes.get(mode)
+            if not isinstance(counters, dict):
+                continue
+            try:
+                correct = max(0, int(counters.get("correct") or 0))
+                incorrect = max(0, int(counters.get("incorrect") or 0))
+            except (TypeError, ValueError):
+                continue
+            clean[mode] = {"correct": correct, "incorrect": incorrect}
+        if clean:
+            out[key] = clean
+    return out
+
+
+def stats_container(workspace: Dict[str, Any],
+                    profile_id: Optional[str] = None) -> Dict[str, Dict[str, int]]:
+    """Счётчики экспертной статистики ПРОФИЛЯ (создаются при первом обращении).
+
+    Профили изолированы: у каждого своя статистика ответов, как и свои задачи.
+    Профиль не передан — статистика не ведётся (возвращаем пустой словарь без
+    записи в workspace).
+    """
+    key = str(profile_id or "").strip()
+    if not key:
+        return {}
+    by_profile = workspace.setdefault("stats_by_profile", {})
+    if not isinstance(by_profile, dict):
+        by_profile = {}
+        workspace["stats_by_profile"] = by_profile
+    modes = by_profile.setdefault(key, {})
+    if not isinstance(modes, dict):
+        modes = {}
+        by_profile[key] = modes
+    return modes
+
+
+def add_expert_result(workspace: Dict[str, Any], mode: str, correct: bool,
+                      profile_id: Optional[str] = None) -> None:
+    """Учитывает вердикт экспертного режима: «Верно» или «Неверно».
+
+    Счётчик режима, которого нет в списке (новая настройка интерфейса),
+    инициализируется на месте — статистика не должна терять ответы.
+    """
+    modes = stats_container(workspace, profile_id)
+    if not modes:
+        return
+    name = str(mode or "").strip()
+    if not name:
+        return
+    counters = modes.setdefault(name, {"correct": 0, "incorrect": 0})
+    counters["correct" if correct else "incorrect"] += 1
+
+
+def expert_stats(workspace: Dict[str, Any],
+                 profile_id: Optional[str] = None) -> Dict[str, Dict[str, int]]:
+    """Снимок статистики экспертных режимов профиля для интерфейса."""
+    modes = stats_container(workspace, profile_id) if str(profile_id or "").strip() else {}
+    out: Dict[str, Dict[str, int]] = {}
+    for mode in EXPERT_MODES:
+        counters = modes.get(mode) if isinstance(modes, dict) else None
+        out[mode] = {
+            "correct": int((counters or {}).get("correct") or 0),
+            "incorrect": int((counters or {}).get("incorrect") or 0),
+        }
     return out
 
 
@@ -871,6 +1004,9 @@ def normalize_workspace(raw: Any) -> Dict[str, Any]:
         # профилей ещё не было) остаются как общее наследие.
         "long_term": _normalize_entries(raw.get("long_term")),
         "long_term_by_profile": _normalize_long_term_by_profile(raw.get("long_term_by_profile")),
+        # Статистика экспертных режимов по профилям (страница «Статистика ответов»):
+        # живёт на сервере, поэтому не обнуляется при переключении режима.
+        "stats_by_profile": _normalize_stats_by_profile(raw.get("stats_by_profile")),
     }
 
 
@@ -904,8 +1040,13 @@ def workspace_payload(workspace: Dict[str, Any]) -> str:
     маршруты (переключение диалога, пауза, запись журнала), поэтому снимок для
     файла нужно снимать атомарно — иначе json.dumps мог бы поймать «изменение
     словаря во время итерации» (см. _persist в chat.py).
+
+    Пишем КОМПАКТНО (без indent): файл машинный, читает его приложение, а
+    отступы в 2 пробела давали +25 % размера и впятеро больше времени на
+    сериализацию — а она идёт в event loop на каждом шаге задачи.
     """
-    return json.dumps(normalize_workspace(workspace), ensure_ascii=False, indent=2)
+    return json.dumps(normalize_workspace(workspace), ensure_ascii=False,
+                      separators=(",", ":"))
 
 
 def write_payload(payload: str, path: Optional[str] = None) -> None:
@@ -1115,6 +1256,8 @@ def purge_profile(workspace: Dict[str, Any], profile_id: Optional[str]) -> int:
         workspace["tasks"] = kept
     workspace.get("active_tasks", {}).pop(key, None)
     workspace.get("long_term_by_profile", {}).pop(key, None)
+    # Статистика экспертных режимов — тоже данные профиля.
+    workspace.get("stats_by_profile", {}).pop(key, None)
     if purged:
         logger.info("Workspace AI-агента: профиль %s удалён вместе с %d задачами",
                     key, purged)
@@ -1184,6 +1327,7 @@ def profile_ids_with_data(workspace: Dict[str, Any]) -> List[str]:
     """
     owners = {task_owner(task) for task in workspace.get("tasks", [])}
     owners |= set(workspace.get("long_term_by_profile") or {})
+    owners |= set(workspace.get("stats_by_profile") or {})
     owners |= set(workspace.get("active_tasks") or {})
     owners.discard("")
     return sorted(owners)

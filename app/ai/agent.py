@@ -38,7 +38,9 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
+from typing import (
+    Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple,
+)
 
 from app import config
 from app.ai import client, demo, invariants as invariants_store, json_utils, task_state
@@ -114,6 +116,17 @@ LONG_TERM_MEMORY_HEADER = (
 # Пределы слоёв памяти (защита от разрастания контекста и файла workspace).
 MAX_MEMORY_ENTRIES = 100
 MEMORY_ENTRY_LIMIT = 4000
+# Бюджеты СЛУЖЕБНЫХ промптов и системных блоков (символы). Служебные вызовы
+# (план, гейт, проверка результата) идут в модель по несколько штук на запрос
+# пользователя, поэтому их контекст ограничен: иначе один вызов плана мог
+# унести в модель всю переписку и все слои памяти (десятки тысяч токенов), а
+# при перепланировании — повторить это ещё раз.
+SERVICE_HISTORY_CHARS = 6000      # хвост истории диалога в служебном промпте
+MEMORY_LAYER_CHARS = 8000         # один слой памяти (рабочая/долговременная)
+MEMORY_TEXT_LIMIT = 20000         # все слои памяти вместе, одной строкой
+SUMMARY_BLOCK_LIMIT = 12000       # блок резюме (стратегия «summary»)
+FACTS_BLOCK_LIMIT = 8000          # блок фактов (стратегия «sticky facts»)
+FACTS_MAX_TOKENS = 1000           # предел вывода обновления фактов
 
 # --- Профиль пользователя (меню профиля в панели Workspace) -----------------
 # Сведения о пользователе (имя, род деятельности, стиль общения, формат ответа,
@@ -202,38 +215,51 @@ PLAN_PROMPT = (
     "ОТВЕТ — ТОЛЬКО один JSON-объект, без markdown и пояснений:\n"
     '{"steps": ["шаг 1", "шаг 2"]}'
 )
-# Служебный вызов плана: явный лимит вывода, чтобы JSON не обрезался, и свой
-# таймаут (план короче плана ветвления — минуты не нужны).
-PLAN_MAX_TOKENS = 1500
-PLAN_TIMEOUT = 90.0
-
 # Содержательная проверка результата (этап validation): ОДИН служебный вызов на
 # завершённую задачу. Локальная самопроверка (см. _self_check в chat.py) ловит
 # только технические сбои, а этот вызов отвечает на вопрос «результат вообще
 # соответствует запросу и плану или шаг нужно переделать».
 REVIEW_PROMPT = (
     "Ты — приёмщик работы ассистента. Тебе дают исходный запрос пользователя, "
-    "план работы (шаги) и результат — последние реплики диалога, в которых "
-    "ассистент выполнял план.\n"
-    "Проверь, соответствует ли результат запросу и плану: все ли шаги реально "
-    "закрыты, нет ли пропущенного пункта, противоречий, обрывочного или пустого "
-    "ответа вместо дела.\n"
-    "ПРАВИЛА: 1) verdict \"redo\" — только если результат реально не покрывает "
-    "план или запрос (шаг пропущен, сделан не тот шаг, ответ противоречит плану, "
-    "вместо результата — обещания); 2) стилистические придирки, пожелания "
+    "план работы (шаги) и решение — ответы ассистента по шагам.\n"
+    "Проверь ДВА уровня:\n"
+    "1) КАЖДЫЙ шаг плана по отдельности: сделан ли он, соответствует ли ответ "
+    "замыслу шага, нет ли вместо дела обещаний, противоречий, обрывочного или "
+    "пустого ответа;\n"
+    "2) ЗАДАЧУ ЦЕЛИКОМ: решает ли результат то, что просил пользователь, все ли "
+    "пункты исходного запроса закрыты.\n"
+    "ПРАВИЛА: 1) \"redo\" по шагу — только если шаг пропущен, сделан не тот шаг "
+    "или ответ противоречит плану/запросу; 2) стилистические придирки, пожелания "
     "«можно было бы подробнее» и новые требования, которых не было в запросе, — "
-    "НЕ повод для \"redo\"; 3) если результат в целом соответствует — \"ok\".\n\n"
+    "НЕ повод для \"redo\"; 3) общий verdict \"redo\", если хотя бы один шаг не "
+    "принят или результат не покрывает исходный запрос.\n\n"
     "ОТВЕТ — ТОЛЬКО один JSON-объект, без markdown и пояснений:\n"
-    '{"verdict": "ok" | "redo", "step": 0, "comment": "коротко: что не так или что подтверждено"}'
+    '{"verdict": "ok" | "redo", '
+    '"steps": [{"n": 1, "ok": true, "comment": "коротко по шагу"}], '
+    '"step": 0, "comment": "коротко: что подтверждено или что не так"}\n'
+    "В \"steps\" перечисли ВСЕ шаги плана по порядку (n — номер шага из плана). "
+    "В \"step\" укажи номер ПЕРВОГО шага, который надо переделать (0 — если "
+    "переделывать нечего)."
 )
-# Вывод короткий (вердикт + пояснение), но с запасом, чтобы JSON не обрезался.
-REVIEW_MAX_TOKENS = 700
+# Вывод — вердикт, разбор по каждому шагу и пояснение; запас с тем расчётом,
+# чтобы JSON не обрезался на плане из MAX_STEPS (20) шагов.
+REVIEW_MAX_TOKENS = 1400
 REVIEW_TIMEOUT = 90.0
-# Сколько символов результата уходит на проверку (последние реплики диалога).
+# Бюджет блока «Решение модели» (ответы по шагам) и одного ответа шага: проверка
+# должна видеть ВСЮ работу по плану, а не только хвост диалога.
+REVIEW_SOLUTION_CHARS = 24000
+REVIEW_ANSWER_CHARS = 3000
+# Запасной бюджет: хвост диалога, когда ответы по шагам распознать не удалось.
 REVIEW_RESULT_CHARS = 6000
 # Значения verdict, которые считаем «принято» / «на доработку».
 REVIEW_OK = ("ok", "ок", "accept", "accepted", "принято", "да")
 REVIEW_REDO = ("redo", "переделать", "revise", "нет", "no")
+# Служебная реплика «выполни текущий шаг» (см. app/routers/chat.py, continue_step):
+# по ней ответ модели привязывается к номеру шага плана.
+_STEP_PROMPT_RE = re.compile(r"^\s*Продолжай по плану:\s*шаг\s+(\d+)\s+из\s+\d+")
+# Сообщение с планом задачи (уходит в проверку отдельным блоком — в «решение»
+# его не включаем).
+_PLAN_MESSAGE_MARK = "📋 План задачи"
 
 
 # --- Стратегия branching ----------------------------------------------------
@@ -310,11 +336,14 @@ BRANCH_PROMPT_COMPACT = (
     '"chosen": "A"}'
 )
 
-# План ветвления — тяжёлый служебный вызов: ответ на ~2000 токенов занимает
-# около минуты, поэтому ему даётся больше времени, чем обычному ответу, и явный
-# лимит вывода (чтобы провайдер не обрезал JSON на своей стороне).
-PLAN_TIMEOUT = 150.0
+# Служебные вызовы плана: явный лимит вывода (чтобы провайдер не обрезал JSON)
+# и свой таймаут — он больше обычного ответа, т.к. ответ модели объёмный.
+# PLAN_* — план ЗАДАЧИ (этап planning), BRANCH_* — план ВЕТВЛЕНИЯ: раньше обе
+# пары назывались PLAN_*, второе объявление молча перекрывало первое.
 PLAN_MAX_TOKENS = 4000
+PLAN_TIMEOUT = 150.0
+BRANCH_MAX_TOKENS = 4000
+BRANCH_TIMEOUT = 150.0
 
 # Заголовок блока ветки: уходит сообщением system, когда пользователь ведёт
 # диалог внутри выбранной ветки (история ветки независима от других ветвей).
@@ -502,6 +531,9 @@ class Agent:
         # выставленный лимит и признак его превышения по входящим токенам.
         # Уезжает на фронт в событии "done" (панель «Токены диалога»).
         self.last_usage: Dict[str, Any] = self._new_usage()
+        # Последний обмен реплик, по которому обновлялся блок фактов: повторный
+        # вызов на том же обмене ничего не изменит, а токены потратит.
+        self._facts_seen = ""
 
     # ------------------------------------------------------------------
     # Конфигурация
@@ -915,6 +947,10 @@ class Agent:
         (см. merge_usage). Переходы автомата здесь НЕ выполняются — план строит
         агент, а состояние меняет веб-слой (app/routers/chat.py).
         """
+        # Замер обнуляем: метод вызывается и повторно (перепланирование), а
+        # веб-слой складывает замеры как ДЕЛЬТЫ — накопительный счётчик давал
+        # бы двойной счёт в панели токенов.
+        self.last_usage = self._new_usage()
         text = (user_message or "").strip()
         if history is not None:
             self.memory = self._normalize_history(history)
@@ -933,10 +969,7 @@ class Agent:
         # Пустой запрос планировать нечего — один шаг «уточнить запрос».
         if not text:
             return ["Уточнить у пользователя, что именно нужно сделать"]
-        rendered = "\n".join(
-            f"{'Пользователь' if msg['role'] == 'user' else 'Ассистент'}: {msg['content']}"
-            for msg in self.memory
-        ) or "(история чата пуста)"
+        rendered = self._service_history_text() or "(история чата пуста)"
         payload = f"История чата:\n{rendered}\n\nТекущий запрос пользователя:\n{text}"
         memory_text = self._memory_text()
         if memory_text:
@@ -957,7 +990,7 @@ class Agent:
             ],
             timeout=PLAN_TIMEOUT,
         )
-        self._track_usage(metrics, service=True)  # служебный вызов (панель токенов)
+        self._track_usage(metrics, self.SERVICE_PLAN)  # служебный вызов (панель токенов)
         steps = self._parse_plan(content) if content else []
         if steps:
             logger.info("Агент %s: план задачи из %d шагов (LLM)", self.name, len(steps))
@@ -990,16 +1023,16 @@ class Agent:
     # ------------------------------------------------------------------
     # Конечный автомат задачи: содержательная проверка результата
     # ------------------------------------------------------------------
-    def _tracked_call(self) -> Any:
-        """Обёртка вызова клиента: расход копится как СЛУЖЕБНЫЙ (service=True).
+    def _tracked_call(self, kind: str = "service") -> Any:
+        """Обёртка вызова клиента: расход копится как СЛУЖЕБНЫЙ, с видом kind.
 
         Нужна служебным проверкам инвариантов: разбор запроса, проверка вариантов
         и код-гейт плана делают НЕСКОЛЬКО вызовов, и каждый должен попасть в
-        панель токенов строкой «из них служебные вызовы».
+        панель токенов — в сумму «из них служебные вызовы» и в разбивку по видам.
         """
         async def tracked(*args: Any, **kwargs: Any) -> Any:
             content, metrics = await client.call_llm_async(*args, **kwargs)
-            self._track_usage(metrics, service=True)
+            self._track_usage(metrics, kind)
             return content, metrics
 
         return tracked
@@ -1022,10 +1055,13 @@ class Agent:
         подтверждены (см. `_plan_gate` в chat.py — план в этом случае не
         принимается). Пустой список шагов проверять нечего — [].
         """
+        # Замер обнуляем: гейт вызывается в цикле (перепланирование), а
+        # веб-слой складывает замеры как дельты.
+        self.last_usage = self._new_usage()
         if invariants is not None:
             self.invariants = invariants_store.normalize(invariants)
         return await invariants_store.check_steps(
-            steps, self.invariants, self._tracked_call())
+            steps, self.invariants, self._tracked_call(self.SERVICE_GATE))
 
     async def check_invariants(
         self,
@@ -1043,15 +1079,18 @@ class Agent:
 
         Вызовов может быть несколько (вердикт + проверка вариантов + повторный
         запрос вариантов), поэтому расход считает обёртка: КАЖДЫЙ вызов копится
-        в self.last_usage как служебный (service=True), а веб-слой складывает его
-        с расходом ответа и плана (см. merge_usage). Пустой разбор означает
-        «вердикта нет» — агент работает как раньше: нарушение не выдумываем,
-        но и не подтверждаем.
+        в self.last_usage как служебный, а веб-слой складывает его с расходом
+        ответа и плана (см. merge_usage). Пустой разбор означает «вердикта нет» —
+        агент работает как раньше: нарушение не выдумываем, но и не подтверждаем.
         """
+        # Замер обнуляем: разбор может вызываться повторно (после правки правил),
+        # а веб-слой складывает замеры как дельты одного обращения.
+        self.last_usage = self._new_usage()
         if invariants is not None:
             self.invariants = invariants_store.normalize(invariants)
         return await invariants_store.analyze(
-            user_message, self.invariants, self._tracked_call())
+            user_message, self.invariants,
+            self._tracked_call(self.SERVICE_INVARIANTS))
 
     async def review_result(
         self,
@@ -1076,6 +1115,9 @@ class Agent:
         «Токены диалога» показывает его в строке «из них служебные вызовы».
         Переходы автомата выполняет веб-слой (app/routers/chat.py).
         """
+        # Замер обнуляем: проверка вызывается и при ОТЛОЖЕННОЙ валидации, а
+        # веб-слой складывает замеры как дельты одного обращения.
+        self.last_usage = self._new_usage()
         if history is not None:
             self.memory = self._normalize_history(history)
         if working_memory is not None:
@@ -1094,21 +1136,30 @@ class Agent:
         steps = task_state.clean_steps(plan or [])
         plan_text = ("\n".join(f"{i}) {step}" for i, step in enumerate(steps, 1))
                      if steps else "(план пуст)")
-        # Результат — последние реплики диалога (в них и есть работа ассистента).
-        result_lines: List[str] = []
-        total = 0
-        for message in reversed(self.memory):
-            line = (f"{'Пользователь' if message['role'] == 'user' else 'Ассистент'}: "
-                    f"{message['content']}")
-            total += len(line)
-            result_lines.append(line)
-            if total >= REVIEW_RESULT_CHARS:
-                break
-        result_text = "\n\n".join(reversed(result_lines))[-REVIEW_RESULT_CHARS:]
+        # Решение — ответы модели по шагам плана. Хвоста диалога мало: на длинной
+        # задаче проверяющему не видно начало работы, а проверить нужно КАЖДЫЙ шаг.
+        solution_text = self._review_solution(user_request, steps)
+        if solution_text:
+            result_block = ("Решение модели (ответы по шагам, в порядке плана):\n"
+                            + solution_text)
+        else:
+            # Шаги не распознаны (нет пар «служебная реплика шага → ответ»):
+            # показываем последние реплики диалога, как раньше.
+            result_lines: List[str] = []
+            total = 0
+            for message in reversed(self.memory):
+                line = (f"{'Пользователь' if message['role'] == 'user' else 'Ассистент'}: "
+                        f"{message['content']}")
+                total += len(line)
+                result_lines.append(line)
+                if total >= REVIEW_RESULT_CHARS:
+                    break
+            result_text = "\n\n".join(reversed(result_lines))[-REVIEW_RESULT_CHARS:]
+            result_block = f"Результат (последние реплики диалога):\n{result_text}"
         payload = (
             f"Исходный запрос пользователя:\n{(user_request or '').strip() or '(не задан)'}\n\n"
             f"План работы (шаги):\n{plan_text}\n\n"
-            f"Результат (последние реплики диалога):\n{result_text}"
+            f"{result_block}"
         )
         memory_text = self._memory_text()
         if memory_text:
@@ -1125,7 +1176,7 @@ class Agent:
             ],
             timeout=REVIEW_TIMEOUT,
         )
-        self._track_usage(metrics, service=True)  # служебный вызов (панель токенов)
+        self._track_usage(metrics, self.SERVICE_REVIEW)  # служебный вызов
         review = self._parse_review_json(content) if content else None
         if review is None:
             logger.warning(
@@ -1136,31 +1187,176 @@ class Agent:
 
     @classmethod
     def _parse_review_json(cls, content: str) -> Optional[Dict[str, Any]]:
-        """Разбирает вердикт проверки: {"verdict", "step", "comment"}.
+        """Разбирает вердикт проверки: {"verdict", "steps", "step", "comment"}.
+
+        `steps` — разбор по каждому шагу плана ([{"n", "ok", "comment"}]); пустой
+        список — модель разбора по шагам не дала (старый формат ответа).
+
+        Разбор по шагам ГЛАВНЕЕ общего вердикта: задача проверяется в целом И
+        каждый шаг в частности, поэтому несоответствие отдельного шага делает
+        результат непринятым, даже если общий verdict — "ok".
 
         None — ответ не разобран или verdict неизвестен (тогда проверка просто
-        не учитывается). Неизвестный шаг приводится к 0 — «шаг не указан».
+        не учитывается).
         """
         payload = _load_json_object(content)
         if not isinstance(payload, dict):
-            return None
+            # Ответ обрезан лимитом токенов (разбор по 20 шагам в 700 токенов не
+            # влезал): целый JSON не собирается, но вердикт и часть записей шагов
+            # в тексте есть — терять из-за этого проверку нельзя.
+            payload = _salvage_review(content)
+            if not isinstance(payload, dict):
+                return None
         verdict = " ".join(str(payload.get("verdict") or payload.get("result") or "").split()).lower()
+        review_steps = cls._parse_review_steps(
+            payload.get("steps") or payload.get("шаги")
+            or payload.get("step_results") or payload.get("этапы"))
+        failed = [item for item in review_steps if item["ok"] is False]
         if verdict in REVIEW_OK:
             ok = True
         elif verdict in REVIEW_REDO:
             ok = False
+        elif failed:
+            # Общий вердикт не разобран, но непринятый шаг есть: несоответствие
+            # шага — это несоответствие результата (в пользу осторожности).
+            ok = False
         else:
             return None
+        if failed:
+            ok = False
         try:
             step = int(payload.get("step") or 0)
         except (TypeError, ValueError):
             step = 0
+        if step <= 0 and failed:
+            # Возврат — на ПЕРВЫЙ непринятый шаг плана.
+            step = failed[0]["n"]
         comment = " ".join(str(payload.get("comment") or payload.get("reason") or "").split())
+        if failed:
+            detail = "; ".join(
+                f"шаг {item['n']}: {item['comment']}" if item["comment"]
+                else f"шаг {item['n']}" for item in failed[:3])
+            comment = (f"{comment}; не приняты — {detail}" if comment
+                       else f"не приняты — {detail}")
         return {
             "ok": ok,
             "step": max(0, step),
             "comment": comment[:600] or ("принято" if ok else "не принято"),
+            "steps": review_steps,
         }
+
+    @classmethod
+    def _parse_review_steps(cls, raw: Any) -> List[Dict[str, Any]]:
+        """Разбор ответа проверки по шагам плана.
+
+        Принимает и список объектов ({"n", "ok", "comment"}), и список флагов.
+        Шаг с непонятным вердиктом пропускается: «не разобрали» ≠ «принят».
+        """
+        items: List[Dict[str, Any]] = []
+        for position, item in enumerate(raw if isinstance(raw, (list, tuple)) else [], 1):
+            if isinstance(item, dict):
+                try:
+                    number = int(item.get("n") or item.get("step")
+                                 or item.get("номер") or position)
+                except (TypeError, ValueError):
+                    number = position
+                flag = cls._step_verdict(
+                    item.get("ok", item.get("вердикт", item.get("status"))))
+                comment = " ".join(str(item.get("comment") or item.get("комментарий")
+                                        or item.get("reason") or "").split())
+            elif isinstance(item, bool):
+                number, flag, comment = position, item, ""
+            else:
+                continue
+            if flag is None:
+                continue
+            items.append({"n": max(0, number), "ok": flag, "comment": comment[:200]})
+        return items
+
+    @staticmethod
+    def _step_verdict(value: Any) -> Optional[bool]:
+        """Вердикт по одному шагу: True/False; None — значение непонятно."""
+        if isinstance(value, bool):
+            return value
+        text = " ".join(str(value if value is not None else "").split()).lower()
+        if text in REVIEW_OK:
+            return True
+        if text in REVIEW_REDO:
+            return False
+        return None
+
+    def _review_solution(self, user_request: str, steps: List[str]) -> str:
+        """«Решение модели» для проверки: ответы по шагам ТЕКУЩЕЙ задачи.
+
+        Память сессии может хранить обмены прежних задач, поэтому начало блока —
+        последняя реплика пользователя с исходным запросом. Ответ каждого шага
+        подписывается номером и текстом шага плана (номер берётся из служебной
+        реплики «Продолжай по плану: шаг N из M»), а окно сжимается так, чтобы в
+        него поместились ВСЕ шаги: проверять нужно каждый этап, а не только конец
+        работы (см. REVIEW_SOLUTION_CHARS).
+
+        Пустая строка — ответы по шагам не распознаны (тогда вызывающий берёт
+        хвост диалога, как раньше).
+        """
+        memory = list(self.memory or [])
+        request = " ".join(str(user_request or "").split())
+        start = 0
+        if request:
+            for index, message in enumerate(memory):
+                if str(message.get("role")) == "user" \
+                        and " ".join(str(message.get("content") or "").split()) == request:
+                    start = index
+        answers: List[Tuple[int, str]] = []
+        pending = 0        # шаг из служебной реплики «Продолжай по плану: шаг N из M»
+        unassigned = 1     # следующий шаг плана, которому ещё не приписан ответ
+        for message in memory[start:]:
+            content = str(message.get("content") or "").strip()
+            if not content:
+                continue
+            if str(message.get("role")) == "user":
+                match = _STEP_PROMPT_RE.match(content)
+                pending = int(match.group(1)) if match else 0
+                continue
+            if content.startswith(_PLAN_MESSAGE_MARK):
+                continue    # план уходит в проверку отдельным блоком
+            # Первый шаг выполняется ответом на подтверждение плана («ок»), а не
+            # служебной репликой: такой ответ приписываем ближайшему шагу без
+            # ответа — шаги идут по порядку плана.
+            answers.append((pending if pending > 0 else unassigned, content))
+            pending = 0
+            unassigned += 1
+        if not answers:
+            return ""
+        # Ответов на шаг может быть несколько (доработка после проверки): в
+        # проверку уходит ПОСЛЕДНИЙ — он и есть текущее состояние шага.
+        grouped: Dict[int, List[str]] = {}
+        order: List[int] = []
+        other: List[str] = []
+        for number, answer in answers:
+            if not steps or not 1 <= number <= len(steps):
+                other.append(answer)
+                continue
+            grouped.setdefault(number, []).append(answer)
+            if number not in order:
+                order.append(number)
+        order.sort()
+        sections: List[Tuple[str, str]] = []
+        for number in order:
+            step_answers = grouped[number]
+            attempts = (f" (ответов: {len(step_answers)}, показан последний)"
+                        if len(step_answers) > 1 else "")
+            sections.append((f"Шаг {number} ({steps[number - 1]}){attempts}",
+                             step_answers[-1]))
+        if other:
+            sections.append(("Прочие ответы модели (вне шагов плана)",
+                             "\n\n".join(other)))
+        limit = REVIEW_ANSWER_CHARS
+        while True:
+            text = "\n\n".join(f"{title}:\n{_cut(answer, limit)}"
+                               for title, answer in sections)
+            if len(text) <= REVIEW_SOLUTION_CHARS or limit <= 400:
+                return text
+            limit //= 2
 
     # ------------------------------------------------------------------
     # Вспомогательные шаги
@@ -1274,16 +1470,36 @@ class Agent:
         if self.task_state is not None:
             blocks.append({"role": "system", "content": task_state.state_block(self.task_state)})
         if self.long_term_memory:
-            body = "\n".join(f"{i}) {item}" for i, item in enumerate(self.long_term_memory, 1))
+            body = _cap_lines(self.long_term_memory, MEMORY_LAYER_CHARS)
             blocks.append({"role": "system", "content": LONG_TERM_MEMORY_HEADER + "\n" + body})
         if self.working_memory:
-            body = "\n".join(f"{i}) {item}" for i, item in enumerate(self.working_memory, 1))
+            body = _cap_lines(self.working_memory, MEMORY_LAYER_CHARS)
             blocks.append({"role": "system", "content": WORKING_MEMORY_HEADER + "\n" + body})
         return blocks
 
     def _memory_text(self) -> str:
         """Тот же текст слоёв памяти, но одной строкой (для промптов-текстовиков)."""
-        return "\n\n".join(block["content"] for block in self._memory_blocks())
+        return _cap_tail("\n\n".join(block["content"] for block in self._memory_blocks()),
+                         MEMORY_TEXT_LIMIT)
+
+    def _service_history_text(self, limit: int = SERVICE_HISTORY_CHARS) -> str:
+        """История диалога для СЛУЖЕБНОГО вызова (план задачи, план ветвления).
+
+        Раньше служебные промпты рендерили ВСЮ память диалога: при длинной
+        переписке один вызов плана раздувался до десятков тысяч символов, а при
+        перепланировании повторялся. Берём хвост истории — он и решает задачу,
+        а старые реплики уже свёрнуты стратегией контекста (окно/резюме/факты).
+        """
+        lines: List[str] = []
+        total = 0
+        for msg in reversed(self.memory):
+            line = (f"{'Пользователь' if msg['role'] == 'user' else 'Ассистент'}: "
+                    f"{msg['content']}")
+            if lines and total + len(line) > limit:
+                break
+            lines.append(line)
+            total += len(line)
+        return "\n".join(reversed(lines))
 
     def _build_context(self, text: str) -> List[Dict[str, str]]:
         """Собирает список сообщений для LLM по текущей стратегии.
@@ -1374,9 +1590,14 @@ class Agent:
         return clean
 
     def _facts_block(self) -> str:
-        """Текст блока фактов для контекста (сообщение system)."""
+        """Текст блока фактов для контекста (сообщение system).
+
+        Блок уходит в модель в КАЖДОМ запросе (и в обновление фактов), поэтому
+        ограничен по объёму: при переполнении остаются САМЫЕ НОВЫЕ факты —
+        старые записи вытесняются, как и в окне истории.
+        """
         lines = "\n".join(f"- {key}: {value}" for key, value in self.facts.items())
-        return f"{FACTS_HEADER}\n{lines}"
+        return _cap_tail(f"{FACTS_HEADER}\n{lines}", FACTS_BLOCK_LIMIT)
 
     async def _update_facts(self, emit: EmitFn) -> None:
         """Обновляет блок фактов по свежему обмену репликами (sticky facts).
@@ -1392,19 +1613,24 @@ class Agent:
             f"{'Пользователь' if msg['role'] == 'user' else 'Ассистент'}: {msg['content']}"
             for msg in self.memory[-2:]
         )
+        # Тот же самый обмен уже обрабатывали (например, повторный вызов после
+        # доработки шага): платить за вызов второй раз нечего.
+        if exchange == self._facts_seen:
+            return
         current = self._facts_block() if self.facts else "Фактов пока нет."
         payload = f"{current}\n\nПоследний обмен репликами:\n{exchange}"
         content, metrics = await client.call_llm_async(
             user_text=payload,
             model=self.config.model or config.LLM_MODEL,
             disable_thinking=True,  # служебный вызов — reasoning не нужен
+            max_tokens=FACTS_MAX_TOKENS,  # JSON фактов не должен обрезаться
             messages=[
                 {"role": "system", "content": FACTS_PROMPT},
                 {"role": "user", "content": payload},
             ],
-            omit_default_max_tokens=True,  # лимит приложения сюда не подставляем
         )
-        self._track_usage(metrics, service=True)
+        self._facts_seen = exchange
+        self._track_usage(metrics, self.SERVICE_FACTS)
         fresh = self._parse_facts_json(content)
         if not fresh:
             await emit(self._step(
@@ -1480,7 +1706,7 @@ class Agent:
         план уезжает в интерфейс событием "branches".
 
         Вызов тяжёлый (ответ ~2000 токенов ≈ минута), поэтому у него отдельный
-        таймаут PLAN_TIMEOUT и явный лимит вывода PLAN_MAX_TOKENS. Если модель
+        таймаут BRANCH_TIMEOUT и явный лимит вывода BRANCH_MAX_TOKENS. Если модель
         не ответила (таймаут/ошибка провайдера — причина пишется в лог),
         делается ОДНА повторная попытка с более компактным промптом
         (BRANCH_PROMPT_COMPACT). Если и она пуста — агент не оставляет
@@ -1493,10 +1719,7 @@ class Agent:
             f"{self.name}: стратегия «branching» — 1. фиксирую контекст "
             "(цель, известные факты, ограничения, открытые вопросы).",
         ))
-        rendered = "\n".join(
-            f"{'Пользователь' if msg['role'] == 'user' else 'Ассистент'}: {msg['content']}"
-            for msg in self.memory
-        ) or "(история чата пуста)"
+        rendered = self._service_history_text() or "(история чата пуста)"
         payload = f"История чата:\n{rendered}\n\nТекущий запрос пользователя:\n{text}"
         # Слои памяти пользователя (рабочая и долговременная) — тоже часть
         # контекста планирования: план должен учитывать данные задачи и
@@ -1511,20 +1734,20 @@ class Agent:
                 await emit(self._step(
                     "debug",
                     f"{self.name}: план не получен — повторяю запрос в более компактном виде "
-                    f"(таймаут {PLAN_TIMEOUT:.0f} с на попытку).",
+                    f"(таймаут {BRANCH_TIMEOUT:.0f} с на попытку).",
                 ))
             content, metrics = await client.call_llm_async(
                 user_text=payload,
                 model=self.config.model or config.LLM_MODEL,
                 disable_thinking=True,  # планирование — служебный вызов, без reasoning
-                max_tokens=PLAN_MAX_TOKENS,  # JSON не должен обрезаться провайдером
+                max_tokens=BRANCH_MAX_TOKENS,  # JSON не должен обрезаться
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": payload},
                 ],
-                timeout=PLAN_TIMEOUT,
+                timeout=BRANCH_TIMEOUT,
             )
-            self._track_usage(metrics, service=True)  # служебный вызов (панель токенов)
+            self._track_usage(metrics, self.SERVICE_BRANCHING)  # служебный вызов
             if content:
                 break
 
@@ -1546,7 +1769,7 @@ class Agent:
             # отвечаем как обычно (одним вызовом) и объясняем, что случилось.
             await emit(self._step(
                 "error",
-                f"Не удалось построить план ветвления: модель не ответила за {PLAN_TIMEOUT:.0f} с "
+                f"Не удалось построить план ветвления: модель не ответила за {BRANCH_TIMEOUT:.0f} с "
                 "(две попытки). Отвечаю обычным способом, без ветвей — попробуйте повторить запрос позже.",
             ))
             await emit(self._step(
@@ -1863,16 +2086,31 @@ class Agent:
     # ------------------------------------------------------------------
     # Учёт токенов (панель «Токены диалога» на фронте)
     # ------------------------------------------------------------------
+    # Виды СЛУЖЕБНЫХ вызовов: их результат не является ответом пользователю.
+    # По видам ведётся отдельная разбивка — панель показывает вклад каждого.
+    SERVICE_PLAN = "plan"            # план задачи (этап planning)
+    SERVICE_GATE = "gate"            # проверка шагов плана по правилам проекта
+    SERVICE_INVARIANTS = "invariants"  # разбор запроса (инварианты)
+    SERVICE_REVIEW = "review"        # содержательная проверка результата
+    SERVICE_SUMMARY = "summary"      # сжатие памяти (стратегия «summary»)
+    SERVICE_FACTS = "facts"          # обновление блока фактов (sticky facts)
+    SERVICE_BRANCHING = "branching"  # план ветвления (стратегия «branching»)
+
     @staticmethod
     def _new_usage() -> Dict[str, Any]:
         """Пустой замер расхода токенов одного запроса пользователя.
 
-        requests/input/output — ВСЕ вызовы LLM по этому запросу (1 — обычный
-        режим, 2 и больше — когда включена суммаризация: служебное сжатие
-        памяти + сам ответ), их суммарные токены (промпт и ответ);
+        requests/input/output — ВСЕ удачные вызовы LLM по этому запросу (1 —
+        обычный режим, 2 и больше — когда включена суммаризация: служебное
+        сжатие памяти + сам ответ), их суммарные токены (промпт и ответ);
         summary_requests/summary_input/summary_output — вклад только служебных
-        вызовов сжатия: он входит в общие числа и дополнительно считается
-        отдельно (строка «из них суммаризация» в панели);
+        вызовов: он входит в общие числа и дополнительно считается отдельно
+        (строка «из них служебные вызовы» в панели);
+        failed_requests — обращения к модели, которые НЕ удались (провайдер
+        ответил ошибкой, сеть оборвалась): расхода по ним нет, но вызов был;
+        service — разбивка служебных вызовов по видам (план, гейт, разбор
+        запроса, проверка результата, сжатие, факты, ветвление): панель
+        показывает вклад каждого вида отдельной строкой;
         limit — выставленный пользователем лимит токенов («Длина»); overflow —
         входящие токены запроса превысили этот лимит.
         """
@@ -1885,31 +2123,62 @@ class Agent:
             "summary_requests": 0,
             "summary_input": 0,
             "summary_output": 0,
+            "failed_requests": 0,
+            # Стоимость запроса в рублях — ОЦЕНКА по тарифам провайдера
+            # (config.MODEL_PRICING): панель показывает её рядом с токенами.
+            "cost_rub": 0.0,
+            "service": {},
         }
 
     def _track_usage(
         self,
         metrics: Optional[Dict[str, Any]],
-        service: bool = False,
+        service: Any = None,
     ) -> None:
         """Добавляет метрики вызова LLM в расход текущего запроса.
 
-        service=True — вызов служебный (сжатие памяти, блок фактов, план
-        ветвления): его токены входят в общий расход запроса, но дополнительно
-        копятся в отдельных полях, чтобы панель могла показать вклад служебных
-        вызовов отдельной строкой и исключить его из строки «Текущий запрос».
+        service — ВИД служебного вызова (Agent.SERVICE_*): его токены входят в
+        общий расход запроса, но дополнительно копятся в отдельных полях
+        (summary_*) и в разбивке по видам (service.<вид>), чтобы панель могла
+        показать вклад служебных вызовов отдельной строкой и исключить его из
+        строки «Ответ шага». service=True (старый вызов) считается видом
+        "service".
+
+        Метрики с пометкой "failed" означают, что обращение к модели было, но
+        не удалось: расход неизвестен, поэтому к суммам токенов оно не
+        добавляется — только к счётчику failed_requests.
         """
         if not metrics:
+            return
+        kind = service if isinstance(service, str) and service else (
+            "service" if service else None)
+        if metrics.get("failed"):
+            self.last_usage["failed_requests"] += 1
+            if kind:
+                self._service_bucket(kind)["failed"] += 1
             return
         prompt = int(metrics.get("prompt_tokens") or 0)
         completion = int(metrics.get("completion_tokens") or 0)
         self.last_usage["requests"] += 1
         self.last_usage["input"] += prompt
         self.last_usage["output"] += completion
-        if service:
+        self.last_usage["cost_rub"] = round(
+            float(self.last_usage.get("cost_rub") or 0.0)
+            + float(metrics.get("cost_rub") or 0.0), 5)
+        if kind:
             self.last_usage["summary_requests"] += 1
             self.last_usage["summary_input"] += prompt
             self.last_usage["summary_output"] += completion
+            bucket = self._service_bucket(kind)
+            bucket["requests"] += 1
+            bucket["input"] += prompt
+            bucket["output"] += completion
+
+    def _service_bucket(self, kind: str) -> Dict[str, int]:
+        """Счётчик одного вида служебных вызовов внутри текущего замера."""
+        service = self.last_usage.setdefault("service", {})
+        return service.setdefault(
+            str(kind)[:20], {"requests": 0, "input": 0, "output": 0, "failed": 0})
 
     @staticmethod
     def _is_limit_exceeded(
@@ -2080,7 +2349,7 @@ class Agent:
         )
         # Токены служебного вызова: входят в общий расход запроса и отдельно —
         # в поля summary_* (панель показывает вклад служебных вызовов строкой).
-        self._track_usage(metrics, service=True)
+        self._track_usage(metrics, self.SERVICE_SUMMARY)
         return (content or "").strip()
 
     def _summary_block(self) -> str:
@@ -2092,7 +2361,9 @@ class Agent:
         parts = "\n".join(
             f"{i}) {text}" for i, text in enumerate(self.summary, 1)
         )
-        return f"{SUMMARY_HEADER}\n{parts}"
+        # Резюме копятся по частям и уходят в модель целиком: при переполнении
+        # оставляем последние части (свежая переписка важнее старой).
+        return _cap_tail(f"{SUMMARY_HEADER}\n{parts}", SUMMARY_BLOCK_LIMIT)
 
     @staticmethod
     def _shorten(text: str, limit: int = 200) -> str:
@@ -2176,15 +2447,20 @@ class Agent:
         параметров — только те, что задал пользователь (см. _merge_params).
         """
         started = time.perf_counter()
+        # Бюджет ответа шага: пользовательский лимит («Длина»), иначе — общий
+        # предел приложения LLM_AGENT_MAX_TOKENS, если он задан (0 — не задан).
+        # Без предела длинный ответ шага оплачивается ещё раз в контексте
+        # следующих шагов.
+        limit = params.get("max_tokens") or (config.LLM_AGENT_MAX_TOKENS or None)
         content, metrics = await client.call_llm_async(
             user_text=text,
-            max_tokens=params.get("max_tokens"),
+            max_tokens=limit,
             stop=params.get("stop"),
             temperature=params.get("temperature"),
             model=params.get("model"),
             disable_thinking=True,  # reasoning-модель отвечает в разы быстрее
             messages=messages,      # история диалога + текущий запрос
-            omit_default_max_tokens=True,  # лимита нет — API его не получает
+            omit_default_max_tokens=True,  # лимит приложения не подставляем
         )
         elapsed = time.perf_counter() - started
         return content, metrics, elapsed
@@ -2199,21 +2475,114 @@ class Agent:
 # ---------------------------------------------------------------------------
 # Разбор JSON-ответов модели (служебные вызовы: факты, план ветвления)
 # ---------------------------------------------------------------------------
+def _cap_tail(text: str, limit: int) -> str:
+    """Оставляет ХВОСТ текста в пределах limit символов (свежее важнее старого).
+
+    Так ограничиваются блоки, которые уходят в модель в каждом запросе (слои
+    памяти, резюме, факты): без предела один блок мог занять сотни тысяч
+    символов, и провайдер отклонил бы запрос целиком.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return "…(начало блока сокращено)\n" + text[-limit:]
+
+
+def _cut(text: Any, limit: int) -> str:
+    """Обрезает текст до лимита, помечая обрыв.
+
+    Начало важнее хвоста: ответ по шагу начинается с сути работы (то же
+    соглашение, что и у блоков памяти, но там важнее свежее).
+    """
+    value = str(text if text is not None else "")
+    if limit <= 0 or len(value) <= limit:
+        return value
+    return value[:max(1, limit - 1)].rstrip() + "…"
+
+
+# Вытаскивание вердикта и записей шагов из ОБРЕЗАННОГО ответа проверки
+# (см. _salvage_review).
+_REVIEW_VERDICT_RE = re.compile(r'"verdict"\s*:\s*"([^"]*)"', re.IGNORECASE)
+_REVIEW_STEP_RE = re.compile(
+    r'"n"\s*:\s*(\d+)[^{}]*?"ok"\s*:\s*(true|false|"[^"]*")',
+    re.IGNORECASE | re.DOTALL)
+
+
+def _salvage_review(text: str) -> Optional[Dict[str, Any]]:
+    """Достаёт вердикт и разбор по шагам из обрезанного ответа проверки.
+
+    Разбор по всем шагам плана (до MAX_STEPS) упирается в лимит токенов, и тогда
+    JSON не закрыт: обычный разбор (и «починка») возвращают None. Превращать это
+    в «проверку выполнить не удалось» нельзя — вытаскиваем то, что успело прийти.
+    """
+    raw = _strip_code_fences(str(text or ""))
+    if not raw:
+        return None
+    payload: Dict[str, Any] = {}
+    verdict = _REVIEW_VERDICT_RE.search(raw)
+    if verdict:
+        payload["verdict"] = verdict.group(1)
+    steps: List[Dict[str, Any]] = []
+    for number, flag in _REVIEW_STEP_RE.findall(raw):
+        if flag in ("true", "false"):
+            steps.append({"n": int(number), "ok": flag == "true", "comment": ""})
+        else:
+            steps.append({"n": int(number), "ok": flag.strip('"'), "comment": ""})
+    if steps:
+        payload["steps"] = steps
+    return payload or None
+
+
+def _cap_lines(lines: List[str], limit: int) -> str:
+    """Нумерует строки записи слоя памяти, укладываясь в бюджет символов.
+
+    Нумерация сохраняется (по ней пользователь сверяет записи в панели памяти),
+    а вытесняются САМЫЕ СТАРЫЕ записи: они же первыми уходят из окна истории.
+    """
+    numbered: List[str] = []
+    total = 0
+    for item in reversed(list(lines)):
+        line = str(item)
+        if numbered and total + len(line) > limit:
+            break
+        numbered.append(line)
+        total += len(line)
+    selected = list(reversed(numbered))
+    offset = len(list(lines)) - len(selected)
+    return "\n".join(f"{offset + i}) {item}" for i, item in enumerate(selected, 1))
+
+
 def merge_usage(base: Optional[Dict[str, Any]],
                 extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Складывает два замера расхода токенов (служебный вызов + ответ).
 
-    Нужен конечному автомату задачи: план на этапе planning строит отдельный
-    агент (Agent.build_plan переиспользует один и тот же Agent, см.
-    app/routers/chat.py), и его токены должны попасть в общий замер запроса —
-    в том числе в отдельные поля служебных вызовов (summary_requests/…), чтобы
-    строка «Текущий запрос» в панели токенов осталась про сам ответ.
+    Нужен конечному автомату задачи: план строит отдельный агент, и его токены
+    должны попасть в общий замер запроса — в том числе в отдельные поля
+    служебных вызовов (summary_requests/…) и в разбивку по видам (service),
+    чтобы строка «Ответ шага» в панели осталась про сам ответ.
+
+    Складывать можно только ДЕЛЬТЫ (расход одного вызова): сами агенты
+    служебных вызовов обнуляют last_usage в начале каждого вызова, иначе
+    повторный merge прибавлял бы уже учтённое (панель завышала расход вдвое).
+    Вложенная разбивка копируется в новый словарь: замеры вызывающего кода не
+    должны меняться «на месте».
     """
     result = dict(base or {})
     other = dict(extra or {})
     for key in ("requests", "input", "output", "summary_requests",
-                "summary_input", "summary_output"):
+                "summary_input", "summary_output", "failed_requests"):
         result[key] = int(result.get(key) or 0) + int(other.get(key) or 0)
+    result["cost_rub"] = round(float(result.get("cost_rub") or 0.0)
+                               + float(other.get("cost_rub") or 0.0), 5)
+    service: Dict[str, Dict[str, int]] = {}
+    for source in (result.get("service"), other.get("service")):
+        for kind, bucket in (source or {}).items():
+            if not isinstance(bucket, dict):
+                continue
+            target = service.setdefault(
+                str(kind)[:20], {"requests": 0, "input": 0, "output": 0, "failed": 0})
+            for field in ("requests", "input", "output", "failed"):
+                target[field] += int(bucket.get(field) or 0)
+    result["service"] = service
     # Лимит и признак переполнения — от самого ответа (у плана лимит не тот).
     if "limit" in other and other.get("limit") is not None:
         result["limit"] = other["limit"]

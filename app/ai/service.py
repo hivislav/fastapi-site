@@ -31,12 +31,9 @@ MODEL_NAMES = {
     "alice-flash": "Alice AI LLM Flash",
 }
 # Цена за 1000 токенов (вход/выход), руб., по тарифам Yandex AI Studio.
-# Используется для расчёта стоимости в аналитике судьи.
-MODEL_PRICING = {
-    "deepseek": {"input": 0.3, "output": 0.5},
-    "alice": {"input": 0.5, "output": 1.2},
-    "alice-flash": {"input": 0.1, "output": 0.2},
-}
+# Тарифы живут в config: их использует и клиент LLM (стоимость запроса в панели
+# токенов агента), и аналитика этой страницы.
+MODEL_PRICING = config.MODEL_PRICING
 # Какие модели поддерживают поле thinking (отключение reasoning).
 # DeepSeek — reasoning-модель, поддерживает "thinking": {"type": "disabled"}.
 # Alice-модели это поле НЕ принимают (HTTP 400), потому им его не отправляем.
@@ -58,12 +55,16 @@ def generate_response(
     temperatures: Optional[list] = None,
     models: Optional[list] = None,
 ) -> tuple:
-    """Возвращает кортеж (ответ, вердикт).
+    """Возвращает кортеж (ответ, вердикт, аналитика).
 
     Вердикт (correct) — True/False, если модель сама оценила свой ответ в
     экспертном режиме; None — вердикт не определялся (обычный режим) или
-    не удалось его получить. В обычном режиме используется только первый
-    элемент кортежа.
+    не удалось его получить.
+
+    Аналитика — список строк таблицы метрик по КАЖДОМУ обращению к модели в
+    этом запросе: время, токены, стоимость (включая служебный вызов судьи,
+    который оценивает верность ответа). Раньше метрики выбрасывались, и на
+    странице статистики не было видно ни расхода, ни цены запроса.
 
     Сначала пытается получить ответ от реальной LLM. Если API-ключ не задан —
     отвечает через демо-правила.
@@ -94,25 +95,30 @@ def generate_response(
         # Фраза «верный ответ: …» вырезается из текста для обычных запросов,
         # но передаётся судье для оценки точности.
         prompt_text, correct_answer = _extract_correct_answer(user_text)
-        responses = _temperature_responses(
+        responses, analytics = _temperature_responses(
             prompt_text, temperatures, response_format, max_tokens, stop
         )
-        judge = _judge_analyst(user_text, correct_answer, responses) if responses else None
-        return {"responses": responses, "judge": judge}, None
+        judge, judge_row = (None, None)
+        if responses:
+            judge, judge_row = _judge_analyst(user_text, correct_answer, responses)
+        if judge_row:
+            analytics.append(judge_row)
+        return {"responses": responses, "analytics": analytics,
+                "judge": judge}, None, analytics
 
     # Настройка «Тест моделей»: запрос отправляется в каждую выбранную модель.
     # Возвращается словарь {"model_responses": [...]} как первый элемент кортежа.
     if models:
-        return _model_responses(
-            user_text, models, response_format, max_tokens, stop
-        ), None
+        payload = _model_responses(user_text, models, response_format, max_tokens, stop)
+        return payload, None, payload.get("analytics") or []
 
-    answer = client.call_llm(
+    answer, metrics = client.call_llm_with_metrics(
         user_text,
         response_format=response_format,
         max_tokens=max_tokens,
         stop=stop,
     )
+    analytics = [_analytics_row("ответ", config.LLM_MODEL, metrics)]
 
     # JSON-режим: никогда не показываем «ошибку» вместо ответа. Если ответ не
     # парсится (обрезан лимитом), дочиняем или оборачиваем в валидный JSON.
@@ -121,23 +127,23 @@ def generate_response(
             if not is_valid_json(answer):
                 repaired = repair_json(answer)
                 answer = repaired if repaired is not None else wrap_as_json(answer)
-            return answer, None
+            return answer, None, analytics
 
         # Ответ пуст — различаем офлайн-режим и реальный сбой.
         if not config.LLM_API_KEY:
             return json.dumps(
                 {"reply": demo.demo_ai(user_text)}, ensure_ascii=False
-            ), None
+            ), None, analytics
         return wrap_as_json(
             "Ответ не влез в заданный лимит токенов — попробуйте увеличить «Длину»."
-        ), None
+        ), None, analytics
 
     # Свободный режим.
     if answer:
-        return answer, None
+        return answer, None, analytics
     if not config.LLM_API_KEY:
-        return demo.demo_ai(user_text), None
-    return "Извините, не удалось получить ответ от модели. Попробуйте ещё раз.", None
+        return demo.demo_ai(user_text), None, analytics
+    return "Извините, не удалось получить ответ от модели. Попробуйте ещё раз.", None, analytics
 
 
 def _extract_correct_answer(user_text: str) -> tuple:
@@ -158,6 +164,29 @@ def _extract_correct_answer(user_text: str) -> tuple:
     return cleaned, answer or None
 
 
+def _analytics_row(label: str, model: str, metrics: Optional[dict]) -> dict:
+    """Строка таблицы метрик: время, токены и стоимость одного вызова LLM.
+
+    Аналитика собирается для КАЖДОГО обращения к модели (включая служебные —
+    судью), поэтому в таблице видно не только ответы, но и цену их оценки.
+    """
+    if not metrics or metrics.get("failed"):
+        return {"label": label, "seconds": 0, "input_tokens": 0,
+                "output_tokens": 0, "cost_rub": 0, "summary": ""}
+    price = config.model_price(model)
+    in_tokens = int(metrics.get("prompt_tokens") or 0)
+    out_tokens = int(metrics.get("completion_tokens") or 0)
+    cost = (in_tokens / 1000) * price["input"] + (out_tokens / 1000) * price["output"]
+    return {
+        "label": label,
+        "seconds": float(metrics.get("elapsed_seconds") or 0),
+        "input_tokens": in_tokens,
+        "output_tokens": out_tokens,
+        "cost_rub": round(cost, 2),
+        "summary": "",
+    }
+
+
 def _judge_analyst(
     user_text: str, correct_answer: Optional[str], responses: list
 ):
@@ -168,11 +197,12 @@ def _judge_analyst(
     оптимальность затраченных токенов. Параметр «точность» оценивается против
     известного верного ответа (если он был в запросе юзера).
 
-    Возвращает список строк таблицы
+    Возвращает ПАРУ (резюме, метрики): резюме — список строк таблицы
     [{"temperature", "accuracy", "creativity", "vocabulary", "conciseness",
-      "tokens", "summary"}, …] — по одному на каждую температуру. Если ответ
-    модели не распарсился как JSON — возвращает сырой текст; если ответ пуст —
-    None.
+      "tokens", "summary"}, …] (по одному на каждую температуру) либо сырой текст,
+    если ответ модели не разобрался как JSON, либо None, если ответа нет;
+    метрики — строка таблицы аналитики по САМОМУ вызову судьи (время, токены,
+    стоимость): без неё расход на оценку ответов оставался невидимым.
     """
     system = (
         "Ты — строгий судья-аналитик. Перед тобой вопрос пользователя и ответы "
@@ -201,11 +231,13 @@ def _judge_analyst(
             for i, r in enumerate(responses)
         )
     )
-    verdict = client.call_llm("\n\n".join(parts), system_prompt=system)
+    verdict, metrics = client.call_llm_with_metrics(
+        "\n\n".join(parts), system_prompt=system)
+    row = _analytics_row("судья-аналитик", config.LLM_MODEL, metrics)
     if not verdict:
-        return None
+        return None, row
     parsed = _parse_judge_json(verdict)
-    return parsed if parsed is not None else verdict.strip()
+    return (parsed if parsed is not None else verdict.strip()), row
 
 
 def _parse_judge_json(text: str):
@@ -260,8 +292,9 @@ def _judge_model_test(answers: list, analytics: list) -> list:
 
     По ответу и метрикам каждой модели (время, вход/выход токены, стоимость)
     модель формирует резюме: скорость, стоимость/ресурсоёмкость и качество
-    ответа. Возвращает список [{"model", "summary"}, …]; пустой список, если
-    резюме получить не удалось.
+    ответа. Возвращает пару (резюме, метрики): резюме — список
+    [{"model", "summary"}, …] (пустой, если получить не удалось), метрики —
+    строка таблицы аналитики по САМОМУ вызову судьи.
     """
     system = (
         "Ты — строгий судья-аналитик. Перед тобой ответы нескольких моделей на "
@@ -279,12 +312,13 @@ def _judge_model_test(answers: list, analytics: list) -> list:
             f"выход {row['output_tokens']} токенов, стоимость {row['cost_rub']:.2f} руб.):\n"
             f"{answer['text']}"
         )
-    verdict = client.call_llm(
+    verdict, metrics = client.call_llm_with_metrics(
         "Ответы и метрики моделей:\n\n" + "\n\n".join(blocks), system_prompt=system
     )
+    row = _analytics_row("судья-аналитик", config.LLM_MODEL, metrics)
     if not verdict:
-        return []
-    return _parse_model_summaries(verdict)
+        return [], row
+    return _parse_model_summaries(verdict), row
 
 
 def _parse_model_summaries(text: str) -> list:
@@ -355,6 +389,7 @@ def _model_responses(
             cost = (in_tokens / 1000) * price["input"] + (out_tokens / 1000) * price["output"]
             analytics.append(
                 {
+                    "label": name,
                     "model": name,
                     "seconds": metrics["elapsed_seconds"],
                     "input_tokens": in_tokens,
@@ -365,6 +400,7 @@ def _model_responses(
         else:
             analytics.append(
                 {
+                    "label": name,
                     "model": name,
                     "seconds": 0,
                     "input_tokens": 0,
@@ -375,10 +411,15 @@ def _model_responses(
     # Резюме судьи-аналитика: краткий разбор каждой модели (скорость, стоимость,
     # ресурсоёмкость, качество). Прикрепляем summary к строкам таблицы.
     if answers:
-        summaries = _judge_model_test(answers, analytics)
+        summaries, judge_row = _judge_model_test(answers, analytics)
         by_model = {s["model"]: s["summary"] for s in summaries}
         for row in analytics:
             row["summary"] = by_model.get(row["model"], "")
+        # Вызов судьи — тоже обращение к модели: показываем его цену отдельной
+        # строкой, иначе расход на оценку в таблице не виден.
+        if judge_row:
+            judge_row["summary"] = ""
+            analytics.append(judge_row)
     return {"model_responses": answers, "analytics": analytics}
 
 
@@ -417,20 +458,24 @@ def _temperature_responses(
     response_format: str,
     max_tokens: Optional[int],
     stop: Optional[str],
-) -> list:
+) -> tuple:
     """Выполняет отдельный запрос к LLM для каждого значения «Температуры».
 
     Каждое заполненное поле = отдельный запрос с temperature=<значение>.
-    Возвращает список словарей {"temperature": t, "text": ответ} — ровно
-    столько ответов, сколько заполненных полей (минимум один).
+    Возвращает пару (ответы, аналитика): ответы — список словарей
+    {"temperature": t, "text": ответ} (ровно столько, сколько заполненных полей,
+    минимум один), аналитика — строки таблицы метрик (время, токены, стоимость)
+    по каждому вызову. Раньше метрики выбрасывались, и на странице статистики
+    вместо реальных чисел стояли только субъективные оценки судьи 1–10.
     """
     results = []
+    analytics = []
     for raw in temperatures:
         try:
             t = float(raw)
         except (TypeError, ValueError):
             continue
-        answer = client.call_llm(
+        answer, metrics = client.call_llm_with_metrics(
             user_text,
             response_format=response_format,
             max_tokens=max_tokens,
@@ -440,21 +485,23 @@ def _temperature_responses(
         results.append(
             {"temperature": t, "text": _normalize_answer(user_text, answer, response_format)}
         )
+        analytics.append(_analytics_row(f"temperature {t}", config.LLM_MODEL, metrics))
     # Если после фильтра значений не осталось — ведём себя как обычный режим.
     if not results:
-        answer = client.call_llm(
+        answer, metrics = client.call_llm_with_metrics(
             user_text,
             response_format=response_format,
             max_tokens=max_tokens,
             stop=stop,
         )
-        return [
+        results = [
             {
                 "temperature": None,
                 "text": _normalize_answer(user_text, answer, response_format),
             }
         ]
-    return results
+        analytics = [_analytics_row("обычный ответ", config.LLM_MODEL, metrics)]
+    return results, analytics
 
 
 def _build_expert_system_prompt(mode: str, roles: list) -> str:
@@ -523,7 +570,40 @@ def _judge_correctness(user_text: str, answer: str, mode: str) -> Optional[bool]
         f"Ответ ИИ:\n{answer}\n\n"
         "Верно или неверно решена задача? Ответь одним словом: ВЕРНО или НЕВЕРНО."
     )
-    verdict = client.call_llm(user, system_prompt=system)
+    return _verdict_of(*client.call_llm_with_metrics(user, system_prompt=system))
+
+
+def _judge_correctness_metrics(user_text: str, answer: str,
+                               mode: str) -> tuple:
+    """Как _judge_correctness, но вместе с метриками своего вызова.
+
+    Возвращает (вердикт|None, метрики|None): страница статистики показывает
+    расход и на сам вердикт — это служебный вызов, о котором иначе не видно.
+    """
+    if mode == "group":
+        system = (
+            "Ты — объективный судья. Оцени результат работы экспертной группы. "
+            "Результат верен ТОЛЬКО если все эксперты пришли к одному и тому же "
+            "правильному ответу. Если ответы экспертов расходятся или допущена "
+            "ошибка — результат неверен. Ответь строго одним словом: ВЕРНО или НЕВЕРНО."
+        )
+    else:
+        system = (
+            "Ты — объективный судья, отвечай как если бы сам решал эту задачу в "
+            "свободном режиме. Определи, верно ли задача решена в предложенном "
+            "ответе ИИ. Ответь строго одним словом: ВЕРНО или НЕВЕРНО."
+        )
+    user = (
+        f"Вопрос/задача: {user_text}\n\n"
+        f"Ответ ИИ:\n{answer}\n\n"
+        "Верно или неверно решена задача? Ответь одним словом: ВЕРНО или НЕВЕРНО."
+    )
+    verdict, metrics = client.call_llm_with_metrics(user, system_prompt=system)
+    return _verdict_of(verdict, metrics), metrics
+
+
+def _verdict_of(verdict: str, _metrics=None):
+    """Разбирает ответ судьи: True — ВЕРНО, False — НЕВЕРНО, None — не понял."""
     if not verdict:
         return None
     v = verdict.strip().upper()
@@ -545,15 +625,20 @@ def _expert_response(
         return "Список ролей пуст.", None
 
     system_prompt = _build_expert_system_prompt(mode, roles)
-    answer = client.call_llm(user_text, system_prompt=system_prompt)
+    answer, metrics = client.call_llm_with_metrics(user_text, system_prompt=system_prompt)
+    analytics = [_analytics_row("ответ эксперта", config.LLM_MODEL, metrics)]
     if answer:
-        correct = _judge_correctness(user_text, answer, mode)
-        return answer, correct
+        # Вердикт о верности даёт отдельный служебный вызов судьи — его расход
+        # тоже показываем (и токены, и стоимость).
+        correct, judge_metrics = _judge_correctness_metrics(user_text, answer, mode)
+        analytics.append(_analytics_row("судья (верность)", config.LLM_MODEL,
+                                        judge_metrics))
+        return answer, correct, analytics
 
     # Фолбэк (нет API-ключа / сбой): демо-правила, без вердикта.
     if not config.LLM_API_KEY:
-        return demo.demo_ai(user_text), None
+        return demo.demo_ai(user_text), None, analytics
     return (
         "Извините, не удалось получить ответ от модели. Попробуйте ещё раз.",
-        None,
+        None, analytics,
     )

@@ -101,6 +101,9 @@ ACTION_PLANNING = "составить план и подтвердить его 
 ACTION_AWAITING = "подтвердить план («ок») или внести правки"
 ACTION_FAILED = "перезапустить задачу или изменить запрос"
 ACTION_PAUSED = "пауза: нажмите «Продолжить»"
+# Проверку результата выполнить не удалось (модель не ответила): задача НЕ
+# объявляется готовой и НЕ уходит на доработку — решение за пользователем.
+ACTION_CHECK_BLOCKED = "повторить проверку или принять результат вручную"
 
 
 class IllegalTransition(ValueError):
@@ -133,6 +136,11 @@ class TaskState:
                       после планирования);
     redo_count      — сколько раз проверка возвращала задачу на доработку
                       (validation → execution); ограничено MAX_REDO;
+    check_blocked   — проверку результата выполнить НЕ удалось (модель не
+                      ответила, ответ не разобран): этап остаётся validation и
+                      решение за пользователем — повторить проверку или принять
+                      результат вручную (это НЕ отказ проверки: доработки по
+                      такому сбою не тратятся и задача не объявляется готовой);
     request         — исходный запрос пользователя, с которого началась задача:
                       по нему проверка результата сверяет работу (см.
                       GET-проверку в chat.py), а не по последнему сообщению;
@@ -151,6 +159,7 @@ class TaskState:
     autonomous: bool = False
     base_stage: str = "planning"
     redo_count: int = 0
+    check_blocked: bool = False
     request: str = ""
     reason: str = ""
     history: List[Dict[str, Any]] = field(default_factory=list)
@@ -323,6 +332,8 @@ def default_action(state: TaskState) -> str:
         step = state.step_text()
         return f"выполнить: {step}"[:ACTION_LIMIT] if step else "выполнить шаг плана"
     if state.stage == "validation":
+        if state.check_blocked:
+            return ACTION_CHECK_BLOCKED
         step = state.step_text()
         return (f"проверить результат шага {state.step_number}: {step}"[:ACTION_LIMIT]
                 if step else "проверить результат")
@@ -424,6 +435,10 @@ def from_dict(raw: Any, task_id: str = "") -> TaskState:
         index = 0
     state.step_index = max(0, min(index, max(0, len(state.steps) - 1)))
     state.request = str(raw.get("request") or "")[:REQUEST_LIMIT]
+    # Признак «проверку выполнить не удалось» живёт вместе с состоянием: после
+    # перезагрузки страницы задача снова ждёт решения пользователя, а не
+    # выглядит готовой.
+    state.check_blocked = raw.get("check_blocked") is True and state.stage == "validation"
     try:
         state.redo_count = max(0, int(raw.get("redo_count") or 0))
     except (TypeError, ValueError):
@@ -453,6 +468,7 @@ def to_dict(state: TaskState) -> Dict[str, Any]:
         "autonomous": bool(state.autonomous),
         "base_stage": state.base_stage,
         "redo_count": int(state.redo_count),
+        "check_blocked": bool(state.check_blocked),
         "request": state.request,
         "reason": state.reason,
         "history": [dict(item) for item in state.history],
@@ -498,6 +514,11 @@ def snapshot(state: TaskState, history_tail: int = 20) -> Dict[str, Any]:
         # Доработки по требованию проверки: «доработка 1 из 2» в полосе этапов.
         "redo_count": int(state.redo_count),
         "max_redo": MAX_REDO,
+        # Проверку выполнить не удалось: задача НЕ готова и ждёт решения
+        # пользователя — «▶ повторить проверку» или «Принять вручную».
+        "check_blocked": bool(state.check_blocked),
+        "can_accept": (state.stage == "validation" and state.check_blocked
+                       and not state.paused),
         "request": state.request,
         "can_redo": can_redo(state),
         "reason": state.reason,
@@ -561,6 +582,7 @@ def to_validation(state: TaskState, reason: str) -> None:
 
 def validation_ok(state: TaskState, reason: str) -> None:
     """validation → done: проверка пройдена (шаг и ожидание очищаются)."""
+    state.check_blocked = False
     state.transition("done", reason, current_step="", expected_action="")
 
 
@@ -572,12 +594,43 @@ def validation_failed(state: TaskState, reason: str, step_index: Optional[int] =
     контроллер понимает, что автоматические повторы пора прекращать
     (см. MAX_REDO и can_redo).
     """
+    state.check_blocked = False
     if step_index is not None and state.steps:
         state.step_index = max(0, min(int(step_index), len(state.steps) - 1))
     step = f"step_{state.step_number}" if state.steps else "step_1"
     state.transition("execution", reason, current_step=step)
     if redo:
         state.redo_count += 1
+    _apply_action(state)
+
+
+def validation_blocked(state: TaskState, reason: str) -> None:
+    """Проверку результата выполнить НЕ удалось: задача ждёт решения пользователя.
+
+    Это не переход автомата: этап остаётся validation, но в снимке появляется
+    `check_blocked`. Отличие от validation_failed принципиальное — недоступная
+    проверка НЕ является отказом проверки: она не возвращает задачу на доработку
+    (доработки не тратятся) и НЕ объявляет результат принятым (задача не уходит
+    в done). Пользователь сам решает: «▶ повторить проверку» или «Принять вручную»
+    (см. validation_checking и маршрут /api/agent/state/accept).
+    """
+    if state.stage != "validation":
+        logger.warning(
+            "TaskState %s: сбой проверки отмечен вне этапа validation (%s)",
+            state.task_id or "—", state.stage,
+        )
+        return
+    state.check_blocked = True
+    state._log("validation", "validation", state.current_step, reason)
+    state.expected_action = ACTION_CHECK_BLOCKED[:ACTION_LIMIT]
+
+
+def validation_checking(state: TaskState, reason: str) -> None:
+    """Новая попытка проверки: признак «проверку выполнить не удалось» снимается."""
+    if not state.check_blocked:
+        return
+    state.check_blocked = False
+    state._log("validation", "validation", state.current_step, reason)
     _apply_action(state)
 
 
@@ -702,6 +755,11 @@ def state_block(state: TaskState) -> str:
             "Идёт проверка результата: коротко подтверди, что сделано по плану, "
             "и что осталось (без выдумывания новых требований)."
         )
+        if state.check_blocked:
+            lines.append(
+                "Проверку результата выполнить не удалось (модель не ответила): "
+                "задача НЕ объявлена готовой и ждёт решения пользователя."
+            )
     if state.paused:
         lines.append("Задача на паузе: пользователь нажал «Пауза».")
     return "\n".join(lines)

@@ -67,6 +67,8 @@ _session_locks: Dict[str, asyncio.Lock] = {}
 # задач и проектов, слои памяти, профили). Вызовы LLM её не держат, поэтому
 # такие операции не ждут ответа модели.
 _workspace_lock = asyncio.Lock()
+# Очередь записи файла workspace: снимки не должны обгонять друг друга.
+_persist_lock = asyncio.Lock()
 
 
 def _session_lock(session_id: str) -> asyncio.Lock:
@@ -204,12 +206,17 @@ async def _persist() -> None:
     (переключение диалога, «Пауза», запись журнала чата) — иначе сериализация в
     потоке могла бы поймать изменение структуры «на лету». В отдельный поток
     уходит только запись файла.
+
+    Записи идут ПО ОЧЕРЕДИ (_persist_lock): часть маршрутов сохраняет workspace
+    без _workspace_lock, и два параллельных снимка могли лечь на диск в обратном
+    порядке — более старый затирал свежий.
     """
-    try:
-        payload = workspace_store.workspace_payload(_workspace)
-        await asyncio.to_thread(workspace_store.write_payload, payload)
-    except Exception:  # noqa: BLE001 — сбой записи логируем, работу продолжаем
-        logger.warning("Не удалось сохранить workspace AI-агента", exc_info=True)
+    async with _persist_lock:
+        try:
+            payload = workspace_store.workspace_payload(_workspace)
+            await asyncio.to_thread(workspace_store.write_payload, payload)
+        except Exception:  # noqa: BLE001 — сбой записи логируем, работу продолжаем
+            logger.warning("Не удалось сохранить workspace AI-агента", exc_info=True)
 
 
 async def _persist_profiles() -> None:
@@ -237,6 +244,9 @@ def _snapshot() -> dict:
     # его вместе со снимком workspace: иконка профиля и его поля обновляются
     # одним ответом на любую операцию с задачами/диалогами.
     snapshot["profile"] = profile_store.snapshot(_profiles)
+    # Статистика экспертных режимов: живёт на сервере (у профиля), поэтому
+    # страница «Статистика ответов» её не теряет.
+    snapshot["stats"] = workspace_store.expert_stats(_workspace, _current_profile_id())
     return snapshot
 
 
@@ -253,18 +263,19 @@ def _usage_matches_history(dialog: Dict[str, Any]) -> None:
         messages = branch.get("messages") if isinstance(branch, dict) else None
         requests += sum(1 for m in (messages or []) if m.get("role") == "user")
     usage = dialog.setdefault("usage", [])
-    # Замеры служебных запросов планирования (kind="plan") реплик в диалоге не
-    # имеют — их синхронизация не касается, иначе расход на план пропадал бы из
-    # панели токенов после перезагрузки страницы.
-    plain = [item for item in usage if item.get("kind") != "plan"]
+    # Замеры СЛУЖЕБНЫХ запросов (kind="plan" — построен только план;
+    # kind="service" — например, отказ по инвариантам) реплик в диалоге не
+    # имеют: синхронизация их не касается, иначе расход пропадал бы из панели
+    # токенов после перезагрузки страницы.
+    plain = [item for item in usage if not item.get("kind")]
     while len(plain) > requests:
         for index, item in enumerate(usage):
-            if item.get("kind") != "plan":
+            if not item.get("kind"):
                 usage.pop(index)
                 break
         else:
             break
-        plain = [item for item in usage if item.get("kind") != "plan"]
+        plain = [item for item in usage if not item.get("kind")]
 
 
 def _exchange_stored(memory: List[Dict[str, str]], user_text: str) -> bool:
@@ -718,6 +729,31 @@ async def state_confirm() -> dict:
         return _state_response(session)
 
 
+@router.post("/agent/state/accept")
+async def state_accept() -> dict:
+    """Кнопка «Принять вручную»: результат принимается без проверки модели.
+
+    Нужна, когда проверку результата выполнить не удалось (`check_blocked`):
+    задача НЕ объявляется готовой сама и на доработку не возвращается — решение
+    за пользователем. Принять можно только такую задачу (этап validation со
+    снятой проверкой), иначе 400: обычный путь закрытия задачи — проверка.
+    """
+    session = _require_session()
+    async with _session_lock(session["id"]):
+        state = workspace_store.dialog_state(session)
+        if state.paused:
+            raise HTTPException(status_code=400, detail="Задача на паузе — нажмите «Продолжить»")
+        if state.stage != "validation" or not state.check_blocked:
+            raise HTTPException(
+                status_code=400,
+                detail="Принимать вручную нечего: проверка результата не ждёт решения",
+            )
+        task_state.validation_ok(
+            state, "результат принят пользователем вручную (проверка не удалась)")
+        await _persist_state(session, state)
+        return _state_response(session)
+
+
 @router.put("/agent/state/plan")
 async def state_plan(payload: PlanUpdate) -> dict:
     """Правка плана на этапе planning: пользователь задаёт свои шаги.
@@ -745,11 +781,11 @@ async def state_plan(payload: PlanUpdate) -> dict:
 
 
 @router.post("/chat")
-def chat(msg: ChatMessage) -> dict:
+async def chat(msg: ChatMessage) -> dict:
     """Принимает сообщение пользователя и возвращает ответ бота."""
     if not msg.content.strip():
         return {"user": msg.content, "bot": "Пожалуйста, введите сообщение."}
-    answer, correct = service.generate_response(
+    answer, correct, analytics = service.generate_response(
         msg.content,
         msg.format,
         msg.max_tokens,
@@ -761,6 +797,23 @@ def chat(msg: ChatMessage) -> dict:
         msg.models,
     )
     result = {"user": msg.content, "bot": answer, "correct": correct}
+    # Метрики обращений к модели за этот запрос (время, токены, стоимость):
+    # страница статистики показывает расход и в обычном, и в экспертном режиме.
+    if analytics:
+        result["analytics"] = analytics
+    # Страница «Статистика ответов» (экспертный режим): вердикт модели копится в
+    # workspace ПРОФИЛЯ, поэтому статистика не обнуляется при переключении
+    # режима, переходе между задачами и перезапуске приложения. Запись файла —
+    # через to_thread, чтобы не блокировать event loop.
+    if msg.expert_mode and isinstance(correct, bool):
+        workspace_store.add_expert_result(
+            _workspace, msg.expert_mode_type, correct, _current_profile_id())
+        # Обновлённый счётчик отдаём тем же ответом: интерфейсу не нужен
+        # отдельный запрос снимка, чтобы показать статистику.
+        result["stats"] = workspace_store.expert_stats(_workspace, _current_profile_id())
+        # Пишем через общий _persist: снимок файла идёт в одной очереди с
+        # остальными записями workspace.
+        await _persist()
     # Настройка «Тест моделей»: ответы каждой модели по отдельности.
     if isinstance(answer, dict) and "model_responses" in answer:
         model_responses = answer["model_responses"]
@@ -768,9 +821,6 @@ def chat(msg: ChatMessage) -> dict:
         result["bot"] = "\n".join(
             f"Ответ модели {r['model']}: {r['text']}" for r in model_responses
         ) if model_responses else "Пожалуйста, введите сообщение."
-        # Аналитика судьи-аналитика (время, токены, стоимость) — отдельным полем.
-        if answer.get("analytics"):
-            result["analytics"] = answer["analytics"]
         return result
     # Настройка «Температура»: несколько независимых ответов + резюме судьи.
     # Фронтенд выводит каждый ответ с пометкой «Ответ при значении temperature …»,
@@ -1253,6 +1303,32 @@ def _analysis_debug(analysis: Dict[str, Any]) -> str:
     )
 
 
+def _gate_cache_key(steps: List[str], snapshot: Dict[str, Any]) -> tuple:
+    """Ключ проверки шагов: сами шаги + действующие правила."""
+    return (tuple(str(step) for step in steps or []),
+            invariants_store.rules_signature(snapshot))
+
+
+def _plan_signature(text: str, snapshot: Dict[str, Any]) -> Dict[str, str]:
+    """Подпись плана: для какого ЗАПРОСА и при каких ПРАВИЛАХ он построен.
+
+    По ней видно, можно ли переиспользовать уже построенный план: если запрос
+    тот же и правила не менялись, новый вызов планировщика и код-гейт — это
+    потраченные впустую токены (например, при перезапуске задачи после ошибки
+    шага: `start_planning` шаги сохраняет, а гейт и план оплачивались заново).
+    """
+    return {
+        "request": str(text or "").strip()[:task_state.REQUEST_LIMIT],
+        "rules": invariants_store.rules_signature(snapshot),
+    }
+
+
+def _plan_is_fresh(dialog: Optional[Dict[str, Any]], signature: Dict[str, str]) -> bool:
+    """True, если план в диалоге построен ровно по этой подписи."""
+    saved = dict((dialog or {}).get("plan_signature") or {})
+    return bool(signature.get("request")) and saved == signature
+
+
 async def _plan_gate(steps: List[str], analyzer: Agent, snapshot: Dict[str, Any],
                      replan: Any) -> Dict[str, Any]:
     """КОД-ГЕЙТ ПЛАНА: шаги проверяются по правилам, нарушающие не принимаются.
@@ -1282,9 +1358,21 @@ async def _plan_gate(steps: List[str], analyzer: Agent, snapshot: Dict[str, Any]
         result["steps"] = list(steps or [])
         return result
     attempt = 0
+    # Кэш ЖИВЁТ ВНУТРИ одного вызова: перепланирование иногда возвращает ровно
+    # те же шаги, и повторная проверка того же текста — оплата за тот же
+    # результат. За пределы запроса вердикт не выходит (там он мог бы устареть).
+    checked: Dict[tuple, Any] = {}
     while True:
-        keep = await analyzer.check_plan(steps, snapshot)
-        usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+        cache_key = _gate_cache_key(steps, snapshot)
+        if cache_key in checked:
+            keep = checked[cache_key]
+            lines.append("эти шаги уже проверялись в этом же запросе — беру "
+                         "прежний вердикт (повторный вызов LLM не нужен).")
+        else:
+            keep = await analyzer.check_plan(steps, snapshot)
+            usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+            if keep is not None:
+                checked[cache_key] = keep
         if keep is None:
             lines.append("проверка шагов плана по инвариантам не удалась "
                          "(служебный вызов не дал вердикта) — план не принимаю.")
@@ -1327,14 +1415,6 @@ async def _plan_gate(steps: List[str], analyzer: Agent, snapshot: Dict[str, Any]
             return result
 
 
-def _last_analysis(dialog: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Последний разбор инвариантов из журнала чата задачи (None — разбора нет)."""
-    for item in reversed((dialog or {}).get("log") or []):
-        if item.get("kind") == workspace_store.LOG_SUGGESTIONS and item.get("analysis"):
-            return dict(item["analysis"])
-    return None
-
-
 @router.post("/agent/invariants/choose")
 async def invariant_choose(payload: InvariantPick) -> dict:
     """Клик по варианту-альтернативе под сообщением агента (разбор инвариантов).
@@ -1373,109 +1453,6 @@ def _last_analysis(dialog: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         if item.get("kind") == workspace_store.LOG_SUGGESTIONS and item.get("analysis"):
             return dict(item["analysis"])
     return None
-
-
-async def invariants_get(session_id: str = "") -> dict:
-    """Инварианты проекта и задачи для модалки (шестерёнки ⚙️).
-
-    Отдаёт {"project": [{"id", "text", "created"}, ...], "task": [...],
-    "pairs": N, "counts": {"project", "task"}, "project_id": ..., "task_id": ...}.
-    Проверок пар здесь НЕТ: правила записываются без обращений к модели, а
-    нарушения и противоречия выясняются в диалоге разбором запроса (§5.10).
-
-    session_id задан — снимок по КОНКРЕТНОЙ задаче (шестерёнка в списке задач:
-    правила правятся, даже если диалог не открыт). Чужая/неизвестная задача —
-    404, как и у прочих маршрутов задач.
-    """
-    if session_id:
-        task, session = _find_session_anywhere(session_id)
-        if task is None or session is None:
-            raise HTTPException(status_code=404, detail="Задача не найдена")
-        return _invariants_view(task, session)
-    task = _current_task()
-    session = workspace_store.active_session(_workspace, task) if task else None
-    return _invariants_view(task, session)
-
-
-async def invariant_create(payload: InvariantCreate) -> dict:
-    """Добавляет инвариант (одно поле — один инвариант) и проверяет противоречия.
-
-    scope="project" — правило всего проекта (все его задачи-диалоги),
-    scope="task" — правило конкретной задачи-диалога. После добавления пары
-    «инвариант проекта × инвариант задачи» проверяются служебным вызовом LLM:
-    противоречие пользователь видит сразу и решает, какое правило главнее
-    (см. POST /api/agent/invariants/conflicts/resolve).
-    """
-    text = payload.text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Нечего добавлять: инвариант пуст")
-    session_id = str(payload.session_id or "").strip()
-    task, session = _invariants_session(session_id)
-    if task is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Сначала создайте проект — инварианты привязаны к проекту",
-        )
-    if payload.scope == "task" and session is None:
-        raise HTTPException(status_code=404, detail="Задача не найдена")
-    async with _workspace_lock:
-        container = task if payload.scope == "project" else session["dialog"]
-        workspace_store.add_invariant(container, text)
-        # Никаких обращений к модели при записи правил: инвариант — это данные.
-        # Противоречия и нарушения выясняются в диалоге (разбор запроса).
-        await _persist()
-        return _invariants_view(task, session)
-
-
-async def invariant_delete(scope: str, invariant_id: str,
-                           session_id: str = "") -> dict:
-    """Удаляет инвариант (корзина рядом с правилом в модалке «Инварианты»).
-
-    Обращений к модели нет: правило — это данные. Разбор запроса сбрасывается —
-    правила изменились, следующий запрос сверяется заново.
-    """
-    scope = str(scope or "").strip().lower()
-    if scope not in invariants_store.SCOPES:
-        raise HTTPException(status_code=400, detail="Неизвестная область инварианта")
-    task, session = _invariants_session(session_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Проект не найден")
-    if scope == "task" and session is None:
-        raise HTTPException(status_code=404, detail="Задача не найдена")
-    async with _workspace_lock:
-        container = task if scope == "project" else session["dialog"]
-        if not workspace_store.delete_invariant(container, invariant_id):
-            raise HTTPException(status_code=404, detail="Инвариант не найден")
-        # Правила изменились — сохранённый разбор запроса больше не актуален.
-        dialog = session["dialog"]
-        dialog["analysis"] = dict(invariants_store.empty_analysis())
-        await _persist()
-        return _invariants_view(task, session)
-
-
-async def invariant_resolve(payload: InvariantResolve) -> dict:
-    """Устаревший маршрут решения противоречия (оставлен для совместимости).
-
-    Приоритет всегда у правила ПРОЕКТА, поэтому «главнее задача» больше не
-    принимается: такой выбор означал бы работу вопреки правилу проекта. Ответ —
-    409 с объяснением; интерфейс этот маршрут не использует (конфликт правила
-    задачи с правилом проекта — обычное нарушение с альтернативами).
-    """
-    task, session = _invariants_session()
-    if task is None or session is None:
-        raise HTTPException(status_code=404, detail="Задача не найдена")
-    if str(payload.winner or "").strip().lower() == invariants_store.WINNER_TASK:
-        # «Главнее задача» означало бы работу вопреки правилу проекта.
-        raise HTTPException(
-            status_code=409,
-            detail="Инвариант проекта всегда главнее: выберите один из предложенных "
-                   "вариантов, которые правила не нарушают",
-        )
-    # Правило проекта и так в силе — состояние не меняем, просто сбрасываем разбор.
-    async with _workspace_lock:
-        session["dialog"]["analysis"] = dict(invariants_store.empty_analysis())
-        await _persist()
-        return _invariants_view(task, session)
 
 
 @router.get("/agent/invariants")
@@ -1862,6 +1839,11 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 # выполнять её сразу нельзя — задача должна остаться на этапе
                 # validation и ждать «Продолжить».
                 validation_deferred_here = False
+                # Задача перезапущена ПОСЛЕ ОШИБКИ: только в этом случае прежний
+                # план (если запрос и правила те же) переиспользуется — при
+                # обычном ответе пользователя план по-прежнему строится заново,
+                # чтобы правки к плану не потерялись.
+                restarted_from_failure = False
                 if text and not machine_step:
                     # Реплика пользователя — в журнал чата: в память диалога она
                     # попадает только вместе с ответом, а при построении плана
@@ -1928,6 +1910,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         autonomous=autonomous,
                     )
                 if state.stage == "failed":
+                    restarted_from_failure = True
                     task_state.start_planning(
                         state,
                         "пользователь перезапустил задачу после ошибки"
@@ -1991,6 +1974,13 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             task_state.await_confirmation(
                                 state, [],
                                 "запрос нарушает инварианты — жду решения пользователя")
+                        # Расход этого запроса (разбор запроса + проверка
+                        # вариантов) сохраняем служебной записью: ответа
+                        # пользователю не было, но токены потрачены — иначе
+                        # замер исчезал бы после перезагрузки страницы.
+                        if usage:
+                            dialog_now.setdefault("usage", []).append(
+                                dict(usage, kind="service"))
                         yield encode(_state_event(state))
                         yield encode({"type": "done", "usage": dict(usage),
                                       "state": task_state.snapshot(state)})
@@ -2011,6 +2001,14 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         task_state.to_validation(
                             state, "все шаги плана выполнены — проверяю результат")
                         yield encode(_state_event(state))
+                    # Новая попытка проверки: признак «проверку выполнить не
+                    # удалось» снимается — иначе интерфейс показывал бы «Принять
+                    # вручную» и во время самой проверки.
+                    was_blocked = bool(state.check_blocked)
+                    task_state.validation_checking(
+                        state, "повторная попытка проверки результата")
+                    if was_blocked:
+                        yield encode(_state_event(state))
                     yield encode({"type": "debug", "text": (
                         f"{_MACHINE}: этап validation — самопроверка полученного ответа "
                         f"({state.steps_total or 1} "
@@ -2018,14 +2016,20 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         + ("ответ и обмен взяты из диалога)." if resumed
                            else "ответ получен, обмен сохранён).")
                     )})
-                    ok, note = _self_check(
+                    self_ok, note = _self_check(
                         answered=answered_step,
                         errors=step_errors,
                         steps_total=state.steps_total,
                         steps_done=state.step_index + 1,
                         stored=stored_exchange,
                     )
+                    # ok — итог проверки: самопроверка, а затем вердикт модели.
+                    ok = self_ok
                     redo_step = state.step_index
+                    # Вердикт содержательной проверки: None — проверку выполнить
+                    # НЕ удалось (модель не ответила / ответ не разобран) либо она
+                    # пропущена по команде остановки. Это НЕ «не принято».
+                    review: Optional[Dict[str, Any]] = None
                     if stopped is not None:
                         # Пользователь просил остановиться: служебный вызов
                         # проверки не делаем (это лишний вызов LLM после «стоп»).
@@ -2055,20 +2059,59 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         if review is None:
                             yield encode({"type": "debug", "text": (
                                 f"{_MACHINE}: содержательная проверка не получена "
-                                "(модель не ответила) — опираюсь на самопроверку."
-                            )})
-                        elif review["ok"]:
-                            note = f"{note}; модель: {review['comment']}"
-                            yield encode({"type": "debug", "text": (
-                                f"{_MACHINE}: содержательная проверка пройдена — "
-                                f"{review['comment']}."
+                                "(модель не ответила) — задачу готовой не объявляю: "
+                                "нужно повторить проверку или принять результат вручную."
                             )})
                         else:
-                            ok = False
-                            note = f"модель не приняла результат: {review['comment']}"
-                            if review["step"]:
-                                redo_step = review["step"] - 1
-                    if ok:
+                            if review.get("steps"):
+                                # Проверка идёт по КАЖДОМУ шагу: показываем разбор,
+                                # чтобы возврат на доработку был объяснён.
+                                yield encode({"type": "debug", "text": (
+                                    f"{_MACHINE}: разбор по шагам — " + "; ".join(
+                                        f"шаг {item['n']}: "
+                                        + ("принят" if item["ok"] else "НЕ принят")
+                                        + (f" ({item['comment']})" if item["comment"] else "")
+                                        for item in review["steps"])[:400]
+                                )})
+                            if review["ok"]:
+                                note = f"{note}; модель: {review['comment']}"
+                                yield encode({"type": "debug", "text": (
+                                    f"{_MACHINE}: содержательная проверка пройдена — "
+                                    f"{review['comment']}."
+                                )})
+                            else:
+                                ok = False
+                                note = f"модель не приняла результат: {review['comment']}"
+                                if review["step"]:
+                                    redo_step = review["step"] - 1
+                    if review is None and self_ok:
+                        # Проверку выполнить НЕ удалось: ни «принято», ни «не
+                        # принято». Задачу готовой не объявляем и на доработку не
+                        # возвращаем (недоступная проверка — не отказ проверки,
+                        # доработки не тратятся): решение за пользователем —
+                        # «▶ повторить проверку» или «Принять вручную».
+                        # Ветка стоит ДО «проверка пройдена»: иначе задача
+                        # закрывалась бы по одной самопроверке, которая про
+                        # соответствие результата задаче ничего не знает.
+                        task_state.validation_blocked(
+                            state,
+                            "проверку результата выполнить не удалось: "
+                            + ("команда остановки" if stopped is not None
+                               else "содержательная проверка не получена"),
+                        )
+                        if stopped is not None:
+                            yield encode({"type": "error", "text": (
+                                "⚠️ Проверка результата пропущена (поступила команда "
+                                "остановки) — задачу готовой не объявляю."
+                            )})
+                        else:
+                            yield encode({"type": "error", "text": (
+                                "⚠️ Проверку результата выполнить не удалось: модель не "
+                                "ответила. Задачу готовой не объявляю — «▶ повторить "
+                                "проверку» в полосе состояния запустит проверку снова, "
+                                "«Принять вручную» завершит задачу без проверки."
+                            )})
+                    elif ok:
                         task_state.validation_ok(state, f"проверка пройдена: {note}")
                         yield encode({"type": "debug", "text": (
                             f"{_MACHINE}: проверка пройдена ({note}) — этап done, задача готова."
@@ -2097,11 +2140,36 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 if state.stage == "planning":
                     # 3. PLANNING: план задачи. Подтверждённый план уже есть —
                     #    строить заново нечего; иначе спрашиваем модель.
+                    # План, который уже построен для запроса ЭТОЙ задачи и при тех
+                    # же правилах, не строим заново: повторные вызовы планировщика
+                    # и код-гейта — оплата за тот же результат (задача перезапущена
+                    # после ошибки: `start_planning` шаги сохраняет).
+                    #
+                    # Переиспользование включается ТОЛЬКО в автономном режиме, где
+                    # подтверждение плана не требуется: в интерактивной задаче план
+                    # по-прежнему показывается заново и ждёт «ок» — иначе
+                    # пользователь потерял бы шаг подтверждения.
+                    _snapshot_for_plan = _invariants_snapshot(task_now, session_now)
+                    plan_signature = _plan_signature(
+                        state.request or text, _snapshot_for_plan)
+                    reuse_plan = bool(
+                        restarted_from_failure and state.autonomous and not confirmed
+                        and state.steps
+                        and _plan_is_fresh(dialog_now, plan_signature))
                     if confirmed and state.steps:
                         task_state.plan_ready(state, state.steps, "план подтверждён пользователем")
                         yield encode({"type": "debug", "text": (
                             f"{_MACHINE}: план подтверждён — этап planning → execution, "
                             f"{state.step_label()}."
+                        )})
+                    elif reuse_plan:
+                        task_state.plan_ready(
+                            state, state.steps,
+                            "запрос не изменился — беру прежний план без нового вызова LLM")
+                        yield encode({"type": "debug", "text": (
+                            f"{_MACHINE}: план по этому запросу уже построен — беру прежний "
+                            f"({len(state.steps)} {task_state.steps_word(len(state.steps))}), "
+                            "вызов модели не нужен."
                         )})
                     else:
                         yield encode({"type": "debug", "text": (
@@ -2121,7 +2189,11 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             # требованию задачи в обход правила проекта.
                             invariants=_invariants_snapshot(task_now, session_now),
                         )
-                        plan_usage = dict(planner.last_usage or {})
+                        # Замер вызова плана — ДЕЛЬТА (агент обнуляет счётчик в
+                        # начале вызова), поэтому повторное перепланирование не
+                        # удваивает уже учтённые токены.
+                        plan_call_usage = dict(planner.last_usage or {})
+                        plan_usage = dict(plan_call_usage)
 
                         # КОД-ГЕЙТ ПЛАНА. Промпт-блок правил — просьба; гарантию
                         # даёт проверка шагов арбитром: нарушающие шаги в работу
@@ -2152,6 +2224,10 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # обе траты этого запроса уходят в панель строкой
                         # «из них служебные вызовы» (kind="plan").
                         plan_usage = merge_usage(plan_usage, gate["usage"])
+                        # Общий расход запроса: уже накопленный (разбор запроса)
+                        # + план + проверка плана. Без этой строки расход разбора
+                        # инвариантов терялся: дальше ветки отдают plan_usage.
+                        usage = merge_usage(usage, plan_usage)
                         for line in gate["lines"]:
                             yield encode({"type": "debug", "text": f"{_MACHINE}: {line}"})
                         if gate["error"]:
@@ -2164,14 +2240,18 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                     state, [],
                                     "план не прошёл проверку по инвариантам")
                             dialog_now.setdefault("usage", []).append(
-                                dict(plan_usage, kind="plan"))
+                                dict(usage, kind="plan"))
                             yield encode(_state_event(state))
-                            yield encode({"type": "done", "usage": dict(plan_usage),
+                            yield encode({"type": "done", "usage": dict(usage),
                                           "state": task_state.snapshot(state)})
                             return
-                        usage = merge_usage(usage, gate["usage"])
                         steps = gate["steps"]
                         state.steps = steps
+                        # Запоминаем, для какого запроса и правил план построен:
+                        # ровно за такой же план больше не платим (см. reuse_plan).
+                        dialog_now["plan_signature"] = dict(_plan_signature(
+                            state.request or text,
+                            _invariants_snapshot(task_now, session_now)))
                         # Исходный запрос задачи — в состоянии: по нему проверка
                         # результата сверяет работу (последнее сообщение может
                         # быть подтверждением «ок» или служебной фразой шага).
@@ -2220,15 +2300,15 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                     + " — план показан, задача остановлена."
                                 )})
                                 yield encode(_state_event(state))
-                            if plan_usage:
-                                # Расход на построение плана — отдельной записью
-                                # (kind="plan"): ответа пользователю в этом
-                                # запросе не было, но токены потрачены.
+                            if usage:
+                                # Расход этого запроса — отдельной записью
+                                # (kind="plan"): ответа пользователю не было, но
+                                # токены потрачены (включая разбор запроса).
                                 dialog_now.setdefault("usage", []).append(
-                                    dict(plan_usage, kind="plan"))
+                                    dict(usage, kind="plan"))
                             workspace_store.set_dialog_state(session_now, state)
                             await _persist()
-                            yield encode({"type": "done", "usage": plan_usage,
+                            yield encode({"type": "done", "usage": dict(usage),
                                           "state": task_state.snapshot(state)})
                             return
 
@@ -2268,7 +2348,10 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # Событие "done" несёт расход токенов текущего запроса.
                         kind = event.get("type")
                         if kind == "done" and isinstance(event.get("usage"), dict):
-                            usage = merge_usage(plan_usage, event["usage"])
+                            # Расход ответа шага добавляется к уже накопленному
+                            # (разбор запроса + план + проверка плана): замер
+                            # агента — дельта одного вызова.
+                            usage = merge_usage(usage, event["usage"])
                         elif kind == "bot" and str(event.get("text") or "").strip():
                             answered = True
                             # Запасной ответ (модель не ответила) — шаг НЕ
@@ -2406,6 +2489,15 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 await _persist()
                 yield encode(_state_event(state))
 
+                # Финальный замер запроса одним событием "done": в этой ветке
+                # (обычный ответ шага) раньше событие не отправлялось вовсе, и
+                # панель токенов показывала только внутренний замер агента — без
+                # разбора запроса, плана и проверки плана. Теперь расход приходит
+                # ОДИН раз и полностью, как он же записан в диалоге.
+                if usage:
+                    yield encode({"type": "done", "usage": dict(usage),
+                                  "state": task_state.snapshot(state)})
+
                 # Ещё раз проверяем отложенную команду: «Пауза»/«Отменить» могла
                 # прийти, пока шаг дорабатывал и сохранялся (окно между чтением
                 # намерения и концом потока). Без этого интерфейс оставался с
@@ -2485,9 +2577,14 @@ async def agent_history() -> dict:
     # GET /api/agent/memory), а окно чата иначе ждало бы конца ответа агента.
     session = _current_session()
     dialog = session["dialog"] if session else workspace_store.empty_dialog()
+    log = [dict(item) for item in dialog.get("log", [])]
+    # Журнал чата и память диалога ДУБЛИРУЮТ друг друга: интерфейс рисует окно
+    # по журналу, а messages берёт только когда журнала ещё нет (старые
+    # диалоги). Отдавать оба — лишняя четверть ответа на каждое переключение.
+    messages = [] if log else [dict(m) for m in dialog["messages"]]
     return {
-            "messages": [dict(m) for m in dialog["messages"]],
-            "log": [dict(item) for item in dialog.get("log", [])],
+            "messages": messages,
+            "log": log,
             "usage": [dict(item) for item in dialog["usage"]],
             "summary": list(dialog["summary"]),
             "facts": dict(dialog["facts"]),

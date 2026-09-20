@@ -38,6 +38,9 @@ const BASE = [
 let state = {};
 let PLAN = ['Собрать данные', 'Написать код', 'Прогнать тесты'];
 let STEP_DELAY = 5;   // задержка ответа «сервера» на шаг (для проверки «Паузы»)
+// «Сервер»: проверку результата выполнить не удалось — задача остаётся на этапе
+// «Проверка» (check_blocked) и ждёт решения пользователя.
+let CHECK_BLOCKED = false;
 
 function setState(patch) {
   state = Object.assign({
@@ -46,6 +49,7 @@ function setState(patch) {
     paused: false, autonomous: false, can_pause: false, can_resume: false, can_confirm: false,
     terminal: false, extra_stage: null, reason: '', task_id: 's-1',
     updated_at: '2026-01-01T00:00:00', history: [], base_stage: 'planning',
+    check_blocked: false, can_accept: false,
   }, patch || {});
   if (BASE.some(b => b.id === state.stage)) state.base_stage = state.stage;
   state.can_confirm = (state.stage === 'planning' || state.stage === 'awaiting_user')
@@ -53,6 +57,9 @@ function setState(patch) {
   state.can_pause = !state.terminal && !state.paused;
   state.can_resume = !!state.paused;
   state.can_cancel = !state.terminal;
+  // Проверку выполнить не удалось: задача не готова и ждёт решения пользователя
+  // (как на сервере — см. task_state.snapshot).
+  state.can_accept = state.stage === 'validation' && !!state.check_blocked && !state.paused;
   state.max_redo = 2;
   state.redo_count = Number(state.redo_count) || 0;
   state.base_stages = BASE.map(s => ({ id: s.id, label: s.label, active: s.id === state.base_stage }));
@@ -213,7 +220,15 @@ async function runStep() {
   }
   const total = state.steps_total || 1;
   const last = state.step_index + 1 >= total;
-  if (last) {
+  if (last && CHECK_BLOCKED) {
+    // Последний шаг выполнен, но проверку результата выполнить не удалось:
+    // задача НЕ объявляется готовой — этап validation + признак check_blocked.
+    setState(Object.assign({}, state, {
+      stage: 'validation', base_stage: 'validation', current_step: 'check',
+      step_index: total - 1, step_number: total, check_blocked: true,
+      expected_action: 'повторить проверку или принять результат вручную',
+    }));
+  } else if (last) {
     setState(Object.assign({}, state, {
       stage: 'done', base_stage: 'done', current_step: '', expected_action: '',
       step_index: total - 1, step_number: total, terminal: true, extra_stage: null,
@@ -229,15 +244,23 @@ async function runStep() {
   // открытый диалог восстанавливается после фонового шага.
   const sessionId = requestSession || workspace.active_session;
   logs[sessionId] = (logs[sessionId] || []).concat([
-    { kind: 'assistant', text: last ? 'Шаг выполнен: итог задачи.' : 'Шаг выполнен.' },
+    { kind: 'assistant',
+      text: (last && !CHECK_BLOCKED) ? 'Шаг выполнен: итог задачи.' : 'Шаг выполнен.' },
   ]);
+  const blockedEvent = CHECK_BLOCKED && last ? {
+    type: 'error',
+    text: '⚠️ Проверку результата выполнить не удалось: модель не ответила. Задачу '
+      + 'готовой не объявляю — «▶ повторить проверку» запустит проверку снова, '
+      + '«Принять вручную» завершит задачу без проверки.',
+  } : null;
   return streamResponse([
     { type: 'state', state: snapshot() },
-    { type: 'bot', text: last ? 'Задача выполнена.' : 'Шаг выполнен.' },
+    { type: 'bot', text: (last && !CHECK_BLOCKED) ? 'Задача выполнена.' : 'Шаг выполнен.' },
     { type: 'state', state: snapshot() },
     // Уточнённый замер: автомат сделал служебный вызов (проверка результата) —
     // фронт обязан ЗАМЕНИТЬ замер запроса, а не добавить второй.
     { type: 'usage', usage: usage({ summary_requests: 1, summary_input: 7, summary_output: 3 }) },
+    ...(blockedEvent ? [blockedEvent] : []),
     { type: 'done', usage: usage(), state: snapshot() },
   ]);
 }
@@ -360,6 +383,18 @@ function makeFetch() {
         expected_action: state.stage === 'awaiting_user'
           ? 'подтвердить план («ок») или внести правки'
           : 'выполнить: ' + step,
+      }));
+      return jsonResponse({ state: snapshot() });
+    }
+    if (url === '/api/agent/state/accept') {
+      // «Принять вручную»: принимается только задача, у которой проверку
+      // выполнить не удалось (как на сервере — иначе 400).
+      if (state.stage !== 'validation' || !state.check_blocked) {
+        return jsonResponse({ detail: 'Принимать вручную нечего' }, false);
+      }
+      setState(Object.assign({}, state, {
+        stage: 'done', base_stage: 'done', current_step: '', expected_action: '',
+        terminal: true, extra_stage: null, check_blocked: false,
       }));
       return jsonResponse({ state: snapshot() });
     }
@@ -1566,6 +1601,96 @@ async function run() {
     chatBodies.slice(bodiesBeforeAlt).some(b => !b.continue_step
       && String(b.content || '').includes('Android-приложение')),
     JSON.stringify(chatBodies.slice(bodiesBeforeAlt).map(b => String(b.content || '').slice(0, 30))));
+
+  console.log('\n[N] Панель «Токены задачи»: пустые замеры, разбивка, лимит');
+  await dom.window.eval('setAgentMode(true)');
+  await wait(60);
+  // Замеры как их отдаёт сервер: обычный шаг со служебной проверкой результата
+  // (лимит «Длина» превышен) и ПУСТОЙ замер — такой приходит в служебных ветках
+  // (пауза, ошибка, «введите сообщение»).
+  dom.window.eval('agentUsage = ' + JSON.stringify([
+    { requests: 2, input: 900, output: 90, summary_requests: 1, summary_input: 700,
+      summary_output: 70, failed_requests: 0, limit: 500, overflow: true,
+      cost_rub: 0.31, service: { review: { requests: 1, input: 700, output: 70, failed: 0 } } },
+    {}
+  ]) + '; agentPanelView = "tokens"; renderAgentPanel();');
+  await wait(30);
+  const panelRows = (id) => Array.from($(id).querySelectorAll('tr'))
+    .map(tr => Array.from(tr.querySelectorAll('td')).map(td => td.textContent));
+  const stepRow = panelRows('agent-stats-body')[0];
+  const totalRows = panelRows('agent-total-body');
+  const chartLabel = $('agent-chart').textContent.replace(/\s+/g, ' ');
+  check('пустой замер не попадает в расчёт «Ответ шага»',
+    stepRow && stepRow[1] === '1', JSON.stringify(stepRow));
+  check('в «Ответ шага» видны лимит «Длина» и переполнение',
+    stepRow && stepRow[5] === '500'
+    && $( 'agent-stats-body').querySelector('td.agent-overflow') !== null,
+    JSON.stringify(stepRow));
+  check('итог считается по обращениям к модели, а не по записям',
+    totalRows[0] && totalRows[0][1] === '2', JSON.stringify(totalRows[0]));
+  check('служебные вызовы разложены по видам',
+    totalRows.some(r => r[0].indexOf('проверка результата') > 0),
+    JSON.stringify(totalRows.map(r => r[0])));
+  check('диаграмма считает запросы, а не записи массива',
+    chartLabel.indexOf('запросов: 1') >= 0, chartLabel);
+  check('под таблицей видна стоимость запросов (оценка по тарифам)',
+    $('agent-cost').textContent.indexOf('за шаг') > 0
+    && $('agent-cost').textContent.indexOf('за диалог') > 0,
+    $('agent-cost').textContent);
+
+  console.log('\n[N2] Проверка не удалась: задача не готова, прогон остановлен');
+  // «Сервер»: проверку результата выполнить не удалось (модель не ответила).
+  CHECK_BLOCKED = true;
+  setState({});
+  await wait(40);
+  await sendRequest('Сделай отчёт');
+  await click($('tm-confirm'), 40);
+  for (let i = 0; i < 100 && state.stage !== 'validation'; i++) await wait(20);
+  check('задача осталась на этапе «Проверка», а не ушла в «Готово»',
+    state.stage === 'validation', state.stage);
+  check('кнопка «Принять вручную» показана', $('tm-accept').hidden === false);
+  check('в полосе видно, что проверка не выполнена',
+    $('tm-redo').hidden === false
+    && $('tm-redo').textContent.indexOf('проверка не выполнена') >= 0,
+    $('tm-redo').textContent);
+  check('подсказка предлагает повторить проверку',
+    $('tm-idle').hidden === false
+    && $('tm-idle').textContent.indexOf('повторить проверку') >= 0,
+    $('tm-idle').textContent);
+  check('в чате объяснено, почему задача не объявлена готовой',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf(
+      'Проверку результата выполнить не удалось') >= 0),
+    q('#messages .msg.bot').map(el => el.textContent.slice(0, 60)).join(' | '));
+  // Прогон остановлен: повторять проверку по кругу автомат не должен (иначе это
+  // лишние вызовы LLM до предохранителя цепочки).
+  const chatsAfterBlock = chatBodies.length;
+  await wait(600);
+  check('прогон остановлен: новых запросов к модели нет',
+    chatBodies.length === chatsAfterBlock,
+    chatsAfterBlock + ' → ' + chatBodies.length);
+  // «Принять вручную» закрывает задачу без проверки.
+  await click($('tm-accept'), 60);
+  check('«Принять вручную» завершает задачу', state.stage === 'done', state.stage);
+  check('кнопка «Принять вручную» скрыта после завершения', $('tm-accept').hidden === true);
+  CHECK_BLOCKED = false;
+
+  console.log('\n[O] Экспертная статистика: счётчики приходят с сервера');
+  dom.window.eval('setExpertMode(false); setAgentMode(false); setExpertMode(true)');
+  dom.window.eval('applyStats({ direct: { correct: 2, incorrect: 1 }, group: { correct: 0, incorrect: 3 } })');
+  await wait(30);
+  const statsRows = () => Array.from($('stats-body').querySelectorAll('tr'))
+    .map(tr => Array.from(tr.querySelectorAll('td')).map(td => td.textContent));
+  check('статистика рисуется из снимка сервера',
+    JSON.stringify(statsRows()[0]) === JSON.stringify(['Прямой ответ', '2', '1'])
+    && JSON.stringify(statsRows()[3]) === JSON.stringify(['Экспертная группа', '0', '3']),
+    JSON.stringify(statsRows()));
+  // Переключение режима больше НЕ обнуляет статистику (она живёт на сервере).
+  dom.window.eval('setExpertMode(false)');
+  dom.window.eval('setExpertMode(true)');
+  await wait(30);
+  check('переключение режима статистику не обнуляет',
+    JSON.stringify(statsRows()[0]) === JSON.stringify(['Прямой ответ', '2', '1']),
+    JSON.stringify(statsRows()));
 
   console.log('\nИтог: ' + (failures ? 'ПРОВАЛЕНО проверок: ' + failures : 'все проверки пройдены'));
   dom.window.close();
