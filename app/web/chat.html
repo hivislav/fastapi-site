@@ -333,6 +333,24 @@
         .icon-btn[hidden] { display: none; }
         .icon-btn:hover { background: var(--surface-3); }
         .icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        /* Кнопка «MCP» рядом с шестерёнкой проекта: это не иконка, а короткая
+           подпись, поэтому ширина по тексту (остальные правила .icon-btn те же). */
+        .icon-btn.mcp-btn {
+            width: auto;
+            min-width: 30px;
+            padding: 0 6px;
+            font-family: var(--mono);
+            font-size: 0.6rem;
+            letter-spacing: 0.04em;
+            color: var(--accent);
+        }
+        /* Включён хотя бы один сервер: кнопка помечена, чтобы «MCP работает» было
+           видно, не открывая диалог (цвета — только переменные темы). */
+        .icon-btn.mcp-btn.on {
+            background: rgba(34, 211, 238, 0.18);
+            color: var(--accent-2);
+            box-shadow: inset 0 0 0 1px var(--line-strong);
+        }
         .task-select,
         .task-new,
         .session-new {
@@ -1049,6 +1067,82 @@
         }
         .inv-add button:hover { background: rgba(34, 211, 238, 0.2); }
         .inv-add button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* ---------- MCP: внешние инструменты проекта (кнопка «MCP») ---------- */
+        .modal-box.mcp-modal {
+            width: 720px !important;
+            max-width: 94vw;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 26px 28px;
+            box-sizing: border-box;
+        }
+        .mcp-modal h3 { font-size: 1.25rem; margin-bottom: 10px; }
+        .mcp-modal .modal-hint { font-size: 0.85rem; line-height: 1.55; }
+        .mcp-list { margin: 16px 0 4px; }
+        .mcp-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 13px 15px;
+            margin-bottom: 10px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--surface-2);
+        }
+        .mcp-item.off { opacity: 0.72; }
+        .mcp-item input[type="checkbox"] {
+            width: 17px;
+            height: 17px;
+            flex: none;
+            margin-top: 2px;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+        .mcp-body { flex: 1; min-width: 0; }
+        .mcp-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+        .mcp-name { font-size: 1rem; color: var(--accent-2); font-weight: 600; }
+        .mcp-source { font-size: 0.74rem; color: var(--muted); font-family: var(--mono); }
+        .mcp-desc { font-size: 0.88rem; color: var(--text-dim); line-height: 1.5; margin: 5px 0 0; }
+        .mcp-tools { margin: 8px 0 0; padding: 0; list-style: none; }
+        .mcp-tools li {
+            font-size: 0.82rem;
+            color: var(--text-dim);
+            line-height: 1.5;
+            padding: 4px 0 4px 12px;
+            border-left: 1px solid var(--line);
+        }
+        .mcp-tools .mcp-tool-name {
+            font-family: var(--mono);
+            color: var(--accent);
+            font-size: 0.78rem;
+        }
+        .mcp-badge {
+            font-size: 0.74rem;
+            padding: 2px 7px;
+            border-radius: 6px;
+            border: 1px solid var(--line-soft);
+            color: var(--text-dim);
+            white-space: nowrap;
+        }
+        .mcp-badge.ok { color: var(--accent-2); border-color: var(--line-strong); }
+        .mcp-badge.bad { color: var(--danger); border-color: var(--danger); }
+        .mcp-error {
+            font-size: 0.8rem;
+            color: var(--warn);
+            margin: 7px 0 0;
+            line-height: 1.45;
+            word-break: break-word;
+        }
+        .mcp-empty {
+            font-size: 0.86rem;
+            color: var(--muted);
+            padding: 10px 12px;
+            border: 1px dashed var(--line);
+            border-radius: 10px;
+        }
+        .mcp-status { margin-top: 10px; color: var(--muted); }
+
         .modal-overlay {
             position: fixed;
             inset: 0;
@@ -1424,6 +1518,12 @@
                              принятые решения, ограничения стека, бизнес-правила). -->
                         <button type="button" class="icon-btn" id="project-invariants"
                                 title="Инварианты проекта: правила, которые агент не имеет права нарушить">⚙️</button>
+                        <!-- MCP ПРОЕКТА: внешние инструменты агента (погода, курсы
+                             валют, цены). Включённые серверы уходят в каждый
+                             запрос агента — он сам вызывает нужные инструменты и
+                             отвечает по фактическим данным. -->
+                        <button type="button" class="icon-btn mcp-btn" id="project-mcp"
+                                title="MCP-инструменты проекта: внешние источники данных для агента">MCP</button>
                         <button type="button" class="icon-btn" id="task-rename" title="Переименовать проект">✏️</button>
                         <button type="button" class="icon-btn" id="task-delete" title="Удалить проект">🗑</button>
                     </span>
@@ -1645,6 +1745,32 @@
                     </div>
                     <div class="modal-actions">
                         <button type="button" class="accept" id="inv-close">закрыть</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- MCP (кнопка «MCP» рядом с шестерёнкой проекта). MCP — протокол
+                 внешних инструментов: сервер объявляет инструменты (погода, курсы
+                 валют, цены), а агент САМ вызывает их, когда для ответа не хватает
+                 данных. Галочка включает сервер для ЭТОГО проекта: включённые
+                 уходят в каждый запрос агента («применить» запоминает набор).
+                 Серверы бесплатные и работают без ключей; список, описания и
+                 инструменты приходят с сервера (GET /api/agent/mcp). -->
+            <div class="modal-overlay" id="mcp-modal" hidden>
+                <div class="modal-box mcp-modal">
+                    <h3>MCP-инструменты проекта</h3>
+                    <p class="modal-hint">MCP (Model Context Protocol) — внешние
+                        источники данных для агента. Включённые серверы агент видит
+                        в каждом запросе: если для ответа не хватает фактов (погода,
+                        курс, цена), он сам вызывает нужный инструмент и отвечает по
+                        полученным данным, а не по догадке. Всё бесплатно и без
+                        ключей — интернет нужен только на время вызова.</p>
+                    <div class="mcp-list" id="mcp-list"></div>
+                    <p class="modal-hint mcp-status" id="mcp-status" hidden></p>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="mcp-refresh">обновить список</button>
+                        <button type="button" class="clear" id="mcp-close">закрыть</button>
+                        <button type="button" class="accept" id="mcp-apply">применить</button>
                     </div>
                 </div>
             </div>
@@ -2700,6 +2826,9 @@
                 // неразрешённое противоречие» ставим сразу после отрисовки (по
                 // последнему снимку; свежий подтянет refreshInvariants).
                 renderInvariantsMarks();
+                // Кнопка «MCP» проекта: по последнему снимку помечаем, что
+                // внешние инструменты включены (свежий снимок подтянет loadMcp).
+                renderMcpMarks();
                 // Срезы памяти привязаны к задаче, но нужны только виду
                 // «Состояние памяти»: грузить их при каждом обновлении панели
                 // (а это каждый шаг задачи) — лишний запрос вхолостую.
@@ -3951,6 +4080,9 @@
             // Кнопка «Инварианты» живёт в панели Workspace (блок проекта) и
             // скрывается вместе с ней — отдельно прятать её не нужно.
             if (!on) closeInvariantsModal();
+            // То же для кнопки «MCP»: вне режима агента внешние инструменты не
+            // работают, поэтому диалог закрываем вместе с панелью проекта.
+            if (!on) closeMcpModal();
             if (!on) {
                 // Обычный режим контекст не хранит: убираем агентский диалог
                 // (восстановленный + реплики сеанса агента) из окна чата, а
@@ -4443,6 +4575,9 @@
             // Инварианты проекта и этой задачи (счётчик на кнопке и метка
             // конфликта) — у каждого диалога свой набор правил.
             await refreshInvariants();
+            // MCP — настройка ПРОЕКТА: при переключении проекта «MCP» должен
+            // показывать набор ЭТОГО проекта, а не прежнего.
+            await loadMcp(false);
             // Вернулись в задачу с неотработанной командой остановки — доводим её.
             if (stopRequest && stopRequest.session === workspace.active_session) {
                 reconcilePendingStop();
@@ -4716,6 +4851,206 @@
                     addInvariant(input === invProjectInput ? 'project' : 'task');
                 }
             });
+        });
+
+        // ---------- MCP: внешние инструменты проекта (кнопка «MCP») ----------
+        // MCP — протокол внешних инструментов (погода, курсы валют, цены).
+        // Галочка в диалоге включает сервер для ТЕКУЩЕГО проекта, «применить»
+        // запоминает набор на сервере: включённые серверы агент видит в каждом
+        // запросе и сам вызывает нужные инструменты. Снимок приходит с сервера
+        // (GET /api/agent/mcp) вместе с настоящим списком инструментов и
+        // состоянием каждого сервера — «включено, но не работает» пользователь
+        // видит причиной, а не молчанием.
+        const projectMcpBtn = document.getElementById('project-mcp');
+        const mcpModal = document.getElementById('mcp-modal');
+        const mcpListEl = document.getElementById('mcp-list');
+        const mcpStatusEl = document.getElementById('mcp-status');
+        // Последний снимок MCP с сервера: серверы, их инструменты и галочки.
+        let mcpData = null;
+
+        async function mcpRequest(url, options) {
+            try {
+                const res = await fetch(url, options);
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    addMessage('bot', '⚠️ ' + (detail || 'Не удалось получить список MCP-серверов.'), true);
+                    return null;
+                }
+                return await res.json();
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+                return null;
+            }
+        }
+
+        // Строка сервера: галочка, название, краткое описание, источник,
+        // состояние и список инструментов.
+        function mcpItemNode(server) {
+            const row = document.createElement('div');
+            row.className = 'mcp-item' + (server.enabled ? '' : ' off');
+
+            const check = document.createElement('input');
+            check.type = 'checkbox';
+            check.checked = !!server.enabled;
+            check.dataset.server = server.id;
+            check.id = 'mcp-check-' + server.id;
+            check.addEventListener('change', () => {
+                // Класс строки — только визуальная подсказка «включено/нет»;
+                // на сервер уходит набор при «применить».
+                row.classList.toggle('off', !check.checked);
+            });
+
+            const body = document.createElement('div');
+            body.className = 'mcp-body';
+            const head = document.createElement('div');
+            head.className = 'mcp-head';
+            const name = document.createElement('label');
+            name.className = 'mcp-name';
+            name.htmlFor = check.id;
+            name.textContent = server.name || server.id;
+            head.appendChild(name);
+            if (server.source) {
+                const source = document.createElement('span');
+                source.className = 'mcp-source';
+                source.textContent = server.source;
+                head.appendChild(source);
+            }
+            const badge = document.createElement('span');
+            const tools = server.tools || [];
+            if (server.available) {
+                badge.className = 'mcp-badge ok';
+                badge.textContent = tools.length
+                    ? `доступен · инструментов: ${tools.length}` : 'доступен';
+            } else {
+                badge.className = 'mcp-badge bad';
+                badge.textContent = 'недоступен';
+            }
+            head.appendChild(badge);
+            body.appendChild(head);
+
+            const desc = document.createElement('p');
+            desc.className = 'mcp-desc';
+            desc.textContent = server.description || '';
+            body.appendChild(desc);
+
+            if (tools.length) {
+                const list = document.createElement('ul');
+                list.className = 'mcp-tools';
+                tools.forEach(tool => {
+                    const item = document.createElement('li');
+                    const toolName = document.createElement('span');
+                    toolName.className = 'mcp-tool-name';
+                    toolName.textContent = tool.name;
+                    item.appendChild(toolName);
+                    const text = tool.description || tool.title || '';
+                    if (text) item.appendChild(document.createTextNode(' — ' + text));
+                    list.appendChild(item);
+                });
+                body.appendChild(list);
+            }
+            if (!server.available && server.error) {
+                const error = document.createElement('p');
+                error.className = 'mcp-error';
+                error.textContent = 'Причина: ' + server.error;
+                body.appendChild(error);
+            }
+
+            row.appendChild(check);
+            row.appendChild(body);
+            return row;
+        }
+
+        function renderMcp() {
+            const data = mcpData || { servers: [] };
+            mcpListEl.innerHTML = '';
+            const servers = data.servers || [];
+            if (!servers.length) {
+                const empty = document.createElement('div');
+                empty.className = 'mcp-empty';
+                empty.textContent = 'MCP-серверов нет: список пуст.';
+                mcpListEl.appendChild(empty);
+            } else {
+                servers.forEach(server => mcpListEl.appendChild(mcpItemNode(server)));
+            }
+            const counts = data.counts || {};
+            mcpStatusEl.textContent = counts.tools
+                ? `Серверов: ${counts.servers}, доступно: ${counts.available}, `
+                  + `инструментов: ${counts.tools}. Включено: ${counts.enabled}.`
+                : 'Список серверов пуст.';
+            mcpStatusEl.hidden = false;
+            renderMcpMarks();
+        }
+
+        // Подпись кнопки «MCP»: сколько серверов включено у текущего проекта.
+        function renderMcpMarks() {
+            const data = mcpData || {};
+            const counts = data.counts || {};
+            const total = Number(counts.servers || 0);
+            const enabled = Number(counts.enabled || 0);
+            projectMcpBtn.classList.toggle('on', enabled > 0);
+            projectMcpBtn.title = 'MCP-инструменты проекта: внешние источники данных '
+                + 'для агента'
+                + (total ? ` (включено ${enabled} из ${total})` : '');
+        }
+
+        async function loadMcp(force) {
+            try {
+                const res = await fetch('/api/agent/mcp' + (force ? '?force=1' : ''));
+                if (!res.ok) { renderMcpMarks(); return; }
+                mcpData = await res.json();
+            } catch (e) {
+                // Эндпоинта нет (старый сервер) — просто не помечаем кнопку.
+                mcpData = null;
+            }
+            renderMcpMarks();
+            if (!mcpModal.hidden) renderMcp();
+        }
+
+        async function openMcpModal() {
+            mcpModal.hidden = false;
+            mcpListEl.innerHTML = '';
+            mcpStatusEl.textContent = 'Опрашиваю MCP-серверы…';
+            mcpStatusEl.hidden = false;
+            await loadMcp(false);
+        }
+
+        function closeMcpModal() {
+            mcpModal.hidden = true;
+        }
+
+        // «Применить»: уходит ПОЛНЫЙ набор галочек — сервер, которого в нём нет,
+        // выключается. Ответ — свежий снимок, по нему перерисовываем диалог.
+        async function applyMcp() {
+            const enabled = Array.from(
+                mcpListEl.querySelectorAll('input[type=checkbox]'))
+                .filter(check => check.checked)
+                .map(check => check.dataset.server);
+            const data = await mcpRequest('/api/agent/mcp',
+                jsonOptions('POST', { enabled: enabled }));
+            if (!data) return;
+            mcpData = data;
+            renderMcp();
+            closeMcpModal();
+            const counts = data.counts || {};
+            addMessage('bot', counts.enabled
+                ? `✅ MCP включён для проекта: серверов ${counts.enabled} `
+                  + `(инструментов ${counts.tools}). Агент вызовет их сам, когда `
+                  + 'для ответа не хватит данных.'
+                : '✅ MCP выключен для проекта: агент отвечает без внешних инструментов.',
+                true);
+        }
+
+        projectMcpBtn.addEventListener('click', openMcpModal);
+        document.getElementById('mcp-close').addEventListener('click', closeMcpModal);
+        document.getElementById('mcp-apply').addEventListener('click', applyMcp);
+        document.getElementById('mcp-refresh').addEventListener('click', async () => {
+            mcpStatusEl.textContent = 'Опрашиваю MCP-серверы…';
+            mcpStatusEl.hidden = false;
+            await loadMcp(true);
+        });
+        mcpModal.addEventListener('click', (e) => {
+            if (e.target === mcpModal) closeMcpModal();
         });
 
         // Снимок workspace + диалог текущей сессии: включение режима агента,

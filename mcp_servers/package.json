@@ -1,0 +1,11 @@
+{
+  "name": "fastapi-site-mcp-servers",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Локальные MCP-серверы проекта на официальном MCP SDK (бесплатные источники без ключей)",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "^4.6.5"
+  }
+}

@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Optional
 
 from app import config
 from app.ai import invariants as invariants_store
+from app.ai import mcp as mcp_store
 from app.ai import task_state
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,15 @@ INVARIANT_ENTRY_LIMIT = 1000
 _MAX_CONFLICTS = 250
 _MAX_UNCHECKED = 250
 
+# MCP (внешние инструменты агента) — см. app/ai/mcp.py. Настройка ПРОЕКТА: поле
+# "mcp" задачи-workspace хранит, какие серверы включены (у каждой задачи-проекта
+# свой набор). Включает и выключает их пользователь в диалоге «MCP» по кнопке
+# рядом с шестерёнкой проекта; включённые серверы уходят в каждый запрос агента.
+MCP_FIELD = "mcp"
+# Сколько серверов может быть включено одновременно (серверов в реестре
+# app/ai/mcp.py сейчас три; запас на будущее — как MAX_INVARIANTS).
+MAX_MCP_SERVERS = 10
+
 # Заголовок пустой сессии (пока пользователь не отправил ни одного запроса).
 EMPTY_SESSION_TITLE = "Новая задача"
 
@@ -183,6 +193,13 @@ def empty_dialog(task_id: str = "") -> Dict[str, Any]:
         # вызов) и НЕ проверять его повторно, когда ни запрос, ни правила не
         # изменились, — например, при перезапуске задачи после ошибки.
         "plan_signature": {},
+        # Данные внешних инструментов MCP по ТЕКУЩЕМУ запросу задачи (см.
+        # app/ai/mcp.py): подпись «включённые серверы + исходный запрос» и
+        # результаты вызовов. Шаги плана и проверка результата идут отдельными
+        # запросами и берут данные отсюда — иначе второй шаг отвечал бы уже без
+        # них. Новый запрос пользователя меняет подпись, и данные собираются
+        # заново.
+        "mcp": {},
     }
 
 
@@ -461,7 +478,47 @@ def normalize_dialog(raw: Any, task_id: str = "") -> Dict[str, Any]:
         raw.get("conflicts"), raw.get("exceptions"))
     dialog["exceptions"] = [dict(item) for item in decisions]
     dialog["plan_signature"] = _clean_plan_signature(raw.get("plan_signature"))
+    # Данные внешних инструментов MCP по текущему запросу задачи (см.
+    # app/ai/mcp.py): подпись + результаты вызовов.
+    dialog["mcp"] = _normalize_dialog_mcp(raw.get("mcp"))
     return dialog
+
+
+def _normalize_dialog_mcp(raw: Any) -> Dict[str, Any]:
+    """Данные MCP диалога: {"signature", "request", "results"} (битое — пусто).
+
+    Хранится ТОЛЬКО то, что уже получено: подпись (включённые серверы + исходный
+    запрос задачи) и результаты вызовов. Сами вызовы не повторяются — при
+    несовпадении подписи данные собираются заново веб-слоем.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    signature = str(raw.get("signature") or "").strip()
+    if not signature:
+        return {}
+    return {
+        "signature": signature[:600],
+        "request": str(raw.get("request") or "")[:400],
+        "results": mcp_store.normalize_results(raw.get("results")),
+    }
+
+
+def dialog_mcp(dialog: Dict[str, Any]) -> Dict[str, Any]:
+    """Данные MCP диалога (нормализует поле на месте, если его нет)."""
+    if not isinstance(dialog.get("mcp"), dict):
+        dialog["mcp"] = _normalize_dialog_mcp(dialog.get("mcp"))
+    return dialog["mcp"]
+
+
+def set_dialog_mcp(dialog: Dict[str, Any], signature: str, request: str,
+                   results: Any) -> Dict[str, Any]:
+    """Запоминает данные MCP текущего запроса задачи (подпись + результаты)."""
+    dialog["mcp"] = _normalize_dialog_mcp({
+        "signature": signature,
+        "request": request,
+        "results": results,
+    })
+    return dialog["mcp"]
 
 
 def _clean_plan_signature(raw: Any) -> Dict[str, str]:
@@ -569,6 +626,56 @@ def _normalize_invariants(raw: Any) -> List[Dict[str, Any]]:
             "created": created or _now(),
         })
     return entries[-MAX_INVARIANTS:]
+
+
+def _normalize_mcp(raw: Any) -> Dict[str, Any]:
+    """Приводит настройку MCP проекта к виду {"enabled": [...]}.
+
+    Включёнными считаются только известные реестру id (app/ai/mcp.py): запись,
+    оставшаяся в файле от прежней версии или от другого набора серверов, ничего
+    не ломает — она просто не попадает в список и в запросы агента.
+    """
+    if isinstance(raw, list):  # запасной формат: голый список включённых серверов
+        raw = {"enabled": raw}
+    data = raw if isinstance(raw, dict) else {}
+    enabled: List[str] = []
+    for item in (data.get("enabled") if isinstance(data.get("enabled"), list) else []):
+        key = str(item or "").strip().lower()
+        if key and key in mcp_store.SERVER_IDS and key not in enabled:
+            enabled.append(key)
+    if not enabled and data.get("enabled"):
+        # Ни одного известного сервера не осталось (реестр изменился) — набор пуст.
+        logger.info("MCP: в настройках проекта нет известных серверов")
+    return {"enabled": enabled[-MAX_MCP_SERVERS:]}
+
+
+def mcp_settings(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Настройка MCP проекта (нормализует поле на месте, если его нет).
+
+    Как invariants(): задача, созданная в памяти и ещё не записанная в файл, не
+    имеет поля — оно появляется при первом обращении, а не падает с KeyError.
+    """
+    if not isinstance(task.get(MCP_FIELD), dict):
+        task[MCP_FIELD] = _normalize_mcp(task.get(MCP_FIELD))
+    return task[MCP_FIELD]
+
+
+def mcp_enabled(task: Optional[Dict[str, Any]]) -> List[str]:
+    """Включённые серверы MCP проекта (пустой список — MCP у проекта выключен)."""
+    if not task:
+        return []
+    return list(mcp_settings(task)["enabled"])
+
+
+def set_mcp_enabled(task: Dict[str, Any], enabled: Any) -> List[str]:
+    """Записывает набор включённых серверов MCP и возвращает его.
+
+    Пишет только известные реестру id: включить сервер, которого нет, нельзя —
+    иначе агент «включённым» инструментом пользоваться не сможет, а интерфейс
+    покажет включённым то, чего в диалоге нет.
+    """
+    task[MCP_FIELD] = _normalize_mcp({"enabled": enabled})
+    return list(task[MCP_FIELD]["enabled"])
 
 
 def exceptions(dialog: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -905,6 +1012,9 @@ def _normalize_task(raw: Any) -> Optional[Dict[str, Any]]:
         # Инварианты ПРОЕКТА (в терминах интерфейса «проект» — это задача):
         # правила, действующие во всех задачах-диалогах этого проекта.
         "invariants": _normalize_invariants(raw.get("invariants")),
+        # MCP ПРОЕКТА: какие внешние инструменты (погода, курсы валют, …) агент
+        # может вызывать в задачах этого проекта (см. app/ai/mcp.py).
+        "mcp": _normalize_mcp(raw.get("mcp")),
     }
 
 

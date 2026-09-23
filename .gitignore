@@ -26,5 +26,8 @@ data/
 # Внутренний промт для старта агент-сессии (не в git)
 SESSION_PROMPT.md
 
+# Зависимости локальных MCP-серверов (mcp_servers/README.md: npm install)
+node_modules/
+
 # Резервные копии данных (tools/cleanup_workspace.py)
 *.bak

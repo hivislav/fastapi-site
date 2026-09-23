@@ -43,7 +43,8 @@ from typing import (
 )
 
 from app import config
-from app.ai import client, demo, invariants as invariants_store, json_utils, task_state
+from app.ai import client, demo, invariants as invariants_store, json_utils, mcp as mcp_store
+from app.ai import task_state
 
 logger = logging.getLogger(__name__)
 
@@ -508,6 +509,14 @@ class Agent:
         # стратегии: выбранная архитектура, принятые решения, ограничения стека и
         # бизнес-правила должны быть видны модели явно, а не «где-то в истории».
         self.invariants: Dict[str, Any] = invariants_store.snapshot()
+        # ДАННЫЕ MCP — результаты ВНЕШНИХ ИНСТРУМЕНТОВ (погода, курсы валют,
+        # цены), которые агент вызвал по текущему запросу пользователя (см.
+        # app/ai/mcp.py). Собираются веб-слоем ДО планирования: он спрашивает
+        # модель, какие инструменты нужны, выполняет их и передаёт результаты
+        # сюда. В messages данные не пишутся — уходят в модель СВОИМ системным
+        # блоком (см. _memory_blocks) вместе с планом, ответом и проверкой
+        # результата: иначе агент «забыл бы» полученные числа на следующем шаге.
+        self.mcp: List[Dict[str, Any]] = []
         # Профиль пользователя — СИСТЕМНЫЙ ПРОМПТ СЕССИИ: готовый текстовый блок
         # (что пользователь рассказал о себе и каким хочет видеть ответ), собранный
         # веб-слоем из app/ai/profiles.py для ТЕКУЩЕГО профиля. Идёт первым
@@ -570,6 +579,7 @@ class Agent:
         profile: Optional[str] = None,
         state: Optional["task_state.TaskState"] = None,
         invariants: Optional[Dict[str, Any]] = None,
+        mcp: Optional[List[Dict[str, Any]]] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
@@ -604,7 +614,7 @@ class Agent:
 
         await self._process(
             user_message, history, sink, summary, facts, branches, branch, covered,
-            working_memory, long_term_memory, profile, state, invariants,
+            working_memory, long_term_memory, profile, state, invariants, mcp,
         )
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
@@ -631,6 +641,7 @@ class Agent:
         profile: Optional[str] = None,
         state: Optional["task_state.TaskState"] = None,
         invariants: Optional[Dict[str, Any]] = None,
+        mcp: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -661,7 +672,7 @@ class Agent:
         runner = asyncio.create_task(
             self._process(
                 user_message, history, sink, summary, facts, branches, branch, covered,
-                working_memory, long_term_memory, profile, state, invariants,
+                working_memory, long_term_memory, profile, state, invariants, mcp,
             )
         )
         try:
@@ -696,6 +707,7 @@ class Agent:
         profile: Optional[str] = None,
         state: Optional["task_state.TaskState"] = None,
         invariants: Optional[Dict[str, Any]] = None,
+        mcp: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -738,6 +750,11 @@ class Agent:
             # app/ai/invariants.py): уходят в модель отдельным системным блоком.
             if invariants is not None:
                 self.invariants = invariants_store.normalize(invariants)
+            # Данные внешних инструментов MCP по этому запросу (см. app/ai/mcp.py):
+            # уходят в модель отдельным системным блоком, поэтому видны и плану,
+            # и ответу, и проверке результата.
+            if mcp is not None:
+                self.mcp = mcp_store.normalize_results(mcp)
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
@@ -760,6 +777,11 @@ class Agent:
                 await emit(self._step(
                     "debug",
                     f"{self.name}: " + invariants_store.rules_note(self.invariants),
+                ))
+            if mcp_store.has_data(self.mcp):
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: " + mcp_store.results_note(self.mcp),
                 ))
             if self.task_state is not None:
                 # Коротко и без повтора: этап, шаг и ожидаемое действие уже
@@ -929,6 +951,7 @@ class Agent:
         profile: Optional[str] = None,
         invariants: Optional[Dict[str, Any]] = None,
         note: Optional[str] = None,
+        mcp: Optional[List[Dict[str, Any]]] = None,
     ) -> List[str]:
         """Строит план задачи (шаги) служебным вызовом LLM — этап planning.
 
@@ -966,6 +989,11 @@ class Agent:
         # правило проекта или задачи, не должен появиться в плане вообще.
         if invariants is not None:
             self.invariants = invariants_store.normalize(invariants)
+        # Данные внешних инструментов MCP — тоже часть контекста планирования:
+        # без них планировщик не знал бы, что погода/курс уже получены, и строил
+        # бы шаг «узнать погоду» вместо работы по фактическим данным.
+        if mcp is not None:
+            self.mcp = mcp_store.normalize_results(mcp)
         # Пустой запрос планировать нечего — один шаг «уточнить запрос».
         if not text:
             return ["Уточнить у пользователя, что именно нужно сделать"]
@@ -1063,6 +1091,29 @@ class Agent:
         return await invariants_store.check_steps(
             steps, self.invariants, self._tracked_call(self.SERVICE_GATE))
 
+    async def choose_mcp_tools(
+        self,
+        user_message: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Выбор ВНЕШНИХ ИНСТРУМЕНТОВ MCP по запросу — ДО этапа планирования.
+
+        Служебный вызов LLM (см. mcp_store.choose): модель получает запрос
+        пользователя и список инструментов включённых серверов MCP (погода,
+        курсы валют, цены) и возвращает JSON с вызовами — что и с какими
+        аргументами вызвать. Вызовы с инструментом, которого сервер не объявлял,
+        отбрасываются: «вызвать» придуманный инструмент нельзя.
+
+        Пустой список означает «внешние данные не нужны» ИЛИ «выбор не удался»: в
+        обоих случаях агент работает как раньше — без данных MCP. Расход вызова
+        копится в self.last_usage как служебный (вид "mcp") и складывается с
+        расходом ответа веб-слоем (см. merge_usage).
+        """
+        # Замер обнуляем: веб-слой складывает замеры как дельты одного обращения.
+        self.last_usage = self._new_usage()
+        return await mcp_store.choose(
+            user_message, list(tools or []), self._tracked_call(self.SERVICE_MCP))
+
     async def check_invariants(
         self,
         user_message: str,
@@ -1101,6 +1152,7 @@ class Agent:
         long_term_memory: Optional[List[str]] = None,
         profile: Optional[str] = None,
         invariants: Optional[Dict[str, Any]] = None,
+        mcp: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Содержательная проверка результата (этап validation) — служебный вызов.
 
@@ -1130,6 +1182,11 @@ class Agent:
         # правила, что и сам ответ (см. _memory_text).
         if invariants is not None:
             self.invariants = invariants_store.normalize(invariants)
+        # Данные MCP уходят и в проверку результата: она должна видеть те же
+        # факты, что и сам ответ (иначе «сходил за погодой» выглядел бы как
+        # выдуманное число).
+        if mcp is not None:
+            self.mcp = mcp_store.normalize_results(mcp)
         # Проверять нечего: пустая история — нечего и оценивать.
         if not self.memory:
             return None
@@ -1456,7 +1513,9 @@ class Agent:
         слои памяти пользователя стратегиям не подчиняются, поэтому их текст
         не сокращается и не вытесняется окном или резюме. Порядок: сначала блок
         профиля (системный промпт сессии — кто пользователь и каким хочет видеть
-        ответ), затем состояние задачи (Task State Machine: этап, план и шаг,
+        ответ), затем правила проекта (инварианты), затем ДАННЫЕ ВНЕШНИХ
+        ИНСТРУМЕНТОВ MCP (факты по текущему запросу: погода, курсы, цены),
+        затем состояние задачи (Task State Machine: этап, план и шаг,
         который выполняется сейчас), затем глобальные знания (долговременная
         память), затем данные текущей задачи (рабочая память) — она ближе к
         запросу.
@@ -1467,6 +1526,11 @@ class Agent:
         invariants_block = invariants_store.block(self.invariants)
         if invariants_block:
             blocks.append({"role": "system", "content": invariants_block})
+        # Данные MCP — сразу после правил: это факты по текущему запросу, на
+        # которые опираются и план, и ответ, и проверка результата.
+        mcp_block = mcp_store.block(self.mcp)
+        if mcp_block:
+            blocks.append({"role": "system", "content": mcp_block})
         if self.task_state is not None:
             blocks.append({"role": "system", "content": task_state.state_block(self.task_state)})
         if self.long_term_memory:
@@ -2095,6 +2159,7 @@ class Agent:
     SERVICE_SUMMARY = "summary"      # сжатие памяти (стратегия «summary»)
     SERVICE_FACTS = "facts"          # обновление блока фактов (sticky facts)
     SERVICE_BRANCHING = "branching"  # план ветвления (стратегия «branching»)
+    SERVICE_MCP = "mcp"              # выбор внешних инструментов MCP (app/ai/mcp.py)
 
     @staticmethod
     def _new_usage() -> Dict[str, Any]:

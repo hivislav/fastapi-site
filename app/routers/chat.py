@@ -36,6 +36,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app.ai import client as llm_client
 from app.ai import service
 from app.ai import invariants as invariants_store
+from app.ai import mcp as mcp_store
 from app.ai import profiles as profile_store
 from app.ai import task_state
 from app.ai import workspace as workspace_store
@@ -44,7 +45,7 @@ from app.ai.agent import (
 )
 from app.schemas import (
     ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
-    MemoryEntryCreate, NameUpdate, PlanUpdate, ProfileCreate, ProfileFields,
+    McpApply, MemoryEntryCreate, NameUpdate, PlanUpdate, ProfileCreate, ProfileFields,
     TaskCreate,
 )
 
@@ -1132,6 +1133,126 @@ def _flat(text: Any) -> str:
     return " ".join(str(text or "").split())
 
 
+# ---------------------------------------------------------------------------
+# MCP: внешние инструменты агента (кнопка «MCP» рядом с шестерёнкой проекта)
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) — протокол внешних инструментов: сервер объявляет
+# инструменты (погода, курсы валют, цены), а агент вызывает их сам, когда для
+# ответа не хватает данных (см. app/ai/mcp.py). Набор серверов — настройка
+# ПРОЕКТА (task["mcp"]): включённые серверы видны в КАЖДОМ запросе агента.
+#
+# Что происходит в запросе (ДО планирования, как и разбор инвариантов):
+#   1) по запросу пользователя служебный вызов выбирает нужные инструменты и их
+#      аргументы (Agent.choose_mcp_tools);
+#   2) инструменты выполняются ЛОКАЛЬНЫМИ процессами-серверами (tools/call);
+#   3) полученные данные уходят в модель отдельным системным блоком — вместе с
+#      планом, ответом и проверкой результата.
+# Данные привязаны к ЗАПРОСУ ЗАДАЧИ (подпись «серверы + исходный запрос»): шаги
+# плана и проверка результата идут отдельными HTTP-запросами, и без сохранённых
+# данных второй шаг отвечал бы уже без них. Новый запрос пользователя — новая
+# подпись, инструменты выбираются заново.
+def _mcp_signature(enabled: List[str], request: str) -> str:
+    """Подпись набора данных MCP: включённые серверы + запрос задачи."""
+    return "|".join(list(enabled) + [_flat(request)[:400]])
+
+
+async def _mcp_view_async(task: Optional[Dict[str, Any]],
+                          force: bool = False) -> Dict[str, Any]:
+    """Снимок MCP для интерфейса (модалка «MCP» рядом с шестерёнкой проекта).
+
+    Отдаёт серверы проекта с описанием, инструментами, состоянием галочек и
+    доступностью. Серверы опрашиваются по-настоящему (initialize + tools/list) в
+    отдельном потоке — цикл событий на это время не блокируется. Пользователь
+    видит, что «включено» — это работающий инструмент, а не просто галочка:
+    сбой сервера показывается причиной, а не молчанием.
+    """
+    enabled = workspace_store.mcp_enabled(task)
+    data = await mcp_store.async_view(enabled, force=force)
+    data["project_id"] = (task or {}).get("id")
+    return data
+
+
+def _mcp_tools(found: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Плоский список инструментов доступных серверов — для выбора моделью."""
+    tools: List[Dict[str, Any]] = []
+    for item in found:
+        if not item.get("ok"):
+            continue
+        for tool in (item.get("tools") or []):
+            tools.append({
+                "server": item["id"],
+                "server_name": item.get("server_name") or item["id"],
+                "tool": tool["name"],
+                "description": tool.get("description") or tool.get("title") or "",
+                "schema": tool.get("schema") or {},
+            })
+    return tools
+
+
+async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: str,
+                         analyzer: Agent, state: "task_state.TaskState",
+                         machine_step: bool = False, reuse: bool = False
+                         ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+    """Данные внешних инструментов MCP по запросу — ДО этапа планирования.
+
+    Возвращает (данные вызовов, расход служебного вызова, строки диагностики).
+    MCP у проекта выключен — ни вызовов, ни расхода: запрос идёт как раньше.
+
+    Данные кладутся в dialog["mcp"] вместе с подписью «серверы + запрос задачи»:
+    шаги плана выполняются отдельными запросами, и каждый из них должен видеть те
+    же факты. `reuse` (служебная реплика шага, подтверждение плана, «работай
+    автономно», «перезапусти») означает «это НЕ новый запрос»: инструменты не
+    выбираются заново ни по служебной фразе, ни по фразе управления, а данные
+    берутся из сохранённых. Новый содержательный текст пользователя (в том числе
+    правка запроса на этапе awaiting_user) — наоборот, новый запрос: инструменты
+    выбираются по НЕМУ, иначе агент отвечал бы по данным прежнего запроса.
+    """
+    dialog = session["dialog"]
+    enabled = workspace_store.mcp_enabled(task)
+    if not enabled:
+        return [], {}, []
+    # Служебные фразы описывают ПРЕЖНИЙ запрос задачи (state.request), новый текст
+    # пользователя — сам является запросом.
+    request_text = ((state.request or text or "").strip() if (reuse or machine_step)
+                    else (text or "").strip())
+    signature = _mcp_signature(enabled, request_text)
+    stored = workspace_store.dialog_mcp(dialog)
+    if stored.get("signature") == signature:
+        # Данные по этому запросу уже собраны (шаг плана, проверка результата или
+        # повтор того же запроса) — служебного вызова и обращений к серверам нет.
+        return list(stored.get("results") or []), {}, []
+    if reuse or machine_step:
+        # Данных по запросу задачи в диалоге нет (например, задача пришла из
+        # файла до первого шага): выбирать инструменты по служебной фразе нельзя.
+        return [], {}, []
+    found = await mcp_store.async_discover(enabled)
+    tools = _mcp_tools(found)
+    if not tools:
+        lines = ["MCP: ни один включённый сервер не ответил — "
+                 + "; ".join(f"{item['id']}: {item['error'] or 'нет инструментов'}"
+                             for item in found)]
+        workspace_store.set_dialog_mcp(dialog, signature, request_text, [])
+        return [], {}, lines
+    calls = await analyzer.choose_mcp_tools(request_text, tools)
+    usage = dict(analyzer.last_usage or {})
+    if not calls:
+        workspace_store.set_dialog_mcp(dialog, signature, request_text, [])
+        return [], usage, [
+            f"MCP: проверил внешние инструменты ({len(enabled)} "
+            f"{'сервер' if len(enabled) == 1 else 'сервера'}, {len(tools)} "
+            "инструментов) — для этого запроса данные не нужны."
+        ]
+    results = await mcp_store.async_run_calls(calls)
+    workspace_store.set_dialog_mcp(dialog, signature, request_text, results)
+    return results, usage, [mcp_store.results_note(results)]
+
+
+def _mcp_debug() -> str:
+    """Строка диагностики перед выбором инструментов (что именно происходит)."""
+    return ("MCP: проверяю внешние инструменты проекта (служебный вызов LLM) — "
+            "какие данные нужны для этого запроса.")
+
+
 def _verified_choice(dialog: Optional[Dict[str, Any]], text: str,
                      snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Разбор с проверенным вариантом, если это сообщение — ОН САМ (иначе None).
@@ -1564,6 +1685,59 @@ async def invariant_resolve(payload: InvariantResolve) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# MCP: внешние инструменты агента (кнопка «MCP» рядом с шестерёнкой проекта)
+# ---------------------------------------------------------------------------
+@router.get("/agent/mcp")
+async def mcp_get(force: int = 0) -> dict:
+    """Серверы MCP проекта: название, описание, инструменты, состояние галочек.
+
+    Отдаёт {"servers": [{"id", "name", "description", "source", "enabled",
+    "available", "error", "tools": [{"name", "title", "description"}, ...]}, ...],
+    "enabled": [...], "counts": {"servers", "enabled", "tools", "available"},
+    "project_id": ...} — этим снимком живёт диалог «MCP» и подпись кнопки.
+
+    Серверы ОПРАШИВАЮТСЯ по-настоящему (initialize + tools/list): модалка
+    показывает не только галочки, но и то, что за ними стоит, — сколько
+    инструментов у сервера и работает ли он вообще. force=1 заставляет опросить
+    заново (кнопка «обновить» в диалоге), иначе работает кэш в памяти процесса.
+    """
+    task = _current_task()
+    return await _mcp_view_async(task, force=bool(force))
+
+
+@router.post("/agent/mcp")
+async def mcp_apply(payload: McpApply) -> dict:
+    """Применяет набор включённых серверов MCP проекта (кнопка «применить»).
+
+    Приходит ПОЛНЫЙ список галочек: сервер, которого в нём нет, выключается.
+    Неизвестные id отбрасываются (см. workspace_store.set_mcp_enabled) — включить
+    то, чего нет в реестре, нельзя. Обращений к модели и к серверам при записи
+    НЕТ: настройка — это данные; серверы опрашиваются только чтобы показать
+    состояние галочек в ответе.
+
+    Данные прежнего запроса при этом сбрасываются (dialog["mcp"]): набор
+    инструментов изменился, и старые данные могли быть получены сервером,
+    который пользователь только что выключил.
+    """
+    task = _current_task()
+    if task is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Сначала создайте проект — MCP-инструменты привязаны к проекту")
+    async with _workspace_lock:
+        workspace_store.set_mcp_enabled(task, payload.enabled)
+        for session in task.get("sessions") or []:
+            dialog = session.get("dialog")
+            if isinstance(dialog, dict):
+                workspace_store.set_dialog_mcp(dialog, "", "", [])
+        await _persist()
+    # Снимок собираем ПОСЛЕ записи и вне блокировки: опрос серверов запускает
+    # процессы и занимает время — держать на нём блокировку всего workspace
+    # нельзя (её ждали бы удаление задач, память, профили).
+    return await _mcp_view_async(task)
+
+
+# ---------------------------------------------------------------------------
 # Профиль пользователя: сведения о юзере уходят в системный промпт сессии
 # ---------------------------------------------------------------------------
 def _profile_fields(payload: ProfileFields) -> Dict[str, Any]:
@@ -1803,6 +1977,9 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         # сохранить состояние и закрыть поток событием "done".
         state: Optional[task_state.TaskState] = None
         session_now: Optional[Dict[str, Any]] = None
+        # Данные внешних инструментов MCP по текущему запросу задачи: заполняются
+        # ДО планирования (см. _preflight_mcp) и уходят в план, ответ и проверку.
+        mcp_data: List[Dict[str, Any]] = []
         try:
             async with _session_lock(session["id"]):
                 # Сессию, диалог и состояние берём ПОД блокировкой СВОЕЙ задачи:
@@ -1986,6 +2163,35 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                       "state": task_state.snapshot(state)})
                         return
 
+                # 1в. ВНЕШНИЕ ИНСТРУМЕНТЫ (MCP). Если у проекта включены
+                #     MCP-серверы (погода, курсы валют, цены), агент сам решает,
+                #     какие из них нужны для запроса, и вызывает их ДО
+                #     планирования: план и ответ должны строиться по фактическим
+                #     данным, а не по догадке (см. app/ai/mcp.py). Данные по
+                #     запросу задачи сохраняются в диалоге — шаги плана и
+                #     проверка результата приходят отдельными запросами и
+                #     берут их оттуда, не выбирая инструменты заново.
+                #     Ответственный расход этого запроса — отдельная служебная
+                #     строка («из них служебные вызовы», вид "mcp").
+                if workspace_store.mcp_enabled(task_now):
+                    if not machine_step:
+                        yield encode({"type": "debug", "text": (
+                            f"{_MACHINE}: " + _mcp_debug()
+                        )})
+                    mcp_data, mcp_usage, mcp_lines = await _preflight_mcp(
+                        task_now, session_now, text, analyzer, state,
+                        machine_step=machine_step,
+                        # Подтверждение плана и фразы управления («работай
+                        # автономно», «перезапусти») — не новый запрос: данные
+                        # уже собраны по запросу задачи. Любой другой текст —
+                        # новый запрос (в том числе правка запроса до подтверждения
+                        # плана): инструменты выбираются по НЕМУ.
+                        reuse=(confirmed or autonomous or restart))
+                    if mcp_usage:
+                        usage = merge_usage(usage, mcp_usage)
+                    for line in mcp_lines:
+                        yield encode({"type": "debug", "text": f"{_MACHINE}: {line}"})
+
                 async def run_validation(answered_step: bool, step_errors: List[str],
                                          stored_exchange: bool, resumed: bool):
                     """Проверка результата: локальная самопроверка + содержательная
@@ -2050,6 +2256,9 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             long_term_memory=long_term_memory,
                             profile=profile,
                             invariants=_invariants_snapshot(task_now, session_now),
+                            # Проверка видит те же данные MCP, что и ответ: без них
+                            # «сходил за погодой» выглядело бы выдуманным числом.
+                            mcp=mcp_data,
                         )
                         if reviewer.last_usage:
                             usage = merge_usage(usage, reviewer.last_usage)
@@ -2188,6 +2397,11 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             # обязан это видеть — иначе он строит план по
                             # требованию задачи в обход правила проекта.
                             invariants=_invariants_snapshot(task_now, session_now),
+                            # Данные внешних инструментов MCP: планировщик должен
+                            # знать, что погода/курс уже получены, — иначе он
+                            # поставит в план шаг «узнать погоду» вместо работы по
+                            # фактическим данным.
+                            mcp=mcp_data,
                         )
                         # Замер вызова плана — ДЕЛЬТА (агент обнуляет счётчик в
                         # начале вызова), поэтому повторное перепланирование не
@@ -2207,6 +2421,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                 long_term_memory=long_term_memory,
                                 profile=profile,
                                 invariants=_invariants_snapshot(task_now, session_now),
+                                mcp=mcp_data,
                                 note=(
                                     "ПРОВЕРКА ПО ПРАВИЛАМ ОТКЛОНИЛА предыдущий план. "
                                     "Эти шаги нарушают правила, повторять их НЕЛЬЗЯ:\n"
@@ -2344,6 +2559,9 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         profile=profile,
                         state=state,
                         invariants=_invariants_snapshot(task_now, session_now),
+                        # Данные внешних инструментов MCP по этому запросу: без них
+                        # ответ шага не знал бы о том, что агент уже получил.
+                        mcp=mcp_data,
                     ):
                         # Событие "done" несёт расход токенов текущего запроса.
                         kind = event.get("type")

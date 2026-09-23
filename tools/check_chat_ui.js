@@ -7,11 +7,15 @@
  * текущего этапа, чипы шагов плана, блок расширенного этапа (awaiting_user),
  * АВТО-ПРОГОН шагов после «Подтвердить план» (без сообщений пользователя),
  * остановка прогона кнопкой «Пауза», «Продолжить», правка плана через модалку,
- * блокировка ввода и подсказка без задачи.
+ * блокировка ввода и подсказка без задачи. Раздел [P] проверяет MCP: кнопку
+ * «MCP» рядом с шестерёнкой проекта, диалог со списком серверов (название,
+ * описание, инструменты, причина недоступности), галочки и «применить».
  *
  * Запуск (нужен jsdom — в зависимостях проекта его нет, ставится отдельно):
- *     npm install jsdom --prefix /tmp/jsdom-check
- *     NODE_PATH=/tmp/jsdom-check/node_modules node tools/check_chat_ui.js
+ *     npm install --no-save jsdom      # в корне проекта (node_modules не в git)
+ *     node tools/check_chat_ui.js
+ * Прежний способ через NODE_PATH в Node.js 26 не работает (переменная больше не
+ * подхватывается), поэтому jsdom ставится рядом с проектом.
  *
  * Сеть и сервер не нужны: fetch подменён внутри страницы. Скрипт возвращает
  * ненулевой код выхода, если хоть одна проверка провалилась.
@@ -161,6 +165,52 @@ function invPayload(sessionId) {
 
 // Последний разбор запроса на соответствие инвариантам (заглушка арбитра).
 let LAST_ANALYSIS = { verdict: '', kind: '', explanation: '', suggestions: [] };
+
+// MCP (внешние инструменты проекта): набор включённых серверов + каталог с
+// инструментами. Заглушка повторяет сервер: GET отдаёт серверы с описанием,
+// инструментами и состоянием галочек; POST применяет ПОЛНЫЙ набор галочек
+// (неизвестные id отбрасываются) и возвращает тот же снимок.
+let MCP = {
+  enabled: [],
+  servers: [
+    {
+      id: 'weather', name: 'Погода', source: '7timer.info',
+      description: 'Текущая погода и прогноз по дням для любого города.',
+      available: true, error: '',
+      tools: [{ name: 'get_weather', title: 'Погода сейчас',
+                description: 'Текущая погода в городе' }],
+    },
+    {
+      id: 'currency', name: 'Курсы валют', source: 'cbr.ru',
+      description: 'Официальные курсы Банка России к рублю.',
+      available: true, error: '',
+      tools: [{ name: 'get_rate', title: 'Курс валюты',
+                description: 'Курс валюты к рублю' }],
+    },
+    {
+      id: 'crypto', name: 'Криптовалюты', source: 'CoinGecko',
+      description: 'Цены криптовалют и обзор рынка.',
+      available: false, error: 'не найден node',
+      tools: [],
+    },
+  ],
+};
+function mcpPayload() {
+  const servers = MCP.servers.map(server => Object.assign({}, server, {
+    enabled: MCP.enabled.indexOf(server.id) >= 0,
+  }));
+  return {
+    servers: servers,
+    enabled: MCP.enabled.slice(),
+    project_id: workspace.active_task,
+    counts: {
+      servers: servers.length,
+      enabled: servers.filter(s => s.enabled).length,
+      tools: servers.reduce((total, s) => total + s.tools.length, 0),
+      available: servers.filter(s => s.available).length,
+    },
+  };
+}
 
 // Шаг «в полёте»: нужен, чтобы проверить мгновенную реакцию «Паузы».
 let stepInFlight = false;
@@ -331,6 +381,14 @@ function makeFetch() {
     }
     if (url === '/api/agent/memory') {
       return jsonResponse({ task: { id: 't-1', name: 'Задача' }, working: [], long_term: [] });
+    }
+    if (url.indexOf('/api/agent/mcp') === 0) {
+      if (method === 'POST') {
+        // Применяется ПОЛНЫЙ набор галочек; неизвестный сервер не включается.
+        const known = MCP.servers.map(s => s.id);
+        MCP.enabled = (body.enabled || []).filter(id => known.indexOf(id) >= 0);
+      }
+      return jsonResponse(mcpPayload());
     }
     if (url === '/api/agent/state') {
       return jsonResponse({ state: snapshot(), session: { id: 's-1', title: 'Диалог' } });
@@ -1335,13 +1393,14 @@ async function run() {
     'display=' + dom.window.getComputedStyle($('project-invariants')).display
       + ', hidden=' + $('project-invariants').hidden
       + ', class=' + $('project-invariants').className);
-  check('порядок иконок проекта: шестерёнка, карандаш, корзина',
+  check('порядок иконок проекта: шестерёнка, MCP, карандаш, корзина',
     (function () {
       const actions = $('project-invariants').closest('.task-actions');
-      return actions.children.length === 3
+      return actions.children.length === 4
         && actions.children[0] === $('project-invariants')
-        && actions.children[1] === $('task-rename')
-        && actions.children[2] === $('task-delete');
+        && actions.children[1] === $('project-mcp')
+        && actions.children[2] === $('task-rename')
+        && actions.children[3] === $('task-delete');
     })());
   check('отдельной кнопки «Инварианты» больше нет',
     dom.window.document.getElementById('invariants-btn') === null);
@@ -1691,6 +1750,95 @@ async function run() {
   check('переключение режима статистику не обнуляет',
     JSON.stringify(statsRows()[0]) === JSON.stringify(['Прямой ответ', '2', '1']),
     JSON.stringify(statsRows()));
+
+  console.log('\n[P] MCP: кнопка у проекта, список серверов, «применить»');
+  // Возвращаемся в режим агента: кнопка «MCP» живёт в блоке проекта.
+  dom.window.eval('setExpertMode(false); setAgentMode(true)');
+  await wait(60);
+  MCP.enabled = [];
+  await dom.window.eval('loadMcp(false)');
+  await wait(40);
+
+  check('кнопка «MCP» стоит рядом с шестерёнкой проекта',
+    $('project-mcp') !== null && $('project-mcp').closest('.task-actions') !== null
+    && $('project-mcp').previousElementSibling === $('project-invariants'));
+  check('кнопка «MCP» действительно видна',
+    $('project-mcp').hidden === false
+    && dom.window.getComputedStyle($('project-mcp')).display !== 'none',
+    'display=' + dom.window.getComputedStyle($('project-mcp')).display);
+  check('диалог MCP закрыт до нажатия', $('mcp-modal').hidden === true);
+  check('выключенный MCP не помечает кнопку',
+    $('project-mcp').classList.contains('on') === false,
+    $('project-mcp').className + ' / ' + $('project-mcp').title);
+
+  await click($('project-mcp'), 60);
+  check('нажатие открывает диалог со списком MCP', $('mcp-modal').hidden === false);
+  const items = q('#mcp-list .mcp-item');
+  check('в диалоге перечислены все серверы проекта', items.length === 3,
+    'серверов: ' + items.length);
+  const names = q('#mcp-list .mcp-name').map(el => el.textContent);
+  check('у каждого сервера есть название',
+    names.join('|') === 'Погода|Курсы валют|Криптовалюты', names.join('|'));
+  const descs = q('#mcp-list .mcp-desc').map(el => el.textContent);
+  check('у каждого сервера есть краткое описание',
+    descs.length === 3 && descs.every(text => text.length > 10), JSON.stringify(descs));
+  check('серверы показаны с инструментами',
+    q('#mcp-list .mcp-tools li').length === 2
+    && $('mcp-list').textContent.indexOf('get_weather') >= 0,
+    String(q('#mcp-list .mcp-tools li').length));
+  check('недоступный сервер показан причиной, а не молчанием',
+    $('mcp-list').textContent.indexOf('недоступен') >= 0
+    && $('mcp-list').textContent.indexOf('не найден node') >= 0);
+  check('у серверов есть галочки',
+    q('#mcp-list input[type=checkbox]').length === 3);
+  check('галочки сняты, пока MCP выключен',
+    q('#mcp-list input[type=checkbox]').every(box => box.checked === false));
+
+  // Включаем погоду и валюты, применяем: на сервер уходит полный набор.
+  const boxes = q('#mcp-list input[type=checkbox]');
+  boxes[0].checked = true;
+  boxes[1].checked = true;
+  const mcpPostsBefore = calls.filter(c => c === 'POST /api/agent/mcp').length;
+  await click($('mcp-apply'), 80);
+  check('«применить» отправил набор на сервер',
+    calls.filter(c => c === 'POST /api/agent/mcp').length === mcpPostsBefore + 1,
+    calls.slice(-3).join(' | '));
+  check('на сервер ушёл полный список галочек',
+    JSON.stringify(MCP.enabled) === JSON.stringify(['weather', 'currency']),
+    JSON.stringify(MCP.enabled));
+  check('после «применить» диалог закрывается', $('mcp-modal').hidden === true);
+  check('включённый MCP помечает кнопку проекта',
+    $('project-mcp').classList.contains('on') === true
+    && $('project-mcp').title.indexOf('включено 2 из 3') > 0,
+    $('project-mcp').className + ' / ' + $('project-mcp').title);
+  check('в чате сказано, что MCP включён',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('MCP включён') >= 0));
+
+  // Повторное открытие показывает сохранённые галочки (снимок с сервера).
+  await click($('project-mcp'), 60);
+  check('повторное открытие показывает включённые серверы',
+    q('#mcp-list input[type=checkbox]').filter(box => box.checked).length === 2
+    && q('#mcp-list input[type=checkbox]')[2].checked === false,
+    JSON.stringify(q('#mcp-list input[type=checkbox]').map(b => b.checked)));
+
+  // Выключаем всё: набор снова пуст, кнопка без пометки.
+  q('#mcp-list input[type=checkbox]').forEach(box => { box.checked = false; });
+  await click($('mcp-apply'), 80);
+  check('выключение всех серверов сохраняется',
+    MCP.enabled.length === 0, JSON.stringify(MCP.enabled));
+  check('пустой набор снимает пометку кнопки',
+    $('project-mcp').classList.contains('on') === false,
+    $('project-mcp').className + ' / ' + $('project-mcp').title);
+
+  // В обычном режиме кнопка «MCP» скрыта вместе с блоком проекта, а диалог
+  // (если был открыт) закрывается.
+  await click($('project-mcp'), 60);
+  dom.window.eval('setAgentMode(false)');
+  await wait(60);
+  check('вне режима агента диалог MCP закрыт', $('mcp-modal').hidden === true);
+  check('кнопка «MCP» скрыта вместе с блоком проекта', $('task-block').hidden === true);
+  dom.window.eval('setAgentMode(true)');
+  await wait(40);
 
   console.log('\nИтог: ' + (failures ? 'ПРОВАЛЕНО проверок: ' + failures : 'все проверки пройдены'));
   dom.window.close();
