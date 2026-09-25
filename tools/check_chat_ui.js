@@ -52,6 +52,7 @@ function setState(patch) {
     stage_label: 'Планирование', steps: [], step_index: 0, step_number: 0, steps_total: 0,
     paused: false, autonomous: false, can_pause: false, can_resume: false, can_confirm: false,
     terminal: false, extra_stage: null, reason: '', task_id: 's-1',
+    repeat_ready: false,
     updated_at: '2026-01-01T00:00:00', history: [], base_stage: 'planning',
     check_blocked: false, can_accept: false,
   }, patch || {});
@@ -70,6 +71,15 @@ function setState(patch) {
 }
 function snapshot() {
   const copy = JSON.parse(JSON.stringify(state));
+  // ПЕРИОДИЧЕСКАЯ задача: сервер отдаёт полосу БЕЗ «проверки» и «готово» — этих
+  // этапов она не проходит (см. task_state.PERIODIC_BASE_STAGES). Определяем
+  // здесь, а не в setState: тот вызывается при инициализации заглушки, когда
+  // workspace ещё не объявлен.
+  if (typeof workspace !== 'undefined' && typeof PERIODIC !== 'undefined'
+      && PERIODIC.tasks[workspace.active_session]) {
+    copy.base_stages = copy.base_stages.filter(
+      item => item.id === 'planning' || item.id === 'execution');
+  }
   copy.steps = (state.steps || []).map((step, i) => ({
     number: i + 1, text: step.text,
     active: i === state.step_index && state.stage !== 'done' && state.stage !== 'cancelled',
@@ -100,11 +110,20 @@ const chatBodies = [];
 // Журналы чата по сессиям (как dialog["log"] на сервере): что пользователь видел
 // в окне — реплики, ответы и служебные debug-строки. По ним фронт восстанавливает
 // чат при переключении диалога (в памяти messages debug не хранится).
+// Время в журнале — как его пишет сервер (наивное локальное, до секунд).
+// Часть записей БЕЗ времени: старые файлы времени не имеют, и подпись тогда не
+// показывается (выдумывать его нельзя).
+function logAt(hours, minutes) {
+  const now = new Date();
+  const pad = value => String(value).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    + `T${pad(hours)}:${pad(minutes)}:00`;
+}
 const logs = {
   's-1': [
-    { kind: 'user', text: 'Сделай отчёт по продажам' },
-    { kind: 'debug', text: 'Автомат задачи: этап planning — разбиваю запрос на шаги.' },
-    { kind: 'assistant', text: '📋 План задачи — 2 шага' },
+    { kind: 'user', text: 'Сделай отчёт по продажам', at: logAt(9, 7) },
+    { kind: 'debug', text: 'Автомат задачи: этап planning — разбиваю запрос на шаги.', at: logAt(9, 8) },
+    { kind: 'assistant', text: '📋 План задачи — 2 шага', at: logAt(9, 9) },
   ],
   's-2': [
     { kind: 'user', text: 'дай рецепт борща' },
@@ -229,9 +248,46 @@ function mcpPayload() {
   };
 }
 
+// --- Периодические задачи: расписания на «сервере» ---------------------------
+// Заглушка повторяет поведение сервера (app/ai/periodic.py, /api/agent/periodic):
+// расписание есть у задачи, созданной кнопкой «Новая периодическая задача»; его
+// период и остановку меняет POST /api/agent/periodic/{id}; в снимке задачи
+// расписание видно как session.periodic, а опрос /api/agent/periodic отдаёт тот
+// же снимок со свежим размером журнала (log_len) — по нему интерфейс понимает,
+// что автозапуск дописал в задачу новое.
+const PERIODIC = { tasks: {} };
+const PERIODIC_LABELS = {
+  '300': 'каждые 5 минут', '900': 'каждые 15 минут', '1800': 'каждые 30 минут',
+  '3600': 'раз в час', '10800': 'каждые 3 часа', '21600': 'каждые 6 часов',
+  '43200': 'каждые 12 часов', '86400': 'раз в сутки', '604800': 'раз в неделю',
+};
+const periodicBodies = [];    // тела POST /api/agent/sessions
+const periodicUpdates = [];   // тела POST /api/agent/periodic/{id}
+
+function periodicBrief(sessionId) {
+  const meta = PERIODIC.tasks[sessionId];
+  if (!meta) return null;
+  return Object.assign({}, meta, { log_len: (logs[sessionId] || []).length });
+}
+function periodicPayload() {
+  const tasks = Object.keys(PERIODIC.tasks).map(sessionId => ({
+    task_id: workspace.active_task,
+    session_id: sessionId,
+    title: ((workspace.sessions || []).find(s => s.id === sessionId) || {}).title || 'Новая задача',
+    periodic: periodicBrief(sessionId),
+  }));
+  return { tasks: tasks, now: '2026-01-01T00:00:00' };
+}
+// Снимок workspace: у периодических задач в списке — свежее расписание.
+function workspacePayload() {
+  return Object.assign({}, workspace, {
+    sessions: (workspace.sessions || []).map(session => Object.assign({}, session,
+      PERIODIC.tasks[session.id] ? { periodic: periodicBrief(session.id) } : {})),
+  });
+}
+
 // Шаг «в полёте»: нужен, чтобы проверить мгновенную реакцию «Паузы».
-let stepInFlight = false;
-// Задержка ответа на переключение задачи: нужна, чтобы проверить, что окно чата
+let stepInFlight = false;// Задержка ответа на переключение задачи: нужна, чтобы проверить, что окно чата
 // очищается СРАЗУ, а не показывает текст прежней задачи.
 let selectDelay = 0;
 // Задержка ответа планировщика (нужна, чтобы нажать паузу во время планирования)
@@ -287,7 +343,20 @@ async function runStep() {
   }
   const total = state.steps_total || 1;
   const last = state.step_index + 1 >= total;
-  if (last && CHECK_BLOCKED) {
+  // ПЕРИОДИЧЕСКАЯ задача: её прогон заканчивается НЕ этапом «Готово» — цикл
+  // заканчивается возвратом на первый шаг, план сохраняется (как на сервере,
+  // task_state.cycle_done). Иначе интерфейс крутил бы повтор за повтором.
+  const periodicSession = !!(PERIODIC.tasks[requestSession || workspace.active_session]);
+  if (last && periodicSession) {
+    setState(Object.assign({}, state, {
+      stage: 'execution', base_stage: 'execution', current_step: 'step_1',
+      step_index: 0, step_number: total ? 1 : 0, terminal: false, extra_stage: null,
+      // Признак СЕРВЕРА: цикл пройден, ждём следующего повтора. По нему прогон
+      // шагов останавливается (см. runStepChain).
+      repeat_ready: true,
+      expected_action: 'повтор по расписанию: ждём следующего повтора',
+    }));
+  } else if (last && CHECK_BLOCKED) {
     // Последний шаг выполнен, но проверку результата выполнить не удалось:
     // задача НЕ объявляется готовой — этап validation + признак check_blocked.
     setState(Object.assign({}, state, {
@@ -305,16 +374,17 @@ async function runStep() {
     setState(Object.assign({}, state, {
       stage: 'execution', current_step: `step_${next + 1}`, step_index: next,
       step_number: next + 1, expected_action: 'выполнить: ' + state.steps[next].text,
+      repeat_ready: false,   // цикл идёт — «ждём повтора» снимается
     }));
   }
   // Журнал задачи, в которой шаг запущен (как dialog["log"] на сервере): по нему
   // открытый диалог восстанавливается после фонового шага.
   const sessionId = requestSession || workspace.active_session;
+  // Текст «итог задачи» — только у ОБЫЧНОЙ задачи: периодическая не завершается.
+  const finalStep = last && !CHECK_BLOCKED && !periodicSession;
   logs[sessionId] = (logs[sessionId] || []).concat([
-    { kind: 'assistant',
-      text: (last && !CHECK_BLOCKED) ? 'Шаг выполнен: итог задачи.' : 'Шаг выполнен.' },
-  ]);
-  const blockedEvent = CHECK_BLOCKED && last ? {
+    { kind: 'assistant', text: finalStep ? 'Шаг выполнен: итог задачи.' : 'Шаг выполнен.' },
+  ]);  const blockedEvent = CHECK_BLOCKED && last ? {
     type: 'error',
     text: '⚠️ Проверку результата выполнить не удалось: модель не ответила. Задачу '
       + 'готовой не объявляю — «▶ повторить проверку» запустит проверку снова, '
@@ -322,7 +392,7 @@ async function runStep() {
   } : null;
   return streamResponse([
     { type: 'state', state: snapshot() },
-    { type: 'bot', text: (last && !CHECK_BLOCKED) ? 'Задача выполнена.' : 'Шаг выполнен.' },
+    { type: 'bot', text: finalStep ? 'Задача выполнена.' : 'Шаг выполнен.' },
     { type: 'state', state: snapshot() },
     // Уточнённый замер: автомат сделал служебный вызов (проверка результата) —
     // фронт обязан ЗАМЕНИТЬ замер запроса, а не добавить второй.
@@ -338,7 +408,25 @@ function makeFetch() {
     calls.push(method + ' ' + url);
     const body = options && options.body ? JSON.parse(options.body) : {};
 
-    if (url === '/api/agent/workspace') return jsonResponse(workspace);
+    if (url === '/api/agent/workspace') return jsonResponse(workspacePayload());
+    if (url === '/api/agent/periodic') return jsonResponse(periodicPayload());
+    if (url.indexOf('/api/agent/periodic/') === 0 && method === 'POST') {
+      // Правка расписания: как сервер — период (числом секунд) и включение-
+      // выключение автозапуска. Ответ — снимок задач вместе с расписаниями.
+      const id = decodeURIComponent(url.split('/')[4]);
+      const meta = PERIODIC.tasks[id];
+      if (!meta) return jsonResponse({ detail: 'Задача не периодическая' }, false);
+      periodicUpdates.push(body);
+      if (body && body.interval) {
+        meta.interval = body.interval;
+        meta.label = PERIODIC_LABELS[String(body.interval)] || 'каждые ' + body.interval + ' с';
+      }
+      if (body && typeof body.enabled === 'boolean') {
+        meta.enabled = body.enabled;
+        meta.when = body.enabled ? 'повтор через ' + meta.label : 'повтор остановлен';
+      }
+      return jsonResponse(Object.assign(workspacePayload(), { periodic: periodicPayload() }));
+    }
     if (url === '/api/agent/history') return jsonResponse({
       messages: [], usage: [], summary: [], facts: {}, branches: {}, active_branch: null,
       log: logs[workspace.active_session] || [],
@@ -421,21 +509,47 @@ function makeFetch() {
       return jsonResponse({ state: snap });
     }
     if (url === '/api/agent/sessions' && method === 'POST') {
+      periodicBodies.push(body);
       const id = 's-' + (workspace.sessions.length + 1) + 'x';
+      const brief = { id: id, title: 'Новая задача' };
+      if (body && body.periodic) {
+        // Периодическая задача: расписание по умолчанию — раз в сутки (как на
+        // сервере, см. periodic.DEFAULT_INTERVAL).
+        PERIODIC.tasks[id] = {
+          enabled: true, interval: 86400, label: 'раз в сутки',
+          next_run: '2026-01-02T12:00:00', last_run: '', left: 86400,
+          when: 'повтор через 24 часа', runs: 0, error: '', request: '',
+          running: false, hold: '',
+        };
+      }
       workspace = Object.assign({}, workspace, {
-        sessions: workspace.sessions.concat([{ id: id, title: 'Новая задача' }]),
+        sessions: workspace.sessions.concat([brief]),
         active_session: id,
       });
       logs[id] = [];
       usageBySession[id] = [];
       setState({});                       // новая задача — автомат с нуля
-      return jsonResponse(workspace);
+      return jsonResponse(workspacePayload());
+    }
+    if (url.indexOf('/api/agent/sessions/') === 0 && method === 'DELETE') {
+      // Удаление задачи: она уходит из списка вместе со своим журналом и
+      // расписанием (как на сервере: задача — это и есть диалог).
+      const id = decodeURIComponent(url.split('/')[4]);
+      const rest = workspace.sessions.filter(s => s.id !== id);
+      workspace = Object.assign({}, workspace, {
+        sessions: rest,
+        active_session: workspace.active_session === id
+          ? ((rest[rest.length - 1] || {}).id || null)
+          : workspace.active_session,
+      });
+      delete PERIODIC.tasks[id];
+      return jsonResponse(workspacePayload());
     }
     if (url.indexOf('/api/agent/sessions/') === 0 && url.endsWith('/select')) {
       if (selectDelay) await sleep(selectDelay);
       const id = decodeURIComponent(url.split('/')[4]);
       workspace = Object.assign({}, workspace, { active_session: id });
-      return jsonResponse(workspace);
+      return jsonResponse(workspacePayload());
     }
     if (url === '/api/agent/state/pause') {
       pauseRequests += 1;
@@ -1861,6 +1975,293 @@ async function run() {
   check('кнопка «MCP» скрыта вместе с блоком проекта', $('task-block').hidden === true);
   dom.window.eval('setAgentMode(true)');
   await wait(40);
+
+  // ---------------------------------------------------------------------
+  // [Q] ПЕРИОДИЧЕСКИЕ ЗАДАЧИ: кнопка под «Новая задача», метка в списке,
+  //     модалка периода и подхват того, что автозапуск дописал в задачу.
+  // Повторы выполняет СЕРВЕР (app/periodic_runner.py): интерфейс только
+  // показывает расписание и опрашивает /api/agent/periodic.
+  // ---------------------------------------------------------------------
+  console.log('\n[Q] Периодические задачи: кнопка, метка, расписание');
+  const periodicBtn = $('session-new-periodic');
+  check('кнопка «Новая периодическая задача» есть на странице', !!periodicBtn);
+  check('подпись кнопки', periodicBtn.textContent === 'Новая периодическая задача',
+    JSON.stringify(periodicBtn.textContent));
+  check('кнопка стоит ПОД «Новая задача»',
+    periodicBtn.previousElementSibling === $('session-new'),
+    (periodicBtn.previousElementSibling || {}).id);
+  check('класс кнопки — тот же, что у «Новая задача»',
+    periodicBtn.classList.contains('session-new')
+    && $('session-new').classList.contains('session-new'),
+    periodicBtn.className);
+  check('кнопка видна в режиме агента', periodicBtn.hidden === false);
+
+  const periodicSessionsBefore = workspace.sessions.length;
+  const periodicPostsBefore = calls.filter(
+    c => c === 'POST /api/agent/sessions').length;
+  await click(periodicBtn, 60);
+  check('нажатие создаёт задачу на сервере',
+    calls.filter(c => c === 'POST /api/agent/sessions').length
+      === periodicPostsBefore + 1,
+    calls.slice(-2).join(' | '));
+  check('создание помечено как периодическое',
+    periodicBodies.some(b => b && b.periodic === true),
+    JSON.stringify(periodicBodies));
+  check('задача появилась в списке', workspace.sessions.length === periodicSessionsBefore + 1);
+  const periodicId = workspace.active_session;
+  const periodicItem = q('#sessions .session-item')
+    .filter(el => el.dataset.session === periodicId)[0];
+  check('периодическая задача выделена в списке',
+    !!periodicItem && periodicItem.classList.contains('periodic'),
+    periodicItem ? periodicItem.className : '(элемент не найден)');
+  check('у неё есть метка с периодом по умолчанию',
+    !!periodicItem
+    && periodicItem.querySelector('.session-period').textContent.indexOf('раз в сутки') > 0,
+    periodicItem ? periodicItem.textContent : '');
+  check('метку периода видно и в подсказке',
+    !!periodicItem
+    && periodicItem.querySelector('.session-period').title.indexOf('Периодическая задача') === 0,
+    periodicItem ? periodicItem.querySelector('.session-period').title : '');
+  // Полоса этапов периодической задачи: блоков «проверка» и «готово» быть не
+  // должно — задача не проверяется и не завершается.
+  setState({});
+  dom.window.eval('applyTaskState(' + JSON.stringify(snapshot()) + ')');
+  await wait(40);
+  const periodicBlocks = blocks().map(el => el.textContent);
+  check('в полосе периодической задачи нет «Проверки» и «Готово»',
+    periodicBlocks.join('|') === 'Планирование|Выполнение', periodicBlocks.join('|'));
+  check('стрелок в полосе на одну меньше блоков',
+    arrows().length === periodicBlocks.length - 1,
+    'блоков: ' + periodicBlocks.length + ', стрелок: ' + arrows().length);
+
+  check('обычные задачи выделения не получают',
+    q('#sessions .session-item').filter(
+      el => el.dataset.session !== periodicId && el.classList.contains('periodic')
+    ).length === 0);
+  check('в чате объяснено, что задача периодическая',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('Создана периодическая задача') >= 0));
+
+  // Кнопка 🔁 открывает расписание: период, срок повтора, счётчик.
+  const gear = periodicItem.querySelector('.icon-btn[title^="Периодическая задача"]');
+  check('у периодической задачи есть кнопка расписания 🔁', !!gear);
+  await click(gear, 60);
+  check('нажатие открывает модалку расписания', $('periodic-modal').hidden === false);
+  const status = $('periodic-status').textContent;
+  check('в модалке видно, что автозапуск включён и с каким периодом',
+    status.indexOf('Автозапуск включён') >= 0 && status.indexOf('раз в сутки') > 0,
+    status.slice(0, 160));
+  check('в модалке виден срок следующего повтора',
+    status.indexOf('Следующий повтор') > 0, status.slice(0, 200));
+  check('в модалке видно, что запрос ещё не написан',
+    $('periodic-request').textContent.indexOf('Запрос ещё не написан') >= 0,
+    $('periodic-request').textContent);
+  check('селект показывает период задачи',
+    $('periodic-period').value === '86400', $('periodic-period').value);
+
+  // Правка периода уходит на сервер и перерисовывает список.
+  const periodicPosts = calls.filter(
+    c => c.indexOf('POST /api/agent/periodic/') === 0).length;
+  $('periodic-period').value = '3600';
+  await click($('periodic-save'), 80);
+  check('«сохранить» отправил период на сервер',
+    calls.filter(c => c.indexOf('POST /api/agent/periodic/') === 0).length
+      === periodicPosts + 1,
+    calls.slice(-2).join(' | '));
+  check('на сервер ушёл выбранный период (раз в час)',
+    periodicUpdates.some(u => u && u.interval === 3600),
+    JSON.stringify(periodicUpdates));
+  check('модалка закрылась после сохранения', $('periodic-modal').hidden === true);
+  const hourItem = q('#sessions .session-item')
+    .filter(el => el.dataset.session === periodicId)[0];
+  check('метка задачи показывает новый период',
+    hourItem.querySelector('.session-period').textContent.indexOf('раз в час') > 0,
+    hourItem.querySelector('.session-period').textContent);
+
+  // Остановка автозапуска: задача остаётся периодической, но помечена как
+  // остановленная.
+  await click(hourItem.querySelector('.icon-btn[title^="Периодическая задача"]'), 60);
+  await click($('periodic-toggle'), 80);
+  check('«остановить автозапуск» ушло на сервер с enabled=false',
+    periodicUpdates.some(u => u && u.enabled === false),
+    JSON.stringify(periodicUpdates));
+  const stoppedItem = q('#sessions .session-item')
+    .filter(el => el.dataset.session === periodicId)[0];
+  check('остановленная задача остаётся периодической',
+    stoppedItem.classList.contains('periodic')
+    && stoppedItem.classList.contains('off'),
+    stoppedItem.className);
+  check('метка говорит, что повтор остановлен',
+    stoppedItem.querySelector('.session-period').textContent.indexOf('остановлена') > 0,
+    stoppedItem.querySelector('.session-period').textContent);
+
+  // ВОЗВРАЩЕНИЕ В ЗАДАЧУ: автозапуск дописал в неё ответ — открытый диалог
+  // должен подхватить это сам (опрос /api/agent/periodic), без перезагрузки.
+  await click(stoppedItem, 60);          // открываем задачу
+  const periodicChatCallsBefore = chatCalls();
+  // Первый опрос только запоминает размер журнала: сравнивать ещё не с чем —
+  // он ничего не перерисовывает.
+  await dom.window.eval('pollPeriodic()');
+  await wait(60);
+  check('первый опрос не перерисовывает окно вслепую',
+    !q('#messages .msg').some(el => el.textContent.indexOf('Повтор: +14') >= 0));
+  const logBefore = (logs[periodicId] || []).length;
+  // Автозапуск дописал в задачу новое: журнал вырос (на сервере это видно по
+  // log_len в снимке расписания).
+  logs[periodicId] = (logs[periodicId] || []).concat([
+    { kind: 'periodic', text: '⏱ Автозапуск (раз в час): Сводка погоды в Москве' },
+    { kind: 'assistant', text: 'Повтор: +14, облачно, воздух чистый.' },
+  ]);
+  await dom.window.eval('pollPeriodic()');
+  await wait(80);
+  const periodicMsgs = q('#messages .msg').filter(
+    el => el.textContent.indexOf('Повтор: +14') >= 0);
+  check('повтор автозапуска появился в открытом чате сам',
+    periodicMsgs.length > 0, String(periodicMsgs.length));
+  check('пометка автозапуска нарисована в чате',
+    q('#messages .msg').some(el => el.textContent.indexOf('⏱ Автозапуск') >= 0));
+  check('опрос не отправил запрос к агенту',
+    chatCalls() === periodicChatCallsBefore, String(chatCalls()));
+  check('новая запись журнала больше прошлой',
+    (logs[periodicId] || []).length > logBefore);
+
+  // Отменённая задача: расписание включено, но повторов не будет — модалка
+  // обязана сказать это прямо (кнопка 🔁 сама задачу не «оживит»).
+  PERIODIC.tasks[periodicId].hold = 'cancelled';
+  await dom.window.eval('pollPeriodic()');
+  await wait(60);
+  await click(hourItem.querySelector('.icon-btn[title^="Периодическая задача"]')
+    || q('#sessions .session-item').filter(el => el.dataset.session === periodicId)[0]
+        .querySelector('.icon-btn[title^="Периодическая задача"]'), 60);
+  check('модалка объясняет, что отменённая задача не повторяется',
+    $('periodic-status').textContent.indexOf('Задача отменена') > 0,
+    $('periodic-status').textContent.slice(0, 160));
+  const cancelledItem = q('#sessions .session-item')
+    .filter(el => el.dataset.session === periodicId)[0];
+  check('метка задачи говорит про отмену',
+    cancelledItem.querySelector('.session-period').title.indexOf('отменена') > 0,
+    cancelledItem.querySelector('.session-period').title);
+  await click($('periodic-close'), 40);
+  PERIODIC.tasks[periodicId].hold = '';
+  await dom.window.eval('pollPeriodic()');
+  await wait(60);
+
+  // РЕАЛЬНЫЙ ПОРЯДОК: сообщение → план → «Подтвердить план» → прогон шагов.
+  // Проверяем, что прогон выполняет ТОЛЬКО ОДИН цикл и не уходит в следующий.
+  setState({});
+  dom.window.eval('applyTaskState(' + JSON.stringify(snapshot()) + ')');
+  $('input').value = 'сводка погоды, раз в час';
+  const confirmCallsBefore = chatCalls();
+  await sendRequest('сводка погоды, раз в час', 120);
+  const planCalls = chatCalls() - confirmCallsBefore;
+  check('запрос построил план (один вызов)', planCalls === 1, 'вызовов: ' + planCalls);
+  check('авто-прогон без подтверждения плана не начался',
+    chatCalls() - confirmCallsBefore === 1, 'вызовов: ' + (chatCalls() - confirmCallsBefore));
+  const cycleStepsPlanned = JSON.parse(dom.window.eval('JSON.stringify(taskMachineState.steps_total)'));
+  await click($('tm-confirm'), 200);
+  const cycleCallsReal = chatCalls() - confirmCallsBefore - 1;
+  check('после подтверждения прогон выполнил ровно один цикл',
+    cycleCallsReal === cycleStepsPlanned && cycleStepsPlanned > 0,
+    'запросов шага: ' + cycleCallsReal + ', шагов в плане: ' + cycleStepsPlanned);
+  const afterConfirm = JSON.parse(dom.window.eval('JSON.stringify(taskMachineState)'));
+  check('после цикла прогон остановлен (состояние ждёт расписания)',
+    afterConfirm.stage === 'execution' && afterConfirm.step_index === 0,
+    JSON.stringify({ stage: afterConfirm.stage, index: afterConfirm.step_index }));
+  await wait(200);
+  check('прогон не пошёл на второй цикл сам',
+    chatCalls() - confirmCallsBefore - 1 === cycleStepsPlanned,
+    'запросов шага: ' + (chatCalls() - confirmCallsBefore - 1));
+
+  // ЦИКЛ периодической задачи: прогон шагов заканчивается возвратом на первый шаг
+  // («Готово» у периодической задачи не бывает), поэтому прогон НЕ крутит повтор
+  // за повтором — он останавливается на конце цикла.
+  setPlan(['Шаг A', 'Шаг B']);
+  setState(Object.assign({}, state, {
+    stage: 'execution', base_stage: 'execution', current_step: 'step_1',
+    step_index: 0, step_number: 1, terminal: false, extra_stage: null,
+    repeat_ready: false,
+    expected_action: 'выполнить: Шаг A',
+  }));
+  dom.window.eval('applyTaskState(' + JSON.stringify(snapshot()) + ')');
+  const cycleCallsBefore = chatCalls();
+  await dom.window.eval('runStepChain(' + JSON.stringify(periodicId) + ')');
+  await wait(150);
+  const cycleCalls = chatCalls() - cycleCallsBefore;
+  check('прогон периодической задачи выполнил ровно один цикл (2 шага)',
+    cycleCalls === 2, 'запросов шага: ' + cycleCalls);
+  const cycleState = JSON.parse(dom.window.eval('JSON.stringify(taskMachineState)'));
+  check('после цикла задача НЕ в «Готово», а ждёт следующего повтора',
+    cycleState.stage === 'execution' && cycleState.step_index === 0
+    && cycleState.terminal === false && cycleState.repeat_ready === true,
+    JSON.stringify({ stage: cycleState.stage, index: cycleState.step_index,
+      terminal: cycleState.terminal, repeat_ready: cycleState.repeat_ready }));
+  check('кнопка предлагает выполнить ПОВТОР, а не «продолжить шаг»',
+    $('tm-idle').hidden === false
+    && $('tm-idle').textContent.indexOf('выполнить повтор сейчас') > 0,
+    $('tm-idle').textContent + ' | hidden=' + $('tm-idle').hidden);
+  check('в поле ввода — подсказка про расписание, а не «задача в работе»',
+    $('input').placeholder.indexOf('Периодическая задача') === 0,
+    $('input').placeholder);
+
+  // Задачу о периодичности удаляем: дальше проверяем обычные задачи.
+  await click(q('#sessions .session-item')
+    .filter(el => el.dataset.session === periodicId)[0]
+    .querySelector('.icon-btn[title="Удалить задачу"]'), 60);
+  await dom.window.eval('document.getElementById("confirm-modal-ok").click()');
+  await wait(80);
+  check('периодическая задача удаляется как обычная',
+    !workspace.sessions.some(s => s.id === periodicId),
+    workspace.sessions.map(s => s.id).join('|'));
+
+  // ---------------------------------------------------------------------
+  // [R] ВРЕМЯ СООБЩЕНИЙ: у реплик пользователя и ответов агента — как в
+  // мессенджерах; у служебных (debug/error) подписи времени нет.
+  // ---------------------------------------------------------------------
+  console.log('\n[R] Время отправки/получения сообщений');
+  // Кладём в журнал ОТКРЫТОЙ задачи записи с временем «от сервера» и перечитываем
+  // диалог: так проверяется отрисовка времени ИМЕННО из журнала, а не «сейчас».
+  const sessionNow = workspace.active_session;
+  logs[sessionNow] = [
+    { kind: 'user', text: 'Реплика с временем', at: logAt(9, 7) },
+    { kind: 'debug', text: 'Служебная строка про работу автомата', at: logAt(9, 8) },
+    { kind: 'assistant', text: 'Ответ агента с временем', at: logAt(9, 9) },
+  ];
+  await dom.window.eval('loadActiveDialog()');
+  await wait(80);
+  const timeNodes = el => (el ? Array.from(el.querySelectorAll('.msg-time')) : []);
+  const pick = (selector, needle) => q(selector).filter(
+    el => el.textContent.indexOf(needle) >= 0)[0];
+  const userMsg = pick('#messages .msg.user', 'Реплика с временем');
+  const botMsg = pick('#messages .msg.bot', 'Ответ агента с временем');
+  const debugMsg = pick('#messages .msg.debug', 'Служебная строка');
+  check('у реплики пользователя есть подпись времени',
+    timeNodes(userMsg).length === 1,
+    userMsg ? userMsg.textContent.slice(0, 60) : '(нет реплики)');
+  check('время взято из журнала сервера (09:07), а не поставлено сейчас',
+    timeNodes(userMsg).length === 1 && timeNodes(userMsg)[0].textContent === '09:07',
+    JSON.stringify(timeNodes(userMsg).map(el => el.textContent)));
+  check('подпись стоит ПОСЛЕ пузыря сообщения',
+    !!userMsg && userMsg.querySelector('.bubble')
+      && userMsg.querySelector('.bubble').nextElementSibling
+      && userMsg.querySelector('.bubble').nextElementSibling.classList.contains('msg-time'));
+  check('в подсказке — полная дата и время',
+    timeNodes(userMsg).length === 1 && timeNodes(userMsg)[0].title.length > 10,
+    JSON.stringify(timeNodes(userMsg).map(el => el.title)));
+  check('у ответа агента тоже есть время (09:09)',
+    timeNodes(botMsg).length === 1 && timeNodes(botMsg)[0].textContent === '09:09',
+    botMsg ? JSON.stringify(timeNodes(botMsg).map(el => el.textContent)) : '(нет ответа)');
+  check('у служебной строки времени НЕТ',
+    !!debugMsg && timeNodes(debugMsg).length === 0,
+    debugMsg ? debugMsg.textContent.slice(0, 60) : '(нет служебной строки)');
+  // Запись из старого файла (без времени): подпись не показываем вовсе.
+  logs[sessionNow] = [{ kind: 'user', text: 'Запись без времени' }];
+  await dom.window.eval('loadActiveDialog()');
+  await wait(60);
+  const oldMsg = pick('#messages .msg.user', 'Запись без времени');
+  check('запись без времени рисуется без подписи',
+    !!oldMsg && timeNodes(oldMsg).length === 0,
+    oldMsg ? oldMsg.textContent : '(нет реплики)');
+  check('вместо времени не появляется «NaN»',
+    !dom.window.document.getElementById('messages').textContent.includes('NaN'));
 
   console.log('\nИтог: ' + (failures ? 'ПРОВАЛЕНО проверок: ' + failures : 'все проверки пройдены'));
   dom.window.close();

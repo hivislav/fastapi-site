@@ -18,6 +18,11 @@ planning → done) запрещено — попытка бросает IllegalT
 записи истории он сохраняется всегда, а на этапе validation переходит в «check»
 вместе со ссылкой на проверяемый шаг в reason/expected_action).
 
+Два перехода — только для ПЕРИОДИЧЕСКИХ задач (см. app/ai/periodic.py):
+execution → execution (cycle_done: цикл пройден, план сохранён, место — снова
+первый шаг) и execution → planning (replan: запрос изменился). Периодическая
+задача НЕ доходит до done: она повторяется, пока её не остановит пользователь.
+
 Модуль чистый: ни файлов, ни сети, ни LLM — только состояние и его переходы.
 Хранение состояния — в dialog["state"] сессии рабочего пространства
 (app/ai/workspace.py), маршруты и контроллер переходов — в app/routers/chat.py,
@@ -39,6 +44,10 @@ Stage = Literal["planning", "execution", "validation",
 
 # Базовые этапы (в порядке автомата) — их рисует полоса состояния в интерфейсе.
 BASE_STAGES: Tuple[str, ...] = ("planning", "execution", "validation", "done")
+# Полоса ПЕРИОДИЧЕСКОЙ задачи: проверки результата у повтора нет, а «готово» не
+# наступает никогда (задача повторяется, пока её не остановит пользователь) —
+# поэтому в её полосе этих двух блоков нет (см. snapshot).
+PERIODIC_BASE_STAGES: Tuple[str, ...] = ("planning", "execution")
 # Расширения: показываются отдельным блоком, когда активны.
 EXTRA_STAGES: Tuple[str, ...] = ("awaiting_user", "failed", "cancelled")
 STAGES: Tuple[str, ...] = BASE_STAGES + EXTRA_STAGES
@@ -62,7 +71,10 @@ ALLOWED_TRANSITIONS: Dict[str, Tuple[str, ...]] = {
     # план готов → работаем; нужны уточнения → ждём пользователя.
     "planning": ("execution", "awaiting_user"),
     # шаги выполнены → проверка; ошибка → failed.
-    "execution": ("validation", "failed"),
+    # execution → execution — НОВЫЙ ЦИКЛ периодической задачи: план тот же, место
+    # снова шаг 1, ждём следующего повтора (задача не «готова» — см. cycle_done);
+    # execution → planning — ЗАПРОС ИЗМЕНИЛСЯ: план строится заново (см. replan).
+    "execution": ("validation", "failed", "execution", "planning"),
     # проверка пройдена → готово; не пройдена → возврат в работу; критическая
     # ошибка → failed.
     "validation": ("done", "execution", "failed"),
@@ -101,6 +113,10 @@ ACTION_PLANNING = "составить план и подтвердить его 
 ACTION_AWAITING = "подтвердить план («ок») или внести правки"
 ACTION_FAILED = "перезапустить задачу или изменить запрос"
 ACTION_PAUSED = "пауза: нажмите «Продолжить»"
+# Периодическая задача между повторами: план сохранён, место — шаг 1, работа
+# начнётся по расписанию (задача НЕ «готова»: она не завершается, пока её не
+# остановит пользователь).
+ACTION_REPEAT = "повтор по расписанию: ждём следующего повтора"
 # Проверку результата выполнить не удалось (модель не ответила): задача НЕ
 # объявляется готовой и НЕ уходит на доработку — решение за пользователем.
 ACTION_CHECK_BLOCKED = "повторить проверку или принять результат вручную"
@@ -136,6 +152,8 @@ class TaskState:
                       после планирования);
     redo_count      — сколько раз проверка возвращала задачу на доработку
                       (validation → execution); ограничено MAX_REDO;
+    repeat_ready    — цикл периодической задачи пройден, ждём следующего повтора
+                      по расписанию (в обычной задаче всегда False);
     check_blocked   — проверку результата выполнить НЕ удалось (модель не
                       ответила, ответ не разобран): этап остаётся validation и
                       решение за пользователем — повторить проверку или принять
@@ -160,6 +178,10 @@ class TaskState:
     base_stage: str = "planning"
     redo_count: int = 0
     check_blocked: bool = False
+    # ЦИКЛ периодической задачи пройден и ждёт следующего повтора (ставит
+    # cycle_done, снимает начало шага/новый план). Нужен интерфейсу: по нему
+    # видно, что «продолжать» нечего — следующую работу запустит расписание.
+    repeat_ready: bool = False
     request: str = ""
     reason: str = ""
     history: List[Dict[str, Any]] = field(default_factory=list)
@@ -262,6 +284,7 @@ class TaskState:
         """
         if self.step_index + 1 >= len(self.steps):
             return False
+        self.repeat_ready = False   # цикл идёт — «ждём повтора» уже неактуально
         self.step_index += 1
         self.current_step = f"step_{self.step_index + 1}"
         self.expected_action = f"выполнить: {self.step_text()}"[:ACTION_LIMIT]
@@ -349,6 +372,86 @@ def _apply_action(state: TaskState) -> None:
     вычислять её заранее (до transition) нельзя.
     """
     state.expected_action = default_action(state)[:ACTION_LIMIT]
+
+
+# ---------------------------------------------------------------------------
+# Форма плана: шаги-«оформление» не считаются работой
+# ---------------------------------------------------------------------------
+# Планировщик (модель) любит одно действие дробить на этапы: «извлечь данные» →
+# «сгруппировать значения» → «сформировать таблицу» → «вывести таблицу». Каждый
+# такой шаг — ОТДЕЛЬНЫЙ вызов LLM, а нового результата не даёт: ответ на
+# предыдущем шаге уже содержит эти данные. Правило в промпте — просьба, поэтому
+# есть код-гарантия: шаги, которые только ОФОРМЛЯЮТ уже полученное, схлопываются
+# (см. compact_steps). Список — узкий: глаголы подачи результата.
+# ВАЖНО: глаголы ДЕЙСТВИЙ с последствиями («отправить», «записать», «создать»,
+# «вывести деньги», «сообщить клиенту») в него НЕ входят — такой шаг может быть
+# настоящей работой через внешний инструмент, и выбрасывать его нельзя.
+PRESENTATION_MARKERS: Tuple[str, ...] = (
+    "выведи", "вывести", "выведи таблиц", "покажи", "показать", "представь",
+    "представить", "оформи", "оформить", "сгруппируй", "сгруппировать",
+    "сформируй таблиц", "сформировать таблиц", "составь таблиц", "составить таблиц",
+    "сведи в таблиц", "свести в таблиц", "извлеки данные", "извлечь данные",
+    "сделай сводк", "сделать сводк", "подготовь ответ", "подготовить ответ",
+    "проверь наличие", "проверить наличие", "убедись", "убедиться",
+)
+# Признаки ДЕЙСТВИЯ с последствиями: такой шаг работой и остаётся, даже если
+# начинается с глагола подачи («Проверить наличие товара и создать заявку»,
+# «Вывести таблицу в файл», «Сформировать счёт и отправить клиенту»).
+EFFECT_MARKERS: Tuple[str, ...] = (
+    "отправ", "отправь", "созда", "запис", "сохран", "удали", "опублик",
+    "загруз", "внести", "оплат", "заказ", "заявк", "платёж", "платеж", "письм",
+    "счёт", "счет", "договор", "документ", "файл", "в базу", "в бд", "на сайт",
+    "позвон", "размест", "забронир", "куп", "перевед", "обнови", "зарегистр",
+    "запуст", "установ", "завед",
+)
+# Сколько символов шага проверяем на маркеры (шаг и так короткий).
+_PRESENTATION_SCAN = 200
+
+
+def is_presentation_step(step: Any) -> bool:
+    """True — шаг только ОФОРМЛЯЕТ уже полученный результат.
+
+    Проверяем НАЧАЛО шага (первые слова): «Вывести таблицу без пояснений»,
+    «Сгруппировать значения по времени», «Извлечь данные из отчёта». Шаг, в
+    котором есть ДЕЙСТВИЕ с последствиями (отправить, создать, записать, заявка,
+    файл…), оформлением НЕ считается: это может быть настоящая работа через
+    внешний инструмент, и терять такой шаг нельзя.
+    """
+    text = " ".join(str(step or "").lower().split())[:_PRESENTATION_SCAN]
+    if not text:
+        return False
+    if any(marker in text for marker in EFFECT_MARKERS):
+        return False
+    return any(marker in text for marker in PRESENTATION_MARKERS)
+
+
+def compact_steps(steps: Any, request: str = "",
+                  limit: int = MAX_STEPS) -> Tuple[List[str], int]:
+    """Убирает из плана шаги-«оформление» (см. PRESENTATION_MARKERS).
+
+    Возвращает (шаги, сколько убрано). Убираются только ХВОСТОВЫЕ такие шаги:
+    шаг-оформление, после которого идёт настоящая работа, оставляем — он может
+    готовить для неё вид данных. План целиком из оформления схлопывается в ОДИН
+    шаг — сам запрос пользователя: работать всё равно надо по нему.
+
+    План без работы не бывает: если после схлопывания не осталось шагов, в плане
+    оказывается один шаг с запросом пользователя.
+    """
+    clean = clean_steps(steps, limit)
+    if len(clean) < 2:
+        return clean, 0
+    keep = len(clean)
+    while keep > 0 and is_presentation_step(clean[keep - 1]):
+        keep -= 1
+    removed = len(clean) - keep
+    if not removed:
+        return clean, 0
+    result = clean[:keep]
+    if not result:
+        # План состоял ТОЛЬКО из оформления: это одна работа, а не четыре.
+        single = " ".join(str(request or "").split())[:STEP_LIMIT]
+        result = [single] if single else [clean[0]]
+    return result, removed
 
 
 def clean_steps(raw: Any, limit: int = MAX_STEPS) -> List[str]:
@@ -439,6 +542,11 @@ def from_dict(raw: Any, task_id: str = "") -> TaskState:
     # перезагрузки страницы задача снова ждёт решения пользователя, а не
     # выглядит готовой.
     state.check_blocked = raw.get("check_blocked") is True and state.stage == "validation"
+    # Цикл периодической задачи пройден (ждём следующего повтора): состояние и
+    # этап при этом как у обычного шага (execution), поэтому признак хранится
+    # отдельно — иначе после перезагрузки страницы интерфейс снова показал бы
+    # «продолжить шаг» вместо ожидания расписания.
+    state.repeat_ready = raw.get("repeat_ready") is True and state.stage == "execution"
     try:
         state.redo_count = max(0, int(raw.get("redo_count") or 0))
     except (TypeError, ValueError):
@@ -469,6 +577,10 @@ def to_dict(state: TaskState) -> Dict[str, Any]:
         "base_stage": state.base_stage,
         "redo_count": int(state.redo_count),
         "check_blocked": bool(state.check_blocked),
+        # Цикл периодической задачи пройден: интерфейсу «продолжать» нечего —
+        # следующую работу запустит расписание (см. cycle_done).
+        "repeat_ready": bool(state.repeat_ready),
+        "repeat_ready": bool(state.repeat_ready),
         "request": state.request,
         "reason": state.reason,
         "history": [dict(item) for item in state.history],
@@ -477,8 +589,16 @@ def to_dict(state: TaskState) -> Dict[str, Any]:
     }
 
 
-def snapshot(state: TaskState, history_tail: int = 20) -> Dict[str, Any]:
-    """Снимок состояния для интерфейса (полоса этапов и кнопка «Пауза»)."""
+def snapshot(state: TaskState, history_tail: int = 20,
+             periodic: bool = False) -> Dict[str, Any]:
+    """Снимок состояния для интерфейса (полоса этапов и кнопка «Пауза»).
+
+    `periodic` — задача ПЕРИОДИЧЕСКАЯ: в её полосе остаются только те этапы,
+    которые она проходит (планирование и выполнение). Этапов «проверка» и
+    «готово» у неё нет: итоговой проверки периодическая задача не проходит, а
+    завершённой не бывает — она повторяется, пока её не остановит пользователь.
+    """
+    stages = PERIODIC_BASE_STAGES if periodic else BASE_STAGES
     return {
         # Три обязательных поля состояния.
         "stage": state.stage,
@@ -491,7 +611,7 @@ def snapshot(state: TaskState, history_tail: int = 20) -> Dict[str, Any]:
         "base_stage": state.base_stage,
         "base_stages": [
             {"id": name, "label": STAGE_LABELS[name], "active": name == state.base_stage}
-            for name in BASE_STAGES
+            for name in stages
         ],
         "extra_stage": ({
             "id": state.stage, "label": STAGE_LABELS.get(state.stage, state.stage),
@@ -517,6 +637,9 @@ def snapshot(state: TaskState, history_tail: int = 20) -> Dict[str, Any]:
         # Проверку выполнить не удалось: задача НЕ готова и ждёт решения
         # пользователя — «▶ повторить проверку» или «Принять вручную».
         "check_blocked": bool(state.check_blocked),
+        # Цикл периодической задачи пройден: «продолжать» нечего — следующую
+        # работу запустит расписание (см. cycle_done, app/periodic_runner.py).
+        "repeat_ready": bool(state.repeat_ready),
         "can_accept": (state.stage == "validation" and state.check_blocked
                        and not state.paused),
         "request": state.request,
@@ -560,6 +683,7 @@ def plan_ready(state: TaskState, steps: List[str], reason: str) -> None:
     """
     state.steps = clean_steps(steps)
     state.step_index = 0
+    state.repeat_ready = False   # цикл начинается — ждать следующего повтора рано
     state.redo_count = 0
     state.transition("execution", reason, current_step="step_1")
     _apply_action(state)
@@ -578,6 +702,40 @@ def to_validation(state: TaskState, reason: str) -> None:
     """execution → validation: все шаги выполнены, проверяем результат."""
     state.transition("validation", reason, current_step="check")
     _apply_action(state)
+
+
+# ---------------------------------------------------------------------------
+# Периодические задачи (см. app/ai/periodic.py, app/periodic_runner.py)
+# ---------------------------------------------------------------------------
+def replan(state: TaskState, reason: str) -> None:
+    """execution → planning: ЗАПРОС периодической задачи изменился.
+
+    План периодической задачи строится ОДИН раз на запрос: пока запрос тот же,
+    повторы берут сохранённый план (ни планировщик, ни гейт плана не вызываются).
+    Но если пользователь написал новый запрос, прежний план к нему не подходит —
+    задача возвращается к планированию, и новый план строится тоже один раз.
+    """
+    state.repeat_ready = False   # план строится заново — цикл начинается с нуля
+    state.transition("planning", reason, current_step="step_1")
+    _apply_action(state)
+
+
+def cycle_done(state: TaskState, reason: str) -> None:
+    """execution → execution: ЦИКЛ периодической задачи пройден.
+
+    План СОХРАНЯЕТСЯ (его не строят заново), место — снова первый шаг: следующий
+    повтор выполнит план с начала. Этап НЕ терминальный и «готово» не ставится:
+    периодическая задача не завершается никогда — её останавливает пользователь
+    (кнопка 🔁 или «Отменить»). Проверки результата у повтора нет: сверять
+    «соответствие задаче» у повторяющегося ответа не с чем, а готовая задача не
+    объявляется — поэтому и `done` здесь недостижим.
+    """
+    state.step_index = 0
+    state.redo_count = 0
+    state.check_blocked = False
+    state.repeat_ready = True
+    state.transition("execution", reason, current_step="step_1")
+    state.expected_action = ACTION_REPEAT[:ACTION_LIMIT]
 
 
 def validation_ok(state: TaskState, reason: str) -> None:

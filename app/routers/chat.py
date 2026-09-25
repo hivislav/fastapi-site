@@ -25,6 +25,8 @@ chat.py (агент получает состояние готовым и пок
 """
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import logging
 import re
@@ -37,6 +39,7 @@ from app.ai import client as llm_client
 from app.ai import service
 from app.ai import invariants as invariants_store
 from app.ai import mcp as mcp_store
+from app.ai import periodic as periodic_store
 from app.ai import profiles as profile_store
 from app.ai import task_state
 from app.ai import workspace as workspace_store
@@ -45,8 +48,8 @@ from app.ai.agent import (
 )
 from app.schemas import (
     ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
-    McpApply, MemoryEntryCreate, NameUpdate, PlanUpdate, ProfileCreate, ProfileFields,
-    TaskCreate,
+    McpApply, MemoryEntryCreate, NameUpdate, PeriodicUpdate, PlanUpdate, ProfileCreate,
+    ProfileFields, SessionCreate, TaskCreate,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,6 +97,10 @@ PENDING_CANCEL = "cancel"
 # команду имеет смысл только для выполняющейся задачи — у остальных диалог никто
 # не пишет, и переход применяется сразу.
 _running_sessions: set = set()
+# id ПЕРИОДИЧЕСКИХ задач, повтор которых выполняет планировщик прямо сейчас (см.
+# app/periodic_runner.py): по этому признаку интерфейс показывает «⏳ автозапуск»,
+# а сам планировщик не запускает повтор дважды.
+_periodic_running: set = set()
 # Ключ снимка состояния: интерфейс показывает по нему «остановлю после текущего
 # шага» (запрос принят, но применён будет по завершении шага).
 PENDING_KEY = "pending"
@@ -149,9 +156,28 @@ if _orphan_profiles:
     )
 
 
+# ПРОФИЛЬ, В КОНТЕКСТЕ КОТОРОГО ИДЁТ ЗАПРОС. Обычно None — берётся активный
+# профиль пользователя. Ставит его ТОЛЬКО планировщик периодических задач
+# (app/periodic_runner.py): повтор задачи профиля, который сейчас не открыт,
+# должен идти в СВОЁМ профиле (свой системный блок профиля, своя долговременная
+# память, свои задачи). ContextVar, а не общая переменная, потому что она
+# локальна для asyncio-задачи: значение видит только тот прогон, который его
+# поставил, а параллельные запросы пользователя продолжают работать с активным
+# профилем.
+_ACTIVE_PROFILE_OVERRIDE: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "agent_profile_override", default=None)
+
+
 def _current_profile() -> Optional[Dict[str, Any]]:
     """Текущий профиль пользователя (None — профилей нет: не должно случаться,
-    профиль заводится при старте)."""
+    профиль заводится при старте).
+
+    Для фонового повтора периодической задачи профиль берётся из переопределения
+    (см. _ACTIVE_PROFILE_OVERRIDE) — это профиль ВЛАДЕЛЬЦА задачи.
+    """
+    override = _ACTIVE_PROFILE_OVERRIDE.get()
+    if override:
+        return profile_store.find_profile(_profiles, override)
     return profile_store.active_profile(_profiles)
 
 
@@ -159,6 +185,23 @@ def _current_profile_id() -> Optional[str]:
     """id текущего профиля — им ограничены задачи, диалоги и память."""
     profile = _current_profile()
     return profile["id"] if profile else None
+
+
+@contextlib.contextmanager
+def profile_override(profile_id: Optional[str]):
+    """Выполняет блок в профиле ВЛАДЕЛЬЦА задачи (для планировщика повторов).
+
+    Ставит переопределение профиля (см. _ACTIVE_PROFILE_OVERRIDE) на время
+    фонового прогона периодической задачи: задача профиля, который сейчас не
+    открыт, должна идти в СВОЁМ профиле — с его системным блоком и его
+    долговременной памятью. Значение живёт в asyncio-задаче планировщика, поэтому
+    запросы пользователя в это же время работают с активным профилем.
+    """
+    token = _ACTIVE_PROFILE_OVERRIDE.set(str(profile_id or "").strip() or None)
+    try:
+        yield
+    finally:
+        _ACTIVE_PROFILE_OVERRIDE.reset(token)
 
 
 def _current_task() -> Optional[Dict[str, Any]]:
@@ -240,7 +283,10 @@ def _profile_block() -> str:
 def _snapshot() -> dict:
     """Снимок workspace для фронтенда: задачи ПРОФИЛЯ, его текущая задача,
     диалоги и сам профиль."""
-    snapshot = workspace_store.snapshot(_workspace, _current_profile_id())
+    # Занятые задачи (шаг агента или автозапуск периодической задачи) — по ним
+    # интерфейс помечает задачи в списке: «⏳ идут шаги» / «⏳ автозапуск».
+    running = set(_running_sessions) | set(_periodic_running)
+    snapshot = workspace_store.snapshot(_workspace, _current_profile_id(), running=running)
     # Профиль — глобальная сущность (не на задачу), но фронту удобно получать
     # его вместе со снимком workspace: иконка профиля и его поля обновляются
     # одним ответом на любую операцию с задачами/диалогами.
@@ -538,7 +584,7 @@ def _pending_state(session: Dict[str, Any], state: "task_state.TaskState",
             task_state.pause(preview, "пользователь нажал «Пауза»")
     except task_state.IllegalTransition:
         pass   # этап уже терминальный — отменять/паузить нечего
-    snapshot = task_state.snapshot(preview)
+    snapshot = _state_snapshot(session, preview)
     snapshot[PENDING_KEY] = action
     return snapshot
 
@@ -566,9 +612,27 @@ def _apply_pending_stop(session: Dict[str, Any], state: "task_state.TaskState",
     return True
 
 
-def _state_event(state: "task_state.TaskState") -> dict:
+def _periodic_session(session: Optional[Dict[str, Any]]) -> bool:
+    """Периодическая ли задача (у неё своя полоса этапов: см. task_state.snapshot)."""
+    return bool(session) and bool(workspace_store.periodic_meta(session))
+
+
+def _state_snapshot(session: Optional[Dict[str, Any]],
+                    state: "task_state.TaskState") -> Dict[str, Any]:
+    """Снимок состояния для интерфейса — с учётом ПЕРИОДИЧНОСТИ задачи.
+
+    У периодической задачи в полосе нет блоков «проверка» и «готово»: итоговой
+    проверки она не проходит, а завершённой не бывает (повторяется, пока её не
+    остановит пользователь). Один помощник на все ответы и события, чтобы полоса
+    не «мигала» четырьмя блоками в одних ответах и двумя в других.
+    """
+    return task_state.snapshot(state, periodic=_periodic_session(session))
+
+
+def _state_event(session: Optional[Dict[str, Any]],
+                 state: "task_state.TaskState") -> dict:
     """Событие потока с состоянием автомата (фронт рисует полосу этапов)."""
-    return {"type": "state", "state": task_state.snapshot(state)}
+    return {"type": "state", "state": _state_snapshot(session, state)}
 
 
 def _session_payload(session: Optional[Dict[str, Any]]) -> Optional[dict]:
@@ -596,7 +660,7 @@ def _state_response(session: Dict[str, Any]) -> dict:
     время шага), в снимке появляется пометка `pending` — интерфейс показывает по
     ней «остановлю после текущего шага».
     """
-    snapshot = task_state.snapshot(workspace_store.dialog_state(session))
+    snapshot = _state_snapshot(session, workspace_store.dialog_state(session))
     pending = _pending_stops.get(str(session.get("id") or ""))
     if pending:
         snapshot[PENDING_KEY] = pending
@@ -618,6 +682,11 @@ async def state_cancel() -> dict:
     Прогресс по плану и текущий шаг сбрасываются, а сам диалог, его память и
     история остаются; следующее сообщение пользователя начинает НОВУЮ задачу
     (done|cancelled → новый автомат, см. agent_chat).
+
+    У ПЕРИОДИЧЕСКОЙ задачи отмена означает остановку повторов: её автозапуск
+    выключает планировщик (см. app/periodic_runner.py), а ВНЕШНИЕ СБОРЫ, которые
+    задача завела на серверах (наблюдения и т. п.), останавливаются ЗДЕСЬ —
+    задача остановлена, значит и работа на сервере ей больше не нужна.
     """
     session = _current_session()
     if session is None:
@@ -631,6 +700,11 @@ async def state_cancel() -> dict:
         task_state.cancel(state, "пользователь отменил задачу (кнопка «Отменить задачу»)")
     except task_state.IllegalTransition as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Внешние сборы снимаем только у ПЕРИОДИЧЕСКОЙ задачи: у обычной «Отмена»
+    # останавливает текущий заход (задачу можно продолжить сообщением), а
+    # удалять накопленные на сервере данные было бы потерей без спроса.
+    if workspace_store.periodic_meta(session):
+        await _stop_mcp_started(session, "периодическая задача отменена")
     await _persist_state(session, state)
     return _state_response(session)
 
@@ -895,10 +969,19 @@ async def task_rename(task_id: str, payload: NameUpdate) -> dict:
 
 @router.delete("/agent/tasks/{task_id}")
 async def task_delete(task_id: str) -> dict:
-    """Удаляет задачу вместе со всеми её диалогами (корзина у списка задач)."""
+    """Удаляет задачу вместе со всеми её диалогами (корзина у списка задач).
+
+    Перед удалением останавливаются ВНЕШНИЕ СБОРЫ ВСЕХ диалогов проекта
+    (наблюдения, подписки MCP — см. _stop_mcp_started): проект удаляется целиком,
+    и работа, которую его задачи завели на серверах, должна прекратиться.
+    """
     async with _workspace_lock:
-        if _own_task(workspace_store.find_task(_workspace, task_id)) is None \
-                or not workspace_store.delete_task(_workspace, task_id):
+        task = _own_task(workspace_store.find_task(_workspace, task_id))
+        if task is None:
+            raise HTTPException(status_code=404, detail="Проект не найден")
+        for session in list(task.get("sessions", [])):
+            await _stop_mcp_started(session, f"проект «{task.get('name') or ''}» удалён")
+        if not workspace_store.delete_task(_workspace, task_id):
             raise HTTPException(status_code=404, detail="Проект не найден")
         await _persist()
         return _snapshot()
@@ -923,8 +1006,16 @@ async def task_select(task_id: str) -> dict:
 
 
 @router.post("/agent/sessions")
-async def session_create() -> dict:
-    """Создаёт в текущей задаче новый пустой диалог (кнопка «Новая сессия»).
+async def session_create(payload: Optional[SessionCreate] = None) -> dict:
+    """Создаёт в текущей задаче новый пустой диалог (кнопки панели Workspace).
+
+    «Новая задача» — обычная задача: выполняется один раз по запросу
+    пользователя. «Новая периодическая задача» (`periodic=true`) — задача с
+    расписанием: сервер сам повторяет её запрос через период (по умолчанию
+    сутки) и кладёт результат в чат этой задачи (см. app/ai/periodic.py и
+    app/periodic_runner.py). Период можно назвать и в самом запросе («Сводка
+    погоды в Москве за последние сутки, раз в час») — сервер распознаёт его,
+    когда пользователь отправит первое сообщение.
 
     Сессия сразу становится текущей — её диалог пуст, а заголовок в истории
     появится по первому запросу пользователя.
@@ -934,9 +1025,89 @@ async def session_create() -> dict:
     task = _current_task()
     if task is None:
         raise HTTPException(status_code=400, detail="Сначала создайте проект")
-    workspace_store.create_session(task)
+    periodic = None
+    if payload is not None and payload.periodic:
+        periodic = payload.interval if payload.interval else periodic_store.DEFAULT_INTERVAL
+    workspace_store.create_session(task, periodic=periodic)
     await _persist()
     return _snapshot()
+
+
+@router.get("/agent/periodic")
+async def periodic_get() -> dict:
+    """Периодические задачи профиля: расписание для списка задач и опроса.
+
+    Отдаёт {"tasks": [{"task_id", "session_id", "title", "periodic": {...}}],
+    "now": "…"}: `periodic` — период, срок следующего повтора, сколько раз задача
+    уже повторялась, ошибка последнего повтора и размер журнала задачи
+    (`log_len`). Интерфейс опрашивает этот маршрут, пока включён режим агента: по
+    `log_len` открытой задачи видно, что автозапуск дописал в чат новое, и окно
+    чата обновляется само (см. pollPeriodic в chat.web/chat.html).
+
+    Задачи без расписания в ответ не попадают; выключенный повтор попадает — он
+    остаётся периодической задачей и его можно снова включить (🔁 в списке).
+    """
+    now = periodic_store.now()
+    tasks: List[Dict[str, Any]] = []
+    for task, session in workspace_store.periodic_sessions(_workspace, _current_profile_id()):
+        brief = workspace_store.session_periodic_brief(
+            session,
+            running=str(session["id"]) in _periodic_running
+            or str(session["id"]) in _running_sessions,
+            moment=now)
+        tasks.append({
+            "task_id": task.get("id"),
+            "session_id": session.get("id"),
+            "title": workspace_store.session_title(session),
+            "periodic": brief,
+        })
+    return {"tasks": tasks, "now": periodic_store.to_iso(now)}
+
+
+@router.post("/agent/periodic/{session_id}")
+async def periodic_update(session_id: str, payload: PeriodicUpdate) -> dict:
+    """Правка расписания периодической задачи (кнопка 🔁 у задачи в списке).
+
+    Меняет период и/или включает-выключает автозапуск. Обычную (одноразовую)
+    задачу сделать периодической этим маршрутом нельзя — 409: расписание заводит
+    только кнопка «Новая периодическая задача», а здесь правится уже заведённое.
+
+    Период задаётся числом секунд (`interval`) или текстом (`period` — «раз в
+    час», «каждые 30 минут»); число важнее текста, значение приводится к
+    допустимым границам (см. app/ai/periodic.py). Выключенный повтор сам не
+    возвращается: даже если в задаче написать ещё сообщение, автозапуск останется
+    выключенным, пока его не включат снова.
+    """
+    task, session = _find_session_anywhere(session_id)
+    if task is None or session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    meta = workspace_store.periodic_meta(session)
+    if not meta:
+        raise HTTPException(
+            status_code=409,
+            detail="Задача не периодическая: её расписание заводит кнопка "
+                   "«Новая периодическая задача»")
+    interval: Optional[int] = None
+    if payload.interval:
+        interval = periodic_store.clamp(payload.interval)
+    elif payload.period.strip():
+        parsed, phrase = periodic_store.parse_request(payload.period)
+        if parsed is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Не понял период — напишите его как «раз в час» или "
+                       "«каждые 30 минут»")
+        interval = parsed
+    if interval is not None:
+        workspace_store.set_periodic(session, periodic_store.reschedule(
+            meta, interval=interval, moment=periodic_store.now()))
+    if payload.enabled != bool(meta.get("enabled")):
+        workspace_store.set_periodic(session, periodic_store.set_enabled(
+            meta, payload.enabled, moment=periodic_store.now()))
+    await _persist()
+    snapshot = _snapshot()
+    snapshot["periodic"] = await periodic_get()
+    return snapshot
 
 
 @router.put("/agent/sessions/{session_id}")
@@ -960,11 +1131,16 @@ async def session_delete(session_id: str) -> dict:
 
     Если удалён текущий диалог, текущим становится соседний — или ни одного,
     и тогда следующий запрос заведёт новый.
+
+    Перед удалением останавливаются ВНЕШНИЕ СБОРЫ задачи (наблюдения, подписки —
+    см. _stop_mcp_started): задачи больше нет, и работа, которую она завела на
+    серверах, должна прекратиться.
     """
     async with _workspace_lock:
         task, session = _find_session_anywhere(session_id)
         if task is None or session is None:
             raise HTTPException(status_code=404, detail="Задача не найдена")
+        await _stop_mcp_started(session, "задача удалена")
         workspace_store.delete_session(task, session_id)
         await _persist()
         return _snapshot()
@@ -1191,7 +1367,8 @@ def _mcp_tools(found: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: str,
                          analyzer: Agent, state: "task_state.TaskState",
-                         machine_step: bool = False, reuse: bool = False
+                         machine_step: bool = False, reuse: bool = False,
+                         fresh: bool = False
                          ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
     """Данные внешних инструментов MCP по запросу — ДО этапа планирования.
 
@@ -1206,6 +1383,13 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
     берутся из сохранённых. Новый содержательный текст пользователя (в том числе
     правка запроса на этапе awaiting_user) — наоборот, новый запрос: инструменты
     выбираются по НЕМУ, иначе агент отвечал бы по данным прежнего запроса.
+
+    `fresh` — АВТОЗАПУСК периодической задачи: запрос у повтора ТОТ ЖЕ, поэтому
+    подпись совпадает с прежней, но данные обязаны быть новыми — за прошедший
+    период они изменились. Сохранённый набор при `fresh` не переиспользуется:
+    инструменты выбираются и вызываются заново, а результат кладётся под ту же
+    подпись — шаги этого повтора берут уже свежие данные. Какие это инструменты —
+    неважно: набор объявляет сам сервер, и он у проекта может меняться.
     """
     dialog = session["dialog"]
     enabled = workspace_store.mcp_enabled(task)
@@ -1217,14 +1401,43 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                     else (text or "").strip())
     signature = _mcp_signature(enabled, request_text)
     stored = workspace_store.dialog_mcp(dialog)
-    if stored.get("signature") == signature:
+    if not fresh and stored.get("signature") == signature:
         # Данные по этому запросу уже собраны (шаг плана, проверка результата или
         # повтор того же запроса) — служебного вызова и обращений к серверам нет.
         return list(stored.get("results") or []), {}, []
-    if reuse or machine_step:
+    if (reuse or machine_step) and not fresh:
         # Данных по запросу задачи в диалоге нет (например, задача пришла из
         # файла до первого шага): выбирать инструменты по служебной фразе нельзя.
         return [], {}, []
+    # ПОВТОР периодической задачи по ТОМУ ЖЕ запросу: спрашивать диспетчера заново
+    # не нужно — вызовы уже выбраны, меняются только данные. Повторяем ЧИТАЮЩИЕ
+    # вызовы (запуски сбора НЕ повторяем: сбор уже идёт, а второй запуск завёл бы
+    # дубль на сервере). Так ответ повтора не остаётся без данных и не «плывёт»:
+    # в живой задаче повтор решил, что данные не нужны, и погоды в ответе не было.
+    replay = []
+    if fresh and str(stored.get("request") or "") == request_text:
+        # Повторяем только те вызовы, которые В ПРОШЛЫЙ РАЗ ДАЛИ ДАННЫЕ: сломанный
+        # вызов (например, отчёт по придуманному id) повторять бессмысленно — он
+        # снова откажет, а модель, оставшись без данных, начинает их выдумывать
+        # (живая задача: отчёт отказал, а суточная таблица всё равно появилась).
+        # Такой повтор выбирает инструменты заново — уже с блоком про идущие сборы.
+        replay = _replayable_calls(stored)
+    if replay:
+        results = await mcp_store.async_run_calls(replay)
+        workspace_store.set_dialog_mcp(dialog, signature, request_text, results,
+                                       calls=replay)
+        return results, {}, [
+            "MCP: повтор — те же запросы данных, что и в прошлый раз ("
+            + ", ".join(f"{call['server']} · {call['tool']}" for call in replay)
+            + "), только свежие."
+        ]
+    if fresh and str(stored.get("request") or "") == request_text and stored.get("calls"):
+        # Повторять нечего (прошлые вызовы — только запуски сбора или все отказали):
+        # выбираем инструменты заново и говорим об этом в чате.
+        lines_pre = ["MCP: прошлый повтор не дал данных для чтения — "
+                     "выбираю инструменты заново (с учётом уже идущих сборов)."]
+    else:
+        lines_pre = []
     found = await mcp_store.async_discover(enabled)
     tools = _mcp_tools(found)
     if not tools:
@@ -1233,24 +1446,195 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                              for item in found)]
         workspace_store.set_dialog_mcp(dialog, signature, request_text, [])
         return [], {}, lines
-    calls = await analyzer.choose_mcp_tools(request_text, tools)
+    # Уже идущие внешние сборы ЭТОЙ задачи (наблюдения, подписки): модель видит их
+    # и не начинает заново, а данные читает по их id — иначе каждый повтор заводил
+    # бы новое наблюдение на сервере (см. started_calls).
+    started = workspace_store.mcp_started(dialog)
+    calls = await analyzer.choose_mcp_tools(request_text, tools, started=started)
     usage = dict(analyzer.last_usage or {})
+    # ВЫБОР ТОЛЬКО ИЗ ДЕЙСТВИЙ — это не данные: агенту нечего сказать по такому
+    # ответу. Спрашиваем диспетчера ещё раз, прямо требуя ЧИТАЮЩИЙ вызов: запрос
+    # «проверяй погоду раз в минуту» превращался в «зарегистрировать наблюдение»,
+    # и пользователь не получал ни погоды, ни объяснения про период.
+    if calls and not mcp_store.has_reads(calls, tools) \
+            and not mcp_store.looks_aggregate(request_text):
+        retry = await analyzer.choose_mcp_tools(
+            request_text, tools, started=started, need_reads=True)
+        usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+        if mcp_store.has_reads(retry, tools):
+            lines_pre.append(
+                "MCP: первые вызовы только запускали сбор — переспросил и добавил "
+                "чтение данных (" + ", ".join(
+                    f"{call['server']} · {call['tool']}"
+                    for call in mcp_store.read_calls(retry, tools)) + ").")
+            calls = retry
     if not calls:
         workspace_store.set_dialog_mcp(dialog, signature, request_text, [])
-        return [], usage, [
+        return [], usage, lines_pre + [
             f"MCP: проверил внешние инструменты ({len(enabled)} "
             f"{'сервер' if len(enabled) == 1 else 'сервера'}, {len(tools)} "
             "инструментов) — для этого запроса данные не нужны."
         ]
+    # Помечаем вызовы (действие или чтение) ДО сохранения: повтору это скажет,
+    # что можно повторять, а что нет.
+    mcp_store.mark_call_kinds(calls, tools)
     results = await mcp_store.async_run_calls(calls)
-    workspace_store.set_dialog_mcp(dialog, signature, request_text, results)
-    return results, usage, [mcp_store.results_note(results)]
+    workspace_store.set_dialog_mcp(dialog, signature, request_text, results,
+                                   calls=calls)
+    lines = lines_pre + [mcp_store.results_note(results)]
+    # Результаты, которые легли в диалог: ИМЕННО они уходят модели системным
+    # блоком и именно их читает отмена задачи. Помечаем в них ДЕЙСТВИЯ (запуск
+    # сбора, подписки): модель видит строку «ДЕЙСТВИЯ … ВЫПОЛНЕНО/НЕ ВЫПОЛНЕНО»
+    # и не выдаёт словами то, чего вызов не делал (см. mcp_store.block).
+    stored_results = list(workspace_store.dialog_mcp(dialog).get("results") or [])
+    mcp_store.mark_actions(stored_results, tools)
+    # Что задача ЗАПУСТИЛА на серверах (сбор наблюдений и т. п.): запоминаем, чтобы
+    # отмена или удаление задачи остановили это (см. _stop_mcp_started).
+    fresh_started = mcp_store.started_calls(stored_results, tools)
+    if fresh_started:
+        known = workspace_store.add_mcp_started(dialog, fresh_started)
+        lines.append(
+            "MCP: задача запустила внешний сбор (" + "; ".join(
+                f"{item['server']} · {item['tool']}" for item in fresh_started)
+            + ") — он остановится вместе с задачей (отмена или удаление). "
+            f"Всего идущих сборов у задачи: {len(known)}.")
+    # ВТОРОЙ ВОПРОС ДИСПЕТЧЕРУ — когда первый выбор данных не дал:
+    #   (а) вызовы только ЗАПУСТИЛИ сбор: id стал известен лишь сейчас, и данные
+    #       надо прочитать по нему (в живой задаче запуск возобновил наблюдение с
+    #       7 образцами, отчёт так и не был запрошен — модель пересказала ответ
+    #       запуска как «результат отчёта»);
+    #   (б) все вызовы ОТКАЗАЛИ (например, отчёт по придуманному id): без данных
+    #       ответ либо пустой, либо выдуманный — выбор делаем заново, уже с
+    #       блоком про идущие сборы этой задачи.
+    started_now = workspace_store.mcp_started(dialog)
+    missed_reads = bool(calls) and mcp_store.has_reads(calls, tools) \
+        and not any(item.get("ok") for item in results)
+    if (fresh_started and not mcp_store.has_reads(calls, tools)) or missed_reads:
+        reason = ("сбор запущен — читаю данные по нему"
+                  if fresh_started and not missed_reads
+                  else "прошлые вызовы отказали — выбираю инструменты заново")
+        more = await analyzer.choose_mcp_tools(
+            request_text, tools, started=started_now, need_reads=not fresh_started)
+        usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+        reads = mcp_store.read_calls(more, tools)
+        if reads:
+            mcp_store.mark_call_kinds(reads, tools)
+            # ВАЖНО: заметка строится по РЕЗУЛЬТАТАМ, а не по вызовам — иначе в
+            # чат уходило «источник отказал» про вызов, который на самом деле
+            # отработал (такую строку видел пользователь при живом отчёте).
+            fresh_results = await mcp_store.async_run_calls(reads)
+            results = results + fresh_results
+            calls = calls + reads
+            workspace_store.set_dialog_mcp(dialog, signature, request_text,
+                                           results, calls=calls)
+            stored_results = list(
+                workspace_store.dialog_mcp(dialog).get("results") or [])
+            mcp_store.mark_actions(stored_results, tools)
+            lines.append(
+                f"MCP: {reason} ("
+                + ", ".join(f"{call['server']} · {call['tool']}" for call in reads)
+                + ").")
+            lines.append(mcp_store.results_note(fresh_results))
+    return results, usage, lines
+
+
+def _looks_like_data_table(text: str) -> bool:
+    """Похож ли ответ на ТАБЛИЦУ с числами (markdown-строки «| … | … |»).
+
+    Нужно только для защиты от выдумки: если внешние данные не получены вовсе,
+    таблица значений — это не «сводка», а придуманные числа (регресс живой задачи:
+    отчёт отказал, а таблица за сутки по часам всё равно появилась).
+    """
+    rows = [line for line in str(text or "").splitlines()
+            if line.strip().startswith("|") and line.count("|") >= 2]
+    if len(rows) < 2:
+        return False
+    return any(any(char.isdigit() for char in row) for row in rows)
+
+
+def _mcp_fabrication_guard(text: str, mcp_data: Any) -> str:
+    """Заменяет выдуманную таблицу честным отказом ("" — заменять не надо).
+
+    Срабатывает УЗКО: только когда внешние инструменты вызывались, но НИ ОДИН не
+    дал данных, а в ответе таблица с числами. Такой ответ не показываем: вместо
+    него пользователь видит причину отказа инструмента. Обычный текст про
+    отсутствие данных под правило не попадает (таблицы в нём нет) и уходит как есть.
+    """
+    data = mcp_store.normalize_results(mcp_data)
+    if not data or any(item.get("ok") for item in data):
+        return ""
+    if not _looks_like_data_table(text):
+        return ""
+    reasons = "; ".join(
+        f"{item['server']} · {item['tool']}: {item['error'] or 'данных нет'}"
+        for item in data)
+    return ("⚠️ Данные от внешних инструментов не получены, поэтому таблицу не "
+            "привожу: значения пришлось бы выдумать.\n"
+            f"Причина: {reasons}")
+
+
+def _replayable_calls(stored: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Вызовы прошлого повтора, которые МОЖНО повторить: чтение и успех.
+
+    Повтор берёт те же запросы данных (выбор инструментов не оплачивается заново),
+    но только те, что реально дали данные: отказавший вызов (например, отчёт по
+    несуществующему id) при повторе откажет снова, а ответ уйдёт без фактов.
+    Успех сверяем по сохранённым результатам: сервер + инструмент + аргументы.
+    """
+    results = [item for item in (stored.get("results") or []) if isinstance(item, dict)]
+    ok_keys = {
+        (str(item.get("server") or ""), str(item.get("tool") or ""),
+         mcp_store.arguments_text(item.get("arguments")))
+        for item in results if item.get("ok")
+    }
+    replay: List[Dict[str, Any]] = []
+    for call in mcp_store.read_calls(stored.get("calls")):
+        key = (str(call.get("server") or ""), str(call.get("tool") or ""),
+               mcp_store.arguments_text(call.get("arguments")))
+        if key in ok_keys:
+            replay.append(call)
+    return replay
 
 
 def _mcp_debug() -> str:
     """Строка диагностики перед выбором инструментов (что именно происходит)."""
     return ("MCP: проверяю внешние инструменты проекта (служебный вызов LLM) — "
             "какие данные нужны для этого запроса.")
+
+
+async def _stop_mcp_started(session: Optional[Dict[str, Any]], reason: str) -> List[str]:
+    """Останавливает ВНЕШНИЕ СБОРЫ, запущенные задачей (наблюдения, подписки).
+
+    Задача отменена или удалена — значит и работа, которую она завела на серверах
+    (например, сбор погоды каждые 15 минут), должна прекратиться: иначе сервер
+    будет собирать и хранить данные для задачи, которой больше нет. Какие именно
+    инструменты отменяют сбор, ЗНАЕТ СЕРВЕР: пары «запускающий ↔ отменяющий»
+    найдены по объявленному списку, а id наблюдения сохранён вместе с задачей
+    (см. app/ai/mcp.py, started_calls).
+
+    Возвращает строки диагностики для журнала чата (пусто — отменять было нечего).
+    Сбой отмены НЕ скрывается: пользователь должен знать, что сбор остался.
+    """
+    if not session:
+        return []
+    dialog = session.get("dialog")
+    if not isinstance(dialog, dict):
+        return []
+    entries = workspace_store.mcp_started(dialog)
+    if not entries:
+        return []
+    reports = await mcp_store.async_cancel_started(entries)
+    # Снимаем только УСПЕШНО отменённые: не отменённые остаются в памяти задачи —
+    # если задачу удаляют, попытка повторится у следующей задачи с теми же сборами.
+    done = [entry for entry, report in zip(entries, reports) if report.get("ok")]
+    workspace_store.clear_mcp_started(dialog, done)
+    note = mcp_store.cancel_note(reports)
+    if not note:
+        return []
+    line = f"{periodic_store.AUTO_MARK} Внешние сборы задачи: {note} ({reason})."
+    workspace_store.add_log(dialog, workspace_store.LOG_DEBUG, line)
+    logger.info("MCP: отмена внешних сборов задачи (%s): %s", reason, note)
+    return [line]
 
 
 def _verified_choice(dialog: Optional[Dict[str, Any]], text: str,
@@ -1430,17 +1814,37 @@ def _gate_cache_key(steps: List[str], snapshot: Dict[str, Any]) -> tuple:
             invariants_store.rules_signature(snapshot))
 
 
-def _plan_signature(text: str, snapshot: Dict[str, Any]) -> Dict[str, str]:
-    """Подпись плана: для какого ЗАПРОСА и при каких ПРАВИЛАХ он построен.
+def _data_basis(results: Any) -> str:
+    """ОСНОВА ДАННЫХ плана: какие внешние данные по запросу получены.
+
+    План строится по фактическим данным (см. блок «ДАННЫЕ MCP»), поэтому смена
+    основы — это другой план: в живой задаче первый выбор диспетчера был «запусти
+    сбор», план вышел про наблюдение, а после исправления выбор стал «прочитай
+    текущую погоду» — и прежний план к такой основе уже не подходит. Считаем только
+    УСПЕШНЫЕ вызовы: план, построенный на отказе инструмента, — это план без данных,
+    и его переиспользовать нельзя. Пустая строка — данных MCP нет (у проекта MCP
+    выключен, запрос их не требует или все вызовы отказали).
+    """
+    pairs = sorted({f"{item.get('server')}·{item.get('tool')}"
+                    for item in (results if isinstance(results, list) else [])
+                    if isinstance(item, dict) and item.get("tool") and item.get("ok")})
+    return ", ".join(pairs)[:300]
+
+
+def _plan_signature(text: str, snapshot: Dict[str, Any],
+                    basis: str = "") -> Dict[str, str]:
+    """Подпись плана: для какого ЗАПРОСА, при каких ПРАВИЛАХ и на КАКИХ данных.
 
     По ней видно, можно ли переиспользовать уже построенный план: если запрос
-    тот же и правила не менялись, новый вызов планировщика и код-гейт — это
-    потраченные впустую токены (например, при перезапуске задачи после ошибки
-    шага: `start_planning` шаги сохраняет, а гейт и план оплачивались заново).
+    тот же, правила не менялись и данные те же, новый вызов планировщика и
+    код-гейт — это потраченные впустую токены (например, при перезапуске задачи
+    после ошибки шага: `start_planning` шаги сохраняет, а гейт и план
+    оплачивались заново).
     """
     return {
         "request": str(text or "").strip()[:task_state.REQUEST_LIMIT],
         "rules": invariants_store.rules_signature(snapshot),
+        "basis": str(basis or "")[:300],
     }
 
 
@@ -1826,6 +2230,12 @@ async def profile_delete(profile_id: str) -> dict:
             raise HTTPException(status_code=404, detail="Профиль не найден")
         profile_store.ensure_profile(_profiles)
         await _persist_profiles()
+        # ВНЕШНИЕ СБОРЫ задач профиля останавливаются ДО удаления данных: задачи
+        # (вместе с записями о своих сборах) исчезнут, и отменять их будет уже
+        # нечем — а сбор на сервере остался бы висеть навсегда.
+        for task in workspace_store.profile_tasks(_workspace, profile_id):
+            for session in list(task.get("sessions", [])):
+                await _stop_mcp_started(session, "профиль удалён")
         # Данные профиля уходят вместе с ним: его задачи с диалогами, рабочая и
         # долговременная память. Иначе в файле оставался бы мусор, который уже
         # никому не виден и не удаляется через интерфейс.
@@ -2010,6 +2420,21 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 # задачу сам (после «Подтвердить план» и между шагами), и
                 # пользователю не нужно придумывать сообщение ради шага.
                 machine_step = bool(getattr(msg, "continue_step", False))
+                # Запрос от АВТОЗАПУСКА ПЕРИОДИЧЕСКОЙ задачи (см.
+                # app/periodic_runner.py): пользователя за клавиатурой нет —
+                # прогон идёт автономно, данные внешних инструментов берутся
+                # заново, а реплика помечается в журнале как автозапуск.
+                periodic_run = bool(getattr(msg, "periodic", False)) and not machine_step
+                # ПЕРИОДИЧЕСКАЯ задача (расписание есть у САМОЙ задачи): у неё свой
+                # ход работы — план строится ОДИН раз на запрос и дальше
+                # переиспользуется, итоговой проверки результата нет, а «готово»
+                # не ставится вовсе: задача повторяется, пока её не остановит
+                # пользователь (см. app/ai/periodic.py, §5.12).
+                periodic_task = bool(workspace_store.periodic_meta(session_now))
+                # Запрос периодической задачи ИЗМЕНИЛСЯ (пользователь написал новый):
+                # прежний план к нему не подходит — план строится заново, тоже один
+                # раз. Заполняется в блоке 2а ниже.
+                request_changed = False
                 # Команда остановки, полученная во время текущего шага (см. ниже).
                 stopped: Optional[str] = None
                 # Проверку отложили в ЭТОМ ЖЕ запросе («Пауза» на последнем шаге):
@@ -2026,7 +2451,17 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                     # попадает только вместе с ответом, а при построении плана
                     # ответа нет, и текст запроса терялся (в восстановленном
                     # диалоге его не было видно).
-                    workspace_store.add_log(dialog_now, workspace_store.LOG_USER, text)
+                    if periodic_run:
+                        # Автозапуск — не реплика пользователя, а служебная
+                        # строка: видно, что задача повторяется сама и с каким
+                        # периодом (тот же текст запроса пользователь уже писал).
+                        meta = workspace_store.periodic_meta(session_now)
+                        workspace_store.add_log(dialog_now, workspace_store.LOG_PERIODIC, (
+                            f"{periodic_store.AUTO_MARK} Автозапуск "
+                            f"({periodic_store.label(meta.get('interval'))}): {text}"
+                        ))
+                    else:
+                        workspace_store.add_log(dialog_now, workspace_store.LOG_USER, text)
                 plan_usage: Dict[str, Any] = {}
                 # Расход текущего запроса: заполняется ответом шага и служебными
                 # вызовами (план/проверка). Объявлен заранее — помощник проверки
@@ -2043,29 +2478,29 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 # 1. ПАУЗА. Автомат остановлен кнопкой «Пауза»: шаг не
                 #    выполняем, просим нажать «Продолжить».
                 if state.paused:
-                    yield encode(_state_event(state))
+                    yield encode(_state_event(session_now, state))
                     yield encode({"type": "error", "text": (
                         "Задача на паузе: нажмите «Продолжить» в полосе состояния, "
                         "чтобы продолжить работу."
                     )})
-                    yield encode({"type": "done", "usage": {}, "state": task_state.snapshot(state)})
+                    yield encode({"type": "done", "usage": {}, "state": _state_snapshot(session_now, state)})
                     return
 
                 if not text and not machine_step:
                     yield encode({"type": "bot", "text": "Пожалуйста, введите сообщение."})
-                    yield encode({"type": "done", "usage": {}, "state": task_state.snapshot(state)})
+                    yield encode({"type": "done", "usage": {}, "state": _state_snapshot(session_now, state)})
                     return
                 if machine_step and state.stage not in ("execution", "validation"):
                     # Автомат сам приходит только за шагом (execution) или за
                     # ОТЛОЖЕННОЙ проверкой результата (validation). В остальных
                     # этапах он ждёт пользователя: план, ошибка, завершение.
-                    yield encode(_state_event(state))
+                    yield encode(_state_event(session_now, state))
                     yield encode({"type": "error", "text": (
                         "Работать нечего: задача на этапе "
                         f"«{task_state.STAGE_LABELS.get(state.stage, state.stage)}». "
                         "Отправьте сообщение или подтвердите план."
                     )})
-                    yield encode({"type": "done", "usage": {}, "state": task_state.snapshot(state)})
+                    yield encode({"type": "done", "usage": {}, "state": _state_snapshot(session_now, state)})
                     return
 
                 # 1а. ИНВАРИАНТЫ. Правило проекта и правило задачи могут
@@ -2075,8 +2510,65 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 #     правил. Проверка и решение — в модалке «Инварианты».
                 # 2. ЭТАП: смотрим, где задача, и что означает это сообщение.
                 confirmed = _is_plan_confirmation(text)
-                autonomous = _wants_autonomous(text)
+                # Автозапуск периодической задачи равносилен режиму «работай
+                # автономно»: подтвердить план пользователю негде — его нет за
+                # клавиатурой, а задача должна повторяться сама.
+                autonomous = _wants_autonomous(text) or periodic_run
                 restart = _wants_restart(text)
+
+                # 2а. РАСПИСАНИЕ ПЕРИОДИЧЕСКОЙ ЗАДАЧИ. Сообщение ПОЛЬЗОВАТЕЛЯ в
+                #     такой задаче — её новый запрос: он и повторяется по
+                #     расписанию. Период берём из текста («Сводка погоды в Москве
+                #     за последние сутки, раз в час»), а если он не назван —
+                #     оставляем прежний (у новой задачи это сутки по умолчанию).
+                #     Служебные фразы («ок», «работай автономно», «перезапусти»)
+                #     запросом НЕ являются: они не меняют ни текст задачи, ни её
+                #     расписание.
+                if periodic_run:
+                    yield encode({"type": "debug", "text": (
+                        f"{_MACHINE}: автозапуск периодической задачи "
+                        f"({periodic_store.label(workspace_store.periodic_meta(session_now).get('interval'))}) — "
+                        "выполняю её запрос по сохранённому плану, данные внешних "
+                        "инструментов беру свежими."
+                    )})
+                elif text and not machine_step and not confirmed and not autonomous and not restart:
+                    meta = workspace_store.periodic_meta(session_now)
+                    if meta:
+                        previous_request = str(meta.get("request") or "").strip()
+                        request_changed = bool(previous_request) and text != previous_request
+                        raw_interval, interval, phrase = \
+                            periodic_store.parse_request_detailed(text)
+                        moment = periodic_store.now()
+                        workspace_store.set_periodic(session_now, periodic_store.reschedule(
+                            meta, interval=interval, request=text, moment=moment))
+                        if interval is not None:
+                            # Период назван меньше допустимого — говорим об этом
+                            # прямо: «раз в 5 секунд» станет «раз в минуту», и
+                            # пользователь должен видеть, что это НАШ предел
+                            # (повтор — целый цикл задачи, то есть вызовы LLM), а
+                            # не интервал сбора внешнего инструмента: его задаёт
+                            # сам сервер инструмента.
+                            raise_note = ""
+                            if raw_interval and interval and raw_interval != interval:
+                                raise_note = (
+                                    f" (в запросе «{phrase}», но чаще "
+                                    f"«{periodic_store.label(interval)}» повторять "
+                                    f"нельзя: повтор — это целый цикл задачи)")
+                            yield encode({"type": "debug", "text": (
+                                f"{_MACHINE}: задача периодическая — «{phrase}»: "
+                                f"повторю её запрос {periodic_store.label(interval)}"
+                                + raise_note
+                                + (", первый повтор — через указанный период."
+                                   if not meta.get("runs") else ".")
+                                + " Интервал сбора внешнего инструмента задаёт его "
+                                  "сервер, период повтора на него не влияет."
+                            )})
+                        elif not meta.get("enabled"):
+                            yield encode({"type": "debug", "text": (
+                                f"{_MACHINE}: повтор этой задачи остановлен "
+                                "(🔁 в списке задач) — запрос выполню один раз, "
+                                "автозапуск останется выключенным."
+                            )})
 
                 if state.stage in ("done", "cancelled"):
                     # Предыдущая задача завершена — это НОВАЯ задача: автомат
@@ -2103,9 +2595,19 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         "пользователь ответил на вопрос о плане"
                         + (" — план подтверждён" if confirmed else " — вношу правки"),
                     )
+                if periodic_task and request_changed and state.stage == "execution" \
+                        and state.steps:
+                    # Периодическая задача с уже готовым планом: пользователь
+                    # написал ДРУГОЙ запрос — прежний план к нему не подходит.
+                    # Строим план заново (и тоже один раз — дальше он живёт, пока
+                    # запрос не изменится снова).
+                    task_state.replan(
+                        state,
+                        "запрос периодической задачи изменился — план строю заново",
+                    )
                 if autonomous:
                     state.autonomous = True
-                yield encode(_state_event(state))
+                yield encode(_state_event(session_now, state))
 
                 # 1б. ИНВАРИАНТЫ И ЗАПРОС. Самое первое, что делает агент, —
                 #     сверяет ЗАПРОС пользователя с правилами, которые нарушать
@@ -2158,9 +2660,9 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         if usage:
                             dialog_now.setdefault("usage", []).append(
                                 dict(usage, kind="service"))
-                        yield encode(_state_event(state))
+                        yield encode(_state_event(session_now, state))
                         yield encode({"type": "done", "usage": dict(usage),
-                                      "state": task_state.snapshot(state)})
+                                      "state": _state_snapshot(session_now, state)})
                         return
 
                 # 1в. ВНЕШНИЕ ИНСТРУМЕНТЫ (MCP). Если у проекта включены
@@ -2186,7 +2688,12 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # уже собраны по запросу задачи. Любой другой текст —
                         # новый запрос (в том числе правка запроса до подтверждения
                         # плана): инструменты выбираются по НЕМУ.
-                        reuse=(confirmed or autonomous or restart))
+                        reuse=(confirmed or autonomous or restart),
+                        # АВТОЗАПУСК периодической задачи: запрос тот же, но
+                        # данные нужны СВЕЖИЕ — иначе повтор отдавал бы в чат
+                        # числа прошлого повтора (подпись «серверы + запрос» у
+                        # них та же).
+                        fresh=periodic_run)
                     if mcp_usage:
                         usage = merge_usage(usage, mcp_usage)
                     for line in mcp_lines:
@@ -2206,7 +2713,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                     if not resumed:
                         task_state.to_validation(
                             state, "все шаги плана выполнены — проверяю результат")
-                        yield encode(_state_event(state))
+                        yield encode(_state_event(session_now, state))
                     # Новая попытка проверки: признак «проверку выполнить не
                     # удалось» снимается — иначе интерфейс показывал бы «Принять
                     # вручную» и во время самой проверки.
@@ -2214,7 +2721,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                     task_state.validation_checking(
                         state, "повторная попытка проверки результата")
                     if was_blocked:
-                        yield encode(_state_event(state))
+                        yield encode(_state_event(session_now, state))
                     yield encode({"type": "debug", "text": (
                         f"{_MACHINE}: этап validation — самопроверка полученного ответа "
                         f"({state.steps_total or 1} "
@@ -2358,11 +2865,27 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                     # подтверждение плана не требуется: в интерактивной задаче план
                     # по-прежнему показывается заново и ждёт «ок» — иначе
                     # пользователь потерял бы шаг подтверждения.
+                    # ПЕРИОДИЧЕСКАЯ задача — второй такой случай: её план строится
+                    # ОДИН раз на запрос (в том числе когда задача пришла на
+                    # автозапуск с показанным, но не подтверждённым планом) —
+                    # планировщик и гейт плана за тот же запрос больше не платятся.
                     _snapshot_for_plan = _invariants_snapshot(task_now, session_now)
+                    # ЗАПРОС, для которого строится или переиспользуется план.
+                    # Служебные фразы («ок», «работай автономно», «перезапусти») и
+                    # реплика шага описывают ПРЕЖНИЙ запрос задачи (state.request);
+                    # новый содержательный текст пользователя — сам является
+                    # запросом. Без этого разделения повтор периодической задачи
+                    # или правка запроса переиспользовали бы ЧУЖОЙ план: подпись
+                    # совпадала бы со старой, и шаги прежнего запроса выполнялись бы
+                    # по новому.
+                    plan_request = (state.request or text) \
+                        if (machine_step or confirmed or restart) \
+                        else (text or state.request)
                     plan_signature = _plan_signature(
-                        state.request or text, _snapshot_for_plan)
+                        plan_request, _snapshot_for_plan, _data_basis(mcp_data))
                     reuse_plan = bool(
-                        restarted_from_failure and state.autonomous and not confirmed
+                        (restarted_from_failure or periodic_task)
+                        and state.autonomous and not confirmed
                         and state.steps
                         and _plan_is_fresh(dialog_now, plan_signature))
                     if confirmed and state.steps:
@@ -2456,17 +2979,39 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                     "план не прошёл проверку по инвариантам")
                             dialog_now.setdefault("usage", []).append(
                                 dict(usage, kind="plan"))
-                            yield encode(_state_event(state))
+                            yield encode(_state_event(session_now, state))
                             yield encode({"type": "done", "usage": dict(usage),
-                                          "state": task_state.snapshot(state)})
+                                          "state": _state_snapshot(session_now, state)})
                             return
                         steps = gate["steps"]
+                        # ФОРМА ПЛАНА: шаги-«оформление» («извлечь данные» →
+                        # «сгруппировать» → «сформировать таблицу» → «вывести
+                        # таблицу») новогo результата не дают, а каждый — отдельный
+                        # вызов LLM. Правило в промпте планировщика — просьба,
+                        # поэтому хвостовые такие шаги схлопывает КОД
+                        # (task_state.compact_steps); действия с последствиями
+                        # («отправить», «создать заявку», «в файл») он не трогает.
+                        # Правку плана пользователем (✎ «План») не трогаем — там
+                        # решение человека.
+                        steps, dropped = task_state.compact_steps(steps, plan_request)
+                        if dropped:
+                            yield encode({"type": "debug", "text": (
+                                f"{_MACHINE}: план сокращён на {dropped} "
+                                f"{task_state.steps_word(dropped)} — это было оформление "
+                                "уже полученного результата, а не отдельная работа "
+                                "(каждый шаг стоил отдельного вызова модели)."
+                            )})
                         state.steps = steps
                         # Запоминаем, для какого запроса и правил план построен:
                         # ровно за такой же план больше не платим (см. reuse_plan).
+                        # Подпись — по ТОМУ ЖЕ запросу, для которого план строился
+                        # (plan_request), иначе она записала бы прежний запрос: при
+                        # новом запросе это выглядело бы как «план уже есть» и
+                        # вернуло бы шаги чужого запроса.
                         dialog_now["plan_signature"] = dict(_plan_signature(
-                            state.request or text,
-                            _invariants_snapshot(task_now, session_now)))
+                            plan_request,
+                            _invariants_snapshot(task_now, session_now),
+                            _data_basis(mcp_data)))
                         # Исходный запрос задачи — в состоянии: по нему проверка
                         # результата сверяет работу (последнее сообщение может
                         # быть подтверждением «ок» или служебной фразой шага).
@@ -2485,7 +3030,13 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # контекст, поэтому он идёт обычной репликой пользователя.
                         if text and not machine_step:
                             dialog_now.setdefault("messages", []).append(
-                                {"role": "user", "content": text})
+                                {"role": "user", "content": text,
+                                 # Автозапуск — не реплика пользователя: пометка
+                                 # переживает запись в файл (см.
+                                 # _restore_message_sources) и в старом диалоге
+                                 # без журнала такая реплика рисуется служебной.
+                                 **({"source": periodic_store.SOURCE_AUTO}
+                                    if periodic_run else {})})
                         dialog_now.setdefault("messages", []).append(
                             {"role": "assistant", "content": plan_text})
                         if state.autonomous:
@@ -2498,7 +3049,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             task_state.await_confirmation(
                                 state, steps, "план показан пользователю — жду «ок» или правок")
                             yield encode({"type": "bot", "text": plan_text})
-                            yield encode(_state_event(state))
+                            yield encode(_state_event(session_now, state))
                             # «Пауза»/«Отменить», нажатые пока строился план:
                             # применяем СРАЗУ (это тот самый «этот этап», после
                             # которого пользователь просил остановиться) — иначе
@@ -2514,7 +3065,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                        else "«Пауза»")
                                     + " — план показан, задача остановлена."
                                 )})
-                                yield encode(_state_event(state))
+                                yield encode(_state_event(session_now, state))
                             if usage:
                                 # Расход этого запроса — отдельной записью
                                 # (kind="plan"): ответа пользователю не было, но
@@ -2524,7 +3075,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             workspace_store.set_dialog_state(session_now, state)
                             await _persist()
                             yield encode({"type": "done", "usage": dict(usage),
-                                          "state": task_state.snapshot(state)})
+                                          "state": _state_snapshot(session_now, state)})
                             return
 
                 if state.stage == "execution":
@@ -2576,6 +3127,17 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             # выполнен: execution → failed (см. ниже).
                             if event.get("fallback"):
                                 fallback_answer = True
+                            # ВЫДУМАННЫЕ ДАННЫЕ: данных нет вовсе, а в ответе
+                            # таблица с числами — показываем отказ инструмента.
+                            replacement = _mcp_fabrication_guard(
+                                str(event.get("text") or ""), mcp_data)
+                            if replacement:
+                                event = dict(event, text=replacement)
+                                yield encode({"type": "debug", "text": (
+                                    f"{_MACHINE}: ответ содержал таблицу, но внешние "
+                                    "данные не получены — показываю причину отказа "
+                                    "вместо выдуманных значений."
+                                )})
                         elif kind == "error":
                             note = str(event.get("text") or "")
                             # Предупреждение о лимите токенов — не провал шага.
@@ -2595,6 +3157,13 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # Реплика сгенерирована автоматом: в интерфейсе это
                         # служебное сообщение, а не запрос пользователя.
                         exchange[-2]["source"] = "machine"
+                    elif stored and periodic_run:
+                        # Реплика отправлена АВТОЗАПУСКОМ периодической задачи (план
+                        # был взят готовым, и в ветку планирования запрос не
+                        # попадал): в памяти диалога пометка нужна так же, как в
+                        # журнале чата — иначе в старом диалоге без журнала повтор
+                        # выглядел бы как сообщение пользователя.
+                        exchange[-2]["source"] = periodic_store.SOURCE_AUTO
                     dialog_now["messages"] = memory
                     dialog_now["summary"] = list(agent.summary)
                     dialog_now["covered"] = agent.covered
@@ -2640,7 +3209,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             f"{_MACHINE}: шаг {state.step_number - 1} из "
                             f"{state.steps_total} выполнен."
                         )})
-                    elif stopped == PENDING_PAUSE:
+                    elif stopped == PENDING_PAUSE and not periodic_task:
                         # Последний шаг выполнен, НО пользователь просил паузу:
                         # проверку не запускаем — переводим задачу на этап
                         # validation и останавливаемся. Проверка выполнится после
@@ -2650,11 +3219,34 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             "шаг выполнен, но пользователь нажал «Пауза» — проверку отложил",
                         )
                         validation_deferred_here = True
-                        yield encode(_state_event(state))
+                        yield encode(_state_event(session_now, state))
                         yield encode({"type": "debug", "text": (
                             f"{_MACHINE}: «Пауза» на последнем шаге — проверку результата "
                             "отложил: задача остановится НА ЭТАПЕ validation, проверка "
                             "выполнится после «Продолжить»."
+                        )})
+                    elif periodic_task:
+                        # ПЕРИОДИЧЕСКАЯ задача: план пройден до конца — ЦИКЛ
+                        # завершён. Итоговой проверки нет (сверять «соответствие
+                        # задаче» у повторяющегося ответа не с чем, а «готово» у
+                        # такой задачи не бывает), план СОХРАНЯЕТСЯ, место — снова
+                        # первый шаг: следующий повтор выполнит план с начала, а
+                        # пока задача ждёт расписания (см. task_state.cycle_done).
+                        _cycle_reason = (
+                            "повтор завершён («Пауза» на последнем шаге) — жду "
+                            "«Продолжить» и следующего повтора"
+                            if stopped == PENDING_PAUSE else
+                            "повтор завершён: все шаги плана выполнены — жду "
+                            "следующего повтора по расписанию"
+                        )
+                        task_state.cycle_done(state, _cycle_reason)
+                        yield encode({"type": "debug", "text": (
+                            f"{_MACHINE}: план пройден — повтор завершён "
+                            f"({state.steps_total} "
+                            f"{task_state.steps_word(state.steps_total)}). План сохранён, "
+                            "задача остаётся периодической: следующий повтор выполнит "
+                            "его с первого шага. Проверки результата и статуса «готово» "
+                            "у периодической задачи нет."
                         )})
                     else:
                         # Последний шаг выполнен — проверяем результат (общий
@@ -2664,6 +3256,22 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             answered and not fallback_answer, errors, stored, resumed=False
                         ):
                             yield chunk
+
+                if state.stage == "validation" and not validation_deferred_here \
+                        and periodic_task:
+                    # Периодическая задача: этап validation ей не положен (проверки
+                    # нет). Такое состояние остаётся от прежней версии или от
+                    # отложенной проверки: закрываем цикл, а не гоняем приёмщика.
+                    task_state.cycle_done(
+                        state,
+                        "повтор завершён: проверка результата у периодической задачи "
+                        "не выполняется — жду следующего повтора",
+                    )
+                    yield encode({"type": "debug", "text": (
+                        f"{_MACHINE}: у периодической задачи этапа «проверка» нет — "
+                        "считаю повтор завершённым, план сохранён."
+                    )})
+                    yield encode(_state_event(session_now, state))
 
                 if state.stage == "validation" and not validation_deferred_here:
                     # ОТЛОЖЕННАЯ ПРОВЕРКА: пользователь поставил «Паузу» на
@@ -2692,7 +3300,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             + ("«Отменить»" if stopped == PENDING_CANCEL else "«Пауза»")
                             + " — применил сразу после ответа."
                         )})
-                    yield encode(_state_event(state))
+                    yield encode(_state_event(session_now, state))
 
                 # Расход токенов запроса — ОДНОЙ записью на запрос пользователя,
                 # уже с учётом служебных вызовов (план и проверка результата).
@@ -2705,7 +3313,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 # шаг и история переходов переживают перезапуск приложения.
                 workspace_store.set_dialog_state(session_now, state)
                 await _persist()
-                yield encode(_state_event(state))
+                yield encode(_state_event(session_now, state))
 
                 # Финальный замер запроса одним событием "done": в этой ветке
                 # (обычный ответ шага) раньше событие не отправлялось вовсе, и
@@ -2714,7 +3322,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 # ОДИН раз и полностью, как он же записан в диалоге.
                 if usage:
                     yield encode({"type": "done", "usage": dict(usage),
-                                  "state": task_state.snapshot(state)})
+                                  "state": _state_snapshot(session_now, state)})
 
                 # Ещё раз проверяем отложенную команду: «Пауза»/«Отменить» могла
                 # прийти, пока шаг дорабатывал и сохранялся (окно между чтением
@@ -2739,7 +3347,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             + ("«Отменить»" if late == PENDING_CANCEL else "«Пауза»")
                             + " не потребовалась — задача уже завершена."
                         )})
-                    yield encode(_state_event(state))
+                    yield encode(_state_event(session_now, state))
         except asyncio.CancelledError:
             raise  # клиент отключился — просто останавливаем поток
         except Exception:  # noqa: BLE001
@@ -2755,7 +3363,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 except Exception:  # noqa: BLE001
                     logger.warning("Не удалось сохранить состояние задачи", exc_info=True)
                 yield encode({"type": "done", "usage": {},
-                              "state": task_state.snapshot(state)})
+                              "state": _state_snapshot(session_now, state)})
         finally:
             # Пометку «задача выполняется» снимаем ВСЕГДА: иначе сбой в потоке
             # оставил бы её висеть и «Пауза» вечно откладывалась бы.
@@ -2809,7 +3417,7 @@ async def agent_history() -> dict:
             "branches": {bid: dict(branch) for bid, branch in dialog["branches"].items()},
             "active_branch": dialog["active_branch"],
             "session": _session_payload(session),
-            "state": task_state.snapshot(workspace_store.dialog_state(session)),
+            "state": _state_snapshot(session, workspace_store.dialog_state(session)),
             "pending": _pending_stops.get(str(session["id"])) if session else None,
         }
 

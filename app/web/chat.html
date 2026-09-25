@@ -381,6 +381,11 @@
         /* «Новая сессия» — в самом низу панели истории диалогов. */
         .session-new { margin-top: 12px; flex: none; }
         .session-new[hidden] { display: none; }
+        /* «Новая периодическая задача» — ТА ЖЕ кнопка, что «Новая задача»
+           (тот же класс .session-new), только с периодом: задача повторяется сама
+           (см. app/periodic_runner.py). Отступ меньше, потому что это вторая
+           кнопка подряд, а не единственная. */
+        .session-new.periodic { margin-top: 8px; }
         /* Элемент истории диалогов: название (первые слова первого запроса или
            своё, после переименования) + карандаш и корзина. Клик — переход в
            этот диалог. */
@@ -395,6 +400,35 @@
         .session-item.active {
             background: var(--surface-3);
             border-left-color: var(--accent);
+        }
+        /* ПЕРИОДИЧЕСКАЯ задача в списке задач: отличается от обычной и слева
+           (пунктирная неоновая полоса), и меткой с периодом справа — видно, что
+           задача повторяется сама, даже когда её диалог не открыт. */
+        .session-item.periodic {
+            border-left-style: dotted;
+            border-left-color: var(--accent-2);
+        }
+        .session-item.periodic.active { border-left-color: var(--accent); }
+        .session-item.periodic .session-title { color: var(--accent-2); }
+        .session-item.periodic.off .session-title { color: var(--muted); }
+        .session-period {
+            flex: none;
+            padding: 1px 6px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            font-family: var(--mono);
+            font-size: 0.62rem;
+            color: var(--accent-2);
+            background: rgba(0, 255, 157, 0.10);
+            white-space: nowrap;
+        }
+        .session-item.periodic.off .session-period {
+            color: var(--muted);
+            background: transparent;
+        }
+        .session-item.periodic.running .session-period {
+            border-color: var(--line-strong);
+            box-shadow: 0 0 10px rgba(0, 255, 157, 0.25);
         }
         .session-title {
             flex: 1;
@@ -788,6 +822,17 @@
             color: var(--text);
             border-bottom-left-radius: 4px;
         }
+        /* Время отправки/получения сообщения (как в мессенджерах): у реплик
+           пользователя и ответов агента. У служебных строк (debug/error)
+           времени нет — это не сообщения переписки. */
+        .msg-time {
+            align-self: flex-end;
+            margin: 0 6px 4px;
+            font-family: var(--mono);
+            font-size: 0.64rem;
+            color: var(--muted);
+            white-space: nowrap;
+        }
         /* Сообщения-отладка режима «AI-агент»: чем агент занят сейчас */
         .msg.debug { justify-content: flex-start; }
         .msg.debug .bubble {
@@ -1142,6 +1187,52 @@
             border-radius: 10px;
         }
         .mcp-status { margin-top: 10px; color: var(--muted); }
+
+        /* ---------- Периодическая задача (кнопка 🔁 у задачи в списке) -------- */
+        .modal-box.periodic-modal {
+            width: 560px !important;
+            max-width: 94vw;
+            padding: 24px 26px;
+        }
+        .periodic-modal h3 { font-size: 1.2rem; margin-bottom: 10px; }
+        .periodic-modal .modal-hint { font-size: 0.85rem; line-height: 1.55; }
+        .periodic-status {
+            margin: 14px 0 4px;
+            padding: 11px 13px;
+            border: 1px solid var(--line);
+            border-left: 3px solid var(--accent-2);
+            border-radius: 10px;
+            background: var(--surface-2);
+            font-size: 0.86rem;
+            line-height: 1.6;
+            color: var(--text-dim);
+        }
+        .periodic-status.off { border-left-color: var(--muted); }
+        .periodic-status b { color: var(--accent-2); font-weight: 600; }
+        .periodic-status .periodic-error { color: var(--warn); }
+        .periodic-field {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 14px 0 0;
+            font-size: 0.86rem;
+            color: var(--text-dim);
+        }
+        .periodic-field select,
+        .periodic-field input {
+            flex: 1;
+            padding: 9px 11px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--surface-2);
+            color: var(--text);
+            font-family: var(--mono);
+            font-size: 0.84rem;
+            outline: none;
+        }
+        .periodic-field select:focus,
+        .periodic-field input:focus { border-color: var(--accent); }
+        .periodic-field[hidden] { display: none; }
 
         .modal-overlay {
             position: fixed;
@@ -1541,6 +1632,12 @@
                  корзина удаляет. -->
             <div id="sessions" class="user-history" hidden></div>
             <button type="button" class="session-new" id="session-new" hidden>Новая задача</button>
+            <!-- «Новая периодическая задача»: та же кнопка, но задача получает
+                 РАСПИСАНИЕ — сервер сам повторяет её запрос (по умолчанию раз в
+                 сутки, а если период назван в запросе — «раз в час» — то по
+                 нему) и кладёт ответ в чат этой задачи. -->
+            <button type="button" class="session-new periodic" id="session-new-periodic"
+                    hidden title="Задача, которая выполняется периодически: запрос повторяется сам, результат приходит в чат">Новая периодическая задача</button>
         </aside>
 
         <!-- Основное окно чата -->
@@ -1771,6 +1868,49 @@
                         <button type="button" class="clear" id="mcp-refresh">обновить список</button>
                         <button type="button" class="clear" id="mcp-close">закрыть</button>
                         <button type="button" class="accept" id="mcp-apply">применить</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Периодическая задача: расписание повторяющегося запроса. Открывается
+                 кнопкой 🔁 у задачи в списке задач. Период по умолчанию — сутки;
+                 если период назван в тексте запроса («раз в час»), сервер берёт его
+                 сам. Автозапуск можно остановить — задача при этом остаётся
+                 периодической (метка в списке сохраняется) и повтор не вернётся сам. -->
+            <div class="modal-overlay" id="periodic-modal" hidden>
+                <div class="modal-box periodic-modal">
+                    <h3>Периодическая задача</h3>
+                    <p class="modal-hint">Задача повторяется сама: сервер заново
+                        выполняет её запрос через выбранный период и кладёт ответ в
+                        чат этой задачи — со свежими данными внешних инструментов
+                        проекта (если они включены у проекта: погода, курс, цена —
+                        набор инструментов меняется, повтор берёт то, что доступно).
+                        Период можно назвать и прямо в запросе: «Сводка погоды в
+                        Москве за последние сутки, раз в час». Задача не завершается
+                        и не проходит проверку результата — она повторяется, пока
+                        автозапуск включён; при отмене или удалении задачи (проекта)
+                        её сборы на серверах внешних инструментов останавливаются.</p>
+                    <div class="periodic-status" id="periodic-status"></div>
+                    <div class="periodic-field" id="periodic-period-field">
+                        <label for="periodic-period">Период повтора</label>
+                        <select id="periodic-period">
+                            <option value="300">каждые 5 минут</option>
+                            <option value="900">каждые 15 минут</option>
+                            <option value="1800">каждые 30 минут</option>
+                            <option value="3600">раз в час</option>
+                            <option value="10800">каждые 3 часа</option>
+                            <option value="21600">каждые 6 часов</option>
+                            <option value="43200">каждые 12 часов</option>
+                            <option value="86400">раз в сутки</option>
+                            <option value="604800">раз в неделю</option>
+                            <option value="custom" id="periodic-period-custom">как в запросе</option>
+                        </select>
+                    </div>
+                    <p class="modal-hint" id="periodic-request"></p>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="periodic-toggle">остановить автозапуск</button>
+                        <button type="button" class="clear" id="periodic-close">закрыть</button>
+                        <button type="button" class="accept" id="periodic-save">сохранить</button>
                     </div>
                 </div>
             </div>
@@ -2701,6 +2841,7 @@
         const taskDeleteBtn = document.getElementById('task-delete');
         const sessionsEl = document.getElementById('sessions');
         const sessionNewBtn = document.getElementById('session-new');
+        const sessionNewPeriodicBtn = document.getElementById('session-new-periodic');
 
         // Снимок workspace с сервера: задачи, текущая задача, её диалоги и
         // текущий диалог.
@@ -2749,6 +2890,24 @@
         function agentModeOn() {            return agentToggle.classList.contains('active');
         }
 
+        // Периодическая ли задача (по расписанию из снимка workspace). Нужна и
+        // прогону шагов, и подсказкам: у периодической задачи ход работы другой —
+        // план строится один раз, итоговой проверки нет, «готово» не ставится, а
+        // повторы ведёт СЕРВЕР по расписанию (см. app/periodic_runner.py).
+        function isPeriodicSession(sessionId) {
+            const session = (workspace.sessions || [])
+                .find(item => item.id === (sessionId || workspace.active_session));
+            return !!(session && session.periodic);
+        }
+
+        // Периодичность ОТКРЫТОЙ задачи (для подсказок в полосе и поле ввода).
+        function activePeriodic() {
+            return periodicOf(workspace.active_session)
+                || (isPeriodicSession(workspace.active_session)
+                    ? (workspace.sessions.find(s => s.id === workspace.active_session) || {}).periodic
+                    : null);
+        }
+
         function jsonOptions(method, body) {
             return {
                 method: method,
@@ -2794,6 +2953,7 @@
                 : '🕘 История введённых данных';
             taskBlock.hidden = !agentOn;
             sessionNewBtn.hidden = !agentOn;
+            sessionNewPeriodicBtn.hidden = !agentOn;
             historyEl.hidden = agentOn;
             sessionsEl.hidden = !agentOn;
             if (agentOn) {
@@ -2846,6 +3006,9 @@
             // начать) — перерисовываем её вместе с панелью.
             renderTaskMachine();
             updateComposerState();
+            // Опрос периодических задач: нужен, только если они есть в проекте
+            // (задачи повторяются на сервере, интерфейс лишь подхватывает новое).
+            ensurePeriodicPoll();
         }
 
         // Доступность поля ввода и кнопок: диалог в режиме агента возможен
@@ -2899,9 +3062,16 @@
                                   + '«▶ выполнить проверку» в полосе состояния'
                                 : (agentOn && taskMachineState
                                     && taskMachineState.stage === 'execution' && !chainHere
-                                    ? `Задача в работе: шаг ${taskMachineState.step_number} из `
-                                      + `${taskMachineState.steps_total} — отправьте сообщение, `
-                                      + 'чтобы выполнить его'
+                                    ? (activePeriodic()
+                                        // Периодическая задача: повторы ведёт сервер,
+                                        // и «готово» у неё не бывает — подсказываем
+                                        // расписание, а не «выполните шаг».
+                                        ? 'Периодическая задача: повтор '
+                                          + ((activePeriodic() || {}).label || '')
+                                          + ' — 🔁 период и остановка'
+                                        : `Задача в работе: шаг ${taskMachineState.step_number} из `
+                                          + `${taskMachineState.steps_total} — отправьте сообщение, `
+                                          + 'чтобы выполнить его')
                                     : 'Введите сообщение...')))));
             // «Отправить» зависит от занятости ОТКРЫТОЙ задачи (openBusy), а не
             // от того, что где-то в фоне считаются другие задачи.
@@ -2924,6 +3094,7 @@
                 // шаг продолжает писаться в СВОЮ задачу. Раньше кнопка гасла,
                 // пока дорабатывал шаг после «Паузы».
                 sessionNewBtn.disabled = switching || !workspace.active_task;
+                sessionNewPeriodicBtn.disabled = switching || !workspace.active_task;
             }
             sessionsEl.classList.toggle('busy', busy || switching);
             // Кнопки полосы состояния. «Пауза» остаётся доступной и во время
@@ -2958,22 +3129,48 @@
 
         // Элемент истории диалогов: название (первые слова первого запроса
         // пользователя или своё, после переименования) + карандаш и корзина.
+        // ПЕРИОДИЧЕСКАЯ задача отличается от обычной: полоса слева пунктирная,
+        // название подсвечено, справа метка с периодом (🔁 «раз в час»), а у
+        // остановленного автозапуска метка приглушена («остановлена»). Кнопка 🔁
+        // открывает расписание задачи: период, следующий повтор, остановка.
         function sessionItem(session) {
             const item = document.createElement('div');
             const title = session.title || 'Новая задача';
+            const period = session.periodic || null;
             item.className = 'history-item session-item'
-                + (session.id === workspace.active_session ? ' active' : '');
+                + (session.id === workspace.active_session ? ' active' : '')
+                + (period ? ' periodic' : '')
+                + (period && !period.enabled ? ' off' : '')
+                + (period && period.running ? ' running' : '');
             // По data-session шестерёнка задачи находит СВОЮ задачу, когда надо
             // пометить её правилами с неразрешённым противоречием.
             item.dataset.session = session.id;
             const label = document.createElement('span');
             label.className = 'session-title';
-            // Задача, у которой прямо сейчас идут шаги, помечена — иначе не видно,
-            // что работа идёт (в том числе когда открыта другая задача).
-            const running = chains.has(session.id);
+            // Задача, у которой прямо сейчас идут шаги (свои или автозапуск),
+            // помечена — иначе не видно, что работа идёт (в том числе когда
+            // открыта другая задача).
+            const running = chains.has(session.id) || !!(period && period.running);
             label.textContent = (running ? '⏳ ' : '') + title;
-            label.title = running ? title + ' — выполняются шаги' : title;
+            label.title = running
+                ? title + (period && period.running ? ' — идёт автозапуск' : ' — выполняются шаги')
+                : title;
             item.appendChild(label);
+            if (period) {
+                const badge = document.createElement('span');
+                badge.className = 'session-period';
+                badge.textContent = (period.running ? '⏳ ' : '🔁 ')
+                    + (period.enabled ? period.label : 'остановлена');
+                badge.title = 'Периодическая задача: ' + (period.enabled
+                    ? period.label + ' — ' + (period.when || '') + '; повторов: '
+                      + (period.runs || 0)
+                    : 'автозапуск остановлен (кнопка 🔁 включит снова)')
+                    + (period.hold === 'paused' ? '; задача на паузе' : '')
+                    + (period.hold === 'cancelled'
+                        ? '; задача отменена — повторов не будет' : '')
+                    + (period.error ? '; последний повтор не удался: ' + period.error : '');
+                item.appendChild(badge);
+            }
             const actions = document.createElement('span');
             actions.className = 'session-actions';
             // Инварианты ЗАДАЧИ: правила конкретного диалога — открываются
@@ -2982,6 +3179,11 @@
                 + 'не имеет права нарушить', () => openInvariantsModal('task', session.id));
             invGear.classList.add('session-invariants');
             actions.appendChild(invGear);
+            if (period) {
+                actions.appendChild(iconButton('🔁', 'Периодическая задача: период, '
+                    + 'следующий повтор, остановка автозапуска',
+                    () => openPeriodicModal(session)));
+            }
             actions.appendChild(iconButton('✏️', 'Переименовать задачу', () => renameSession(session)));
             actions.appendChild(iconButton('🗑', 'Удалить задачу', () => deleteSession(session)));
             item.appendChild(actions);
@@ -3077,13 +3279,16 @@
             }
         }
 
-        // Новый диалог в текущей задаче (кнопка «Новая сессия»): сессия пустая,
-        // название подтянется по первому запросу.
-        async function createSession() {
+        // Новая задача в текущем проекте (кнопки «Новая задача» и «Новая
+        // периодическая задача»): сессия пустая, название подтянется по первому
+        // запросу. Периодическая задача сразу получает расписание (по умолчанию
+        // раз в сутки; период можно назвать в самом запросе — «раз в час»).
+        async function createSession(periodic) {
             if (switching || !workspace.active_task) return;
             setSwitching(true);
             try {
-                const data = await workspaceRequest('/api/agent/sessions', jsonOptions('POST'));
+                const data = await workspaceRequest('/api/agent/sessions',
+                    jsonOptions('POST', periodic ? { periodic: true } : {}));
                 if (!data) return;
                 workspace = data;
                 renderWorkspace();
@@ -3092,6 +3297,14 @@
                 setSwitching(false);
             }
             input.focus();
+            if (periodic) {
+                ensurePeriodicPoll();
+                addMessage('bot', '🔁 Создана периодическая задача. Напишите её запрос — '
+                    + 'он будет повторяться: по умолчанию раз в сутки, а если назвать '
+                    + 'период в тексте («Сводка погоды в Москве за последние сутки, '
+                    + 'раз в час») — то с указанной периодичностью. Период и остановку '
+                    + 'автозапуска открывает кнопка 🔁 у задачи в списке.', true);
+            }
         }
 
         async function createTask(name) {
@@ -3533,7 +3746,10 @@
         });
         taskRenameBtn.addEventListener('click', renameTask);
         taskDeleteBtn.addEventListener('click', deleteTask);
-        sessionNewBtn.addEventListener('click', createSession);
+        // Кнопка-обработчик передаёт событие первым аргументом, поэтому период
+        // задаём явно: обработчиками служат стрелки, а не сама функция.
+        sessionNewBtn.addEventListener('click', () => createSession(false));
+        sessionNewPeriodicBtn.addEventListener('click', () => createSession(true));
         taskSelect.addEventListener('change', () => selectTask(taskSelect.value));
 
         // ---------- Полоса состояния задачи (Task State Machine) ----------
@@ -3556,7 +3772,11 @@
         const tmPending = document.getElementById('tm-pending');
         const tmIdle = document.getElementById('tm-idle');
         const tmAcceptBtn = document.getElementById('tm-accept');
-        // Базовые этапы автомата (в порядке перехода) и подписи в полосе.
+        // Базовая цепочка этапов (подписи блоков) — запасной вариант: полосу рисуем
+        // по СНИМКУ с сервера (state.base_stages). У ПЕРИОДИЧЕСКОЙ задачи цепочка
+        // короче: «проверка» и «готово» в неё не входят — проверки результата у
+        // повтора нет, а завершённой такая задача не бывает (она повторяется, пока
+        // её не остановит пользователь).
         const TM_BASE = [
             { id: 'planning', label: 'Планирование' },
             { id: 'execution', label: 'Выполнение' },
@@ -3597,10 +3817,17 @@
             // расширений (awaiting_user/failed) оно своё, а сам расширенный этап
             // рисуется отдельным блоком перед кнопкой.
             const stage = (state && state.base_stage) || 'planning';
-            const stageIndex = TM_BASE.findIndex(stageItem => stageItem.id === stage);
+            // Цепочка этапов — С СЕРВЕРА (state.base_stages): у периодической
+            // задачи в ней только планирование и выполнение. Снимка ещё нет —
+            // рисуем полную цепочку, как раньше.
+            const stages = (state && Array.isArray(state.base_stages)
+                && state.base_stages.length)
+                ? state.base_stages.map(item => ({ id: item.id, label: item.label }))
+                : TM_BASE;
+            const stageIndex = stages.findIndex(stageItem => stageItem.id === stage);
 
             tmTrack.innerHTML = '';
-            TM_BASE.forEach((stageItem, index) => {
+            stages.forEach((stageItem, index) => {
                 if (index) tmTrack.appendChild(tmArrow());
                 let className = '';
                 if (stageItem.id === stage) {
@@ -3710,11 +3937,20 @@
             const idle = hasTask && state && !state.paused && !state.pending && !chainHereNow
                 && (checkPending || (state.stage === 'execution' && state.step_number > 0));
             if (idle) {
+                // У периодической задачи шаг 1 после пройденного цикла означает
+                // «ждём следующего повтора», а не «задача застряла»: кнопка честно
+                // запускает повтор ВРУЧНУЮ (расписание сделает это само).
+                const repeatReady = !!state.repeat_ready;
                 tmIdle.hidden = false;
-                tmIdle.textContent = checkPending
+                tmIdle.textContent = repeatReady
+                    ? '▶ выполнить повтор сейчас'
+                    : checkPending
                     ? (state.check_blocked ? '▶ повторить проверку' : '▶ выполнить проверку')
                     : `▶ продолжить: шаг ${state.step_number} из ${state.steps_total}`;
-                tmIdle.title = checkPending
+                tmIdle.title = repeatReady
+                    ? 'Выполнить цикл задачи сейчас, не дожидаясь расписания '
+                      + '(🔁 у задачи — период и остановка автозапуска)'
+                    : checkPending
                     ? (state.check_blocked
                         ? 'Проверку выполнить не удалось — нажмите, чтобы проверить снова'
                         : 'Проверка результата отложена («Пауза» на последнем шаге) — нажмите, чтобы выполнить')
@@ -4009,6 +4245,14 @@
             // удалась (check_blocked). Дальше прогон останавливается, чтобы
             // повторять проверку по кругу не жгло вызовы LLM.
             let attempted = false;
+            // ПЕРИОДИЧЕСКАЯ задача: её повторы ведёт СЕРВЕР по расписанию, а
+            // прогон в интерфейсе нужен только для ТЕКУЩЕГО цикла (первый запрос
+            // пользователя, правка запроса, доработка). Конец цикла сервер
+            // помечает САМ (`repeat_ready` в снимке состояния): этап у
+            // периодической задачи остаётся «Выполнение», «Готово» не наступает,
+            // поэтому по этапу конец цикла не виден — а без остановки прогон
+            // крутил бы повтор за повтором, сжигая вызовы LLM.
+            const periodicTask = isPeriodicSession(target);
             try {
                 while (!chain.stop && !noChainFor.has(target) && agentModeOn()
                         && steps < TM_CHAIN_LIMIT) {
@@ -4019,6 +4263,7 @@
                                   || (state.check_blocked && attempted)
                                   || (state.stage !== 'execution'
                                       && state.stage !== 'validation'))) break;
+                    if (state && state.repeat_ready) break;
                     attempted = true;
                     steps += 1;
                     const background = target !== workspace.active_session;
@@ -4265,7 +4510,29 @@
             return div;
         }
 
-        function addMessage(role, text, agentMsg, memoryButtons) {
+        // Подпись времени сообщения для чата: сегодня — «ЧЧ:ММ», в другой день —
+        // «ДД.ММ ЧЧ:ММ»; полный момент — в подсказке. Пустая строка на входе
+        // означает «время неизвестно» (запись из старого файла): тогда подписи
+        // НЕТ — выдумывать время нельзя. Без аргумента берём текущий момент
+        // (живое сообщение).
+        function msgTimeNode(at) {
+            if (at === '' || at === null) return null;
+            const date = at ? new Date(at) : new Date();
+            if (!(date instanceof Date) || isNaN(date.getTime())) return null;
+            const pad = value => String(value).padStart(2, '0');
+            const time = pad(date.getHours()) + ':' + pad(date.getMinutes());
+            const now = new Date();
+            const today = date.getFullYear() === now.getFullYear()
+                && date.getMonth() === now.getMonth() && date.getDate() === now.getDate();
+            const node = document.createElement('span');
+            node.className = 'msg-time';
+            node.textContent = today ? time
+                : pad(date.getDate()) + '.' + pad(date.getMonth() + 1) + ' ' + time;
+            node.title = date.toLocaleString();
+            return node;
+        }
+
+        function addMessage(role, text, agentMsg, memoryButtons, at) {
             const wrap = document.createElement('div');
             wrap.className = 'msg ' + role;
             if (agentMsg) wrap.setAttribute('data-agent', '1');
@@ -4273,6 +4540,12 @@
             bubble.className = 'bubble';
             bubble.textContent = text;
             wrap.appendChild(bubble);
+            // Время — у реплик пользователя и ответов агента; у служебной строки
+            // (role="debug") его не показываем.
+            if (role !== 'debug') {
+                const timeNode = msgTimeNode(at);
+                if (timeNode) wrap.appendChild(timeNode);
+            }
             // Под сообщением пользователя и под ответом агента — кнопки
             // «добавить в рабочую/долговременную память».
             if (memoryButtons) addMemoryButtons(wrap, role === 'user' ? 'user' : 'assistant');
@@ -4306,15 +4579,15 @@
         // (сессии), поэтому в историю введённых данных реплики не пишутся.
         // Под сообщением пользователя и под ответом агента — кнопки добавления
         // этого текста в рабочую/долговременную память.
-        function drawAgentNode(role, text, analysis) {
+        function drawAgentNode(role, text, analysis, at) {
             if (role === 'user') {
-                addMessage('user', text, true, true);
+                addMessage('user', text, true, true, at);
             } else if (role === 'debug') {
                 addMessage('debug', text, true);
             } else if (role === 'error') {
-                addMessage('bot', '⚠️ ' + text, true);
+                addMessage('bot', '⚠️ ' + text, true, undefined, at);
             } else {
-                const wrap = addMessage('bot', text, true, true);
+                const wrap = addMessage('bot', text, true, true, at);
                 // Разбор инвариантов: под сообщением — кликабельные варианты
                 // решения (ни один не нарушает правила).
                 if (analysis && analysis.suggestions) drawInvariantOptions(wrap, analysis);
@@ -4388,8 +4661,13 @@
 
         // Добавляет реплику в текущее представление и сразу рисует её.
         function pushAgentNode(role, text, analysis) {
-            agentViewMessages().push({ role: role, text: text, analysis: analysis || null });
-            drawAgentNode(role, text, analysis);
+            // Живая реплика: время ставим СЕЙЧАС (у служебных строк оно хранится,
+            // но не показывается). В файл его запишет сервер со своей меткой — она
+            // и будет показана после переключения задачи или перезагрузки.
+            const at = new Date().toISOString();
+            agentViewMessages().push({ role: role, text: text,
+                                       analysis: analysis || null, at: at });
+            drawAgentNode(role, text, analysis, at);
         }
 
         // Полная перерисовка окна чата для текущего представления (после
@@ -4397,7 +4675,8 @@
         // Заглушка-приветствие видна только в пустом диалоге.
         function renderAgentDialog() {
             messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
-            agentViewMessages().forEach(m => drawAgentNode(m.role, m.text, m.analysis));
+            agentViewMessages().forEach(
+                m => drawAgentNode(m.role, m.text, m.analysis, m.at === undefined ? '' : m.at));
             // План ветвления показываем в корневом диалоге (он относится к нему).
             if (!agentView && agentAnalysis) renderBranchPlan(agentAnalysis);
             greetingMsg.hidden = !!messagesEl.querySelector('[data-agent]');
@@ -4548,12 +4827,16 @@
             const roleOf = kind => (kind === 'assistant' ? 'assistant'
                 : kind === 'debug' ? 'debug'
                 : kind === 'error' ? 'error'
+                // Автозапуск периодической задачи — служебная строка, а не реплика
+                // пользователя: видно, что задача повторилась САМА и с каким
+                // периодом (см. app/periodic_runner.py).
+                : kind === 'periodic' ? 'debug'
                 // Узел с разбором инвариантов — это сообщение АГЕНТА (отказ и
                 // варианты), а не реплика пользователя.
                 : kind === 'suggestions' ? 'assistant' : 'user');
             agentRootMessages = (log.length ? log : msgs.map(m => ({
                 // Старые диалоги (журнала ещё нет): собираем из памяти диалога.
-                kind: m && m.source === 'machine' ? 'debug'
+                kind: m && (m.source === 'machine' || m.source === 'periodic') ? 'debug'
                     : (m && m.role === 'user' ? 'user' : 'assistant'),
                 text: m && m.content
             })))
@@ -4562,7 +4845,10 @@
                     role: roleOf(item.kind), text: item.text,
                     // Разбор инвариантов хранит варианты решения — их рисуем
                     // заново (кликабельными) после переключения задачи.
-                    analysis: item.analysis || null
+                    analysis: item.analysis || null,
+                    // Время сообщения из журнала сервера; у старых записей его нет
+                    // — тогда подпись не показываем (выдумывать нельзя).
+                    at: item.at || ''
                 }));
             renderBranchSelect();
             // Ветви есть — список «Стратегия» переключаем на branching, иначе
@@ -5051,6 +5337,227 @@
         });
         mcpModal.addEventListener('click', (e) => {
             if (e.target === mcpModal) closeMcpModal();
+        });
+
+        // ---------- Периодические задачи: расписание, опрос, обновление чата ----
+        // Периодическая задача повторяется на СЕРВЕРЕ (app/periodic_runner.py):
+        // интерфейс не запускает повторы, он только показывает расписание и
+        // подхватывает то, что автозапуск дописал в задачу, — этим занимается
+        // опрос /api/agent/periodic (pollPeriodic).
+        const periodicModal = document.getElementById('periodic-modal');
+        const periodicStatusEl = document.getElementById('periodic-status');
+        const periodicPeriodSelect = document.getElementById('periodic-period');
+        const periodicCustomOption = document.getElementById('periodic-period-custom');
+        const periodicRequestEl = document.getElementById('periodic-request');
+        const periodicToggleBtn = document.getElementById('periodic-toggle');
+        // Последние расписания с сервера: session_id -> periodic.
+        let periodicData = {};
+        // Задача, расписание которой открыто в модалке.
+        let periodicModalSession = '';
+        // Размер журнала задачи на прошлом опросе: вырос — автозапуск дописал в
+        // чат новое, и открытое окно этой задачи надо обновить.
+        const periodicLogLen = {};
+        let periodicPollTimer = null;
+        // Периодические задачи повторяются не чаще раза в минуту, поэтому опроса
+        // раз в 15 секунд достаточно: задержка показа нового ответа незаметна.
+        const PERIODIC_POLL_MS = 15000;
+
+        function periodicOf(sessionId) {
+            return periodicData[sessionId] || null;
+        }
+
+        function hasPeriodicTasks() {
+            return (workspace.sessions || []).some(session => session.periodic);
+        }
+
+        // Опрос расписаний нужен ТОЛЬКО когда периодические задачи есть: без них
+        // это лишние запросы вхолостую.
+        function ensurePeriodicPoll() {
+            if (periodicPollTimer) {
+                clearInterval(periodicPollTimer);
+                periodicPollTimer = null;
+            }
+            if (agentModeOn() && hasPeriodicTasks()) {
+                periodicPollTimer = setInterval(pollPeriodic, PERIODIC_POLL_MS);
+            }
+        }
+
+        // Раскладывает расписания из ответа сервера по задачам списка: и в
+        // workspace.sessions (по нему рисуется список), и в periodicData (по нему
+        // рисуется модалка). Форм ответа две: GET /api/agent/periodic отдаёт
+        // {"tasks": [...]}, а POST /api/agent/periodic/{id} — снимок workspace с
+        // расписаниями в поле "periodic".
+        function adoptPeriodic(payload) {
+            const source = (payload && payload.periodic) ? payload.periodic : payload;
+            const list = (source && source.tasks) || [];
+            periodicData = {};
+            list.forEach(item => { periodicData[item.session_id] = item.periodic; });
+            (workspace.sessions || []).forEach(session => {
+                session.periodic = periodicData[session.id] || null;
+            });
+        }
+
+        // Опрос расписаний: обновляет метки задач в списке и, если автозапуск
+        // дописал что-то в ОТКРЫТУЮ задачу, подтягивает её диалог — новый ответ
+        // появляется в чате сам, без перезагрузки страницы.
+        async function pollPeriodic() {
+            if (!agentModeOn()) return;
+            let payload = null;
+            try {
+                const res = await fetch('/api/agent/periodic');
+                if (!res.ok) return;
+                payload = await res.json();
+            } catch (e) {
+                return;   // сервер недоступен — просто попробуем на следующем тике
+            }
+            const before = JSON.stringify(periodicData);
+            adoptPeriodic(payload);
+            // Метки в списке задач: период, «идёт автозапуск», остановленный повтор.
+            if (JSON.stringify(periodicData) !== before) renderWorkspace();
+            if (!periodicModal.hidden) {
+                // Расписание открытой модалки могли удалить вместе с задачей —
+                // тогда показывать в ней нечего.
+                if (periodicOf(periodicModalSession)) renderPeriodicModal();
+                else closePeriodicModal();
+            }
+            const active = workspace.active_session;
+            const brief = periodicData[active];
+            if (!brief) return;
+            const previous = periodicLogLen[active];
+            periodicLogLen[active] = brief.log_len;
+            // Первый снимок задачи — только запоминаем размер журнала: сравнивать
+            // ещё не с чем.
+            if (previous === undefined || brief.log_len === previous) return;
+            // Своя работа в этой задаче идёт прямо сейчас — не перерисовываем окно
+            // из-под неё (ответ и так рисуется по мере поступления).
+            if (switching || requestBusyHere() || chains.has(active)) return;
+            await loadActiveDialog();
+        }
+
+        function periodicStatusLine(text, cls) {
+            const line = document.createElement('div');
+            if (cls) line.className = cls;
+            line.textContent = text;
+            periodicStatusEl.appendChild(line);
+        }
+
+        // Расписание задачи в модалке: что включено, каким периодом повторяется,
+        // когда следующий повтор, сколько повторов было и чем закончился
+        // последний. Пока задача повторяется на сервере, окно обновляет опрос.
+        function renderPeriodicModal() {
+            const data = periodicOf(periodicModalSession) || {};
+            periodicStatusEl.className = 'periodic-status'
+                + (data.enabled ? '' : ' off');
+            periodicStatusEl.innerHTML = '';
+            periodicStatusLine(data.enabled
+                ? 'Автозапуск включён: задача повторяется сама.'
+                : 'Автозапуск остановлен: задача осталась периодической, но не повторяется.');
+            periodicStatusLine('Период: ' + (data.label || '—'));
+            if (data.enabled) periodicStatusLine('Следующий повтор: ' + (data.when || '—'));
+            periodicStatusLine('Повторов выполнено: ' + (data.runs || 0)
+                + (data.last_run ? ' · последний: ' + data.last_run.replace('T', ' ') : ''));
+            if (data.hold === 'paused') {
+                periodicStatusLine('Задача на паузе — повторы ждут «Продолжить» '
+                    + 'в полосе состояния.');
+            }
+            if (data.hold === 'cancelled') {
+                // Отмена и есть остановка периодической задачи: автомат
+                // терминальный, поэтому повтор не пойдёт, пока в задаче не начнут
+                // новую работу сообщением.
+                periodicStatusLine('Задача отменена — повторов не будет. Чтобы '
+                    + 'вернуть её к работе, отправьте в задачу новое сообщение '
+                    + '(план будет построен заново), а повтор включите кнопкой 🔁.');
+            }
+            if (data.running) {
+                periodicStatusLine('⏳ Автозапуск выполняется прямо сейчас.');
+            }
+            if (data.error) {
+                periodicStatusLine('Последний повтор: ' + data.error, 'periodic-error');
+            }
+            periodicRequestEl.textContent = data.request
+                ? 'Повторяющийся запрос: «' + data.request + '»'
+                : 'Запрос ещё не написан: отправьте сообщение в этой задаче — оно '
+                  + 'станет повторяющимся запросом.';
+            periodicToggleBtn.textContent = data.enabled
+                ? 'остановить автозапуск' : 'включить автозапуск';
+            // Текущий период: если он не из списка (назван в тексте запроса) —
+            // показываем вариант «как в запросе», чтобы выбор его не терял.
+            const interval = String(data.interval || '');
+            const known = Array.from(periodicPeriodSelect.options).some(
+                option => option.value === interval && option.value !== 'custom');
+            periodicPeriodSelect.value = known ? interval : 'custom';
+            periodicCustomOption.textContent = 'период из запроса (' + (data.label || '—') + ')';
+        }
+
+        function openPeriodicModal(session) {
+            periodicModalSession = session.id;
+            if (!periodicOf(session.id) && session.periodic) {
+                periodicData[session.id] = session.periodic;
+            }
+            renderPeriodicModal();
+            periodicModal.hidden = false;
+        }
+
+        function closePeriodicModal() {
+            periodicModal.hidden = true;
+            periodicModalSession = '';
+        }
+
+        // Отправка расписания на сервер: период (или «как в запросе») и состояние
+        // автозапуска. Ответ — снимок workspace, поэтому список задач сразу
+        // получает свежие метки.
+        async function applyPeriodic(enabled, interval) {
+            if (!periodicModalSession) return null;
+            const body = { enabled: enabled };
+            if (interval) body.interval = interval;
+            const current = periodicOf(periodicModalSession) || {};
+            const data = await workspaceRequest(
+                '/api/agent/periodic/' + encodeURIComponent(periodicModalSession),
+                jsonOptions('POST', body));
+            if (!data) return null;
+            adoptPeriodic(data);
+            delete data.periodic;
+            workspace = data;
+            renderWorkspace();
+            ensurePeriodicPoll();
+            if (!periodicModal.hidden) renderPeriodicModal();
+            return Object.assign({}, current, periodicOf(periodicModalSession) || {});
+        }
+
+        async function savePeriodic() {
+            const current = periodicOf(periodicModalSession) || {};
+            const value = periodicPeriodSelect.value;
+            // «Период из запроса» — оставляем прежний период: его назвал сам
+            // пользователь в тексте задачи, переписывать его выбором не нужно.
+            const interval = value === 'custom' ? null : Number(value);
+            const fresh = await applyPeriodic(!!current.enabled, interval);
+            if (!fresh) return;
+            addMessage('bot', 'Повтор задачи: ' + fresh.label + '.'
+                + (fresh.enabled
+                    ? ' Автозапуск включён — ' + (fresh.when || '') + '.'
+                    : ' Автозапуск остановлен: пока его не включат снова, задача '
+                      + 'повторяться не будет.'), true);
+            closePeriodicModal();
+        }
+
+        async function togglePeriodic() {
+            const current = periodicOf(periodicModalSession) || {};
+            const enabled = !current.enabled;
+            const fresh = await applyPeriodic(enabled, null);
+            if (!fresh) return;
+            addMessage('bot', enabled
+                ? '🔁 Автозапуск включён: задача повторится ' + fresh.label + '.'
+                : '⏸ Автозапуск остановлен: задача осталась периодической, но '
+                  + 'повторяться не будет, пока не включить его снова (🔁 в списке задач).',
+                true);
+            closePeriodicModal();
+        }
+
+        document.getElementById('periodic-save').addEventListener('click', savePeriodic);
+        periodicToggleBtn.addEventListener('click', togglePeriodic);
+        document.getElementById('periodic-close').addEventListener('click', closePeriodicModal);
+        periodicModal.addEventListener('click', (e) => {
+            if (e.target === periodicModal) closePeriodicModal();
         });
 
         // Снимок workspace + диалог текущей сессии: включение режима агента,

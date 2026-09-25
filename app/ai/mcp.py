@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -185,7 +186,30 @@ BLOCK_HEADER = (
     "текущему запросу пользователя. Опирайся на них как на источник истины: "
     "используй эти числа и формулировки в плане, шагах и ответе, не выдумывай "
     "других значений и не пересчитывай их по памяти. Если нужных данных в блоке "
-    "нет — честно скажи, что их нет, и не подменяй их догадкой."
+    "нет — честно скажи, что их нет, и не подменяй их догадкой.\n"
+    "СТРОГО: любые числа, таблицы, ряды значений, времена и даты можно брать "
+    "ТОЛЬКО из этого блока — целиком, как они там написаны. Нельзя: достраивать "
+    "ряд по одному значению, повторять одно значение как разные, подписывать "
+    "часы или даты от себя (в том числе часовым поясом, которого в данных нет) и "
+    "выдавать правдоподобный пример за измерение. Если вызов вернул ОШИБКУ или "
+    "данных за нужный период не хватает — так и скажи и покажи причину; таблицу "
+    "или сводку в этом случае НЕ строй.\n"
+    "ДЕЙСТВИЯ ВНЕШНИХ ИНСТРУМЕНТОВ (запуск наблюдения, подписка, задание) "
+    "подтверждаются ТОЛЬКО вызовом из этого блока: нет вызова или он вернул "
+    "ошибку — значит действие НЕ выполнено, и утверждать обратное нельзя. "
+    "Параметры работы внешнего инструмента (интервал сбора, окно, лимиты) задаёт "
+    "САМ сервер — они указаны в его описании и в ответе вызова; период повтора "
+    "задачи к ним отношения не имеет, поэтому не переноси его в интервал сбора."
+)
+
+# Машинная пометка «данных нет вовсе»: ставится в блок, когда НИ ОДИН вызов не
+# дал данных. Правило в заголовке модель может проигнорировать (в живой задаче
+# проигнорировала: отчёт отказал, а суточная таблица всё равно была нарисована),
+# поэтому факт «данных нет» идёт отдельной строкой ПЕРЕД ошибками.
+NO_DATA_NOTE = (
+    "⚠ ДАННЫХ НЕТ: ни один вызов не дал данных — ниже причины отказов. Таблицу, "
+    "ряд значений, числа и времена формировать НЕЛЬЗЯ: сообщи пользователю, что "
+    "данные не получены, и назови причину отказа (это факт из блока, а не догадка)."
 )
 
 # Инструкция служебного вызова: какие инструменты вызвать по запросу.
@@ -213,10 +237,57 @@ TOOLS_PROMPT = (
     "5) Если в запросе не хватает обязательного для вызова сведения (например, "
     "не назван город) — НЕ вызывай инструмент: пусть агент сначала уточнит "
     "запрос у пользователя.\n"
+    "6) ПЕРИОД В ЗАПРОСЕ — это НЕ интервал сбора и НЕ повод что-то запускать. "
+    "Повтор запроса ведёт сам агент по своему расписанию («раз в минуту», «раз в "
+    "час»), а внешний инструмент при каждом повторе просто вызывается заново. "
+    "Запуск сбора на сервере (инструмент, который НАЧИНАЕТ наблюдение/подписку) "
+    "нужен ТОЛЬКО когда запрос просит НАКОПЛЕННЫЕ данные за прошедший промежуток: "
+    "сводку, итог, минимум/максимум/среднее, динамику, историю («сводка за "
+    "сутки», «как менялась погода за неделю»). Запрос «проверяй/сообщай/следи за "
+    "чем-то» — это ПОВТОРЯЮЩЕЕСЯ ЧТЕНИЕ, а не сбор: собирать ничего не нужно.\n"
+    "7) ЧТО ЧИТАТЬ ПОД ЗАПРОС. Есть два разных вида данных: (а) значение СЕЙЧАС "
+    "или прогноз — их отдают читающие инструменты («текущая погода», «прогноз», "
+    "«координаты», «курс на дату»); (б) сводка ЗА ПРОШЕДШИЙ период — её отдаёт "
+    "инструмент накопленной истории, а копит данные сбор. Выбирай по смыслу "
+    "запроса: «проверяй погоду раз в минуту» → читающий инструмент текущей "
+    "погоды (каждый повтор агент вызовет его снова и получит свежее значение); "
+    "«сводка за сутки» → сначала сбор (если он ещё не идёт), затем отчёт по нему.\n"
+    "   ЕСЛИ НУЖНА ТАБЛИЦА ИЛИ РЯД ЗНАЧЕНИЙ ПО ВРЕМЕНИ — проси ПОДРОБНЫЕ записи: "
+    "у инструментов накопленной истории часто есть флаг (в схеме: include_samples, "
+    "details, raw, verbose и подобные) — без него вернутся только агрегаты "
+    "(минимум/максимум/среднее), и построить таблицу по часам будет НЕ из чего. "
+    "Передавай такой флаг, когда запрос просит таблицу, ряд значений или «всё, что "
+    "есть»; и НИКОГДА не достраивай ряд из агрегатов.\n"
+    "   ИДЕНТИФИКАТОР СБОРА НЕ УГАДЫВАЙ: инструмент, которому нужен id, в одном "
+    "ответе с ЗАПУСКОМ сбора вызывать бессмысленно — id станет известен только из "
+    "ответа на запуск (и попадёт в блок про уже идущие сборы этой задачи). В таком "
+    "запросе верни ТОЛЬКО запуск, а отчёт прочитаешь следующим запросом: "
+    "придуманный id — это отказ инструмента и пустой ответ вместо данных.\n"
+    "8) ЗАПУСК СБОРА — ЭТО ДЕЙСТВИЕ НА СЕРВЕРЕ: он живёт, пока его не "
+    "остановят, и останавливается вместе с задачей (отмена или удаление). "
+    "Поэтому: не запускай сбор «на всякий случай», при сомнении — ЧИТАЙ; не "
+    "запускай повторно сбор, который уже идёт (см. блок про уже идущие сборы "
+    "ниже); наличие идущего сбора НЕ отменяет чтение данных — если запросу нужны "
+    "фактические значения, читающий вызов всё равно нужен. Имена и назначение "
+    "инструментов бери ТОЛЬКО из списка ниже: набор у проекта МЕНЯЕТСЯ "
+    "(инструменты добавляются и отключаются), ничего не придумывай по памяти. "
+    "Параметры сбора (интервал, срок хранения) задаёт СЕРВЕР инструмента: не "
+    "передавай интервал из текста запроса, если такого аргумента нет в схеме.\n"
     "Ответ — ТОЛЬКО JSON без пояснений:\n"
     '{"calls": [{"server": "weather", "tool": "get_weather", '
     '"arguments": {"city": "Москва"}}]}\n'
     "Если внешние данные не нужны — {\"calls\": []}."
+)
+
+# Что говорим диспетчеру ПОВТОРНО: первый ответ состоял из одних ЗАПУСКОВ сбора,
+# а данных для ответа не принёс. Так запрос «проверяй погоду раз в минуту» не
+# превращается в «зарегистрировать наблюдение»: агенту нужны ФАКТЫ.
+NEED_READS_NOTE = (
+    "Твои вызовы только ЗАПУСКАЮТ работу на сервере и НЕ читают данные — "
+    "ответить по ним нельзя. Верни вызов ЧИТАЮЩЕГО инструмента, который отдаёт "
+    "нужные запросу фактические данные ПРЯМО СЕЙЧАС (текущее значение, прогноз, "
+    "координаты, курс, сводку по уже идущему сбору). Запускать новый сбор не "
+    "нужно, если только запрос прямо не просит копить данные за период."
 )
 
 # Служебные маркеры ошибок сервера.
@@ -277,7 +348,7 @@ def server_url(entry: Dict[str, Any]) -> str:
 
 
 def server_token(entry: Dict[str, Any]) -> str:
-    """Токен доступа удалённого сервера (пусто — переменная не задана).
+    """Токен доступа удалённого сервера (пусто — переменная не задана).\n"
 
     Значение читается ТОЛЬКО из окружения: в реестре лежит имя переменной,
     поэтому секрет не попадает ни в код, ни в интерфейс, ни в диагностику.
@@ -287,7 +358,7 @@ def server_token(entry: Dict[str, Any]) -> str:
 
 
 def availability_error(entry: Dict[str, Any]) -> str:
-    """Почему сервер заведомо не подключится (пусто — предпосылок к сбою нет).
+    """Почему сервер заведомо не подключится (пусто — предпосылок к сбою нет).\n"
 
     Проверяем то, что видно без обращения к серверу. Для локальных серверов это
     наличие запускаемой программы, файла сервера и установленного MCP SDK (иначе
@@ -331,7 +402,7 @@ def availability_error(entry: Dict[str, Any]) -> str:
 # Клиент MCP по stdio: JSON-RPC 2.0 построчно (локальный сервер)
 # ---------------------------------------------------------------------------
 class _StdioSession:
-    """Одно соединение с MCP-сервером: запуск процесса, запросы, закрытие.
+    """Одно соединение с MCP-сервером: запуск процесса, запросы, закрытие.\n"
 
     Протокол — JSON-RPC 2.0, по одному объекту в строке. stdout сервера занят
     протоколом, поэтому диагностика сервера идёт в stderr и попадает в текст
@@ -483,7 +554,7 @@ class _StdioSession:
 # Клиент MCP по Streamable HTTP: JSON-RPC 2.0 в теле POST (удалённый сервер)
 # ---------------------------------------------------------------------------
 class _HttpSession:
-    """Соединение с УДАЛЁННЫМ MCP-сервером по Streamable HTTP.
+    """Соединение с УДАЛЁННЫМ MCP-сервером по Streamable HTTP.\n"
 
     Каждый запрос — отдельный HTTP POST на адрес сервера: так работает
     Streamable HTTP из спецификации MCP. Сервер без состояния соединение не
@@ -736,7 +807,7 @@ def forget(server_id: str = "") -> None:
 
 
 def discover(server_id: str, force: bool = False) -> Dict[str, Any]:
-    """Список инструментов сервера (с кэшем): {"ok", "tools", "error", ...}.
+    """Список инструментов сервера (с кэшем): {"ok", "tools", "error", ...}.\n"
 
     Сбой не бросает исключение: интерфейсу нужен ответ «сервер недоступен и вот
     почему», а агенту — просто отсутствие инструментов (запрос выполняется без
@@ -808,7 +879,7 @@ def _content_text(result: Dict[str, Any]) -> str:
 
 def call_tool(server_id: str, tool: str, arguments: Optional[Dict[str, Any]] = None,
               timeout: float = CALL_TIMEOUT) -> Dict[str, Any]:
-    """Вызывает инструмент сервера: {"ok", "text", "error"}.
+    """Вызывает инструмент сервера: {"ok", "text", "error"}.\n"
 
     Каждый вызов — отдельное соединение с сервером (процесс для локального,
     HTTP-запрос для удалённого): соединение не переиспользуется, поэтому
@@ -848,7 +919,7 @@ def call_tool(server_id: str, tool: str, arguments: Optional[Dict[str, Any]] = N
 
 
 def run_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Выполняет вызовы инструментов и возвращает результаты (последовательно).
+    """Выполняет вызовы инструментов и возвращает результаты (последовательно).\n"
 
     Последовательно — намеренно: вызовы запускают локальные процессы и ходят во
     внешние источники, а параллельный запуск только добавил бы нагрузку; за
@@ -892,6 +963,366 @@ async def async_run_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Внешние обязательства: что задача ЗАПУСТИЛА на стороне сервера
+# ---------------------------------------------------------------------------
+# Инструмент может не только прочитать данные, но и ЗАПУСТИТЬ что-то на сервере:
+# сбор наблюдений, подписку, задание. Такое нельзя бросить — иначе на сервере
+# останется висеть вечный сбор, о котором задача уже забыла (её отменили или
+# удалили). Код НЕ знает имён инструментов: пара «запускающий ↔ отменяющий»
+# определяется по ИМЕНИ (общий префикс start_/stop_) и проверяется по списку,
+# который объявил сам сервер (`tools/list`). Аргументы отмены (id наблюдения)
+# достаются из ТЕКСТА ответа запускающего инструмента — по именам обязательных
+# полей схемы отменяющего.
+START_PREFIX = "start_"
+STOP_PREFIX = "stop_"
+# Сколько обязательств помним на задачу (страховка от разрастания диалога).
+MAX_STARTED = 20
+# Ключи, по которым ищем значение в тексте ответа («id: "abc"», `"id": "abc"`,
+# «id=abc», «id abc»). Регистр не важен, кавычки любые.
+_VALUE_PATTERNS = (
+    r'["\']?{key}["\']?\s*[:=]\s*["\']([^"\'\s,;)]+)["\']',
+    r'["\']?{key}["\']?\s*[:=]\s*([^\s,;)]+)',
+)
+
+
+def undo_tool(tool: Any, tool_names: Any) -> str:
+    """Имя ОТМЕНЯЮЩЕГО инструмента для запускающего ("" — пары нет).\n"
+
+    Соглашение об именах + проверка по объявленному списку: `start_weather_watch`
+    → `stop_weather_watch`. Если сервер такого инструмента не объявлял, отменять
+    нечем — и выдумывать вызов нельзя.
+    """
+    name = str(tool or "").strip()
+    if not name.startswith(START_PREFIX):
+        return ""
+    candidate = STOP_PREFIX + name[len(START_PREFIX):]
+    names = {str(item).strip() for item in (tool_names or [])}
+    return candidate if candidate in names else ""
+
+
+def _schema_of(tools: List[Dict[str, Any]], server_id: str, tool: str) -> Dict[str, Any]:
+    """Схема аргументов инструмента из объявленного сервером списка."""
+    for item in (tools or []):
+        if str(item.get("server") or "") != server_id:
+            continue
+        if str(item.get("tool") or "") != tool:
+            continue
+        schema = item.get("schema")
+        return schema if isinstance(schema, dict) else {}
+    return {}
+
+
+def find_value(text: Any, key: str) -> str:
+    """Значение поля `key` из текста ответа инструмента ("" — не нашлось).\n"
+
+    Ответы инструментов — обычный текст (часто с JSON внутри), поэтому значение
+    ищем по образцам «ключ: значение», «"ключ": "значение"», «ключ=значение».
+
+    Поле-идентификатор у сервера может называться иначе, чем в схеме отменяющего
+    инструмента: например, инструмент отмены требует `collection_id`, а ответ
+    называет его просто `id`. Поэтому пробуем не только точное имя, но и его
+    «хвосты» (последнее слово, `id`) — от точного к самому общему; первое
+    найденное значение побеждает.
+    """
+    body = str(text or "")
+    if not body or not str(key or "").strip():
+        return ""
+    for candidate in _key_candidates(key):
+        for pattern in _VALUE_PATTERNS:
+            match = re.search(pattern.format(key=re.escape(candidate)), body,
+                              re.IGNORECASE)
+            if match:
+                value = match.group(1).strip().strip('"\'')
+                if value:
+                    return value[:200]
+    return ""
+
+
+def _key_candidates(key: Any) -> List[str]:
+    """Имена, под которыми значение поля может стоять в тексте ответа.\n"
+
+    «collection_id» → ["collection_id", "id", "collection"]: точное имя первым,
+    дальше — «хвосты», которые сервер мог использовать вместо него.
+    """
+    name = str(key or "").strip()
+    if not name:
+        return []
+    candidates = [name]
+    parts = [part for part in re.split(r"[_\-\s]+", name) if part]
+    if len(parts) > 1:
+        # Последнее слово обычно и есть идентификатор («…_id»).
+        if parts[-1].lower() != name.lower():
+            candidates.append(parts[-1])
+        if parts[0].lower() != name.lower():
+            candidates.append(parts[0])
+    if name.lower().endswith("id") and name.lower() != "id":
+        candidates.append("id")
+    out: List[str] = []
+    for item in candidates:
+        if len(item) >= 2 and item not in out:
+            out.append(item)
+    return out
+
+
+def stop_arguments(result: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Аргументы отмены из ответа запускающего инструмента.\n"
+
+    Берём ОБЯЗАТЕЛЬНЫЕ строковые поля схемы отменяющего инструмента (у
+    наблюдения это «id») и ищем их значения в тексте ответа. Хотя бы одно
+    обязательное поле не нашлось — отменять нечем: пустой словарь.
+    """
+    required = [str(key) for key in ((schema or {}).get("required") or [])]
+    properties = (schema or {}).get("properties") or {}
+    if not required:
+        # Схема без обязательных полей: отменяющий инструмент самодостаточен
+        # (например, «остановить всё») — вызываем его без аргументов.
+        return {}
+    found: Dict[str, Any] = {}
+    for key in required:
+        kind = (properties.get(key) or {}).get("type")
+        if kind not in (None, "string"):
+            return {}
+        value = find_value(result.get("text"), key)
+        if not value:
+            return {}
+        found[key] = value
+    return found
+
+
+def started_calls(results: Any, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Что задача ЗАПУСТИЛА на серверах: список обязательств для отмены.\n"
+
+    Смотрим результаты ВЫПОЛНЕННЫХ вызовов: если у вызванного инструмента есть
+    отменяющая пара в объявленном списке и из ответа достаются её аргументы,
+    обязательство запоминается — потом его отменит отмена/удаление задачи
+    (см. cancel_started). Имена инструментов берутся из данных сервера.
+    """
+    out: List[Dict[str, Any]] = []
+    for item in normalize_results(results):
+        if not item.get("ok"):
+            continue
+        server_id = item.get("server") or ""
+        tool = item.get("tool") or ""
+        names = [entry.get("tool") for entry in (tools or [])
+                 if str(entry.get("server") or "") == server_id]
+        stop = undo_tool(tool, names)
+        if not stop:
+            continue
+        schema = _schema_of(tools or [], server_id, stop)
+        required = [str(key) for key in ((schema or {}).get("required") or [])]
+        arguments = stop_arguments(item, schema)
+        if required and not arguments:
+            # Аргументы отмены (id наблюдения) в ответе не нашлись: запоминать
+            # нечего — «отмена» вызвала бы инструмент без нужных аргументов и
+            # сбор остался бы висеть, а пользователь думал бы, что он остановлен.
+            logger.info(
+                "MCP: %s/%s запустил внешний сбор, но аргументы отмены (%s) в "
+                "ответе не найдены — задача о сборе не помнит",
+                server_id, tool, ", ".join(required))
+            continue
+        entry = {
+            "server": server_id,
+            "server_name": item.get("server_name") or server_id,
+            "tool": tool,
+            "stop_tool": stop,
+            "arguments": arguments,
+        }
+        if entry not in out:
+            out.append(entry)
+    return out[:MAX_STARTED]
+
+
+def normalize_calls(raw: Any) -> List[Dict[str, Any]]:
+    """Приводит список вызовов к безопасному виду: [{"server","tool","arguments"}]."""
+    out: List[Dict[str, Any]] = []
+    for item in (raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        server_id = str(item.get("server") or "").strip()[:80]
+        tool = str(item.get("tool") or "").strip()[:120]
+        if not server_id or not tool:
+            continue
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        call: Dict[str, Any] = {
+            "server": server_id, "tool": tool,
+            "arguments": {str(key)[:60]: value
+                          for key, value in list(arguments.items())[:10]},
+        }
+        # Признак «вызов что-то ЗАПУСКАЕТ на сервере» ставится при выборе (тогда
+        # известен список инструментов) и хранится вместе с вызовом: повтору он
+        # нужен, чтобы НЕ повторять запуск сбора и не ходить за списком сервера.
+        if item.get("action") is True:
+            call["action"] = True
+        if call not in out:
+            out.append(call)
+    return out[:MAX_CALLS_PER_REQUEST]
+
+
+def is_action_tool(tool: Any, tools: List[Dict[str, Any]],
+                   server_id: str = "") -> bool:
+    """True — инструмент ЗАПУСКАЕТ/ОСТАНАВЛИВАЕТ работу на сервере, а не читает.\n"
+
+    Действием считается вызов, у которого есть отменяющая пара в объявленном
+    списке (см. undo_tool): регистрация наблюдения, подписка, задание. Такие
+    вызовы имеют побочный эффект на сервере, поэтому к ним относимся строже:
+    чтение данных безопасно, а брошенный сбор придётся останавливать.
+    """
+    names = [entry.get("tool") for entry in (tools or [])
+             if not server_id or str(entry.get("server") or "") == server_id]
+    return bool(undo_tool(tool, names))
+
+
+def read_calls(calls: Any, tools: Optional[List[Dict[str, Any]]] = None
+               ) -> List[Dict[str, Any]]:
+    """Только ЧИТАЮЩИЕ вызовы (без запуска/остановки работы на сервере).
+
+    Признак берётся из самого вызова (`action`, ставится при выборе). Список
+    инструментов нужен только для старых записей без признака — тогда действие
+    определяется по паре start_/stop_ в объявленном списке.
+    """
+    out: List[Dict[str, Any]] = []
+    for call in normalize_calls(calls):
+        if call.get("action") is True:
+            continue
+        if call.get("action") is None and tools is not None \
+                and is_action_tool(call.get("tool"), tools,
+                                   str(call.get("server") or "")):
+            continue
+        out.append(call)
+    return out
+
+
+def has_reads(calls: Any, tools: Optional[List[Dict[str, Any]]] = None) -> bool:
+    """Есть ли среди вызовов хотя бы один читающий (иначе данных не будет)."""
+    return bool(read_calls(calls, tools))
+
+
+# Просьба о НАКОПЛЕННЫХ данных за промежуток. Нужна ТОЛЬКО как предохранитель
+# (см. looks_aggregate): по ней решается, можно ли переспрашивать диспетчера,
+# когда он ответил одними запусками сбора. Инструменты по этим словам НЕ
+# выбираются — выбор всегда за моделью.
+AGGREGATE_MARKERS = (
+    "сводк", "итог", "суммарн", "за сутки", "за день", "за недел", "за месяц",
+    "за период", "за последн", "за прошл", "минимум", "максимум", "средн",
+    "динамик", "тренд", "истори", "накопл", "как менял", "статистик", "за сутки",
+)
+
+
+def looks_aggregate(text: Any) -> bool:
+    """Похож ли запрос на просьбу о СВОДКЕ за прошедший промежуток.
+
+    Предохранитель: запрос «сводка за сутки» требует НАКОПЛЕННЫХ данных, поэтому
+    вызовы, которые только запускают сбор, для него — правильный ответ, и
+    переспрашивать диспетчера не нужно (см. _preflight_mcp). Запрос «проверяй
+    погоду раз в минуту» — наоборот, про текущее значение: если диспетчер ответил
+    одним запуском сбора, ответ нужно уточнить.
+    """
+    body = " ".join(str(text or "").lower().split())
+    return any(marker in body for marker in AGGREGATE_MARKERS)
+
+
+def mark_call_kinds(calls: Any, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Помечает вызовы признаком «действие на сервере» (запуск/остановка).
+
+    Вызывается сразу после выбора инструментов: тогда список объявленных
+    инструментов под рукой, и повтору достаточно посмотреть на сам вызов.
+    """
+    for call in (calls if isinstance(calls, list) else []):
+        if not isinstance(call, dict):
+            continue
+        if is_action_tool(call.get("tool"), tools, str(call.get("server") or "")):
+            call["action"] = True
+        else:
+            call.pop("action", None)
+    return calls if isinstance(calls, list) else []
+
+
+def mark_actions(results: Any, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Помечает в результатах ДЕЙСТВИЯ и возвращает удачные сборы для отмены.\n"
+
+    Действие — вызов инструмента, у которого есть отменяющая пара в объявленном
+    списке сервера (см. undo_tool): регистрация наблюдения, подписка и т. п.
+    Помеченные результаты уходят модели с явной строкой «ДЕЙСТВИЯ В ЭТОМ
+    ЗАПРОСЕ» (см. block), поэтому выдумать несостоявшуюся регистрацию нельзя,
+    а неудачное действие считается НЕ выполненным.
+
+    Возвращает то же, что started_calls: список обязательств для последующей
+    отмены (только успешно запущенные).
+    """
+    marked: List[Dict[str, Any]] = []
+    # Помечаем ИМЕННО те словари, что лежат в dialog["mcp"] (их читает block):
+    # копия здесь была бы бесполезна — модель видела бы старые результаты.
+    for item in (results if isinstance(results, list) else []):
+        if not isinstance(item, dict):
+            continue
+        server_id = str(item.get("server") or "").strip()
+        tool = str(item.get("tool") or "").strip()
+        names = [entry.get("tool") for entry in (tools or [])
+                 if str(entry.get("server") or "") == server_id]
+        if not tool or not undo_tool(tool, names):
+            continue
+        item["action"] = "started" if item.get("ok") else "failed"
+        marked.append(item)
+    return marked
+
+
+def cancel_started(entries: Any) -> List[Dict[str, Any]]:
+    """ОТМЕНЯЕТ внешние сборы задачи: вызывает отменяющие инструменты.\n"
+
+    Возвращает отчёты: [{"server", "tool", "ok", "text", "error"}]. Сбои не
+    скрываются: их видит пользователь (в чате задачи), потому что незакрытый
+    сбор на сервере — это работающий впустую источник и место на диске.
+    """
+    reports: List[Dict[str, Any]] = []
+    for item in (entries if isinstance(entries, list) else []):
+        if not isinstance(item, dict):
+            continue
+        server_id = str(item.get("server") or "").strip()
+        tool = str(item.get("stop_tool") or "").strip()
+        if not server_id or not tool:
+            continue
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        try:
+            result = call_tool(server_id, tool, arguments)
+        except Exception as exc:  # noqa: BLE001 — сбой отмены не должен ломать удаление
+            logger.warning("MCP: отмена %s/%s не удалась", server_id, tool, exc_info=True)
+            reports.append({"server": server_id, "tool": tool, "ok": False,
+                            "text": "", "error": str(exc)[:300]})
+            continue
+        reports.append({
+            "server": server_id, "tool": tool,
+            "ok": bool(result.get("ok")),
+            "text": str(result.get("text") or "")[:400],
+            "error": str(result.get("error") or "")[:300],
+        })
+    return reports
+
+
+async def async_cancel_started(entries: Any) -> List[Dict[str, Any]]:
+    """То же в отдельном потоке: отмена — сетевые вызовы, цикл событий не держим."""
+    if not entries:
+        return []
+    return await asyncio.to_thread(cancel_started, entries)
+
+
+def cancel_note(reports: List[Dict[str, Any]]) -> str:
+    """Строка для чата: что удалось (и не удалось) отменить на серверах."""
+    if not reports:
+        return ""
+    done = [item for item in reports if item.get("ok")]
+    failed = [item for item in reports if not item.get("ok")]
+    parts: List[str] = []
+    if done:
+        parts.append("остановлены внешние сборы: " + "; ".join(
+            f"{item['server']} · {item['tool']} "
+            f"({(item.get('text') or '').splitlines()[0][:80]})" for item in done))
+    for item in failed:
+        parts.append(f"НЕ удалось остановить {item['server']} · {item['tool']}"
+                     + (f": {item['error']}" if item.get("error") else ""))
+    return "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Выбор инструментов служебным вызовом модели
 # ---------------------------------------------------------------------------
 def tools_text(tools: List[Dict[str, Any]]) -> str:
@@ -907,12 +1338,43 @@ def tools_text(tools: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) if lines else "(инструментов нет)"
 
 
-def build_query(user_message: str, tools: List[Dict[str, Any]]) -> str:
-    """Текст запроса к модели: запрос пользователя + доступные инструменты."""
-    return (
-        "ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n" + (str(user_message or "").strip() or "(пусто)") +
-        "\n\nДОСТУПНЫЕ ИНСТРУМЕНТЫ:\n" + tools_text(tools)
+def build_query(user_message: str, tools: List[Dict[str, Any]],
+                started: Optional[List[Dict[str, Any]]] = None,
+                extra: str = "") -> str:
+    """Текст запроса к модели: запрос пользователя + доступные инструменты.\n"
+
+    `started` — ВНЕШНИЕ СБОРЫ, которые эта задача уже начала (наблюдения,
+    подписки: см. started_calls). Они идут у сервера прямо сейчас, и начинать их
+    повторно нельзя: модель получает их отдельным блоком вместе с аргументами
+    отмены (в них — id, по которому читается накопленная сводка). Блок строится
+    из ДАННЫХ сервера, а не из имён в коде: имена инструментов код не знает.
+    """
+    text = (
+        "ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n" + (str(user_message or "").strip() or "(пусто)")
     )
+    if extra:
+        # Дополнительное условие (например, «нужны ФАКТИЧЕСКИЕ данные, а не запуск
+        # сбора»): так диспетчер спрашивается повторно, если первый ответ состоял
+        # из одних действий и данных для ответа не дал.
+        text += "\n\nВАЖНОЕ УСЛОВИЕ:\n" + str(extra).strip()
+    if started:
+        lines = []
+        for item in started:
+            args = item.get("arguments") or {}
+            args_text = ", ".join(f"{key}={value}" for key, value in args.items())
+            lines.append(
+                f"- сервер: {item.get('server')}; сбор УЖЕ ИДЁТ (запущен инструментом "
+                f"{item.get('tool')}); его идентификатор и параметры: "
+                f"{args_text or '(без параметров)'} — сводку по нему читай "
+                "инструментом отчёта (тем, который принимает эти параметры), "
+                "а сбор заново НЕ начинай"
+            )
+        text += (
+            "\n\nУЖЕ ИДУЩИЕ ВНЕШНИЕ СБОРЫ ЭТОЙ ЗАДАЧИ (их НЕ надо начинать заново; "
+            "накопленные данные читай по их параметрам — например, сводку за "
+            "прошедший период):\n" + "\n".join(lines)
+        )
+    return text + "\n\nДОСТУПНЫЕ ИНСТРУМЕНТЫ:\n" + tools_text(tools)
 
 
 def _load_object(content: str) -> Any:
@@ -940,7 +1402,7 @@ def _load_object(content: str) -> Any:
 
 def parse_calls(content: str,
                 tools: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    """Разбирает ответ модели в вызовы инструментов (пусто — разобрать не удалось).
+    """Разбирает ответ модели в вызовы инструментов (пусто — разобрать не удалось).\n"
 
     Принимает и русские ключи («вызовы», «сервер», «инструмент», «аргументы»).
     Вызовы с неизвестным сервером или инструментом ОТБРАСЫВАЮТСЯ: модель может
@@ -987,18 +1449,23 @@ def parse_calls(content: str,
 
 
 async def choose(user_message: str, tools: List[Dict[str, Any]],
-                 call: LlmCall) -> List[Dict[str, Any]]:
-    """Служебный вызов: какие инструменты вызвать по запросу пользователя.
+                 call: LlmCall,
+                 started: Optional[List[Dict[str, Any]]] = None,
+                 extra: str = "") -> List[Dict[str, Any]]:
+    """Служебный вызов: какие инструменты вызвать по запросу пользователя.\n"
 
     Пустой список означает «внешние данные не нужны» ИЛИ «вызов не удался»: в
     обоих случаях агент работает как раньше — без данных MCP. Сбой не выдумывает
     вызовы (как и сбой разбора инвариантов не выдумывает нарушение).
+
+    `started` — уже идущие внешние сборы задачи (см. build_query): модель видит
+    их и не начинает заново.
     """
     if not tools:
         return []
     messages = [
         {"role": "system", "content": TOOLS_PROMPT},
-        {"role": "user", "content": build_query(user_message, tools)},
+        {"role": "user", "content": build_query(user_message, tools, started, extra)},
     ]
     try:
         content, _metrics = await call(
@@ -1044,6 +1511,9 @@ def normalize_results(raw: Any) -> List[Dict[str, Any]]:
             "ok": bool(item.get("ok")),
             "text": str(item.get("text") or "")[:RESULT_CHARS],
             "error": str(item.get("error") or "")[:400],
+            # ДЕЙСТВИЕ на сервере (запуск/остановка сбора, подписки): ставит
+            # mark_actions. Нужно, чтобы модель не выдавала желаемое за сделанное.
+            "action": str(item.get("action") or "")[:20],
         })
     return out[:MAX_CALLS_PER_REQUEST]
 
@@ -1061,6 +1531,26 @@ def block(results: Any) -> str:
     if not data:
         return ""
     lines: List[str] = [BLOCK_HEADER, ""]
+    # ДЕЙСТВИЯ этого запроса — отдельной строкой: без неё модель «регистрирует»
+    # наблюдения словами, когда никакого вызова не было (и пользователь получает
+    # «✅ всё зарегистрировано» при пустом списке наблюдений).
+    started = [item for item in data if item.get("action") == "started"]
+    failed = [item for item in data if item.get("action") == "failed"]
+    summary = []
+    for item in started:
+        summary.append(f"ВЫПОЛНЕНО: {item['tool']} "
+                       f"({(item['text'] or '').splitlines()[0][:80]})")
+    for item in failed:
+        summary.append(f"НЕ ВЫПОЛНЕНО (ошибка): {item['tool']} "
+                       f"({(item['error'] or 'без пояснения')[:80]})")
+    if not any(item.get("ok") for item in data):
+        lines.append(NO_DATA_NOTE)
+        lines.append("")
+    lines.append("ДЕЙСТВИЯ НА СЕРВЕРАХ В ЭТОМ ЗАПРОСЕ: "
+                 + ("; ".join(summary) if summary
+                    else "не выполнялись (были только запросы данных) — значит, "
+                         "ничего не запускалось и не регистрировалось"))
+    lines.append("")
     for index, item in enumerate(data, 1):
         args = arguments_text(item["arguments"])
         head = (f"{index}) {item['server_name']} — {item['tool']}"
@@ -1104,7 +1594,7 @@ def results_note(results: Any) -> str:
 def view(enabled: Optional[List[str]] = None,
          ids: Optional[List[str]] = None,
          force: bool = False) -> Dict[str, Any]:
-    """Снимок каталога MCP для интерфейса (модалка «MCP»).
+    """Снимок каталога MCP для интерфейса (модалка «MCP»).\n"
 
     Каждая запись: id, название, краткое описание, источник, признак «включён»,
     доступность (запустился ли сервер) и его инструменты. Сбой сервера не

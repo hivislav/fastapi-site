@@ -23,11 +23,19 @@
           {"id": "s-9f8e7d6c",
            "title": "",
            "created": "2025-01-01T12:00:10",
+           "periodic": {"enabled": true, "interval": 3600, "request": "…",
+                        "next_run": "2025-01-01T13:00:10", "last_run": "",
+                        "runs": 0, "error": ""},
            "dialog": {"messages": [], "usage": [], "summary": [],
                       "covered": 0, "facts": {}, "branches": {},
                       "active_branch": null}}
         ]}
      ]}
+
+Поле "periodic" есть только у ПЕРИОДИЧЕСКОЙ задачи (кнопка «Новая периодическая
+задача»): это расписание, по которому сервер сам повторяет запрос задачи и кладёт
+ответ в её чат (см. app/ai/periodic.py и app/periodic_runner.py). Задача без
+расписания выполняется один раз и поля "periodic" не имеет.
 
 У каждого профиля СВОЯ долговременная память ("long_term_by_profile": {"<id
 профиля>": {"long_term": [...]}}), поэтому её записи видны и удаляются только в
@@ -62,6 +70,7 @@ from typing import Any, Dict, List, Optional
 from app import config
 from app.ai import invariants as invariants_store
 from app.ai import mcp as mcp_store
+from app.ai import periodic as periodic_store
 from app.ai import task_state
 
 logger = logging.getLogger(__name__)
@@ -106,7 +115,12 @@ LOG_ERROR = "error"
 # (анализ запроса: нарушение требования инвариантом или конфликт правил). Отдельный
 # вид узла, потому что у него есть структура, а не только текст.
 LOG_SUGGESTIONS = "suggestions"
-LOG_KINDS = (LOG_USER, LOG_ASSISTANT, LOG_DEBUG, LOG_ERROR, LOG_SUGGESTIONS)
+# Автозапуск ПЕРИОДИЧЕСКОЙ задачи: реплика отправлена не пользователем, а
+# планировщиком по расписанию (см. app/periodic_runner.py). Отдельный вид узла,
+# чтобы в окне чата было видно, что задача повторилась САМА, и с каким периодом.
+LOG_PERIODIC = "periodic"
+LOG_KINDS = (LOG_USER, LOG_ASSISTANT, LOG_DEBUG, LOG_ERROR, LOG_SUGGESTIONS,
+             LOG_PERIODIC)
 # Разбор инвариантов в журнале: сколько вариантов и полей храним.
 _MAX_SUGGESTIONS = 4
 _SUGGESTION_TEXT = 600
@@ -141,6 +155,9 @@ _MAX_UNCHECKED = 250
 # свой набор). Включает и выключает их пользователь в диалоге «MCP» по кнопке
 # рядом с шестерёнкой проекта; включённые серверы уходят в каждый запрос агента.
 MCP_FIELD = "mcp"
+# Сколько ВНЕШНИХ СБОРОВ (наблюдений, подписок) помним на задачу: список нужен,
+# чтобы отмена или удаление задачи остановили их на сервере (см. app/ai/mcp.py).
+_MAX_MCP_STARTED = 20
 # Сколько серверов может быть включено одновременно (серверов в реестре
 # app/ai/mcp.py сейчас три; запас на будущее — как MAX_INVARIANTS).
 MAX_MCP_SERVERS = 10
@@ -200,6 +217,10 @@ def empty_dialog(task_id: str = "") -> Dict[str, Any]:
         # них. Новый запрос пользователя меняет подпись, и данные собираются
         # заново.
         "mcp": {},
+        # ВНЕШНИЕ СБОРЫ, ЗАПУЩЕННЫЕ этой задачей (наблюдения, подписки, задания):
+        # по ним отмена/удаление задачи останавливает работу на САМОМ сервере —
+        # иначе сбор остался бы висеть там навсегда.
+        "mcp_started": [],
     }
 
 
@@ -321,8 +342,8 @@ def _clean_log(raw: Any) -> List[Dict[str, Any]]:
     """Приводит журнал чата сессии к списку записей журнала.
 
 
-    kind — user | assistant | debug | error | suggestions (LOG_KINDS). Пустые
-    записи отбрасываются, длинные тексты обрезаются, старые вытесняются
+    kind — user | assistant | debug | error | suggestions | periodic (LOG_KINDS).
+    Пустые записи отбрасываются, длинные тексты обрезаются, старые вытесняются
     (_MAX_LOG записей и _MAX_LOG_CHARS символов). У узла suggestions дополнительно
     лежит разбор инвариантов (объяснение + варианты решения), по нему интерфейс
     рисует кликабельные варианты — в том числе после перезагрузки страницы.
@@ -335,7 +356,12 @@ def _clean_log(raw: Any) -> List[Dict[str, Any]]:
         text = str(item.get("text") or "").strip()
         if kind not in LOG_KINDS or not text:
             continue
-        entry: Dict[str, Any] = {"kind": kind, "text": text[:_MAX_LOG_TEXT]}
+        entry: Dict[str, Any] = {
+            "kind": kind, "text": text[:_MAX_LOG_TEXT],
+            # Время узла (у старых файлов его нет — тогда интерфейс времени не
+            # показывает: выдумывать его нельзя).
+            "at": str(item.get("at") or "").strip()[:40],
+        }
         if kind == LOG_SUGGESTIONS:
             # Узел разбора хранится вместе с текстом сообщения: даже если вариантов
             # нет (старая запись без analysis или разбор без альтернатив), текст
@@ -353,18 +379,25 @@ def _clean_log(raw: Any) -> List[Dict[str, Any]]:
     return clean
 
 
-def add_log(dialog: Dict[str, Any], kind: str, text: str) -> None:
+def add_log(dialog: Dict[str, Any], kind: str, text: str,
+            at: str = "") -> None:
     """Добавляет узел в журнал чата сессии (что пользователь видит в окне).
 
     Пишется веб-слоем по ходу ответа: реплика пользователя, ответ агента,
     показанный план и служебные debug/error-строки. Так окно чата можно
     восстановить целиком при переключении сессии (см. GET /api/agent/history).
+
+    `at` — время узла (наивное локальное, как метки задач). Интерфейс показывает
+    его у реплик пользователя и ответов агента, как в мессенджерах; служебные
+    строки (debug/error) времени не показывают, но оно всё равно хранится —
+    по нему видно порядок и когда именно шла работа.
     """
     value = str(text or "").strip()
     if kind not in LOG_KINDS or not value:
         return
     log = dialog.setdefault("log", [])
-    log.append({"kind": kind, "text": value[:_MAX_LOG_TEXT]})
+    log.append({"kind": kind, "text": value[:_MAX_LOG_TEXT],
+                "at": str(at or "").strip()[:40] or _now()})
     if len(log) > _MAX_LOG:
         del log[:len(log) - _MAX_LOG]
     total = sum(len(item.get("text") or "") for item in log)
@@ -374,14 +407,14 @@ def add_log(dialog: Dict[str, Any], kind: str, text: str) -> None:
 
 
 def add_log_event(dialog: Dict[str, Any], kind: str, text: str,
-                  analysis: Any = None) -> None:
+                  analysis: Any = None, at: str = "") -> None:
     """Добавляет в журнал узел со структурой (разбор инвариантов).
 
     Отличается от add_log() только тем, что вместе с текстом сохраняет сам
     разбор: по нему интерфейс рисует кликабельные варианты решения и после
     переключения задачи/перезагрузки страницы.
     """
-    add_log(dialog, kind, text)
+    add_log(dialog, kind, text, at=at)
     log = dialog.get("log") or []
     if kind != LOG_SUGGESTIONS or not log:
         return
@@ -481,15 +514,19 @@ def normalize_dialog(raw: Any, task_id: str = "") -> Dict[str, Any]:
     # Данные внешних инструментов MCP по текущему запросу задачи (см.
     # app/ai/mcp.py): подпись + результаты вызовов.
     dialog["mcp"] = _normalize_dialog_mcp(raw.get("mcp"))
+    # Внешние сборы, запущенные задачей: их отменяет отмена/удаление задачи.
+    dialog["mcp_started"] = _normalize_started(raw.get("mcp_started"))
     return dialog
 
 
 def _normalize_dialog_mcp(raw: Any) -> Dict[str, Any]:
-    """Данные MCP диалога: {"signature", "request", "results"} (битое — пусто).
+    """Данные MCP диалога: {"signature", "request", "calls", "results"}.
 
-    Хранится ТОЛЬКО то, что уже получено: подпись (включённые серверы + исходный
-    запрос задачи) и результаты вызовов. Сами вызовы не повторяются — при
-    несовпадении подписи данные собираются заново веб-слоем.
+    Хранится то, что уже получено: подпись (включённые серверы + исходный запрос
+    задачи), САМИ вызовы и их результаты. Вызовы нужны повторам периодической
+    задачи: тот же запрос — те же ЧИТАЮЩИЕ вызовы, только данные свежие
+    (см. _preflight_mcp); выбор инструментов моделью заново не оплачивается и не
+    «плывёт» от повтора к повтору. Битое — пусто.
     """
     if not isinstance(raw, dict):
         return {}
@@ -499,6 +536,7 @@ def _normalize_dialog_mcp(raw: Any) -> Dict[str, Any]:
     return {
         "signature": signature[:600],
         "request": str(raw.get("request") or "")[:400],
+        "calls": mcp_store.normalize_calls(raw.get("calls")),
         "results": mcp_store.normalize_results(raw.get("results")),
     }
 
@@ -510,26 +548,107 @@ def dialog_mcp(dialog: Dict[str, Any]) -> Dict[str, Any]:
     return dialog["mcp"]
 
 
+def _normalize_started(raw: Any) -> List[Dict[str, Any]]:
+    """Внешние сборы, ЗАПУЩЕННЫЕ задачей (наблюдения, подписки; см. app/ai/mcp.py).
+
+    Хранится вместе с диалогом задачи, потому что отменять их нужно и ПОСЛЕ того,
+    как диалог переписан: отмена или удаление задачи обязаны остановить то, что
+    она запустила на серверах, — иначе там останется висеть вечный сбор, о
+    котором задача уже забыла.
+    """
+    out: List[Dict[str, Any]] = []
+    for item in (raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        server_id = str(item.get("server") or "").strip()[:80]
+        tool = str(item.get("tool") or "").strip()[:120]
+        stop_tool = str(item.get("stop_tool") or "").strip()[:120]
+        if not server_id or not tool or not stop_tool:
+            continue
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        entry = {
+            "server": server_id,
+            "server_name": str(item.get("server_name") or server_id)[:120],
+            "tool": tool,
+            "stop_tool": stop_tool,
+            "arguments": {str(key)[:60]: str(value)[:200]
+                          for key, value in list(arguments.items())[:10]},
+        }
+        if entry not in out:
+            out.append(entry)
+    return out[-_MAX_MCP_STARTED:]
+
+
+def mcp_started(dialog: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Внешние сборы задачи (нормализует поле на месте, если его нет)."""
+    if not isinstance(dialog.get("mcp_started"), list):
+        dialog["mcp_started"] = _normalize_started(dialog.get("mcp_started"))
+    return dialog["mcp_started"]
+
+
+def add_mcp_started(dialog: Dict[str, Any], entries: Any) -> List[Dict[str, Any]]:
+    """Запоминает внешние сборы, запущенные задачей (дубликаты отбрасываются)."""
+    current = mcp_started(dialog)
+    for entry in _normalize_started(entries):
+        if entry not in current:
+            current.append(entry)
+    del current[:-_MAX_MCP_STARTED]
+    return current
+
+
+def clear_mcp_started(dialog: Dict[str, Any], entries: Any = None) -> List[Dict[str, Any]]:
+    """Убирает обязательства из памяти задачи (отменённые — отменять не нужно).
+
+    Возвращает снятые записи. `entries` — какие именно сняты; None — снять все.
+    """
+    current = mcp_started(dialog)
+    if entries is None:
+        dialog["mcp_started"] = []
+        return current
+    drop = _normalize_started(entries)
+    kept = [item for item in current if item not in drop]
+    dialog["mcp_started"] = kept
+    return [item for item in current if item in drop]
+
+
 def set_dialog_mcp(dialog: Dict[str, Any], signature: str, request: str,
-                   results: Any) -> Dict[str, Any]:
-    """Запоминает данные MCP текущего запроса задачи (подпись + результаты)."""
+                   results: Any, calls: Any = None) -> Dict[str, Any]:
+    """Запоминает данные MCP текущего запроса задачи: подпись, вызовы, результаты.
+
+    Вызовы (`calls`) хранятся, чтобы повтор периодической задачи выполнил те же
+    ЧИТАЮЩИЕ вызовы со свежими данными, а не спрашивал модель заново: выбор
+    инструментов иначе «плыл» бы от повтора к повтору (в живой задаче повтор
+    решил, что данные не нужны, и ответ ушёл без погоды).
+    """
     dialog["mcp"] = _normalize_dialog_mcp({
         "signature": signature,
         "request": request,
+        "calls": calls if calls is not None else [],
         "results": results,
     })
     return dialog["mcp"]
 
 
 def _clean_plan_signature(raw: Any) -> Dict[str, str]:
-    """Подпись построенного плана: {"request", "rules"} (битое — пусто)."""
+    """Подпись построенного плана: {"request", "rules", "basis"} (битое — пусто).
+
+    `basis` — ОСНОВА ДАННЫХ плана (какие внешние данные получены по запросу, см.
+    _data_basis в chat.py): смена основы означает другой план, а ключ обязан
+    переживать перезагрузку — иначе после каждого запуска приложения план
+    пересобирался бы заново (лишний вызов планировщика и гейт).
+    """
     if not isinstance(raw, dict):
         return {}
     out: Dict[str, str] = {}
-    for key in ("request", "rules"):
+    for key in ("request", "rules", "basis"):
         value = str(raw.get(key) or "").strip()
         if value:
             out[key] = value[:400]
+        elif key == "basis":
+            # Пустая основа — законное значение («данных MCP нет»): подпись без
+            # ключа не совпала бы с подписью с пустым ключом, и план пересобирался
+            # бы на каждой перезагрузке.
+            out[key] = ""
     return out
 
 
@@ -544,7 +663,104 @@ def _normalize_session(raw: Any) -> Optional[Dict[str, Any]]:
         # task_id состояния — это id САМОЙ сессии: задача пользователя в режиме
         # «AI-агент» ведётся в диалоге (сессии) и своей сессии не имеет.
         "dialog": normalize_dialog(raw.get("dialog"), session_id),
+        # Расписание ПЕРИОДИЧЕСКОЙ задачи (см. app/ai/periodic.py): период,
+        # следующий срок, счётчик повторов. Пусто — задача обычная, одноразовая.
+        "periodic": periodic_store.normalize(raw.get("periodic")),
     }
+
+
+# ---------------------------------------------------------------------------
+# Периодические задачи (расписание рядом с сессией, см. app/ai/periodic.py)
+# ---------------------------------------------------------------------------
+def periodic_meta(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Расписание сессии ({} — задача не периодическая).
+
+    Поле нормализуется на месте: файл мог быть записан прежней версией или
+    поправлен руками — расписание всё равно читается безопасно.
+    """
+    if not session:
+        return {}
+    meta = periodic_store.normalize(session.get("periodic"))
+    session["periodic"] = meta
+    return meta
+
+
+def set_periodic(session: Dict[str, Any], meta: Any) -> Dict[str, Any]:
+    """Записывает расписание в сессию ({} — задача снова обычная)."""
+    normalized = periodic_store.normalize(meta)
+    session["periodic"] = normalized
+    return normalized
+
+
+def make_periodic(session: Dict[str, Any], interval: Any = None,
+                  request: str = "", enabled: bool = True) -> Dict[str, Any]:
+    """Заводит (или заменяет) расписание ГОТОВОЙ сессии.
+
+    Нужен, когда периодической становится уже существующая задача (сейчас такой
+    путь есть только у проверок: интерфейс заводит расписание вместе с задачей —
+    см. create_session). Период не задан — берётся сутки по умолчанию.
+    """
+    meta = periodic_store.make(
+        periodic_store.DEFAULT_INTERVAL if interval is None else interval,
+        request=request, enabled=enabled)
+    session["periodic"] = meta
+    return meta
+
+
+def session_periodic_brief(session: Dict[str, Any], running: bool = False,
+                           moment: Optional[datetime] = None
+                           ) -> Optional[Dict[str, Any]]:
+    """Расписание сессии для снимка фронтенда (None — задача не периодическая).
+
+    Вместе с расписанием отдаётся ПРИЧИНА, по которой повторы сейчас не идут
+    (`hold`): «paused» — задача на паузе, «cancelled» — задача отменена (отмена и
+    есть остановка периодической задачи). Интерфейс показывает это в списке задач
+    и в модалке расписания.
+    """
+    meta = periodic_meta(session)
+    if not meta:
+        return None
+    dialog = session.get("dialog") or {}
+    state = dialog_state(session)
+    hold = "paused" if state.paused else ("cancelled" if state.stage == "cancelled" else "")
+    return periodic_store.brief(
+        meta, running=running, hold=hold,
+        log_len=len(dialog.get("log") or []), moment=moment)
+
+
+def periodic_sessions(workspace: Dict[str, Any],
+                      profile_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Все периодические задачи профиля: пары (задача, сессия).
+
+    Периодическая задача — всегда ЗАДАЧА-ДИАЛОГ (сессия) конкретного проекта:
+    свой запрос, свой автомат, своё расписание. Выключенный повтор (enabled:
+    False) тоже здесь — задача остаётся периодической, просто не повторяется.
+    """
+    found: List[Dict[str, Any]] = []
+    for task in profile_tasks(workspace, profile_id):
+        for session in task.get("sessions", []):
+            if periodic_meta(session):
+                found.append((task, session))
+    return found
+
+
+def due_periodic_sessions(workspace: Dict[str, Any],
+                          moment: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """Периодические задачи, у которых наступил срок повтора (по всему файлу).
+
+    Планировщик работает для ВСЕХ профилей: задача профиля, который сейчас не
+    открыт, тоже должна повторяться (профиль подставляется планировщиком, см.
+    PROFILE_OVERRIDE в chat.py).
+    """
+    moment = moment or periodic_store.now()
+    found: List[Dict[str, Any]] = []
+    for task in workspace.get("tasks", []):
+        for session in task.get("sessions", []):
+            meta = periodic_meta(session)
+            if meta and periodic_store.is_due(meta, moment):
+                found.append((task, session))
+    found.sort(key=lambda pair: str(periodic_meta(pair[1]).get("next_run") or ""))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1289,8 +1505,15 @@ def create_task(workspace: Dict[str, Any], name: str,
     return task
 
 
-def create_session(task: Dict[str, Any], title: str = "") -> Dict[str, Any]:
-    """Создаёт в задаче новую сессию-диалог и делает её текущей."""
+def create_session(task: Dict[str, Any], title: str = "",
+                   periodic: Any = None) -> Dict[str, Any]:
+    """Создаёт в задаче новую сессию-диалог и делает её текущей.
+
+    `periodic` — период ПЕРИОДИЧЕСКОЙ задачи в секундах (кнопка «Новая
+    периодическая задача»): None — обычная задача, которая выполняется один раз.
+    Для периодической сразу заводится расписание (по умолчанию — сутки) и первый
+    срок повтора; сам запрос задачи появится с первым сообщением пользователя.
+    """
     session_id = new_id("s")
     session = {
         "id": session_id,
@@ -1300,6 +1523,10 @@ def create_session(task: Dict[str, Any], title: str = "") -> Dict[str, Any]:
         # (этап planning), а его task_id — id этой сессии.
         "dialog": empty_dialog(session_id),
     }
+    if periodic is not None:
+        session["periodic"] = periodic_store.make(periodic)
+    else:
+        session["periodic"] = {}
     task.setdefault("sessions", []).append(session)
     task["sessions"] = task["sessions"][-_MAX_SESSIONS:]
     task["active_session"] = session["id"]
@@ -1448,19 +1675,31 @@ def _task_brief(task: Dict[str, Any]) -> Dict[str, Any]:
     return {"id": task["id"], "name": task["name"]}
 
 
-def snapshot(workspace: Dict[str, Any], profile_id: Optional[str] = None) -> Dict[str, Any]:
+def snapshot(workspace: Dict[str, Any], profile_id: Optional[str] = None,
+             running: Optional[Any] = None,
+             moment: Optional[datetime] = None) -> Dict[str, Any]:
     """Снимок для фронтенда: задачи ПРОФИЛЯ, его текущая задача и её диалоги.
 
     Профили изолированы: в снимке только задачи переданного профиля (и его
     текущая задача из active_tasks), поэтому чужой профиль их не видит. В каждой
     задаче есть поле "profile" — id профиля-владельца.
+
+    У периодической задачи-диалога вместе с заголовком отдаётся её расписание
+    ("periodic": период, срок следующего повтора, счётчик, ошибка) — по нему
+    интерфейс помечает такую задачу в списке. `running` — id задач, повтор
+    которых выполняется ПРЯМО СЕЙЧАС (ведёт планировщик, см. chat.py).
     """
+    running_ids = running or set()
     tasks = profile_tasks(workspace, profile_id)
     task = active_task(workspace, profile_id)
-    sessions = [
-        {"id": session["id"], "title": session_title(session)}
-        for session in (task.get("sessions", []) if task else [])
-    ]
+    sessions = []
+    for session in (task.get("sessions", []) if task else []):
+        brief = {"id": session["id"], "title": session_title(session)}
+        periodic = session_periodic_brief(
+            session, running=str(session["id"]) in running_ids, moment=moment)
+        if periodic:
+            brief["periodic"] = periodic
+        sessions.append(brief)
     return {
         "tasks": [_task_brief(item) for item in tasks],
         "active_task": task["id"] if task else None,
