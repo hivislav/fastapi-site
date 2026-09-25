@@ -20,6 +20,11 @@
       «ДАННЫЕ MCP» в контексте планировщика и ответа, повторное использование
       данных на ШАГАХ плана (без нового служебного вызова) и выключенный MCP
       (ни вызовов, ни расхода).
+  [6] удалённый сервер проекта (свой open-meteo-mcp на VPS) — транспорт
+      Streamable HTTP против НАСТОЯЩЕГО HTTP-сервера на stdlib во временном
+      каталоге: рукопожатие, tools/list, tools/call, ответ потоком SSE, токен
+      заголовком Authorization, отказ по неверному токену, причина без токена и
+      недоступный сервер (туннель не поднят).
 
 Рабочие данные не трогаются: workspace, история агента и профили пишутся во
 временный каталог (переменные AGENT_*_FILE выставляются ДО импорта chat).
@@ -30,6 +35,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -180,6 +187,145 @@ def restore_registry() -> None:
     reloaded = importlib.reload(mcp_store)
     mcp_store.SERVERS = reloaded.SERVERS
     mcp_store.SERVER_IDS = reloaded.SERVER_IDS
+
+
+# ---------------------------------------------------------------------------
+# Тестовый MCP-сервер по Streamable HTTP: тот же протокол, но в теле POST
+# ---------------------------------------------------------------------------
+# Так проверяется УДАЛЁННЫЙ сервер проекта (свой open-meteo-mcp на VPS): сеть
+# здесь только локальная (127.0.0.1), внешние источники не участвуют. Сервер
+# требует токен заголовком Authorization и умеет отвечать и телом JSON, и
+# потоком SSE — клиент обязан понимать оба вида ответа.
+HTTP_TOKEN = "test-token-42"
+HTTP_ID = "remote"
+
+HTTP_TOOLS = [
+    {
+        "name": "get_current_weather",
+        "title": "Погода сейчас",
+        "description": "Текущая погода по названию места",
+        "inputSchema": {"type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"]},
+    },
+    {
+        "name": "boom",
+        "title": "Сломанный инструмент",
+        "description": "Всегда возвращает ошибку",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def http_answer(message):
+    """Ответ тестового HTTP-сервера на сообщение JSON-RPC (None — уведомление)."""
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fake-http-mcp", "version": "0.2"}}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": HTTP_TOOLS}}
+    if method == "tools/call":
+        params = message.get("params") or {}
+        args = params.get("arguments") or {}
+        if params.get("name") == "get_current_weather":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [
+                {"type": "text",
+                 "text": "Погода в " + str(args.get("location", "?"))
+                         + ": +12,6, слабая морось"}]}}
+        if params.get("name") == "boom":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "источник недоступен"}]}}
+        return {"jsonrpc": "2.0", "id": request_id,
+                "error": {"code": -32602, "message": "unknown tool"}}
+    if method == "notifications/initialized":
+        return None
+    return {"jsonrpc": "2.0", "id": request_id,
+            "error": {"code": -32601, "message": "unknown method"}}
+
+
+class FakeMcpHttp:
+    """MCP-сервер по HTTP на stdlib: токен обязателен, ответ — JSON или SSE."""
+
+    def __init__(self, token: str, stream: bool = False) -> None:
+        self.token = token
+        self.stream = stream
+        self.headers = []      # заголовки запросов: видно, что ушёл токен
+        self.messages = []     # тела запросов: видно, что просил клиент
+        self._server = None
+
+    def start(self) -> str:
+        """Поднимает сервер на свободном порту, возвращает адрес эндпоинта."""
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):  # тишина в выводе проверки
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length)
+                try:
+                    message = json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    message = {}
+                outer.messages.append(message)
+                outer.headers.append(
+                    {key.lower(): value for key, value in self.headers.items()})
+                if self.headers.get("Authorization") != "Bearer " + outer.token:
+                    self.reply(401, {"error": "unauthorized"}, "application/json")
+                    return
+                answer = http_answer(message)
+                kind = "text/event-stream" if outer.stream else "application/json"
+                self.reply(202 if answer is None else 200, answer, kind)
+
+            def reply(self, status, payload, kind):
+                if payload is None:
+                    data = b""
+                elif kind == "text/event-stream":
+                    body = json.dumps(payload, ensure_ascii=False)
+                    data = ("event: message\ndata: " + body + "\n\n").encode("utf-8")
+                else:
+                    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                if data:
+                    self.wfile.write(data)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        host, port = self._server.server_address[:2]
+        return "http://%s:%d/mcp" % (host, port)
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+
+
+def use_http_registry(url: str) -> None:
+    """Переводит клиент на тестовый HTTP-сервер (как на удалённый сервер VPS)."""
+    mcp_store.SERVERS = [{
+        "id": HTTP_ID,
+        "name": "Тестовый HTTP",
+        "description": "Сервер проверки транспорта",
+        "source": "локальный тест",
+        "transport": "http",
+        "url": url,
+        "url_env": "OPEN_METEO_MCP_URL",
+        "token_env": "OPEN_METEO_MCP_TOKEN",
+    }]
+    mcp_store.SERVER_IDS = [HTTP_ID]
+    mcp_store.forget()
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +692,10 @@ async def test_dialog():
     check("модели показан список инструментов сервера",
           "get_weather" in (MCP_PAYLOADS[0] if MCP_PAYLOADS else ""),
           (MCP_PAYLOADS[0] if MCP_PAYLOADS else "")[:200])
+    check("в подсказке диспетчера названы аргументы поиска (язык и страна)",
+          "language" in mcp_store.TOOLS_PROMPT
+          and "countryCode" in mcp_store.TOOLS_PROMPT,
+          mcp_store.TOOLS_PROMPT[-200:])
     check("вызов инструмента выполнен", len(TOOL_CALLS) == 1
           and TOOL_CALLS[0][0]["tool"] == "get_weather", str(TOOL_CALLS)[:200])
     check("в чате видно, что сделал MCP",
@@ -664,20 +814,152 @@ async def test_dialog():
     check("сбой выбора не оставляет блок данных",
           "ДАННЫЕ MCP" not in system_texts(), system_texts()[-200:])
 
-    # 5.6 Реестр проекта: три бесплатных сервера без ключей.
+    # 5.6 Реестр проекта: три локальных сервера без ключей и свой сервер на VPS.
     restore_registry()
     registry = mcp_store.servers()
-    check("к проекту подключены три MCP-сервера", len(registry) == 3,
+    check("к проекту подключены четыре MCP-сервера", len(registry) == 4,
           str([entry["id"] for entry in registry]))
     check("у каждого есть название и краткое описание",
           all(entry["name"] and entry["description"] for entry in registry),
           str(registry)[:200])
-    check("id серверов — погода, курсы валют, криптовалюты",
-          [entry["id"] for entry in registry] == ["weather", "currency", "crypto"],
+    check("id серверов — погода, курсы валют, криптовалюты, свой Open-Meteo",
+          [entry["id"] for entry in registry]
+          == ["weather", "currency", "crypto", "open_meteo"],
           str([entry["id"] for entry in registry]))
-    check("серверы проекта — локальные файлы MCP SDK",
-          all(str(entry.get("script", "")).endswith(".mjs") for entry in registry),
-          str([entry.get("script") for entry in registry]))
+    local = [entry for entry in registry
+             if mcp_store.transport_of(entry) == mcp_store.STDIO_TRANSPORT]
+    check("три сервера проекта — локальные файлы MCP SDK на stdio",
+          len(local) == 3
+          and all(str(entry.get("script", "")).endswith(".mjs") for entry in local),
+          str([entry.get("script") for entry in local]))
+    remote = mcp_store.find_server("open_meteo") or {}
+    check("четвёртый сервер — удалённый, транспорт http",
+          mcp_store.transport_of(remote) == mcp_store.HTTP_TRANSPORT,
+          str(remote)[:200])
+    check("по умолчанию адрес — локальный туннель, а не адрес VPS",
+          str(remote.get("url") or "").startswith("http://127.0.0.1:3000"),
+          str(remote.get("url")))
+    check("секрет в реестре не хранится: только ИМЯ переменной окружения",
+          remote.get("token_env") == "OPEN_METEO_MCP_TOKEN" and "token" not in remote,
+          str(sorted(remote))[:200])
+    saved_token = os.environ.pop("OPEN_METEO_MCP_TOKEN", "")
+    try:
+        gap = mcp_store.availability_error(remote)
+    finally:
+        if saved_token:
+            os.environ["OPEN_METEO_MCP_TOKEN"] = saved_token
+    check("без переменной с токеном причина видна заранее",
+          "OPEN_METEO_MCP_TOKEN" in gap, gap)
+
+
+# ---------------------------------------------------------------------------
+# 6. Удалённый сервер проекта: транспорт Streamable HTTP
+# ---------------------------------------------------------------------------
+def test_http():
+    print("\n[6] Свой сервер на VPS: транспорт Streamable HTTP")
+    server = FakeMcpHttp(HTTP_TOKEN)
+    url = server.start()
+    os.environ["OPEN_METEO_MCP_TOKEN"] = HTTP_TOKEN
+    os.environ["OPEN_METEO_MCP_URL"] = url
+    try:
+        use_http_registry(url)
+        found = mcp_store.discover(HTTP_ID, force=True)
+        check("HTTP-сервер объявил инструменты", found.get("ok"), str(found)[:200])
+        check("имя сервера из рукопожатия (HTTP)",
+              found.get("server_name") == "fake-http-mcp",
+              str(found.get("server_name")))
+        names = [tool["name"] for tool in found.get("tools") or []]
+        check("инструменты прочитаны по HTTP",
+              names == ["get_current_weather", "boom"], str(names))
+        check("токен уходит заголовком Authorization",
+              bool(server.headers)
+              and all(str(item.get("authorization") or "")
+                      == "Bearer " + HTTP_TOKEN for item in server.headers),
+              str(server.headers[:1])[:200])
+        check("клиент соглашается и на JSON, и на поток SSE",
+              bool(server.headers)
+              and all("text/event-stream" in str(item.get("accept") or "")
+                      for item in server.headers),
+              str(server.headers[:1])[:200])
+        check("адрес берётся из переменной окружения",
+              mcp_store.server_url(mcp_store.find_server(HTTP_ID) or {}) == url,
+              mcp_store.server_url(mcp_store.find_server(HTTP_ID) or {}))
+
+        result = mcp_store.call_tool(HTTP_ID, "get_current_weather",
+                                     {"location": "Москва"})
+        check("вызов инструмента по HTTP вернул текст",
+              result["ok"] and "Москва" in result["text"], str(result)[:200])
+
+        broken = mcp_store.call_tool(HTTP_ID, "boom", {})
+        check("ошибка инструмента (isError) по HTTP не выдаёт себя за данные",
+              not broken["ok"] and "источник недоступен" in broken["error"],
+              str(broken)[:200])
+
+        unknown = mcp_store.call_tool(HTTP_ID, "нет_такого", {})
+        check("ошибка протокола по HTTP возвращается понятным текстом",
+              not unknown["ok"] and "unknown tool" in unknown["error"],
+              str(unknown)[:200])
+
+        # Тот же транспорт, но ответ приходит ПОТОКОМ (SSE): сервер вправе
+        # выбрать вид ответа, и клиент обязан понять оба.
+        stream_server = FakeMcpHttp(HTTP_TOKEN, stream=True)
+        stream_url = stream_server.start()
+        try:
+            use_http_registry(stream_url)
+            streamed = mcp_store.discover(HTTP_ID, force=True)
+            check("ответ потоком SSE разобран",
+                  streamed.get("ok")
+                  and streamed.get("server_name") == "fake-http-mcp",
+                  str(streamed)[:200])
+            streamed_call = mcp_store.call_tool(HTTP_ID, "get_current_weather",
+                                                {"location": "Казань"})
+            check("вызов по SSE вернул текст",
+                  streamed_call["ok"] and "Казань" in streamed_call["text"],
+                  str(streamed_call)[:200])
+        finally:
+            stream_server.stop()
+
+        # Неверный токен: сервер отвечает 401 — причина понятная, секрет не течёт.
+        os.environ["OPEN_METEO_MCP_TOKEN"] = "wrong-token"
+        use_http_registry(url)
+        denied = mcp_store.discover(HTTP_ID, force=True)
+        check("неверный токен — понятная причина, а не исключение",
+              denied.get("ok") is False and "401" in str(denied.get("error")),
+              str(denied)[:200])
+        check("токен не попадает в текст ошибки",
+              HTTP_TOKEN not in str(denied.get("error")), str(denied)[:200])
+
+        # Токен с не-ASCII символами: заголовок HTTP их не примет — говорим об
+        # этом словами, а не ошибкой кодека.
+        os.environ["OPEN_METEO_MCP_TOKEN"] = "чужой-токен"
+        use_http_registry(url)
+        broken_header = mcp_store.discover(HTTP_ID, force=True)
+        check("не-ASCII токен объясняется понятно",
+              broken_header.get("ok") is False
+              and "HTTP-заголовке" in str(broken_header.get("error")),
+              str(broken_header)[:200])
+        os.environ["OPEN_METEO_MCP_TOKEN"] = HTTP_TOKEN
+
+        # Токена нет вовсе: причина видна ЗАРАНЕЕ, без обращения к серверу.
+        saved = os.environ.pop("OPEN_METEO_MCP_TOKEN", "")
+        problem = mcp_store.availability_error(mcp_store.find_server(HTTP_ID) or {})
+        check("без токена причина названа заранее",
+              "OPEN_METEO_MCP_TOKEN" in problem, problem)
+        os.environ["OPEN_METEO_MCP_TOKEN"] = saved
+
+        # Сервер (или туннель) недоступен: подсказка вместо трассировки.
+        server.stop()
+        down = mcp_store.discover(HTTP_ID, force=True)
+        check("недоступный сервер объясняется понятно",
+              down.get("ok") is False and "недоступен" in str(down.get("error")),
+              str(down)[:200])
+        check("в причине есть подсказка про туннель",
+              "туннел" in str(down.get("error")), str(down)[:200])
+    finally:
+        server.stop()
+        os.environ.pop("OPEN_METEO_MCP_TOKEN", None)
+        os.environ.pop("OPEN_METEO_MCP_URL", None)
+        restore_registry()
 
 
 def main():
@@ -689,6 +971,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.run_until_complete(test_routes())
     loop.run_until_complete(test_dialog())
+    test_http()
     print("\nИтог: " + (f"ПРОВАЛЕНО проверок: {len(FAILURES)} → {FAILURES}"
                        if FAILURES else "все проверки пройдены"))
     return 1 if FAILURES else 0

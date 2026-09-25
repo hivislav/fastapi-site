@@ -13,18 +13,27 @@ MCP-серверы проекта уходят в КАЖДЫЙ запрос аг
 уходят в модель отдельным системным блоком (`block`) — вместе с планом задачи,
 ответом и проверкой результата.
 
-Серверы — ЛОКАЛЬНЫЕ процессы на официальном MCP SDK (@modelcontextprotocol/sdk,
-каталог mcp_servers/), общение по stdio: JSON-RPC 2.0 построчно. Все три сервера
-проекта бесплатные и работают БЕЗ ключей и регистрации:
+Серверы проекта бывают двух видов, но говорят на одном протоколе:
 
-    weather   — погода (7timer.info + геокодер Open-Meteo);
-    currency  — курсы валют Банка России (cbr.ru);
-    crypto    — курсы криптовалют (CoinGecko).
+    weather    — погода (7timer.info + геокодер Open-Meteo)      stdio, локальный
+    currency   — курсы валют Банка России (cbr.ru)               stdio, локальный
+    crypto     — курсы криптовалют (CoinGecko)                   stdio, локальный
+    open_meteo — погода, прогноз, качество воздуха, координаты    http, свой сервер
+                 (ensemble-api, geocoding-api, air-quality-api)  на VPS
+
+Три первых — ЛОКАЛЬНЫЕ процессы на официальном MCP SDK
+(@modelcontextprotocol/sdk, каталог mcp_servers/), общение по stdio: JSON-RPC 2.0
+построчно; бесплатные, без ключей и регистрации. Четвёртый — СВОЙ сервер
+`open-meteo-mcp` (тот же SDK), развёрнутый на VPS: он слушает только loopback
+сервера, поэтому агент ходит к нему через SSH-туннель по Streamable HTTP
+(JSON-RPC 2.0 в теле POST) и предъявляет токен доступа. Токен в реестре НЕ
+хранится — в записи указано только ИМЯ переменной окружения
+(`OPEN_METEO_MCP_TOKEN`), а сам секрет лежит в `.env` (в git не попадает).
 
 Клиент сам по себе не зависит от SDK: он говорит на протоколе, поэтому к проекту
 можно подключить любой MCP-сервер (в том числе сторонний) — достаточно добавить
-запись в `SERVERS` (или переопределить каталог переменной окружения
-`MCP_SERVERS_FILE`).
+запись в `SERVERS` (или переопределить каталог локальных серверов переменной
+окружения `MCP_SERVERS_DIR`).
 
 Модуль без состояния в файлах: на вход приходят включённые id серверов и запрос
 пользователя, на выход — вызовы и текст блока. Работа с моделью идёт через
@@ -38,10 +47,13 @@ import logging
 import os
 import queue
 import shutil
+import socket
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from app import config
 from app.ai import json_utils
@@ -86,17 +98,35 @@ TOOLS_TIMEOUT = 45.0
 # Реестр серверов проекта.
 #
 # Каждая запись — описание сервера MCP: имя для интерфейса, краткое пояснение
-# (его видит пользователь в диалоге «MCP») и команда запуска. `command` — либо
-# готовая команда (["node", "script.mjs"]), либо имя файла в каталоге серверов
-# (тогда запускается через node). Каталог по умолчанию — mcp_servers/ в корне
-# проекта; путь можно переопределить переменной окружения MCP_SERVERS_DIR.
+# (его видит пользователь в диалоге «MCP») и способ подключения.
+#
+# `transport` — как клиент говорит с сервером:
+#   "stdio" (по умолчанию) — ЛОКАЛЬНЫЙ процесс: `command` — либо готовая команда
+#       (["node", "script.mjs"]), либо имя файла в каталоге серверов (тогда
+#       запускается через node). Каталог по умолчанию — mcp_servers/ в корне
+#       проекта; путь переопределяет переменная окружения MCP_SERVERS_DIR.
+#   "http" — УДАЛЁННЫЙ сервер по Streamable HTTP: `url` (адрес эндпоинта, его
+#       переопределяет переменная из `url_env`) и `token_env` — имя переменной
+#       окружения с токеном доступа. Секрет в записи НЕ хранится.
 # ---------------------------------------------------------------------------
 SERVERS_DIR_ENV = "MCP_SERVERS_DIR"
 NODE_ENV = "MCP_NODE_BIN"
 
+# Транспорты клиента.
+STDIO_TRANSPORT = "stdio"
+HTTP_TRANSPORT = "http"
+
 WEATHER = "weather"
 CURRENCY = "currency"
 CRYPTO = "crypto"
+OPEN_METEO = "open_meteo"
+
+# Свой сервер на VPS: адрес туннеля и ИМЯ переменной с токеном (не сам токен).
+# Туннель (launchd на Mac) поднимает 127.0.0.1:3000 -> loopback VPS; сам сервер
+# снаружи недоступен, поэтому в записи стоит адрес туннеля, а не адрес VPS.
+OPEN_METEO_URL_ENV = "OPEN_METEO_MCP_URL"
+OPEN_METEO_TOKEN_ENV = "OPEN_METEO_MCP_TOKEN"
+OPEN_METEO_DEFAULT_URL = "http://127.0.0.1:3000/mcp"
 
 SERVERS: List[Dict[str, Any]] = [
     {
@@ -129,6 +159,21 @@ SERVERS: List[Dict[str, Any]] = [
         "source": "CoinGecko",
         "script": "crypto.mjs",
     },
+    {
+        "id": OPEN_METEO,
+        "name": "Погода Open-Meteo (свой сервер на VPS)",
+        "description": (
+            "Текущая погода по названию города или координатам, прогноз по "
+            "дням, качество воздуха и определение координат места. Данные "
+            "отдаёт свой сервер open-meteo-mcp на VPS (через SSH-туннель)."
+        ),
+        "source": "Open-Meteo: ensemble-api · geocoding-api · air-quality-api "
+                  "(свой сервер на VPS)",
+        "transport": HTTP_TRANSPORT,
+        "url": OPEN_METEO_DEFAULT_URL,
+        "url_env": OPEN_METEO_URL_ENV,
+        "token_env": OPEN_METEO_TOKEN_ENV,
+    },
 ]
 
 # Пометка в диагностике: серверов нет вовсе (реестр пуст).
@@ -160,7 +205,11 @@ TOOLS_PROMPT = (
     "совпадать с ним точно. Придумывать инструменты нельзя.\n"
     "4) Аргументы — строго по схеме: обязательные поля заполнены, лишних нет. "
     "Названия городов и валют бери из запроса пользователя; город пиши словами "
-    "(«Москва»), валюту — кодом (USD, EUR, RUB).\n"
+    "(«Москва»), валюту — кодом (USD, EUR, RUB). Заполняй и необязательные "
+    "аргументы ПОИСКА, если они у инструмента есть: язык (`language`) и страну "
+    "(`countryCode`) — по языку запроса (для русского названия `language` «ru», "
+    "для российского города `countryCode` «RU»): у геокодеров язык влияет на "
+    "поиск, и без него русское название может не найтись.\n"
     "5) Если в запросе не хватает обязательного для вызова сведения (например, "
     "не назван город) — НЕ вызывай инструмент: пусть агент сначала уточнит "
     "запрос у пользователя.\n"
@@ -214,18 +263,51 @@ def command_for(entry: Dict[str, Any]) -> List[str]:
     return [node_bin(), os.path.join(servers_dir(), script)]
 
 
-def availability_error(entry: Dict[str, Any]) -> str:
-    """Почему сервер заведомо не запустится (пусто — предпосылок к сбою нет).
+def transport_of(entry: Dict[str, Any]) -> str:
+    """Транспорт записи реестра ("stdio" по умолчанию, "http" — удалённый сервер)."""
+    value = str(entry.get("transport") or STDIO_TRANSPORT).strip().lower()
+    return HTTP_TRANSPORT if value == HTTP_TRANSPORT else STDIO_TRANSPORT
 
-    Проверяем то, что видно без запуска: есть ли запускаемая программа, файл
-    сервера и установленный MCP SDK (для серверов на Node — а ими и являются
-    серверы проекта). Так пользователь в диалоге «MCP» видит понятную причину
-    («Node.js не найден», «не выполнен npm install»), а не молчаливое
-    «недоступен».
+
+def server_url(entry: Dict[str, Any]) -> str:
+    """Адрес удалённого сервера: переменная окружения важнее значения в записи."""
+    name = str(entry.get("url_env") or "").strip()
+    value = os.getenv(name) if name else None
+    return str(value or entry.get("url") or "").strip()
+
+
+def server_token(entry: Dict[str, Any]) -> str:
+    """Токен доступа удалённого сервера (пусто — переменная не задана).
+
+    Значение читается ТОЛЬКО из окружения: в реестре лежит имя переменной,
+    поэтому секрет не попадает ни в код, ни в интерфейс, ни в диагностику.
+    """
+    name = str(entry.get("token_env") or "").strip()
+    return str(os.getenv(name) or "").strip() if name else ""
+
+
+def availability_error(entry: Dict[str, Any]) -> str:
+    """Почему сервер заведомо не подключится (пусто — предпосылок к сбою нет).
+
+    Проверяем то, что видно без обращения к серверу. Для локальных серверов это
+    наличие запускаемой программы, файла сервера и установленного MCP SDK (иначе
+    пользователь в диалоге «MCP» видел бы молчаливое «недоступен» вместо причины
+    «Node.js не найден», «не выполнен npm install»). Для удалённого — заданы ли
+    адрес и токен доступа: без токена сервер ответит 401, и об этом лучше сказать
+    заранее и словами, а не кодом ошибки.
 
     Сервер с собственной командой (`command` в записи реестра) проверяется только
     на существование программы и файла: SDK нужен лишь серверам на Node.
     """
+    if transport_of(entry) == HTTP_TRANSPORT:
+        if not server_url(entry):
+            name = str(entry.get("url_env") or "").strip()
+            return ("не задан адрес сервера MCP"
+                    + (": переменная окружения " + name if name else ""))
+        token_env = str(entry.get("token_env") or "").strip()
+        if token_env and not server_token(entry):
+            return "не задан токен доступа: переменная окружения " + token_env
+        return ""
     command = command_for(entry)
     binary = command[0]
     if os.path.isabs(binary) or os.sep in binary:
@@ -246,7 +328,7 @@ def availability_error(entry: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Клиент MCP по stdio: JSON-RPC 2.0 построчно
+# Клиент MCP по stdio: JSON-RPC 2.0 построчно (локальный сервер)
 # ---------------------------------------------------------------------------
 class _StdioSession:
     """Одно соединение с MCP-сервером: запуск процесса, запросы, закрытие.
@@ -397,12 +479,196 @@ class _StdioSession:
                 logger.warning("MCP: не удалось остановить процесс %s", self.command)
 
 
-def _open_session(entry: Dict[str, Any]) -> _StdioSession:
-    """Запускает сервер и выполняет рукопожатие MCP (initialize)."""
+# ---------------------------------------------------------------------------
+# Клиент MCP по Streamable HTTP: JSON-RPC 2.0 в теле POST (удалённый сервер)
+# ---------------------------------------------------------------------------
+class _HttpSession:
+    """Соединение с УДАЛЁННЫМ MCP-сервером по Streamable HTTP.
+
+    Каждый запрос — отдельный HTTP POST на адрес сервера: так работает
+    Streamable HTTP из спецификации MCP. Сервер без состояния соединение не
+    держит, а SSH-туннель живёт отдельно от агента, поэтому закрывать нечего.
+    Ответ приходит либо телом JSON, либо потоком SSE (`text/event-stream`):
+    это один транспорт, и вид ответа выбирает сервер — понимаем оба.
+
+    Токен доступа уходит ТОЛЬКО заголовком `Authorization` и никогда не попадает
+    в текст ошибки: этот текст видит пользователь в диалоге «MCP».
+    """
+
+    def __init__(self, url: str, token: str = "", token_env: str = "") -> None:
+        self.url = url
+        self._token = token
+        self._token_env = token_env
+        self._send_lock = threading.Lock()
+        self._next_id = 0
+        self._session_id = ""
+        self._closed = False
+        self.started = time.monotonic()
+        # Имя и версия сервера из рукопожатия (initialize) — как у stdio-сессии.
+        self.server_name = ""
+        self.server_version = ""
+
+    # -- HTTP ---------------------------------------------------------------
+    def _headers(self) -> Dict[str, str]:
+        """Заголовки запроса: протокол, авторизация и идентификатор сессии."""
+        headers = {
+            "content-type": "application/json",
+            # Оба типа ответа перечислены явно: сервер вправе ответить потоком,
+            # и без согласия на `text/event-stream` он вправе отказать.
+            "accept": "application/json, text/event-stream",
+            "user-agent": CLIENT_NAME + "/" + CLIENT_VERSION,
+        }
+        if self._token:
+            headers["authorization"] = "Bearer " + self._token
+        if self._session_id:
+            # Сервер с состоянием выдаёт идентификатор сессии в ответе на
+            # initialize и ждёт его обратно; сервер без состояния его не шлёт,
+            # и тогда заголовка просто нет.
+            headers["mcp-session-id"] = self._session_id
+        return headers
+
+    def _post(self, payload: Dict[str, Any],
+              timeout: float) -> Optional[Dict[str, Any]]:
+        """Один POST: сообщение JSON-RPC -> ответ (None — ответа нет)."""
+        body = json.dumps(payload).encode("utf-8")
+        limit = max(1.0, float(timeout))
+        try:
+            request = urllib.request.Request(self.url, data=body,
+                                             headers=self._headers(),
+                                             method="POST")
+            with urllib.request.urlopen(request, timeout=limit) as response:
+                kind = str(response.headers.get("Content-Type") or "")
+                session_id = response.headers.get("Mcp-Session-Id")
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            raise McpError(self._http_error(exc))
+        except UnicodeEncodeError:
+            # Заголовки HTTP — только ASCII: не-ASCII токен (например, скопированный
+            # с лишними символами) иначе падал бы ошибкой кодека.
+            raise McpError("токен доступа содержит символы, недопустимые в "
+                           "HTTP-заголовке (нужны только ASCII-символы)")
+        except socket.timeout:
+            raise McpError(f"сервер не ответил за {limit:.0f} с: {self.url}")
+        except (urllib.error.URLError, OSError) as exc:
+            # Сюда попадают и «туннель не поднят», и «сервер остановлен»:
+            # пользователю нужна причина и подсказка, а не трассировка.
+            reason = getattr(exc, "reason", None) or exc
+            raise McpError("сервер недоступен: " + str(reason) + " (" + self.url
+                           + " — проверьте, что MCP-сервер и SSH-туннель запущены)")
+        if session_id:
+            self._session_id = str(session_id).strip()
+        return self._parse(raw, kind)
+
+    def _http_error(self, exc: Any) -> str:
+        """Текст ошибки HTTP: код, подсказка и короткая выдержка из тела."""
+        detail = ""
+        try:
+            detail = exc.read()[:300].decode("utf-8", "replace").strip()
+        except Exception:  # noqa: BLE001 — тело нужно лишь для пояснения
+            detail = ""
+        if exc.code in (401, 403):
+            hint = "проверьте токен доступа"
+            if self._token_env:
+                hint += ": переменная окружения " + self._token_env
+        elif exc.code == 404:
+            hint = "проверьте адрес сервера: " + self.url
+        else:
+            hint = self.url
+        parts = [f"сервер ответил ошибкой HTTP {exc.code}", hint]
+        if detail:
+            parts.append(detail.replace("\n", " ")[:200])
+        return "; ".join(part for part in parts if part)
+
+    def _parse(self, raw: bytes, kind: str) -> Optional[Dict[str, Any]]:
+        """Ответ сервера: тело JSON или поток SSE -> сообщение JSON-RPC."""
+        if "text/event-stream" in kind.lower():
+            return self._from_stream(raw)
+        text = raw.decode("utf-8", "replace").strip()
+        if not text:
+            return None
+        try:
+            message = json.loads(text)
+        except ValueError:
+            raise McpError("сервер вернул не JSON: " + text[:200])
+        return message if isinstance(message, dict) else None
+
+    @staticmethod
+    def _from_stream(raw: bytes) -> Optional[Dict[str, Any]]:
+        """Сообщение JSON-RPC из потока SSE (строки «data: {...}»).
+
+        В потоке могут быть и уведомления сервера, поэтому берём ПОСЛЕДНЕЕ
+        сообщение с ответом (`result` или `error`) — оно и есть ответ на запрос.
+        """
+        found: Optional[Dict[str, Any]] = None
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            chunk = line[len("data:"):].strip()
+            if not chunk or chunk == "[DONE]":
+                continue
+            try:
+                message = json.loads(chunk)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and ("result" in message
+                                              or "error" in message):
+                found = message
+        return found
+
+    # -- протокол ----------------------------------------------------------
+    def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """Уведомление серверу (ответа не ждём).
+
+        Сбой уведомления НЕ считается сбоем соединения: рукопожатие уже прошло,
+        а уведомление нужно не всем серверам — сервер без состояния соединение
+        не хранит и часто отвечает на него пустым 202.
+        """
+        payload: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        try:
+            self._post(payload, INIT_TIMEOUT)
+        except McpError as exc:
+            logger.info("MCP %s: уведомление %s не принято: %s",
+                        self.url, method, exc)
+
+    def request(self, method: str, params: Optional[Dict[str, Any]] = None,
+                timeout: float = LIST_TIMEOUT) -> Dict[str, Any]:
+        """Запрос к серверу: возвращает result (сбой — McpError)."""
+        with self._send_lock:
+            self._next_id += 1
+            request_id = self._next_id
+            payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": request_id,
+                                       "method": method}
+            if params is not None:
+                payload["params"] = params
+            message = self._post(payload, timeout)
+        if not isinstance(message, dict):
+            raise McpError(f"сервер не ответил на {method} (пустой ответ)")
+        if message.get("error"):
+            error = message.get("error")
+            text = error.get("message") if isinstance(error, dict) else str(error)
+            raise McpError(f"{method}: сервер вернул ошибку: {text}")
+        result = message.get("result")
+        return result if isinstance(result, dict) else {}
+
+    def close(self) -> None:
+        """Закрывать нечего: соединение живёт ровно один HTTP-запрос."""
+        self._closed = True
+
+
+def _open_session(entry: Dict[str, Any]) -> Union[_StdioSession, _HttpSession]:
+    """Открывает соединение с сервером и выполняет рукопожатие MCP (initialize)."""
     problem = availability_error(entry)
     if problem:
         raise McpError(problem)
-    session = _StdioSession(command_for(entry), servers_dir())
+    session: Union[_StdioSession, _HttpSession]
+    if transport_of(entry) == HTTP_TRANSPORT:
+        session = _HttpSession(server_url(entry), server_token(entry),
+                               str(entry.get("token_env") or "").strip())
+    else:
+        session = _StdioSession(command_for(entry), servers_dir())
     try:
         result = session.request("initialize", {
             "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -544,9 +810,10 @@ def call_tool(server_id: str, tool: str, arguments: Optional[Dict[str, Any]] = N
               timeout: float = CALL_TIMEOUT) -> Dict[str, Any]:
     """Вызывает инструмент сервера: {"ok", "text", "error"}.
 
-    Каждый вызов — отдельный процесс сервера: соединение не переиспользуется,
-    поэтому «залипший» сервер не портит следующие запросы. Ошибку источника
-    инструмент возвращает сам (isError), и её текст уходит модели как есть.
+    Каждый вызов — отдельное соединение с сервером (процесс для локального,
+    HTTP-запрос для удалённого): соединение не переиспользуется, поэтому
+    «залипший» сервер не портит следующие запросы. Ошибку источника инструмент
+    возвращает сам (isError), и её текст уходит модели как есть.
     """
     entry = find_server(server_id)
     if entry is None:
@@ -583,8 +850,8 @@ def call_tool(server_id: str, tool: str, arguments: Optional[Dict[str, Any]] = N
 def run_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Выполняет вызовы инструментов и возвращает результаты (последовательно).
 
-    Последовательно — намеренно: вызовы ходят в один и тот же локальный node, а
-    параллельный запуск нескольких процессов только добавил бы нагрузку; за
+    Последовательно — намеренно: вызовы запускают локальные процессы и ходят во
+    внешние источники, а параллельный запуск только добавил бы нагрузку; за
     запрос их и так не больше MAX_CALLS_PER_REQUEST.
     """
     results: List[Dict[str, Any]] = []
@@ -610,16 +877,17 @@ def run_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Асинхронные обёртки: запуск процессов не должен блокировать цикл событий
+# Асинхронные обёртки: запуск процессов и HTTP-запросы не должны блокировать
+# цикл событий
 # ---------------------------------------------------------------------------
 async def async_discover(ids: Optional[List[str]] = None,
                          force: bool = False) -> List[Dict[str, Any]]:
-    """Асинхронный список инструментов серверов (процессы — в отдельном потоке)."""
+    """Асинхронный список инструментов серверов (серверы — в отдельном потоке)."""
     return await asyncio.to_thread(discover_many, ids, force)
 
 
 async def async_run_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Асинхронное выполнение вызовов (процессы — в отдельном потоке)."""
+    """Асинхронное выполнение вызовов (серверы — в отдельном потоке)."""
     return await asyncio.to_thread(run_calls, calls)
 
 

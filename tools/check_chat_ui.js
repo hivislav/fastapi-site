@@ -193,6 +193,23 @@ let MCP = {
       available: false, error: 'не найден node',
       tools: [],
     },
+    {
+      id: 'open_meteo', name: 'Погода Open-Meteo (свой сервер на VPS)',
+      source: 'Open-Meteo (свой сервер на VPS)',
+      description: 'Текущая погода, прогноз, качество воздуха и координаты '
+        + 'по названию места. Данные отдаёт свой сервер open-meteo-mcp на VPS.',
+      available: true, error: '',
+      tools: [
+        { name: 'geocode_location', title: 'Координаты места',
+          description: 'Координаты по названию места' },
+        { name: 'get_current_weather', title: 'Погода сейчас',
+          description: 'Текущая погода' },
+        { name: 'get_weather_forecast', title: 'Прогноз по дням',
+          description: 'Прогноз погоды по дням' },
+        { name: 'get_air_quality', title: 'Качество воздуха',
+          description: 'Качество воздуха' },
+      ],
+    },
   ],
 };
 function mcpPayload() {
@@ -1774,23 +1791,28 @@ async function run() {
   await click($('project-mcp'), 60);
   check('нажатие открывает диалог со списком MCP', $('mcp-modal').hidden === false);
   const items = q('#mcp-list .mcp-item');
-  check('в диалоге перечислены все серверы проекта', items.length === 3,
+  check('в диалоге перечислены все серверы проекта', items.length === 4,
     'серверов: ' + items.length);
   const names = q('#mcp-list .mcp-name').map(el => el.textContent);
   check('у каждого сервера есть название',
-    names.join('|') === 'Погода|Курсы валют|Криптовалюты', names.join('|'));
+    names.join('|') === 'Погода|Курсы валют|Криптовалюты|'
+      + 'Погода Open-Meteo (свой сервер на VPS)', names.join('|'));
   const descs = q('#mcp-list .mcp-desc').map(el => el.textContent);
   check('у каждого сервера есть краткое описание',
-    descs.length === 3 && descs.every(text => text.length > 10), JSON.stringify(descs));
+    descs.length === 4 && descs.every(text => text.length > 10), JSON.stringify(descs));
   check('серверы показаны с инструментами',
-    q('#mcp-list .mcp-tools li').length === 2
+    q('#mcp-list .mcp-tools li').length === 6
     && $('mcp-list').textContent.indexOf('get_weather') >= 0,
     String(q('#mcp-list .mcp-tools li').length));
+  check('удалённый сервер показывает свои инструменты',
+    $('mcp-list').textContent.indexOf('get_current_weather') >= 0
+    && $('mcp-list').textContent.indexOf('доступен · инструментов: 4') >= 0,
+    $('mcp-list').textContent.slice(0, 120));
   check('недоступный сервер показан причиной, а не молчанием',
     $('mcp-list').textContent.indexOf('недоступен') >= 0
     && $('mcp-list').textContent.indexOf('не найден node') >= 0);
   check('у серверов есть галочки',
-    q('#mcp-list input[type=checkbox]').length === 3);
+    q('#mcp-list input[type=checkbox]').length === 4);
   check('галочки сняты, пока MCP выключен',
     q('#mcp-list input[type=checkbox]').every(box => box.checked === false));
 
@@ -1809,7 +1831,7 @@ async function run() {
   check('после «применить» диалог закрывается', $('mcp-modal').hidden === true);
   check('включённый MCP помечает кнопку проекта',
     $('project-mcp').classList.contains('on') === true
-    && $('project-mcp').title.indexOf('включено 2 из 3') > 0,
+    && $('project-mcp').title.indexOf('включено 2 из 4') > 0,
     $('project-mcp').className + ' / ' + $('project-mcp').title);
   check('в чате сказано, что MCP включён',
     q('#messages .msg.bot').some(el => el.textContent.indexOf('MCP включён') >= 0));
