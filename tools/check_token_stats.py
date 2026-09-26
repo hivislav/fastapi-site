@@ -28,6 +28,9 @@ os.environ["AGENT_WORKSPACE_FILE"] = os.path.join(_TMP, "workspace.json")
 os.environ["AGENT_MEMORY_FILE"] = os.path.join(_TMP, "agent_memory.json")
 os.environ["AGENT_PROFILES_FILE"] = os.path.join(_TMP, "profiles.json")
 os.environ.setdefault("YANDEX_API_KEY", "test-key")
+# Ключ провайдера по умолчанию (deepseek-official): без него клиент считает,
+# что обращения к модели не было.
+os.environ.setdefault("DEEPSEEK_API_KEY", "test-key")
 
 from app.ai import agent as agent_mod  # noqa: E402
 from app.ai import client  # noqa: E402

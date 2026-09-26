@@ -29,12 +29,15 @@ import contextlib
 import contextvars
 import json
 import logging
+import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+from app.ai import attachments as attach_store
 from app.ai import client as llm_client
 from app.ai import service
 from app.ai import invariants as invariants_store
@@ -443,8 +446,14 @@ def _wants_restart(text: str) -> bool:
     return bool(_RESTART_RE.search(_normalized(text)))
 
 
-def _plan_message(state: "task_state.TaskState", autonomous: bool = False) -> str:
-    """Текст плана для чата (этап planning): шаги и что делать дальше."""
+def _plan_message(state: "task_state.TaskState", autonomous: bool = False,
+                  delivered: bool = False) -> str:
+    """Текст плана для чата (этап planning): шаги и что делать дальше.
+
+    `delivered` — результат по запросу УЖЕ получен внешними инструментами (данные
+    собраны, файл выгружен): подтверждение не спрашивается, и текст плана обязан
+    говорить то же самое. Иначе чат просил «нажмите ок», а задача уже шла.
+    """
     steps = state.steps or []
     plural = task_state.steps_word(len(steps))
     lines = [f"📋 План задачи — {len(steps)} {plural}:"]
@@ -453,6 +462,11 @@ def _plan_message(state: "task_state.TaskState", autonomous: bool = False) -> st
         lines.append(
             "Режим «работай автономно»: подтверждение плана не требуется — "
             "начинаю выполнение с первого шага."
+        )
+    elif delivered:
+        lines.append(
+            "Подтверждение не требуется: результат по запросу уже получен внешними "
+            "инструментами (данные собраны, файл приложен) — начинаю выполнять шаги."
         )
     else:
         lines.append(
@@ -535,6 +549,10 @@ def _log_event(dialog: Optional[Dict[str, Any]], event: Dict[str, Any]) -> None:
     В журнал идут только узлы окна чата: ответ (bot) и служебные сообщения
     (debug/error). Служебные события (state/usage/done/branches) не пишутся:
     это не сообщения, а состояние и замеры.
+
+    У узла ответа могут быть ВЛОЖЕНИЯ (`files`): файлы, которые вернули
+    MCP-инструменты. Они хранятся в журнале вместе с текстом — карточки со
+    ссылкой на скачивание видны и после переключения задачи.
     """
     if not dialog:
         return
@@ -544,7 +562,8 @@ def _log_event(dialog: Optional[Dict[str, Any]], event: Dict[str, Any]) -> None:
     elif kind == "error":
         workspace_store.add_log(dialog, workspace_store.LOG_ERROR, event.get("text"))
     elif kind == "bot":
-        workspace_store.add_log(dialog, workspace_store.LOG_ASSISTANT, event.get("text"))
+        workspace_store.add_log(dialog, workspace_store.LOG_ASSISTANT, event.get("text"),
+                                files=event.get("files"))
 
 
 def _defer_stop(session: Dict[str, Any], action: str) -> Optional[Dict[str, Any]]:
@@ -1368,8 +1387,8 @@ def _mcp_tools(found: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: str,
                          analyzer: Agent, state: "task_state.TaskState",
                          machine_step: bool = False, reuse: bool = False,
-                         fresh: bool = False
-                         ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+                         fresh: bool = False, approved: bool = False
+                         ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str], bool]:
     """Данные внешних инструментов MCP по запросу — ДО этапа планирования.
 
     Возвращает (данные вызовов, расход служебного вызова, строки диагностики).
@@ -1390,32 +1409,56 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
     инструменты выбираются и вызываются заново, а результат кладётся под ту же
     подпись — шаги этого повтора берут уже свежие данные. Какие это инструменты —
     неважно: набор объявляет сам сервер, и он у проекта может меняться.
+
+    `approved` — ПЛАН ПОДТВЕРЖДЁН (или задача автономная/периодическая): только
+    тогда выполняются вызовы, меняющие что-то на сервере (сохранение набора,
+    выгрузка файла, запуск сбора). До подтверждения выполняется ТОЛЬКО ЧТЕНИЕ —
+    данные для плана, без побочных эффектов и без файла в чате; отложенная часть
+    доигрывается на первом шаге выполнения (см. `_resume_mcp_chain`).
     """
     dialog = session["dialog"]
     enabled = workspace_store.mcp_enabled(task)
     if not enabled:
-        return [], {}, []
+        return [], {}, [], False
     # Служебные фразы описывают ПРЕЖНИЙ запрос задачи (state.request), новый текст
     # пользователя — сам является запросом.
     request_text = ((state.request or text or "").strip() if (reuse or machine_step)
                     else (text or "").strip())
+    # ДЕДЛАЙН ЦЕПОЧКИ. У обычной задачи это общий предел времени на цепочку
+    # (CHAIN_DEADLINE_S); у ПЕРИОДИЧЕСКОЙ — не больше половины её периода: повтор
+    # приходит по расписанию, и цепочка не имеет права «переехать» в следующий
+    # цикл (у задачи с периодом 60 с дедлайн получается ~30 с).
+    deadline = time.monotonic() + mcp_store.CHAIN_DEADLINE_S
+    meta = session.get("periodic") if isinstance(session.get("periodic"), dict) else {}
+    try:
+        interval = int((meta or {}).get("interval") or 0)
+    except (TypeError, ValueError):
+        interval = 0
+    if interval > 0:
+        deadline = time.monotonic() + min(mcp_store.CHAIN_DEADLINE_S,
+                                          max(20.0, interval * 0.5))
     signature = _mcp_signature(enabled, request_text)
     stored = workspace_store.dialog_mcp(dialog)
-    if not fresh and stored.get("signature") == signature:
+    chain_state = stored.get("chain") or {}
+    same_request = bool(stored.get("signature")) and stored.get("signature") == signature
+    # ЦЕПОЧКА НЕ ДОИГРАНА: до подтверждения плана выполнены только чтения, а
+    # сохранение и выгрузка ждали «ок». Теперь их пора выполнить — доигрываем.
+    resume = bool(approved and chain_state.get("pending") and same_request)
+    if not fresh and same_request and not resume:
         # Данные по этому запросу уже собраны (шаг плана, проверка результата или
         # повтор того же запроса) — служебного вызова и обращений к серверам нет.
-        return list(stored.get("results") or []), {}, []
-    if (reuse or machine_step) and not fresh:
+        return list(stored.get("results") or []), {}, [], False
+    if (reuse or machine_step) and not fresh and not resume:
         # Данных по запросу задачи в диалоге нет (например, задача пришла из
         # файла до первого шага): выбирать инструменты по служебной фразе нельзя.
-        return [], {}, []
+        return [], {}, [], False
     # ПОВТОР периодической задачи по ТОМУ ЖЕ запросу: спрашивать диспетчера заново
     # не нужно — вызовы уже выбраны, меняются только данные. Повторяем ЧИТАЮЩИЕ
     # вызовы (запуски сбора НЕ повторяем: сбор уже идёт, а второй запуск завёл бы
     # дубль на сервере). Так ответ повтора не остаётся без данных и не «плывёт»:
     # в живой задаче повтор решил, что данные не нужны, и погоды в ответе не было.
     replay = []
-    if fresh and str(stored.get("request") or "") == request_text:
+    if fresh and not resume and str(stored.get("request") or "") == request_text:
         # Повторяем только те вызовы, которые В ПРОШЛЫЙ РАЗ ДАЛИ ДАННЫЕ: сломанный
         # вызов (например, отчёт по придуманному id) повторять бессмысленно — он
         # снова откажет, а модель, оставшись без данных, начинает их выдумывать
@@ -1423,14 +1466,37 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
         # Такой повтор выбирает инструменты заново — уже с блоком про идущие сборы.
         replay = _replayable_calls(stored)
     if replay:
-        results = await mcp_store.async_run_calls(replay)
+        # Повтор выполняет ВСЮ цепочку прошлого раза, а не один её раунд: у
+        # `async_run_calls` умолчание — предел ОДНОГО раунда (3 вызова), и без
+        # явного предела последний вызов цепочки (выгрузка файла) молча терялся —
+        # повтор оставался без свежего файла.
+        chain_state = stored.get("chain") or {}
+        # Повторная запись того же набора: сервер отказывает без флага перезаписи,
+        # а в повторе диспетчер не спрашивается — ставим флаг сами (см.
+        # mcp_store.enforce_overwrite). Схемы инструментов берём из объявленного
+        # списка: он кэширован в памяти, отдельного обращения к серверу нет.
+        try:
+            found_now = await mcp_store.async_discover(enabled)
+            known_tools = _mcp_tools(found_now)
+        except Exception:  # noqa: BLE001 — без схем повтор просто идёт как раньше
+            logger.warning("MCP: список инструментов для повтора не получен",
+                           exc_info=True)
+            known_tools = []
+        overwrites = mcp_store.enforce_overwrite(
+            replay, known_tools, chain_state.get("ids") or {})
+        results = await mcp_store.async_run_calls(
+            replay, limit=mcp_store.MAX_TOTAL_CALLS_PER_REQUEST)
         workspace_store.set_dialog_mcp(dialog, signature, request_text, results,
                                        calls=replay)
-        return results, {}, [
+        lines = [
             "MCP: повтор — те же запросы данных, что и в прошлый раз ("
             + ", ".join(f"{call['server']} · {call['tool']}" for call in replay)
             + "), только свежие."
         ]
+        for note in overwrites:
+            lines.append("MCP: повторная запись того же ключа — ставлю флаг "
+                         f"перезаписи ({note}).")
+        return results, {}, lines, True
     if fresh and str(stored.get("request") or "") == request_text and stored.get("calls"):
         # Повторять нечего (прошлые вызовы — только запуски сбора или все отказали):
         # выбираем инструменты заново и говорим об этом в чате.
@@ -1445,13 +1511,38 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                  + "; ".join(f"{item['id']}: {item['error'] or 'нет инструментов'}"
                              for item in found)]
         workspace_store.set_dialog_mcp(dialog, signature, request_text, [])
-        return [], {}, lines
+        return [], {}, lines, False
     # Уже идущие внешние сборы ЭТОЙ задачи (наблюдения, подписки): модель видит их
     # и не начинает заново, а данные читает по их id — иначе каждый повтор заводил
     # бы новое наблюдение на сервере (см. started_calls).
     started = workspace_store.mcp_started(dialog)
-    calls = await analyzer.choose_mcp_tools(request_text, tools, started=started)
+    if resume:
+        # ПЛАН ПОДТВЕРЖДЁН, а цепочка осталась не доигранной: до «ок» выполнялись
+        # только чтения, сохранение и выгрузка ждали подтверждения. Доигрываем.
+        return await _resume_mcp_chain(dialog, signature, request_text, tools,
+                                       analyzer, stored, deadline, started,
+                                       lines_pre)
+    # РЕШЕНИЕ ДИСПЕТЧЕРА + МАРШРУТИЗАЦИЯ (гибридная схема). Разовый запрос идёт
+    # одним раундом — дешёвым путём, как раньше. Многошаговый (следующий вызов
+    # зависит от результата предыдущего: сохранить прочитанное, выгрузить файл по
+    # полученному идентификатору) уходит в ограниченный цикл. Режим объявляет сам
+    # диспетчер, а дешёвые признаки (маркеры в запросе + схемы инструментов)
+    # подтверждают его: так «какая погода в Казани» не платит за цикл, а «получи,
+    # сохрани и отдай Excel» доходит до конца.
+    decision = await analyzer.decide_mcp_tools(
+        request_text, tools, started=started, chain_state=stored.get("chain"))
     usage = dict(analyzer.last_usage or {})
+    calls = list(decision.get("calls") or [])
+    signals = mcp_store.chain_signals(tools, request_text, expected=len(calls))
+    chain_mode = str(decision.get("mode") or "") == "chain" or bool(signals.get("needed"))
+    if chain_mode:
+        lines_pre.append(
+            "MCP: задача многошаговая — работаю цепочкой (до "
+            f"{mcp_store.MAX_CHAIN_ITERATIONS} раундов и "
+            f"{mcp_store.MAX_TOTAL_CALLS_PER_REQUEST} вызовов). Причина: "
+            + (mcp_store.chain_reason(signals)
+               or "диспетчер объявил режим chain: следующий вызов зависит "
+                  "от результата предыдущего"))
     # ВЫБОР ТОЛЬКО ИЗ ДЕЙСТВИЙ — это не данные: агенту нечего сказать по такому
     # ответу. Спрашиваем диспетчера ещё раз, прямо требуя ЧИТАЮЩИЙ вызов: запрос
     # «проверяй погоду раз в минуту» превращался в «зарегистрировать наблюдение»,
@@ -1468,16 +1559,67 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                     f"{call['server']} · {call['tool']}"
                     for call in mcp_store.read_calls(retry, tools)) + ").")
             calls = retry
+    if not calls and chain_mode:
+        # ДИСПЕТЧЕР ОТВЕТИЛ «ДАННЫЕ НЕ НУЖНЫ» на запрос, который явно просит
+        # сохранить/выгрузить. Это живой случай: на один и тот же запрос модель то
+        # строит цепочку, то возвращает пустой список — и задача остаётся без
+        # данных и без файла. Переспрашиваем ОДИН раз, назвав невызванные
+        # инструменты, которые создают результат (см. deliver_note): нужен
+        # читающий вызов и режим chain, дальше цепочка дойдёт сама.
+        candidates = mcp_store.delivery_candidates(
+            tools, {(str(c.get("server") or ""), str(c.get("tool") or "")) for c in calls})
+        if candidates:
+            retry = await analyzer.decide_mcp_tools(
+                request_text, tools, started=started,
+                extra=mcp_store.deliver_note(candidates, request_text, initial=True))
+            usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+            if retry.get("calls"):
+                calls = list(retry["calls"])
+                lines_pre.append(
+                    "MCP: диспетчер ответил «данные не нужны», хотя запрос просит "
+                    "сохранить/выгрузить — переспросил ("
+                    + ", ".join(f"{call['server']} · {call['tool']}" for call in calls)
+                    + ").")
+                if str(retry.get("mode") or "") == "chain":
+                    chain_mode = True
     if not calls:
         workspace_store.set_dialog_mcp(dialog, signature, request_text, [])
         return [], usage, lines_pre + [
             f"MCP: проверил внешние инструменты ({len(enabled)} "
             f"{'сервер' if len(enabled) == 1 else 'сервера'}, {len(tools)} "
             "инструментов) — для этого запроса данные не нужны."
-        ]
+        ], False
+    # ФАЗА ДО ПОДТВЕРЖДЕНИЯ ПЛАНА: выполняем ТОЛЬКО ЧТЕНИЯ. Вызовы, которые что-то
+    # меняют на сервере (сохранение набора, выгрузка файла, запуск сбора),
+    # откладываются: пользователь утверждает план до любых побочных эффектов, а
+    # файл не появляется в чате раньше плана.
+    deferred_note = ""
+    if not approved:
+        reads, effects = mcp_store.split_calls(calls, tools)
+        if effects:
+            deferred_note = mcp_store.calls_note(effects)
+            lines_pre.append(
+                "MCP: до подтверждения плана выполняю только чтение — изменения "
+                f"отложены до «ок»: {deferred_note}.")
+        calls = reads
+        if not calls:
+            # Читать нечего, а изменения ждут подтверждения: цепочка остаётся
+            # не доигранной и продолжится на первом шаге выполнения.
+            workspace_store.set_dialog_mcp(dialog, signature, request_text, [],
+                                           calls=[], chain={"pending": True})
+            return [], usage, lines_pre + [
+                "MCP: запрос выполняется внешними инструментами — изменения "
+                "выполню после подтверждения плана."], False
     # Помечаем вызовы (действие или чтение) ДО сохранения: повтору это скажет,
     # что можно повторять, а что нет.
     mcp_store.mark_call_kinds(calls, tools)
+    # Повторная запись под ключом, который задача уже использовала (правка запроса,
+    # второй прогон той же задачи): флаг перезаписи ставим сами — иначе сервер
+    # откажет, а данные не обновятся.
+    for note in mcp_store.enforce_overwrite(
+            calls, tools, (stored.get("chain") or {}).get("ids") or {}):
+        lines_pre.append("MCP: повторная запись того же ключа — ставлю флаг "
+                         f"перезаписи ({note}).")
     results = await mcp_store.async_run_calls(calls)
     workspace_store.set_dialog_mcp(dialog, signature, request_text, results,
                                    calls=calls)
@@ -1535,7 +1677,274 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                 + ", ".join(f"{call['server']} · {call['tool']}" for call in reads)
                 + ").")
             lines.append(mcp_store.results_note(fresh_results))
-    return results, usage, lines
+    if chain_mode and not approved:
+        # ДО ПОДТВЕРЖДЕНИЯ ПЛАНА РАУНДЫ ЦЕПОЧКИ НЕ НУЖНЫ: данные для плана уже
+        # прочитаны, а результат (сохранение, выгрузка) всё равно откладывается до
+        # «ок» — значит спрашивать диспетчера не о чем, его предложения были бы
+        # тут же отложены. Каждый такой вопрос — целый вызов LLM с самым дорогим
+        # промптом (живой замер: 5–8 тыс. входных токенов), и он тратился впустую.
+        # Помечаем цепочку не доигранной: после «ок» её продолжит _resume_mcp_chain.
+        keep_ids = mcp_store.extract_ids(results)
+        for key, value in mcp_store.produced_ids(calls).items():
+            keep_ids.setdefault(key, value)
+        workspace_store.set_dialog_mcp(
+            dialog, signature, request_text, results, calls=calls,
+            chain={"ids": keep_ids,
+                   "keys": sorted(mcp_store.call_key(call) for call in calls),
+                   "iterations": 0, "pending": True})
+        lines.append("MCP: цепочка продолжится после подтверждения плана — результат "
+                     "(сохранение и файл) выдаётся на последнем шаге.")
+    elif chain_mode:
+        # ЦЕПОЧКА: следующие вызовы строятся по РЕЗУЛЬТАТАМ (сохранить данные,
+        # выгрузить файл по id из ответа сервера). Границы — итерации, суммарные
+        # вызовы и время (см. _mcp_chain).
+        results, calls, usage, lines = await _mcp_chain(
+            dialog, request_text, tools, results, calls, analyzer, usage, signals,
+            signature, deadline=deadline,
+            started=workspace_store.mcp_started(dialog),
+            chain_state=stored.get("chain"), lines=lines, approved=approved)
+    return results, usage, lines, True
+
+
+async def _resume_mcp_chain(dialog: Dict[str, Any], signature: str, request_text: str,
+                            tools: List[Dict[str, Any]], analyzer: Agent,
+                            stored: Dict[str, Any], deadline: float,
+                            started: Optional[List[Dict[str, Any]]] = None,
+                            lines_pre: Optional[List[str]] = None
+                            ) -> Tuple[List[Dict[str, Any]], Dict[str, Any],
+                                       List[str], bool]:
+    """Доигрывает цепочку ПОСЛЕ подтверждения плана.
+
+    Гибридная схема: до «ок» выполнялись только ЧТЕНИЯ (по ним построен план), а
+    вызовы, меняющие что-то на сервере (сохранение набора, выгрузка файла),
+    остались отложенными. Теперь план подтверждён — цепочка продолжается с того же
+    места: диспетчер видит прежние результаты и выбирает следующие вызовы сам
+    (сохранение, затем выгрузка по идентификатору из ответа сервера). Границы,
+    защита и идемпотентность — те же (см. `_mcp_chain`).
+
+    Результаты и вызовы прежней фазы берутся из диалога, поэтому чтения не
+    повторяются: их ключи уже в `done_keys`.
+    """
+    chain_state = stored.get("chain") or {}
+    results = list(stored.get("results") or [])
+    calls = list(stored.get("calls") or [])
+    signals = mcp_store.chain_signals(tools, request_text, expected=len(calls))
+    lines = list(lines_pre or [])
+    lines.append("MCP: план подтверждён — доигрываю цепочку: выполняю отложенные "
+                 "шаги (сохранение результата и выгрузка файла).")
+    results, calls, usage, lines = await _mcp_chain(
+        dialog, request_text, tools, results, calls, analyzer, {}, signals,
+        signature, deadline=deadline, started=started,
+        chain_state=chain_state, lines=lines, approved=True)
+    return results, usage, lines, True
+
+
+async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
+                     tools: List[Dict[str, Any]], results: List[Dict[str, Any]],
+                     calls: List[Dict[str, Any]], analyzer: Agent,
+                     usage: Dict[str, Any], signals: Dict[str, Any],
+                     signature: str, deadline: float,
+                     started: Optional[List[Dict[str, Any]]] = None,
+                     chain_state: Optional[Dict[str, Any]] = None,
+                     lines: Optional[List[str]] = None,
+                     approved: bool = True
+                     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
+                                Dict[str, Any], List[str]]:
+    """ЦЕПОЧКА вызовов по результатам (agent loop) — вторая половина гибридной схемы.
+
+    Каждый раунд: диспетчер получает запрос, список инструментов и ДАЙДЖЕСТ уже
+    выполненных вызовов (короткие результаты, найденные идентификаторы, подсказки
+    «что теперь возможно») и решает, нужен ли СЛЕДУЮЩИЙ вызов. Так собираются
+    задачи с зависимостью по данным: «получи прогноз → сохрани → выгрузи Excel»,
+    где идентификатор сохранённого набора приходит только из ответа сервера.
+
+    Останавливаемся, когда: диспетчер сказал «готово»; новых вызовов нет;
+    исчерпан бюджет вызовов или раундов; вышло время. Недопустимые вызовы
+    (выдуманный идентификатор, разрушительный без просьбы пользователя, повтор
+    уже выполненного) отбрасываются ДО выполнения — см. mcp_store.guard_calls.
+
+    Возвращает накопленные результаты, вызовы, расход и строки диагностики.
+    """
+    lines = list(lines or [])
+    done_keys = {mcp_store.call_key(call) for call in calls}
+    chain_ids = mcp_store.extract_ids(results)
+    for key, value in ((chain_state or {}).get("ids") or {}).items():
+        chain_ids.setdefault(str(key), str(value))
+    # Идентификаторы, которые НАЗВАЛИ создающие вызовы (save_/create_/…): их можно
+    # переиспользовать дальше (выгрузить файл по сохранённому набору, обновить его
+    # на повторе), хотя в результатах их ещё не было.
+    issued = dict(mcp_store.produced_ids(calls))
+    issued.update(chain_ids)
+    # Уточнение «запрос просил сохранить/выгрузить — вызова не было»: уходит в
+    # условие СЛЕДУЮЩЕГО раунда (см. deliver_note). `nudged` не даёт уговаривать
+    # диспетчера повторно — иначе это превратилось бы в цикл уговоров.
+    nudge_pending = ""
+    nudged = False
+    # До подтверждения плана изменения откладываются: признак «цепочка не
+    # доиграна» уходит в диалог, и после «ок» её продолжит `_resume_mcp_chain`.
+    pending = False
+    deferred_names: List[str] = []
+    # Очевидная достройка (см. auto_followup): вычисляется после раунда и
+    # выполняется следующим раундом БЕЗ вызова диспетчера.
+    auto_call: Optional[Dict[str, Any]] = None
+    for round_number in range(1, mcp_store.MAX_CHAIN_ITERATIONS + 1):
+        if time.monotonic() > deadline:
+            lines.append("MCP: время, отведённое на цепочку, вышло — останавливаюсь "
+                         "на том, что уже получено.")
+            break
+        remaining = mcp_store.MAX_TOTAL_CALLS_PER_REQUEST - len(calls)
+        if remaining <= 0:
+            lines.append(f"MCP: предел вызовов за запрос "
+                         f"({mcp_store.MAX_TOTAL_CALLS_PER_REQUEST}) достигнут — "
+                         "цепочка остановлена.")
+            break
+        if auto_call is not None:
+            # ОЧЕВИДНАЯ ДОСТРОЙКА БЕЗ МОДЕЛИ: остался ровно один невызванный
+            # инструмент результата, и все его обязательные аргументы — уже
+            # известные идентификаторы (см. auto_followup). Спрашивать
+            # диспетчера незачем: это целый вызов LLM с самым дорогим промптом.
+            allowed, rejected = [auto_call], []
+            lines.append("MCP: остался один очевидный шаг результата — вызываю "
+                         f"без диспетчера ({auto_call['server']} · {auto_call['tool']}).")
+            auto_call = None
+        else:
+            extra = mcp_store.chain_note(round_number, mcp_store.MAX_CHAIN_ITERATIONS,
+                                         remaining, signals)
+            if nudge_pending:
+                # ПРИНУДИТЕЛЬНОЕ УТОЧНЕНИЕ: диспетчер непостоянен — на один и тот
+                # же запрос он то строит цепочку, то решает «данных хватает». Если
+                # запрос просит сохранить/выгрузить, а вызовов для этого не было,
+                # называем подходящие инструменты прямо (см. deliver_note).
+                # Уточнение уходит РОВНО в один следующий раунд.
+                extra += "\n\n" + nudge_pending
+                nudge_pending = ""
+            decision = await analyzer.decide_mcp_tools(
+                request_text, tools, started=started,
+                extra=extra,
+                results=results,
+                remaining=remaining,
+                chain_state={"ids": chain_ids} if chain_ids else None)
+            usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+            allowed, rejected = mcp_store.guard_calls(
+                decision.get("calls"), results, tools,
+                user_text=request_text, done_keys=done_keys, issued_ids=issued)
+        for item in rejected:
+            lines.append(f"MCP: вызов {item['server']} · {item['tool']} отброшен — "
+                         f"{item['reason']}.")
+        if not approved:
+            # ДО ПОДТВЕРЖДЕНИЯ ПЛАНА раунд выполняет только ЧТЕНИЯ: вызовы,
+            # меняющие что-то на сервере (сохранение, выгрузка, запуск сбора),
+            # откладываются до «ок» — пользователь утверждает план до побочных
+            # эффектов, а файл не появляется в чате раньше плана.
+            reads, effects = mcp_store.split_calls(allowed, tools)
+            if effects:
+                names = mcp_store.calls_note(effects)
+                deferred_names.extend(str(call.get("tool") or "") for call in effects)
+                lines.append("MCP: до подтверждения плана изменения не выполняю — "
+                             f"отложено до «ок»: {names}.")
+            allowed = reads
+        allowed = allowed[:remaining]
+        if not allowed:
+            reason = str((decision or {}).get("reason") or "").strip()
+            if not approved and deferred_names:
+                # Отложенная часть есть, но выполнять её до «ок» нельзя: цепочка
+                # остаётся НЕ ДОИГРАННОЙ и продолжится на первом шаге выполнения.
+                pending = True
+                lines.append("MCP: цепочка продолжится сразу после подтверждения плана.")
+                keep_ids = dict(chain_ids)
+                for key, value in issued.items():
+                    keep_ids.setdefault(key, value)
+                workspace_store.set_dialog_mcp(
+                    dialog, signature, request_text, results, calls=calls,
+                    chain={"ids": keep_ids, "keys": sorted(done_keys),
+                           "iterations": round_number, "pending": True})
+                break
+            # Запрос просил «сделать с данными ещё шаг», а вызовов для этого нет:
+            # спрашиваем диспетчера ЕЩЁ РАЗ, назвав невызванные инструменты, которые
+            # создают результат (файл, набор, отчёт). Один раз на цепочку — иначе
+            # это превратилось бы в цикл уговоров.
+            if not nudged and not rejected:
+                done_pairs = {(str(call.get("server") or ""), str(call.get("tool") or ""))
+                              for call in calls}
+                candidates = mcp_store.delivery_candidates(tools, done_pairs)
+                if candidates:
+                    nudged = True
+                    nudge_pending = mcp_store.deliver_note(candidates, request_text)
+                    lines.append(
+                        "MCP: запрос просит сохранить/выгрузить, а вызовов для этого "
+                        "не было — уточняю задачу диспетчеру ("
+                        + ", ".join(item["tool"] for item in candidates[:5]) + ").")
+                    continue
+            if (decision or {}).get("done") and not rejected:
+                lines.append("MCP: цепочка завершена — "
+                             + (reason or "всё нужное выполнено") + ".")
+            else:
+                lines.append("MCP: допустимых новых вызовов нет — цепочка закончена."
+                             if rejected else
+                             "MCP: новых вызовов не требуется — цепочка закончена.")
+            break
+        mcp_store.mark_call_kinds(allowed, tools)
+        # Раунд цепочки повторно пишет под уже известным ключом? Ставим флаг
+        # перезаписи сами (сервер иначе отказывает) — до выполнения вызовов.
+        known_ids = dict(chain_ids)
+        for key, value in issued.items():
+            known_ids.setdefault(key, value)
+        for note in mcp_store.enforce_overwrite(allowed, tools, known_ids):
+            lines.append("MCP: повторная запись того же ключа — ставлю флаг "
+                         f"перезаписи ({note}).")
+        fresh_results = await mcp_store.async_run_calls(allowed, limit=remaining)
+        results = list(results) + fresh_results
+        calls = list(calls) + allowed
+        done_keys |= {mcp_store.call_key(call) for call in allowed}
+        chain_ids.update(mcp_store.extract_ids(fresh_results))
+        # Идентификаторы, названные создающими вызовами (save_/create_/…): сервер их
+        # принял, значит они существуют. Храним их вместе с цепочкой — повтор
+        # периодической задачи обновляет ТОТ ЖЕ набор, а не заводит новый.
+        issued.update(mcp_store.produced_ids(allowed))
+        keep_ids = dict(chain_ids)
+        for key, value in issued.items():
+            keep_ids.setdefault(key, value)
+        # Сохраняем ПОСЛЕ каждого раунда: шаги плана и проверка результата видят
+        # всю цепочку, а повтор периодической задачи — её идентификаторы.
+        stored = workspace_store.set_dialog_mcp(
+            dialog, signature, request_text, results, calls=calls,
+            chain={"ids": keep_ids, "keys": sorted(done_keys),
+                   "iterations": round_number, "pending": False})
+        mcp_store.mark_actions(stored.get("results") or [], tools)
+        fresh_started = mcp_store.started_calls(stored.get("results") or [], tools)
+        if fresh_started:
+            workspace_store.add_mcp_started(dialog, fresh_started)
+            lines.append("MCP: задача запустила внешний сбор ("
+                         + "; ".join(f"{item['server']} · {item['tool']}"
+                                     for item in fresh_started)
+                         + ") — он остановится вместе с задачей.")
+        lines.append(f"MCP: раунд {round_number} цепочки — "
+                     + ", ".join(f"{call['server']} · {call['tool']}"
+                                 for call in allowed) + ".")
+        lines.append(mcp_store.results_note(fresh_results))
+        # ФАЙЛ ВЫДАН — ЦЕПОЧКА ЗАКОНЧЕНА. Если раунд принёс вложение (файл), а
+        # невызванных инструментов, создающих результат, больше нет, спрашивать
+        # диспетчера «всё ли готово» незачем: это ещё один ПОЛНЫЙ вызов LLM
+        # (промпт диспетчера — самая дорогая часть задачи), а решение очевидно.
+        if any(item.get("attachments") for item in fresh_results):
+            done_pairs = {(str(call.get("server") or ""), str(call.get("tool") or ""))
+                          for call in calls}
+            if not mcp_store.delivery_candidates(tools, done_pairs):
+                lines.append("MCP: файл выдан, других инструментов результата нет — "
+                             "цепочка завершена.")
+                break
+        # Осталась одна очевидная достройка результата? Выполним её без модели
+        # (см. auto_followup): решение однозначно, а вызов диспетчера — самый
+        # дорогой вызов задачи.
+        if approved and not pending:
+            done_pairs = {(str(call.get("server") or ""), str(call.get("tool") or ""))
+                          for call in calls}
+            auto_call = mcp_store.auto_followup(tools, done_pairs, keep_ids)
+    else:
+        lines.append(f"MCP: исчерпан предел раундов цепочки "
+                     f"({mcp_store.MAX_CHAIN_ITERATIONS}) — останавливаюсь на "
+                     "достигнутом.")
+    return results, calls, usage, lines
 
 
 def _looks_like_data_table(text: str) -> bool:
@@ -1600,6 +2009,24 @@ def _mcp_debug() -> str:
     """Строка диагностики перед выбором инструментов (что именно происходит)."""
     return ("MCP: проверяю внешние инструменты проекта (служебный вызов LLM) — "
             "какие данные нужны для этого запроса.")
+
+
+def _mcp_files_text(files: List[Dict[str, Any]]) -> str:
+    """Подпись узла чата с файлами, полученными от MCP-инструментов.
+
+    Сам файл показывается карточкой со ссылкой на скачивание (её рисует
+    интерфейс по полю `files`); текст — короткое пояснение, что это и откуда.
+    """
+    if not files:
+        return ""
+    if len(files) == 1:
+        item = files[0]
+        origin = f" ({item['origin']})" if item.get("origin") else ""
+        return (f"📎 Файл готов: {item['name']} — {item['size_text']}{origin}. "
+                "Скачать можно по ссылке в карточке ниже.")
+    return ("📎 Готовы файлы: "
+            + "; ".join(f"{item['name']} ({item['size_text']})" for item in files)
+            + ". Скачать можно по ссылкам в карточках ниже.")
 
 
 async def _stop_mcp_started(session: Optional[Dict[str, Any]], reason: str) -> List[str]:
@@ -2390,6 +2817,14 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         # Данные внешних инструментов MCP по текущему запросу задачи: заполняются
         # ДО планирования (см. _preflight_mcp) и уходят в план, ответ и проверку.
         mcp_data: List[Dict[str, Any]] = []
+        # Файлы, полученные инструментами в ЭТОМ запросе (карточки в чате), и
+        # признак «готовый результат уже есть» (по нему не спрашиваем
+        # подтверждение плана: работа сделана, ждать пользователя нечего).
+        mcp_files: List[Dict[str, Any]] = []
+        mcp_delivered = False
+        # Карточка файла, которую показываем ПОСЛЕ финального отчёта (см. ниже).
+        mcp_files_event: Optional[Dict[str, Any]] = None
+        mcp_files_shown = False
         try:
             async with _session_lock(session["id"]):
                 # Сессию, диалог и состояние берём ПОД блокировкой СВОЕЙ задачи:
@@ -2675,12 +3110,18 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 #     берут их оттуда, не выбирая инструменты заново.
                 #     Ответственный расход этого запроса — отдельная служебная
                 #     строка («из них служебные вызовы», вид "mcp").
+                #     ПОСЛЕДНИЙ ЛИ ЭТО ШАГ ПЛАНА: результат работы (сохранение
+                #     данных и файл) выдаётся именно на нём — перед финальным
+                #     отчётом. До последнего шага и до подтверждения плана внешние
+                #     инструменты только читают.
+                _steps_total = int(getattr(state, "steps_total", 0) or 0)
+                last_step = bool(_steps_total) and int(state.step_number or 0) >= _steps_total
                 if workspace_store.mcp_enabled(task_now):
                     if not machine_step:
                         yield encode({"type": "debug", "text": (
                             f"{_MACHINE}: " + _mcp_debug()
                         )})
-                    mcp_data, mcp_usage, mcp_lines = await _preflight_mcp(
+                    mcp_data, mcp_usage, mcp_lines, mcp_fresh = await _preflight_mcp(
                         task_now, session_now, text, analyzer, state,
                         machine_step=machine_step,
                         # Подтверждение плана и фразы управления («работай
@@ -2693,11 +3134,43 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # данные нужны СВЕЖИЕ — иначе повтор отдавал бы в чат
                         # числа прошлого повтора (подпись «серверы + запрос» у
                         # них та же).
-                        fresh=periodic_run)
+                        fresh=periodic_run,
+                        # ГИБРИДНАЯ СХЕМА: до подтверждения плана внешние
+                        # инструменты только ЧИТАЮТ. Вызовы, которые создают
+                        # РЕЗУЛЬТАТ (сохранение набора, выгрузка файла), выполняются
+                        # на ПОСЛЕДНЕМ шаге плана — перед финальным отчётом: так
+                        # пользователь видит сначала готовый ответ, а под ним
+                        # таблицу, а не наоборот. До последнего шага и до «ок»
+                        # результат откладывается (см. `_resume_mcp_chain`).
+                        approved=bool((confirmed or machine_step or autonomous
+                                       or periodic_run) and last_step))
                     if mcp_usage:
                         usage = merge_usage(usage, mcp_usage)
                     for line in mcp_lines:
                         yield encode({"type": "debug", "text": f"{_MACHINE}: {line}"})
+                    # ФАЙЛЫ от MCP-инструментов (xlsx и т. п.): их отдаём
+                    # пользователю КАРТОЧКОЙ в чате со ссылкой на скачивание
+                    # (см. GET /api/agent/files/{id}). Узел пишется в журнал
+                    # сессии, поэтому карточки видны и после переключения задачи.
+                    # Показываем только файлы, полученные СЕЙЧАС: шаги плана и
+                    # проверка берут данные из диалога, и без этой проверки одна и
+                    # та же карточка появлялась бы в чате на каждом шаге.
+                    mcp_files = mcp_store.attachments_of(mcp_data) if mcp_fresh else []
+                    # Готовый результат (файл или сохранённый набор), полученный в
+                    # ЭТОМ запросе: по нему решается, нужно ли вообще спрашивать
+                    # подтверждение плана (см. ниже).
+                    mcp_delivered = bool(mcp_fresh) and mcp_store.produced_result(mcp_data)
+                    if mcp_files:
+                        # КАРТОЧКА ФАЙЛА — ПОСЛЕ ФИНАЛЬНОГО ОТЧЁТА, а не до него:
+                        # пользователь видит сначала ответ, а под ним — таблицу
+                        # (см. `mcp_files_event` ниже). В журнал узел попадёт САМ:
+                        # encode() пишет каждое событие через _log_event, а ручная
+                        # запись здесь давала ДВЕ одинаковые карточки в чате.
+                        mcp_files_event = {
+                            "type": "bot",
+                            "text": _mcp_files_text(mcp_files),
+                            "files": mcp_files,
+                        }
 
                 async def run_validation(answered_step: bool, step_errors: List[str],
                                          stored_exchange: bool, resumed: bool):
@@ -3022,7 +3495,8 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             f"{_MACHINE}: план готов — {len(steps)} {steps_plural}"
                             + (": " + "; ".join(steps) if steps else ".")
                         )})
-                        plan_text = _plan_message(state, autonomous=state.autonomous)
+                        plan_text = _plan_message(state, autonomous=state.autonomous,
+                                                  delivered=mcp_delivered)
                         # Запрос пользователя и показанный план — в память диалога
                         # сессии: иначе после переключения сессии/перезагрузки их
                         # не было бы видно в окне чата (память хранила только
@@ -3039,11 +3513,26 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                     if periodic_run else {})})
                         dialog_now.setdefault("messages", []).append(
                             {"role": "assistant", "content": plan_text})
-                        if state.autonomous:
-                            task_state.plan_ready(
-                                state, steps,
-                                "режим «работай автономно» — подтверждение плана не требуется",
-                            )
+                        if state.autonomous or mcp_delivered:
+                            # РАБОТА УЖЕ ВЫПОЛНЕНА ИНСТРУМЕНТАМИ (цепочка MCP
+                            # собрала данные, сохранила набор и выгрузила файл):
+                            # подтверждение плана спрашивать не о чем — пользователь
+                            # не может «поправить» уже сделанное, а задача висела бы
+                            # в ожидании при готовом результате (живой случай: файл
+                            # в чате есть, а полоса этапов просит «ок»). План
+                            # подтверждаем сами и идём выполнять ответ.
+                            reason = ("режим «работай автономно» — подтверждение "
+                                      "плана не требуется" if state.autonomous else
+                                      "результат уже получен внешними инструментами "
+                                      "(файл приложен) — подтверждение плана не требуется")
+                            if mcp_delivered and not state.autonomous:
+                                yield encode({"type": "debug", "text": (
+                                    f"{_MACHINE}: результат по запросу уже получен "
+                                    "внешними инструментами (вложение/сохранённый "
+                                    "набор) — план подтверждаю сам, задача не ждёт "
+                                    "пользователя."
+                                )})
+                            task_state.plan_ready(state, steps, reason)
                             yield encode({"type": "bot", "text": plan_text})
                         else:
                             task_state.await_confirmation(
@@ -3143,7 +3632,26 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             # Предупреждение о лимите токенов — не провал шага.
                             if _LIMIT_WARNING_MARK not in note:
                                 errors.append(note)
+                        if kind == "bot" and not last_step \
+                                and str(event.get("text") or "").strip():
+                            # ПРОМЕЖУТОЧНЫЙ ШАГ: его ответ не показываем репликой
+                            # в чате — работа идёт по плану, а ход виден в журнале
+                            # (debug). Сам текст остаётся в ПАМЯТИ диалога: он нужен
+                            # следующему шагу и проверке результата (см. `memory`
+                            # ниже), поэтому «прячем» только показ, а не данные.
+                            yield encode({"type": "debug", "text": (
+                                f"{_MACHINE}: {state.step_label()} выполнен — ответ "
+                                "ушёл в следующий шаг и в проверку (в чате не "
+                                "показываю: смотрите журнал работы выше)."
+                            )})
+                            continue
                         yield encode(event)
+                        # ФИНАЛЬНЫЙ ОТЧЁТ + ТАБЛИЦА: карточка файла идёт ПОСЛЕ
+                        # ответа последнего шага, чтобы пользователь видел сначала
+                        # готовый отчёт, а под ним — файл.
+                        if kind == "bot" and mcp_files_event and not mcp_files_shown:
+                            yield encode(mcp_files_event)
+                            mcp_files_shown = True
                     # Обмен завершён — запоминаем реплики и состояние стратегии
                     # (резюме и его границу, факты, ветви плана, активную ветку)
                     # В ДИАЛОГЕ ЭТОЙ СЕССИИ.
@@ -3315,6 +3823,13 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 await _persist()
                 yield encode(_state_event(session_now, state))
 
+                # Карточка файла, если финального ответа в этом запросе не было
+                # (шаг не выполнен, пауза, отмена): файл всё равно получен и его
+                # надо показать — но ВСЕГДА после ответа, а не до него.
+                if mcp_files_event and not mcp_files_shown:
+                    yield encode(mcp_files_event)
+                    mcp_files_shown = True
+
                 # Финальный замер запроса одним событием "done": в этой ветке
                 # (обычный ответ шага) раньше событие не отправлялось вовсе, и
                 # панель токенов показывала только внутренний замер агента — без
@@ -3371,6 +3886,23 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 _running_sessions.discard(str(session_now["id"]))
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@router.get("/agent/files/{file_id}")
+async def agent_file(file_id: str) -> FileResponse:
+    """СКАЧИВАНИЕ файла, который вернул MCP-инструмент (карточка файла в чате).
+
+    Файлы инструментов сохраняются на диск при получении (см.
+    app/ai/attachments.py), а в диалоге и журнале остаётся ссылка на этот
+    маршрут. Каталог вложений — единственное место, откуда отдаются файлы: id
+    проверяется шаблоном (никаких путей и `..`), поэтому скачать что-то другое
+    через этот маршрут нельзя.
+    """
+    path = attach_store.resolve(file_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    return FileResponse(path, filename=os.path.basename(path),
+                        media_type="application/octet-stream")
 
 
 @router.get("/agent/history")

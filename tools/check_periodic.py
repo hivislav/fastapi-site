@@ -186,7 +186,12 @@ def install_mcp_stubs() -> None:
             ],
         } for server_id in (ids or [mcp_store.OPEN_METEO])]
 
-    async def fake_run_calls(calls):
+    async def fake_run_calls(calls, limit=None):
+        # Лимит соблюдаем как настоящий run_calls: у него умолчание — предел
+        # ОДНОГО раунда (3), а повтор периодической задачи выполняет цепочку
+        # целиком и передаёт предел запроса (иначе вызовы терялись бы молча).
+        cap = mcp_store.MAX_CALLS_PER_REQUEST if limit is None else max(0, int(limit))
+        calls = list(calls)[:cap]
         TOOL_CALLS.append(list(calls))
         results = []
         for call in calls:
@@ -237,11 +242,27 @@ def install_mcp_stubs() -> None:
         return {"ok": True,
                 "text": f'{tool} для {arguments or {}}: остановлено', "error": ""}
 
+    def fake_discover_sync(server_id=None, force=False):
+        """Синхронное обнаружение: схемы инструментов читаются и из кэша."""
+        found = [{
+            "id": server_id, "ok": True, "error": "",
+            "server_name": str(server_id), "server_version": "0.1",
+            "tools": [
+                {"name": "get_data", "title": "Данные",
+                 "description": "Данные внешнего источника",
+                 "schema": {"type": "object",
+                            "properties": {"place": {"type": "string"}}}},
+            ],
+        }]
+        return found[0]
+
     mcp_store.async_discover = fake_discover
     mcp_store.async_run_calls = fake_run_calls
+    mcp_store.discover = fake_discover_sync
     mcp_store.call_tool = fake_call_tool
     chat.mcp_store.async_discover = fake_discover
     chat.mcp_store.async_run_calls = fake_run_calls
+    chat.mcp_store.discover = fake_discover_sync
     chat.mcp_store.call_tool = fake_call_tool
 
 
@@ -646,9 +667,15 @@ async def test_repeat():
     check("в чате есть пометка автозапуска с периодом",
           markers and markers[0].startswith(periodic_store.AUTO_MARK)
           and "раз в час" in markers[0], str(markers)[:200])
-    check("в чате появились ответы всех шагов повтора",
-          sum(1 for text in log_texts(session, "assistant") if ANSWER in text) >= len(PLAN_STEPS),
+    # ГИБРИД UX: репликой в чате показывается ФИНАЛЬНЫЙ ответ повтора, а ответы
+    # промежуточных шагов остаются в журнале работы (строки «шаг выполнен») и в
+    # памяти задачи — пользователю нужен итог, а не каждый шаг.
+    check("в чате появился финальный ответ повтора",
+          any(ANSWER in text for text in log_texts(session, "assistant")),
           str(log_texts(session, "assistant"))[-200:])
+    check("ход промежуточных шагов повтора виден в журнале",
+          sum(1 for text in log_texts(session, "debug") if "выполнен" in text) >= 1,
+          str(log_texts(session, "debug"))[-250:])
     check("журнал задачи вырос (интерфейсу есть что подхватить)",
           len(log_texts(session)) > log_before,
           f"было {log_before}, стало {len(log_texts(session))}")

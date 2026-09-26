@@ -25,6 +25,10 @@
       каталоге: рукопожатие, tools/list, tools/call, ответ потоком SSE, токен
       заголовком Authorization, отказ по неверному токену, причина без токена и
       недоступный сервер (туннель не поднят).
+  [7] ЦЕПОЧКА вызовов (agent loop): маршрутизация «разовый запрос ↔ многошаговый»,
+      раунды по РЕЗУЛЬТАТАМ (прогноз → сохранить → выгрузить файл), защита
+      (выдуманный идентификатор, повтор, разрушительный вызов без просьбы) и
+      ДОСТАВКА ФАЙЛА в чат: карточка со ссылкой и скачивание по маршруту.
 
 Рабочие данные не трогаются: workspace, история агента и профили пишутся во
 временный каталог (переменные AGENT_*_FILE выставляются ДО импорта chat).
@@ -36,7 +40,10 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,7 +55,11 @@ os.environ["AGENT_PROFILES_FILE"] = os.path.join(_TMP, "profiles.json")
 # Каталог серверов MCP — тоже временный: настоящие серверы (Node) здесь не
 # запускаются, их место занимает тестовый сервер на Python.
 os.environ["MCP_SERVERS_DIR"] = os.path.join(_TMP, "mcp_servers")
+# Вложения MCP (файлы, которые вернули инструменты) — во временный каталог:
+# проверка не должна оставлять файлы в рабочих данных проекта.
+os.environ["MCP_ATTACH_DIR"] = os.path.join(_TMP, "mcp_files")
 
+from app.ai import attachments as attach_store  # noqa: E402
 from app.ai import client, mcp as mcp_store  # noqa: E402
 from app.ai import workspace as workspace_store  # noqa: E402
 from app.routers import chat  # noqa: E402
@@ -349,6 +360,11 @@ ANSWER_PAYLOADS = []
 # Счётчики обращений к серверам MCP (реальные процессы не запускаем).
 DISCOVER_CALLS = 0
 TOOL_CALLS = []
+# ОЧЕРЕДЬ РЕШЕНИЙ ДИСПЕТЧЕРА для проверки ЦЕПОЧКИ (см. test_chain): каждое
+# обращение к диспетчеру берёт следующий элемент — так воспроизводится цикл
+# «решение → вызов → результат → решение». Пустая очередь — прежнее поведение
+# (один ответ MCP_CALLS на любой вызов).
+MCP_DECISIONS = []
 
 
 def _metrics(prompt=20, completion=10):
@@ -373,6 +389,9 @@ async def fake_call_llm_async(*args, **kwargs):
         global MCP_CHOICE_CALLS
         MCP_CHOICE_CALLS += 1
         MCP_PAYLOADS.append(user)
+        if MCP_DECISIONS:
+            decision = MCP_DECISIONS.pop(0)
+            return json.dumps(decision, ensure_ascii=False), _metrics(45, 18)
         return (json.dumps({"calls": list(MCP_CALLS)}, ensure_ascii=False),
                 _metrics(45, 18))
     ANSWER_PAYLOADS.append(user)
@@ -399,7 +418,7 @@ def install_mcp_stubs() -> None:
             ],
         }]
 
-    async def fake_run_calls(calls):
+    async def fake_run_calls(calls, limit=None):
         TOOL_CALLS.append(list(calls))
         return [{
             "server": FAKE_ID, "server_name": "Тестовый MCP", "source": "локальный тест",
@@ -962,6 +981,637 @@ def test_http():
         restore_registry()
 
 
+# ---------------------------------------------------------------------------
+# 7. Цепочка вызовов (agent loop): зависимости по данным и файлы в чат
+# ---------------------------------------------------------------------------
+# Тестовый сервер «как open-meteo на VPS»: чтение (прогноз), запись (сохранение
+# набора) и выгрузка файла, которой нужен идентификатор от сохранения. Именно
+# такая зависимость по данным и проверяется — ни имена, ни предметная область в
+# механике цепочки не зашиты.
+CHAIN_ID = "chain-mcp"
+CHAIN_CALLS = []
+# «Файл» из инструмента: настоящий xlsx здесь не нужен, проверяется доставка
+# байтов (сигнатура PK — как у xlsx, чтобы имя и тип были осмысленными).
+XLSX_BYTES = b"PK\x03\x04check-xlsx-payload"
+DELIVER_REQUEST = ("получи прогноз погоды на завтра в Екатеринбурге, прогноз погоды "
+                   "на завтра в Казани, сохрани их и отдай в виде эксель таблицы")
+SIMPLE_REQUEST = "какая сейчас погода в Казани"
+CHAIN_TOOLS = [
+    {"name": "get_forecast", "title": "Прогноз",
+     "description": "Прогноз погоды по городу на несколько дней",
+     "schema": {"type": "object", "properties": {"location": {"type": "string"}},
+                "required": ["location"]}},
+    {"name": "save_weather_summary", "title": "Сохранить таблицу",
+     "description": "Сохраняет таблицу значений на сервере под идентификатором",
+     "schema": {"type": "object",
+                "properties": {"dataset_id": {"type": "string"},
+                               "entries": {"type": "array"},
+                               # Как у настоящего сервера: без флага перезаписи
+                               # сохранение под существующим id отклоняется.
+                               "replace": {"type": "boolean"}},
+                "required": ["entries"]}},
+    {"name": "export_weather_summary_excel", "title": "Выгрузить Excel",
+     "description": "Строит файл .xlsx из сохранённого набора",
+     "schema": {"type": "object", "properties": {"dataset_id": {"type": "string"}},
+                "required": ["dataset_id"]}},
+    {"name": "delete_weather_watch", "title": "Удалить наблюдение",
+     "description": "Удаляет наблюдение вместе с данными",
+     "schema": {"type": "object", "properties": {"id": {"type": "string"}},
+                "required": ["id"]}},
+]
+DATASET_ID = "ekb-kzn-27-09"
+
+
+def use_chain_registry() -> None:
+    """Реестр из одного «цепочного» сервера (без процессов и сети)."""
+    mcp_store.SERVER_IDS = [CHAIN_ID]
+    mcp_store.forget()
+
+
+def install_chain_stubs() -> None:
+    """Подмена серверов цепочки: инструменты отвечают как настоящие, но локально."""
+    async def fake_discover(ids=None, force=False):
+        return [{"id": CHAIN_ID, "ok": True, "error": "", "server_name": "chain-mcp",
+                 "server_version": "0.1",
+                 "tools": [dict(tool) for tool in CHAIN_TOOLS]}]
+
+    def result(call, text, attachments=None):
+        return {"server": CHAIN_ID, "server_name": "chain-mcp",
+                "source": "локальный тест", "tool": str(call.get("tool") or ""),
+                "arguments": dict(call.get("arguments") or {}),
+                "ok": True, "text": text, "error": "",
+                "attachments": list(attachments or [])}
+
+    def fake_discover_sync(server_id=None, force=False):
+        """Синхронное обнаружение (нужно там, где схемы читаются из кэша)."""
+        found = {"id": CHAIN_ID, "ok": True, "error": "", "server_name": "chain-mcp",
+                 "server_version": "0.1",
+                 "tools": [dict(tool) for tool in CHAIN_TOOLS]}
+        return found if server_id in (None, CHAIN_ID) else {
+            "id": str(server_id), "ok": False, "error": "нет такого сервера",
+            "server_name": "", "server_version": "", "tools": []}
+
+    async def fake_run_calls(calls, limit=None):
+        # Лимит соблюдаем как настоящий run_calls: иначе проверка не заметила бы
+        # потерю вызова цепочки (умолчание — предел ОДНОГО раунда).
+        cap = mcp_store.MAX_CALLS_PER_REQUEST if limit is None else max(0, int(limit))
+        calls = list(calls)[:cap]
+        CHAIN_CALLS.append(list(calls))
+        out = []
+        for call in calls:
+            tool = str(call.get("tool") or "")
+            args = call.get("arguments") or {}
+            if tool == "get_forecast":
+                out.append(result(call, f"Прогноз для {args.get('location')}: "
+                                        "2026-09-27, минимум 6.9, максимум 17.5"))
+            elif tool == "save_weather_summary":
+                out.append(result(call, "Таблица сохранена. dataset_id: "
+                                        f"\"{args.get('dataset_id')}\", строк: "
+                                        f"{len(args.get('entries') or [])}"))
+            elif tool == "export_weather_summary_excel":
+                ref = attach_store.store(
+                    XLSX_BYTES, name="weather-ekb-kzn.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument."
+                         "spreadsheetml.sheet",
+                    origin="chain-mcp · export_weather_summary_excel")
+                out.append(result(call, "Файл выгружен на сервере: "
+                                        f"/app/data/{ref['name']}", [ref]))
+        return out
+
+    mcp_store.async_discover = fake_discover
+    mcp_store.async_run_calls = fake_run_calls
+    mcp_store.discover = fake_discover_sync
+    chat.mcp_store.async_discover = fake_discover
+    chat.mcp_store.async_run_calls = fake_run_calls
+    chat.mcp_store.discover = fake_discover_sync
+
+
+def flat_chain_tools():
+    """Инструменты цепочки в том виде, в каком их видит диспетчер."""
+    return [{"server": CHAIN_ID, "server_name": "chain-mcp", "tool": tool["name"],
+             "description": tool.get("description") or "",
+             "schema": tool.get("schema") or {}}
+            for tool in CHAIN_TOOLS]
+
+
+async def test_chain():
+    print("\n[7] Цепочка вызовов: зависимости по данным и файл в чате")
+    flat = flat_chain_tools()
+
+    # 7.1 Маршрутизация: разовый запрос — дешёвый путь, «сохрани и отдай Excel» — цепочка.
+    simple = mcp_store.chain_signals(flat, SIMPLE_REQUEST, expected=1)
+    deliver = mcp_store.chain_signals(flat, DELIVER_REQUEST, expected=2)
+    check("разовый запрос не уходит в цепочку", not simple["needed"], str(simple))
+    check("запрос «сохрани и отдай Excel» уходит в цепочку", deliver["needed"], str(deliver))
+    check("назван инструмент, которому нужен идентификатор из результата",
+          "export_weather_summary_excel" in [item["tool"] for item in deliver["id_tools"]],
+          str(deliver["id_tools"]))
+
+    # 7.2 Разбор решения диспетчера: режим работы и признак «готово».
+    parsed = mcp_store.parse_decision(json.dumps({
+        "mode": "chain", "reason": "нужно сохранить",
+        "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                   "arguments": {"location": "Казань"}}]}), flat)
+    check("режим цепочки разобран из ответа диспетчера",
+          parsed["mode"] == "chain" and len(parsed["calls"]) == 1, str(parsed))
+    old = mcp_store.parse_decision(
+        json.dumps({"calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                               "arguments": {"location": "Казань"}}]}), flat)
+    check("прежний формат ответа читается как разовый режим",
+          old["mode"] == "single" and len(old["calls"]) == 1, str(old))
+
+    # 7.3 Защита вызовов: выдуманный идентификатор, повтор, разрушительное.
+    forecast_results = [{"server": CHAIN_ID, "tool": "get_forecast", "arguments": {},
+                         "ok": True, "text": "Прогноз для Казани: 2026-09-27", "error": ""}]
+    export_call = {"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                   "arguments": {"dataset_id": DATASET_ID}}
+    invented = [{"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                 "arguments": {"dataset_id": "я-придумал-этот-id"}}]
+    allowed, rejected = mcp_store.guard_calls(invented, forecast_results, flat,
+                                              user_text=DELIVER_REQUEST)
+    check("выдуманный dataset_id отброшен до вызова", not allowed and bool(rejected),
+          str(rejected))
+    saved_results = forecast_results + [
+        {"server": CHAIN_ID, "tool": "save_weather_summary", "arguments": {},
+         "ok": True, "text": f"Таблица сохранена. dataset_id: \"{DATASET_ID}\"", "error": ""},
+        {"server": CHAIN_ID, "tool": "get_forecast", "arguments": {},
+         "ok": True, "text": "Наблюдение активно. watch_id: \"w-1\"", "error": ""}]
+    allowed, rejected = mcp_store.guard_calls([export_call], saved_results, flat,
+                                              user_text=DELIVER_REQUEST)
+    check("идентификатор из результатов пропускается", bool(allowed) and not rejected,
+          str(rejected))
+    allowed, rejected = mcp_store.guard_calls([export_call], forecast_results, flat,
+                                              user_text=DELIVER_REQUEST,
+                                              issued_ids={"dataset_id": DATASET_ID})
+    check("идентификатор, названный сохранением, тоже годится",
+          bool(allowed) and not rejected, str(rejected))
+    allowed, rejected = mcp_store.guard_calls([export_call], saved_results, flat,
+                                              user_text=DELIVER_REQUEST,
+                                              done_keys={mcp_store.call_key(export_call)})
+    check("повтор уже выполненного вызова отброшен", not allowed and bool(rejected),
+          str(rejected))
+    kill = [{"server": CHAIN_ID, "tool": "delete_weather_watch",
+             "arguments": {"id": "w-1"}}]
+    allowed, rejected = mcp_store.guard_calls(kill, saved_results, flat,
+                                              user_text=SIMPLE_REQUEST)
+    check("разрушительный вызов без просьбы пользователя отброшен",
+          not allowed and bool(rejected), str(rejected))
+    allowed, rejected = mcp_store.guard_calls(
+        kill, saved_results, flat, user_text="удали наблюдение w-1")
+    check("разрушительный вызов по прямой просьбе проходит", bool(allowed), str(rejected))
+
+    # 7.4 ГИБРИД: до подтверждения плана — ТОЛЬКО ЧТЕНИЯ. Данные для плана есть,
+    # а побочных эффектов нет: ни набора на сервере, ни файла в чате.
+    install_chain_stubs()
+    use_chain_registry()
+    await chat.task_create(chat.TaskCreate(name="Проект с цепочкой"))
+    await chat.session_create()
+    await chat.mcp_apply(McpApply(enabled=[CHAIN_ID]))
+    reset_calls()
+    CHAIN_CALLS.clear()
+    save_call = {"server": CHAIN_ID, "tool": "save_weather_summary",
+                 "arguments": {"dataset_id": DATASET_ID,
+                               "entries": [{"location": "Екатеринбург",
+                                            "date": "2026-09-27"},
+                                           {"location": "Казань",
+                                            "date": "2026-09-27"}]}}
+    export_call = {"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                   "arguments": {"dataset_id": DATASET_ID}}
+    MCP_DECISIONS[:] = [
+        {"mode": "chain", "reason": "нужны прогнозы по двум городам",
+         "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Екатеринбург", "days": 2}},
+                   {"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Казань", "days": 2}}]},
+        # Раунд цепочки ДО подтверждения: сохранение — оно откладывается.
+        {"done": False, "reason": "сохраняю прогнозы одним набором",
+         "calls": [save_call]},
+    ]
+    events = await run_chat(DELIVER_REQUEST)
+    executed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("до подтверждения плана выполнены только чтения",
+          executed == ["get_forecast", "get_forecast"], str(executed))
+    check("цепочка отложена до «ок» и это сказано в чате",
+          any("цепочка продолжится после подтверждения плана" in text
+              for text in texts(events, "debug")),
+          str(texts(events, "debug"))[-300:])
+    check("файла в чате до подтверждения плана нет",
+          not any(e.get("type") == "bot" and e.get("files") for e in events),
+          str([e.get("type") for e in events])[:200])
+    final_states = [e["state"] for e in events
+                    if e.get("type") == "done" and e.get("state")]
+    stage_after = (final_states[-1].get("stage") if final_states else None)
+    check("задача честно ждёт подтверждения плана", stage_after == "awaiting_user",
+          str(stage_after))
+    check("текст плана просит подтверждение (работа ещё не сделана)",
+          any("Подтвердите план — кнопка" in text for text in texts(events, "bot")),
+          str(texts(events, "bot"))[:250])
+    stored = workspace_store.dialog_mcp(chat._current_session()["dialog"])
+    check("цепочка помечена как НЕ доигранная (ждёт подтверждения)",
+          (stored.get("chain") or {}).get("pending") is True,
+          str(stored.get("chain"))[:200])
+    # ДО ПОДТВЕРЖДЕНИЯ ПЛАНА цепочка больше НЕ спрашивает диспетчера: его
+    # предложения всё равно откладывались до «ок», то есть вызов LLM уходил
+    # впустую. Остаётся ровно один вызов — первичный выбор инструментов.
+    check("до подтверждения плана диспетчер спрашивается РОВНО один раз",
+          MCP_CHOICE_CALLS == 1, f"вызовов диспетчера: {MCP_CHOICE_CALLS}")
+
+    # 7.4б «ОК» — ЭТО ШАГ 1 ИЗ 2: до последнего шага результат не выдаётся.
+    reset_calls()
+    CHAIN_CALLS.clear()
+    MCP_DECISIONS[:] = [
+        {"done": False, "reason": "сохраняю прогнозы одним набором",
+         "calls": [save_call]},
+        {"done": False, "reason": "выгружаю файл по идентификатору набора",
+         "calls": [export_call]},
+        {"done": True, "reason": "данные получены, набор сохранён, файл выгружен",
+         "calls": []},
+    ]
+    ok_events = await run_chat("ок")
+    check("на непоследнем шаге результат ещё не выдаётся",
+          not [call["tool"] for batch in CHAIN_CALLS for call in batch],
+          str(CHAIN_CALLS))
+    check("ответ промежуточного шага не показывается репликой в чате",
+          not any(e.get("type") == "bot" and ANSWER in str(e.get("text") or "")
+                  for e in ok_events),
+          str([(e.get("type"), str(e.get("text"))[:40]) for e in ok_events])[:250])
+    check("вместо ответа промежуточного шага — строка в журнале",
+          any("в чате не показываю" in text for text in texts(ok_events, "debug")),
+          str(texts(ok_events, "debug"))[-250:])
+    stored_mid = workspace_store.dialog_mcp(chat._current_session()["dialog"])
+    check("цепочка всё ещё ждёт последнего шага",
+          (stored_mid.get("chain") or {}).get("pending") is True,
+          str(stored_mid.get("chain"))[:200])
+
+    # 7.4в ПОСЛЕДНИЙ ШАГ: отложенная часть доигрывается — сохранение и выгрузка,
+    # затем ФИНАЛЬНЫЙ ОТЧЁТ, и только под ним — карточка файла.
+    reset_calls()
+    CHAIN_CALLS.clear()
+    MCP_DECISIONS[:] = [
+        {"done": False, "reason": "сохраняю прогнозы одним набором",
+         "calls": [save_call]},
+        {"done": False, "reason": "выгружаю файл по идентификатору набора",
+         "calls": [export_call]},
+        {"done": True, "reason": "данные получены, набор сохранён, файл выгружен",
+         "calls": []},
+    ]
+    events = await run_chat("", continue_step=True)
+    executed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("на последнем шаге выполнены сохранение и выгрузка",
+          executed == ["save_weather_summary", "export_weather_summary_excel"],
+          str(executed))
+    check("идентификатор сохранения передан в выгрузку",
+          (CHAIN_CALLS[1][0].get("arguments") or {}).get("dataset_id") == DATASET_ID,
+          str(CHAIN_CALLS[1:]))
+    check("в чате сказано, что цепочка доиграна после подтверждения",
+          any("доигрываю цепочку" in text for text in texts(events, "debug")),
+          str(texts(events, "debug"))[-300:])
+    # ОЧЕВИДНАЯ ДОСТРОЙКА: после сохранения остался ровно один инструмент
+    # результата (выгрузка) и его обязательный dataset_id уже известен — он
+    # вызывается БЕЗ диспетчера (экономия целого вызова LLM).
+    check("очевидная выгрузка выполнена без вызова диспетчера",
+          MCP_CHOICE_CALLS == 1, f"вызовов диспетчера в этой фазе: {MCP_CHOICE_CALLS}")
+    check("в чате сказано, что шаг выполнен без диспетчера",
+          any("остался один очевидный шаг результата" in text
+              for text in texts(events, "debug")),
+          str(texts(events, "debug"))[-250:])
+    final_answer_at = [index for index, e in enumerate(events)
+                       if e.get("type") == "bot" and ANSWER in str(e.get("text") or "")]
+    file_card_at = [index for index, e in enumerate(events)
+                    if e.get("type") == "bot" and e.get("files")]
+    check("финальный отчёт показан репликой в чате", bool(final_answer_at),
+          str([(e.get("type"), str(e.get("text"))[:40]) for e in events])[:250])
+    check("карточка файла идёт ПОСЛЕ финального отчёта",
+          bool(final_answer_at) and bool(file_card_at)
+          and min(file_card_at) > max(final_answer_at),
+          f"отчёт: {final_answer_at}, файл: {file_card_at}")
+    # После выдачи файла цепочка больше НЕ спрашивает диспетчера «всё ли готово»
+    # (это ещё один полный вызов LLM), и выгрузку тоже сделала сама: в очереди
+    # остались неиспользованными решения «выгрузка» и «готово».
+    check("после файла цепочка не тратит вызов диспетчера на «всё ли готово»",
+          len(MCP_DECISIONS) == 2, f"неиспользованных решений: {len(MCP_DECISIONS)}")
+
+    # 7.5 Файл: карточка в чате, запись на диск, скачивание по ссылке.
+    file_events = [e for e in events if e.get("type") == "bot" and e.get("files")]
+    check("файл показан в чате карточкой", len(file_events) == 1
+          and file_events[0]["files"][0]["name"] == "weather-ekb-kzn.xlsx",
+          str(file_events)[:200])
+    ref = (file_events[0]["files"][0] if file_events else {})
+    check("у файла есть ссылка на скачивание",
+          str(ref.get("url") or "").startswith("/api/agent/files/"), str(ref))
+    path = attach_store.resolve(ref.get("id"))
+    check("файл сохранён на диск",
+          bool(path) and os.path.getsize(path) == len(XLSX_BYTES), str(path))
+    if path:
+        with open(path, "rb") as handle:
+            check("на диск записаны те же байты", handle.read() == XLSX_BYTES, str(path))
+    response = await chat.agent_file(str(ref.get("id")))
+    check("маршрут скачивания отдаёт файл",
+          os.path.basename(str(getattr(response, "path", ""))) == ref.get("id"),
+          str(getattr(response, "path", "")))
+    try:
+        await chat.agent_file("../../etc/passwd")
+        blocked = False
+    except HTTPException:
+        blocked = True
+    check("через маршрут нельзя выйти за каталог вложений", blocked)
+
+    dialog = chat._current_session()["dialog"]
+    stored = workspace_store.dialog_mcp(dialog)
+    check("все вызовы цепочки сохранены в диалоге",
+          [call["tool"] for call in stored.get("calls") or []]
+          == ["get_forecast", "get_forecast", "save_weather_summary",
+              "export_weather_summary_excel"], str(stored.get("calls"))[:200])
+    check("состояние цепочки запомнено (для повторов задачи)",
+          (stored.get("chain") or {}).get("ids", {}).get("dataset_id") == DATASET_ID,
+          str(stored.get("chain"))[:200])
+    check("файл в журнале чата (карточка переживёт перезагрузку)",
+          any(item.get("files") for item in dialog.get("log") or []),
+          str([item.get("kind") for item in dialog.get("log") or []])[:200])
+    cards = [item for item in dialog.get("log") or [] if item.get("files")]
+    check("в журнале РОВНО одна карточка файла (дубля в чате нет)",
+          len(cards) == 1, f"карточек: {len(cards)}")
+    check("модель видит, что файл уже у пользователя",
+          "ПОЛУЧЕННЫЕ ФАЙЛЫ" in all_context(), all_context()[-300:])
+
+    # 7.6 ПОВТОР периодической задачи: цепочка обязана повториться ЦЕЛИКОМ и
+    # идемпотентно — тот же набор данных на сервере (тот же dataset_id), свежие
+    # значения, новый файл. Читающие вызовы повторяются без выбора инструментов
+    # (диспетчер не оплачивается), но вызовы ЗАПИСИ и ВЫГРУЗКИ в цепочке — тоже
+    # часть работы задачи, и пропустить их нельзя: файл остался бы прошлым.
+    CHAIN_CALLS.clear()
+    reset_calls()
+    # Автозапуск повторяет ЗАПРОС задачи (см. periodic_runner._turn): тот же
+    # текст, флаг periodic — прогон автономный, данные берутся заново.
+    repeat_events = await run_chat(DELIVER_REQUEST, periodic=True)
+    replayed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("повтор задачи выполняет ВСЮ цепочку, а не только чтение",
+          replayed == ["get_forecast", "get_forecast", "save_weather_summary",
+                       "export_weather_summary_excel"], str(replayed))
+    repeat_save = next((call for batch in CHAIN_CALLS for call in batch
+                        if call["tool"] == "save_weather_summary"), {})
+    check("повтор сохраняет под ТЕМ ЖЕ идентификатором (идемпотентность)",
+          (repeat_save.get("arguments") or {}).get("dataset_id") == DATASET_ID,
+          str(repeat_save))
+    check("повтор САМ ставит флаг перезаписи (сервер иначе отказывает)",
+          (repeat_save.get("arguments") or {}).get("replace") is True,
+          str(repeat_save))
+    check("в чате сказано, что флаг перезаписи поставлен агентом",
+          any("флаг перезаписи" in text for text in texts(repeat_events, "debug")),
+          str(texts(repeat_events, "debug"))[-200:])
+    check("повтор не оплачивает выбор инструментов заново", MCP_CHOICE_CALLS == 0,
+          f"вызовов диспетчера: {MCP_CHOICE_CALLS}")
+    stored_after = workspace_store.dialog_mcp(chat._current_session()["dialog"])
+    check("после повтора в диалоге по-прежнему все вызовы цепочки",
+          [call["tool"] for call in stored_after.get("calls") or []]
+          == ["get_forecast", "get_forecast", "save_weather_summary",
+              "export_weather_summary_excel"], str(stored_after.get("calls"))[:200])
+    check("идентификатор набора после повтора не изменился",
+          (stored_after.get("chain") or {}).get("ids", {}).get("dataset_id") == DATASET_ID,
+          str(stored_after.get("chain"))[:200])
+
+    # 7.7 Разовый запрос при том же наборе инструментов цикл НЕ оплачивает.
+    reset_calls()
+    CHAIN_CALLS.clear()
+    MCP_CALLS[:] = [{"server": CHAIN_ID, "tool": "get_forecast",
+                     "arguments": {"location": "Казань"}}]
+    MCP_DECISIONS.clear()
+    simple_events = await run_chat(SIMPLE_REQUEST)
+    check("разовый запрос обошёлся одним вызовом диспетчера",
+          MCP_CHOICE_CALLS == 1, f"вызовов диспетчера: {MCP_CHOICE_CALLS}")
+    check("разовый запрос сделал один вызов инструмента",
+          len([call for batch in CHAIN_CALLS for call in batch]) == 1, str(CHAIN_CALLS))
+    check("разовый запрос не идёт цепочкой",
+          not any("цепочкой" in text for text in texts(simple_events, "debug")),
+          str(texts(simple_events, "debug"))[-200:])
+
+    # 7.8 Чистка каталога вложений: срок хранения и предел по числу файлов.
+    old = attach_store.store(b"old-attachment", name="old.txt", mime="text/plain")
+    fresh = attach_store.store(b"fresh-attachment", name="fresh.txt", mime="text/plain")
+    old_path = attach_store.resolve((old or {}).get("id"))
+    ancient = time.time() - 90 * 86400
+    if old_path:
+        os.utime(old_path, (ancient, ancient))
+    removed = attach_store.prune(force=True)
+    check("старое вложение удалено по сроку хранения",
+          (old or {}).get("id") in removed and not attach_store.resolve((old or {}).get("id")),
+          str(removed))
+    check("свежее вложение после чистки на месте",
+          bool(attach_store.resolve((fresh or {}).get("id"))), "файл свежего вложения пропал")
+    os.environ["MCP_ATTACH_MAX_FILES"] = "2"
+    try:
+        for index in range(4):
+            attach_store.store(f"bulk-{index}".encode(), name=f"bulk{index}.txt",
+                               mime="text/plain")
+            time.sleep(0.01)
+        attach_store.prune(force=True)
+        left = sorted(name for name in os.listdir(attach_store.directory()))
+        check("каталог не превышает предел по числу файлов", len(left) <= 2, str(left))
+    finally:
+        os.environ.pop("MCP_ATTACH_MAX_FILES", None)
+    check("пределы хранения читаются из переменных окружения",
+          attach_store.limits() == (attach_store.DEFAULT_TTL_DAYS,
+                                    attach_store.DEFAULT_MAX_FILES,
+                                    attach_store.DEFAULT_MAX_DIR_BYTES),
+          str(attach_store.limits()))
+
+    # 7.9 ДИСПЕТЧЕР РЕШИЛ «ДАННЫХ ХВАТАЕТ». Живой случай: на тот же запрос модель
+    # то строит цепочку, то отвечает «ничего больше не нужно» — и задача остаётся
+    # без сохранения и файла. После «ок» агент обязан уточнить задачу, назвав
+    # невызванные инструменты результата, и довести работу до файла.
+    nudge_request = ("прогноз на завтра для Екатеринбурга и Казани, сохрани его "
+                     "и приложи файлом Excel")
+    CHAIN_CALLS.clear()
+    reset_calls()
+    MCP_DECISIONS[:] = [
+        {"mode": "chain", "reason": "нужны прогнозы",
+         "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Екатеринбург"}},
+                   {"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Казань"}}]},
+    ]
+    nudge_events = await run_chat(nudge_request)
+    nudge_executed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("до подтверждения плана прочитаны данные и цепочка отложена",
+          nudge_executed == ["get_forecast", "get_forecast"], str(nudge_executed))
+    # ПОДТВЕРЖДЕНИЕ: доигрывание цепочки. Первый ответ диспетчера — «данных
+    # хватает» (отказ), значит агент обязан переспросить.
+    reset_calls()
+    CHAIN_CALLS.clear()
+    MCP_DECISIONS[:] = [
+        {"done": True, "reason": "данных достаточно для ответа", "calls": []},
+        {"done": False, "reason": "сохраняю прогнозы",
+         "calls": [{"server": CHAIN_ID, "tool": "save_weather_summary",
+                    "arguments": {"dataset_id": DATASET_ID, "replace": True,
+                                  "entries": [{"location": "Екатеринбург"},
+                                              {"location": "Казань"}]}}]},
+    ]
+    await run_chat("ок")
+    approve_events = await run_chat("", continue_step=True)
+    nudge_payloads = [p for p in MCP_PAYLOADS if "ЗАПРОС ВЫПОЛНЕН НЕ ПОЛНОСТЬЮ" in p]
+    check("в уточнении названы невызванные инструменты результата",
+          len(nudge_payloads) == 1
+          and "save_weather_summary" in nudge_payloads[0]
+          and "export_weather_summary_excel" in nudge_payloads[0],
+          str(nudge_payloads)[:200])
+    check("уточнение запрашивается ОДИН раз (без цикла уговоров)",
+          len(nudge_payloads) == 1, f"уточнений: {len(nudge_payloads)}")
+    check("уточнение видно в чате",
+          any("уточняю задачу диспетчеру" in text for text in texts(approve_events, "debug")),
+          str(texts(approve_events, "debug"))[-200:])
+    check("файл получен после уточнения и подтверждения",
+          any(e.get("type") == "bot" and e.get("files") for e in approve_events),
+          str([e.get("type") for e in approve_events])[:200])
+
+    # 7.10 ДИСПЕТЧЕР ОТВЕТИЛ «ДАННЫЕ НЕ НУЖНЫ» на запрос, который явно просит
+    # сохранить и выдать файл (живой случай: модель вернула пустой список, и
+    # цепочка даже не начиналась). Агент обязан переспросить и выполнить работу.
+    initial_request = ("прогноз на завтра по Екатеринбургу и Казани, сохрани его "
+                       "и отдай файлом xlsx")
+    # Свежий проект и диалог: проверка не должна зависеть от состояния задачи,
+    # оставшегося от предыдущих разделов.
+    await chat.task_create(chat.TaskCreate(name="Проект: «данные не нужны»"))
+    await chat.session_create()
+    await chat.mcp_apply(McpApply(enabled=[CHAIN_ID]))
+    CHAIN_CALLS.clear()
+    reset_calls()
+    MCP_DECISIONS[:] = [
+        {"mode": "single", "reason": "для ответа хватит знаний модели", "calls": []},
+        {"mode": "chain", "reason": "нужны прогнозы",
+         "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Екатеринбург"}},
+                   {"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Казань"}}]},
+        {"done": False, "reason": "сохраняю",
+         "calls": [{"server": CHAIN_ID, "tool": "save_weather_summary",
+                    "arguments": {"dataset_id": DATASET_ID, "replace": True,
+                                  "entries": [{"location": "Екатеринбург"},
+                                              {"location": "Казань"}]}}]},
+    ]
+    initial_events = await run_chat(initial_request)
+    initial_executed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("после «данные не нужны» агент переспросил и собрал данные",
+          initial_executed == ["get_forecast", "get_forecast"], str(initial_executed))
+    check("первичное уточнение требует чтение и режим chain",
+          any('mode="chain"' in payload for payload in MCP_PAYLOADS),
+          str([p[:80] for p in MCP_PAYLOADS])[:200])
+    check("первичное уточнение видно в чате",
+          any("хотя запрос просит" in text for text in texts(initial_events, "debug")),
+          str(texts(initial_events, "debug"))[-200:])
+    check("повторных уговоров нет (уточнение одно)",
+          sum(1 for payload in MCP_PAYLOADS
+              if "ЗАПРОС ВЫПОЛНЕН НЕ ПОЛНОСТЬЮ" in payload) == 1,
+          f"уточнений: {sum(1 for p in MCP_PAYLOADS if 'НЕ ПОЛНОСТЬЮ' in p)}")
+    stored_initial = workspace_store.dialog_mcp(chat._current_session()["dialog"])
+    check("цепочка после уточнения помечена как не доигранная",
+          (stored_initial.get("chain") or {}).get("pending") is True,
+          str(stored_initial.get("chain"))[:300])
+    initial_states = [e["state"] for e in initial_events
+                      if e.get("type") == "done" and e.get("state")]
+    check("в 7.10 задача ждёт подтверждения плана",
+          (initial_states[-1].get("stage") if initial_states else None) == "awaiting_user",
+          str(initial_states[-1] if initial_states else None)[:200])
+    reset_calls()
+    CHAIN_CALLS.clear()
+    MCP_DECISIONS[:] = [
+        {"done": False, "reason": "сохраняю",
+         "calls": [{"server": CHAIN_ID, "tool": "save_weather_summary",
+                    "arguments": {"dataset_id": DATASET_ID, "replace": True,
+                                  "entries": [{"location": "Екатеринбург"},
+                                              {"location": "Казань"}]}}]},
+        {"done": False, "reason": "выгружаю файл",
+         "calls": [{"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                    "arguments": {"dataset_id": DATASET_ID}}]},
+    ]
+    await run_chat("ок")
+    initial_approve = await run_chat("", continue_step=True)
+    check("после подтверждения получен файл (работа доведена до конца)",
+          any(e.get("type") == "bot" and e.get("files") for e in initial_approve),
+          str([e.get("type") for e in initial_approve])[:200])
+
+    # 7.11 Единичные признаки: что считается РЕЗУЛЬТАТОМ, а что чтением.
+    check("сохранение набора считается результатом работы",
+          mcp_store.produced_result([{"server": CHAIN_ID, "tool": "save_weather_summary",
+                                      "arguments": {}, "ok": True, "text": "saved",
+                                      "error": ""}]) is True, "")
+    check("чтение отчёта результатом НЕ считается",
+          mcp_store.produced_result([{"server": CHAIN_ID,
+                                      "tool": "get_weather_watch_report",
+                                      "arguments": {}, "ok": True, "text": "report",
+                                      "error": ""}]) is False, "")
+    check("чтения и изменения делятся по имени инструмента",
+          [call["tool"] for call in mcp_store.split_calls(
+              [{"server": CHAIN_ID, "tool": "get_forecast", "arguments": {}},
+               {"server": CHAIN_ID, "tool": "save_weather_summary", "arguments": {}},
+               {"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                "arguments": {}}], flat_chain_tools())[1]]
+          == ["save_weather_summary", "export_weather_summary_excel"], "")
+
+    # 7.12 ЭКОНОМИЯ ТОКЕНОВ: список инструментов и данные для приёмщика сжаты.
+    # Полный дамп схем занимал ~24 000 символов (~8 000 токенов) на КАЖДЫЙ вызов
+    # диспетчера, а полный блок данных уходил ещё и в каждый акт проверки.
+    rich_tool = {
+        "server": CHAIN_ID, "server_name": "chain-mcp", "tool": "get_forecast",
+        "description": "Прогноз. " + "Подробное описание. " * 40,
+        "schema": {"type": "object",
+                   "properties": {
+                       "location": {"type": "string",
+                                    "description": "Название города. " + "Ещё текст. " * 30},
+                       "days": {"type": "integer", "description": "Сколько дней."},
+                       "countryCode": {"type": "string", "description": "ISO-код страны."}},
+                   "required": ["location"]}}
+    compact = mcp_store.tools_text([rich_tool])
+    full_dump = json.dumps(rich_tool["schema"], ensure_ascii=False)
+    check("список инструментов сжат, а не полный дамп схем",
+          len(compact) * 2 < len(full_dump),
+          f"сжато: {len(compact)}, схема: {len(full_dump)}")
+    check("в сжатом списке есть имена, типы и обязательность аргументов",
+          "location!" in compact and "days: integer" in compact
+          and "countryCode: string" in compact, compact[:200])
+    check("подсказка по аргументу сохранена (язык/страна важны диспетчеру)",
+          "ISO-код страны" in compact and "Название города" in compact, compact[:250])
+
+    long_result = [{"server": CHAIN_ID, "tool": "get_forecast", "arguments": {},
+                    "ok": True, "text": "данные: " + "7.6 18.3 5.8 0 5.5 3.2 " * 120,
+                    "error": ""},
+                   {"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                    "arguments": {}, "ok": True, "text": "файл выгружен", "error": "",
+                    "attachments": [{"id": "f1", "name": "t.xlsx", "size": 10,
+                                     "size_text": "10 Б", "url": "/api/agent/files/f1",
+                                     "mime": "application/vnd", "sha256": "x",
+                                     "origin": "тест", "previewable": False}]}]
+    full_block = mcp_store.block(long_result)
+    digest = mcp_store.review_digest(long_result)
+    check("сводка для приёмщика короче полного блока данных",
+          len(digest) < len(full_block), f"{len(digest)} против {len(full_block)}")
+    check("в сводке приёмщика есть вызовы, их исход и файлы",
+          f"get_forecast — OK" in digest and "t.xlsx" in digest, digest[:250])
+    check("значения источника в сводку приёмщика не попадают",
+          "7.6 18.3 5.8" not in digest, digest[:250])
+    # Список вызовов обязан дойти ЦЕЛИКОМ: длинная инструкция-заголовок полного
+    # блока (про «источник истины») занимала весь предел сводки, список
+    # обрезался, и приёмщик писал «сохранение не подтверждено вызовом» при
+    # живых вызовах в блоке.
+    many = [{"server": CHAIN_ID, "tool": f"save_set_{index}", "arguments": {},
+             "ok": True, "text": "saved " + "x" * 400, "error": ""}
+            for index in range(6)]
+    many.append({"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                 "arguments": {"dataset_id": "ds-1"}, "ok": True,
+                 "text": "файл", "error": ""})
+    many_digest = mcp_store.review_digest(many)
+    check("сводка приёмщика перечисляет ВСЕ вызовы, не обрезая список",
+          all(f"save_set_{index}" in many_digest for index in range(6))
+          and "export_weather_summary_excel" in many_digest
+          and "dataset_id=ds-1" in many_digest,
+          many_digest[-300:])
+    check("полный блок данных при этом значения сохраняет",
+          "7.6 18.3 5.8" in full_block, full_block[:120])
+    today = time.strftime("%Y-%m-%d")
+    check("в блоке данных есть якорь даты (относительные сроки считаются от него)",
+          "СЕГОДНЯ" in full_block and today in full_block,
+          full_block[full_block.find("СЕГОДНЯ"):full_block.find("СЕГОДНЯ") + 120])
+
+
 def main():
     print("Проверка MCP (внешних инструментов агента) — без сети и ключей")
     _write_fake_servers()
@@ -972,6 +1622,7 @@ def main():
     loop.run_until_complete(test_routes())
     loop.run_until_complete(test_dialog())
     test_http()
+    loop.run_until_complete(test_chain())
     print("\nИтог: " + (f"ПРОВАЛЕНО проверок: {len(FAILURES)} → {FAILURES}"
                        if FAILURES else "все проверки пройдены"))
     return 1 if FAILURES else 0

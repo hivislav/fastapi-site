@@ -42,6 +42,7 @@ MCP-серверы проекта уходят в КАЖДЫЙ запрос аг
 """
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -57,6 +58,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from app import config
+from app.ai import attachments as attach_store
 from app.ai import json_utils
 
 logger = logging.getLogger(__name__)
@@ -90,10 +92,147 @@ ERROR_TTL = 60.0
 MAX_CALLS_PER_REQUEST = 3
 RESULT_CHARS = 4000
 BLOCK_CHARS = 12000
+# Короткая сводка данных для ПРИЁМЩИКА (см. review_digest): ему нужны имена
+# вызовов, их исход и файлы, а не значения из источника.
+REVIEW_BLOCK_CHARS = 1500
 # Сколько символов описания инструмента показываем модели и интерфейсу.
 DESCRIPTION_CHARS = 400
+# СЖАТЫЙ список инструментов для диспетчера: назначение — до 200 символов,
+# подсказка по аргументу — до 80, не больше 12 аргументов на инструмент и 12 000
+# символов на весь список. Полные схемы серверов втрое-вчетверо длиннее, а этот
+# текст уходит в КАЖДЫЙ вызов диспетчера (см. tools_text).
+TOOL_DESCRIPTION_CHARS = 200
+ARG_HINT_CHARS = 80
+ARG_LIMIT = 12
+TOOLS_TEXT_CHARS = 12000
 TOOLS_MAX_TOKENS = 700
 TOOLS_TIMEOUT = 45.0
+
+# ---------------------------------------------------------------------------
+# ЦЕПОЧКА вызовов (agent loop) — многошаговые задачи с зависимостью по данным.
+#
+# Разовый запрос («какая погода в Казани») закрывается одним раундом: вызов →
+# данные → ответ. Но бывает задача, где следующий вызов зависит от РЕЗУЛЬТАТА
+# предыдущего: «получи прогноз, сохрани его и отдай Excel» — сохранить надо то,
+# что прочитано, а выгрузить файл — по идентификатору, который вернуло
+# сохранение. Одним раундом такое не собрать: диспетчер выбирает вызовы ДО того,
+# как увидит результаты.
+#
+# Поэтому у диспетчера есть второй режим: ограниченный цикл «решение → вызов →
+# результат в контекст → решение». Границы жёсткие: итерации, суммарные вызовы и
+# дедлайн. Разовые запросы цикл НЕ оплачивают — в него уходят только задачи с
+# признаками зависимости (см. chain_signals).
+MAX_CHAIN_ITERATIONS = 4         # раундов решения (каждый — служебный вызов LLM)
+# Вызовов инструментов за весь запрос. Запас нужен на ЧТЕНИЯ по нескольким
+# объектам (три города = три вызова) плюс сохранение, выгрузка и ПОВТОРНАЯ
+# попытка, если сервер отклонил запись (живой случай: сохранение с пустым
+# полем сервер отверг, модель переписала его с флагом перезаписи — на шести
+# вызовах выгрузка оказалась на самой грани).
+MAX_TOTAL_CALLS_PER_REQUEST = 8  # вызовов инструментов за весь запрос
+CHAIN_DEADLINE_S = 120.0         # предел времени на цепочку (у повторов — меньше)
+CHAIN_DIGEST_CHARS = 6000        # сколько символов результатов видит диспетчер
+DIGEST_RESULT_CHARS = 1500       # сколько символов одного результата в дайджесте
+
+# Признаки «нужна цепочка» в тексте запроса: просьба СОХРАНИТЬ/ВЫГРУЗИТЬ (сделать
+# с данными что-то ЕЩЁ) либо явная последовательность шагов. Слова нейтральны к
+# предметной области: подходят любому серверу и инструменту.
+CHAIN_MARKERS = (
+    "сохран", "запиши", "записать", "занеси", "сложи в",
+    "экспорт", "выгруз", "скач", "файл", "xlsx", "excel", "эксель",
+    "таблиц", "отчёт", "отчет", "сформируй", "сделай в виде", "оформи",
+    "затем", "потом", "после этого", "на основе получ", "из полученн",
+    "сравни", "для каждого", "обоих", "сводн", "приложи",
+    "export", "download", "save", "spreadsheet", "attach",
+)
+
+# Аргумент, значение которого НЕЛЬЗЯ придумать: оно приходит из результата
+# другого инструмента (dataset_id, watch_id, key, ref…). Значение такого
+# аргумента обязано быть найдено в результатах — иначе вызов отбрасывается
+# (см. guard_calls): выдуманный id — это отказ сервера и пустой ответ.
+ID_ARG_RE = re.compile(r"(^|_)(id|ids|key|ref|handle|token)$")
+
+# Разрушительные инструменты: удаление/остановка чего-либо на сервере. В цикле их
+# нельзя вызывать «по догадке» — только если пользователь прямо об этом просит.
+DESTRUCTIVE_RE = re.compile(r"^(delete|remove|drop|stop|cancel|revoke|purge)_")
+DESTRUCTIVE_MARKERS = (
+    "удали", "удалить", "убери", "убрать", "сотри", "останов", "останови",
+    "сними", "отмени", "прекрати", "delete", "remove", "cancel",
+)
+
+# Инструменты, которые СОЗДАЮТ то, что называют: сохраняют набор, заводят запись,
+# регистрируют наблюдение. Такому инструменту идентификатор можно ЗАДАТЬ (он его и
+# создаёт) — в отличие от читающего/выгружающего, который обязан брать значение из
+# результата. Различаем по имени, как пары start_/stop_ выше: схемы MCP описывают
+# только вход, и «кто создаёт идентификатор» из них не видно.
+PRODUCER_RE = re.compile(
+    r"^(save|create|add|register|write|store|put|upsert|set|new|import|upload|publish|start)_")
+# Значение, названное моделью для создающего инструмента: обычный короткий токен
+# (без путей, пробелов и переводов строк) — иначе это не идентификатор.
+TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# Имя инструмента, который СОЗДАЁТ то, о чём просил пользователь: сохраняет
+# набор, выгружает файл, строит отчёт. По таким инструментам агент проверяет,
+# что «сделать с данными ещё шаг» действительно выполнено (см.
+# delivery_candidates): только по имени, потому что схема MCP описывает вход.
+DELIVERY_NAME_RE = re.compile(
+    r"(export|download|save|store|write|create|upload|publish|report|backup"
+    r"|excel|xlsx|csv|pdf|sheet|file)", re.IGNORECASE)
+
+# Флаги перезаписи в схемах инструментов: серверы называют их по-разному. Если у
+# создающего инструмента такой флаг объявлен, агент ставит его сам при повторной
+# записи того же ключа (см. enforce_overwrite) — иначе сервер отказывает:
+# «A dataset with id … already exists. Pass replace: true to overwrite it».
+OVERWRITE_FLAGS = ("replace", "overwrite", "overwrite_existing", "force",
+                   "update", "upsert")
+
+# ГИБРИДНАЯ СХЕМА: до подтверждения плана пользователем выполняются только ЧТЕНИЯ.
+# Вызов, который СОЗДАЁТ РЕЗУЛЬТАТ (сохраняет набор, выгружает файл, строит отчёт),
+# до «ок» не выполняется — он откладывается и доигрывается на первом шаге
+# выполнения. Так пользователь утверждает план до побочных эффектов, а данные для
+# плана всё равно фактические.
+#
+# ЧТО НЕ ОТКЛАДЫВАЕТСЯ: ЗАПУСК СБОРА (`start_*`) — это ДОБЫЧА данных, а не
+# результат: по нему потом читается накопленная сводка, и проект умеет аккуратно
+# закрывать такие сборы вместе с задачей (`mcp_started`, `cancel_started`).
+# Отложить запуск значило бы оставить запрос о сводке без данных.
+# Отбор — по префиксу имени инструмента (схема MCP описывает только вход, и
+# «этот вызов что-то создаёт» из неё не видно); чтения (`get_*`, `list_*`,
+# `search_*`, `geocode_*`…) под правило не попадают.
+RESULT_RE = re.compile(
+    r"^(save|create|add|register|write|store|put|upsert|export|download|publish|"
+    r"upload|send|submit|generate|build|render|report|attach)_")
+
+
+def is_deferred_call(call: Any, tools: Optional[List[Dict[str, Any]]] = None) -> bool:
+    """Откладывается ли вызов до подтверждения плана.
+
+    True — вызов создаёт РЕЗУЛЬТАТ (набор, файл, отчёт) или разрушает что-то
+    (удаление, остановка): до «ок» он не выполняется. Запуск сбора (`start_*`) —
+    НЕ результат, а добыча данных: он выполняется сразу, иначе план для запроса о
+    сводке строился бы без данных.
+    """
+    if not isinstance(call, dict):
+        return False
+    tool = str(call.get("tool") or "")
+    if not tool:
+        return False
+    return bool(RESULT_RE.match(tool) or DESTRUCTIVE_RE.match(tool))
+
+
+def split_calls(calls: Any, tools: Optional[List[Dict[str, Any]]] = None
+                ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Делит вызовы на (безопасные чтения, отложенные до «ок»)."""
+    reads: List[Dict[str, Any]] = []
+    deferred: List[Dict[str, Any]] = []
+    for call in normalize_calls(calls, limit=MAX_TOTAL_CALLS_PER_REQUEST):
+        (deferred if is_deferred_call(call, tools) else reads).append(call)
+    return reads, deferred
+
+
+def calls_note(calls: Any) -> str:
+    """Имена вызовов одной строкой (для диагностики в чате и в блоках)."""
+    return ", ".join(f"{call['server']} · {call['tool']}"
+                     for call in normalize_calls(calls, limit=MAX_TOTAL_CALLS_PER_REQUEST))
 
 # ---------------------------------------------------------------------------
 # Реестр серверов проекта.
@@ -274,9 +413,22 @@ TOOLS_PROMPT = (
     "Параметры сбора (интервал, срок хранения) задаёт СЕРВЕР инструмента: не "
     "передавай интервал из текста запроса, если такого аргумента нет в схеме.\n"
     "Ответ — ТОЛЬКО JSON без пояснений:\n"
-    '{"calls": [{"server": "weather", "tool": "get_weather", '
+    '{"mode": "single", "calls": [{"server": "weather", "tool": "get_weather", '
     '"arguments": {"city": "Москва"}}]}\n'
-    "Если внешние данные не нужны — {\"calls\": []}."
+    "Если внешние данные не нужны — {\"mode\": \"single\", \"calls\": []}.\n"
+    "ПОЛЕ mode — нужен ли ЦЕПОЧКА вызовов (несколько шагов, где следующий вызов "
+    "зависит от результата предыдущего):\n"
+    "- \"single\" — запрос закрывается тем, что ты вызовешь сейчас (получить "
+    "данные и ответить). Так почти всегда.\n"
+    "- \"chain\" — просят сделать с данными ЕЩЁ ЧТО-ТО, а не только прочитать: "
+    "«сохрани», «запиши», «экспортируй», «выгрузи в файл/Excel», «сформируй "
+    "таблицу-файл», «затем», «после этого»; либо результат одного инструмента "
+    "нужен как аргумент другого (например, чтобы выгрузить файл, нужен "
+    "идентификатор, который возвращает сохранение). В режиме chain верни в этом "
+    "раунде только ПЕРВЫЕ (читающие) вызовы: сохранение и выгрузку ты выполнишь "
+    "следующими раундами, когда увидишь результаты.\n"
+    "Никогда не выдумывай идентификаторы (dataset_id, watch_id, id): их значения "
+    "берут из результатов инструментов, а не из головы."
 )
 
 # Что говорим диспетчеру ПОВТОРНО: первый ответ состоял из одних ЗАПУСКОВ сбора,
@@ -864,27 +1016,60 @@ def discover_many(ids: Optional[List[str]] = None,
 # ---------------------------------------------------------------------------
 def _content_text(result: Dict[str, Any]) -> str:
     """Текст результата инструмента (MCP content -> строка)."""
+    return _content_parts(result)[0]
+
+
+def _content_parts(result: Dict[str, Any],
+                   origin: str = "") -> Tuple[str, List[Dict[str, Any]]]:
+    """Результат инструмента -> (текст, вложения).
+
+    Текстовые блоки склеиваются в текст. Бинарный ресурс (`resource.blob`) —
+    это ФАЙЛ: он сохраняется на диск, а вместо него в текст идёт строка о файле
+    (имя, размер, ссылка на скачивание), чтобы модель знала о полученном файле и
+    не выдумывала путь. Ссылка на внешний ресурс (`resource_link`/uri без
+    содержимого) остаётся текстом: файл на сервере, качать его нечем.
+    """
     parts: List[str] = []
+    files: List[Dict[str, Any]] = []
     for item in (result.get("content") or []):
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "text":
+        kind = item.get("type")
+        if kind == "text":
             parts.append(str(item.get("text") or ""))
-        elif item.get("type") == "resource":
+        elif kind == "resource":
             resource = item.get("resource")
-            if isinstance(resource, dict) and resource.get("text"):
+            if not isinstance(resource, dict):
+                continue
+            if resource.get("text"):
                 parts.append(str(resource.get("text")))
-    return "\n".join(part for part in parts if part.strip()).strip()
+                continue
+            saved = attach_store.from_resource(resource, origin=origin)
+            if saved is not None and len(files) < attach_store.MAX_PER_RESULT:
+                files.append(saved)
+                parts.append(
+                    f"[файл] {saved['name']} ({saved['size_text']}) — сохранён, "
+                    f"доступен пользователю по ссылке {saved['url']}"
+                )
+        elif kind == "resource_link":
+            name = str(item.get("name") or "")
+            uri = str(item.get("uri") or "")
+            if name or uri:
+                parts.append(f"[ресурс на сервере] {name or uri} — {uri}".strip())
+    text = "\n".join(part for part in parts if part.strip()).strip()
+    return text, files
 
 
 def call_tool(server_id: str, tool: str, arguments: Optional[Dict[str, Any]] = None,
               timeout: float = CALL_TIMEOUT) -> Dict[str, Any]:
-    """Вызывает инструмент сервера: {"ok", "text", "error"}.\n"
+    """Вызывает инструмент сервера: {"ok", "text", "error", "attachments"}.\n"
 
     Каждый вызов — отдельное соединение с сервером (процесс для локального,
     HTTP-запрос для удалённого): соединение не переиспользуется, поэтому
     «залипший» сервер не портит следующие запросы. Ошибку источника инструмент
-    возвращает сам (isError), и её текст уходит модели как есть.
+    возвращает сам (isError), и её текст уходит модели как есть. Файлы, которые
+    инструмент вернул, сохраняются на диск и уходят вложениями — их показывает
+    чат со ссылкой на скачивание (см. app/ai/attachments.py).
     """
     entry = find_server(server_id)
     if entry is None:
@@ -907,7 +1092,7 @@ def call_tool(server_id: str, tool: str, arguments: Optional[Dict[str, Any]] = N
     finally:
         if session is not None:
             session.close()
-    text = _content_text(result)
+    text, files = _content_parts(result, origin=f"{entry.get('name') or server_id} · {name}")
     # isError — инструмент отработал, но источник данных отказал: текст ошибки
     # уходит модели, чтобы она не выдумывала значения вместо недоступных.
     failed = bool(result.get("isError"))
@@ -915,18 +1100,22 @@ def call_tool(server_id: str, tool: str, arguments: Optional[Dict[str, Any]] = N
         "ok": not failed,
         "text": text[:RESULT_CHARS],
         "error": "" if not failed else (text[:400] or "инструмент вернул ошибку"),
+        "attachments": [] if failed else files,
     }
 
 
-def run_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def run_calls(calls: List[Dict[str, Any]],
+              limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Выполняет вызовы инструментов и возвращает результаты (последовательно).\n"
 
     Последовательно — намеренно: вызовы запускают локальные процессы и ходят во
-    внешние источники, а параллельный запуск только добавил бы нагрузку; за
-    запрос их и так не больше MAX_CALLS_PER_REQUEST.
+    внешние источники, а параллельный запуск только добавил бы нагрузку. `limit`
+    ограничивает число вызовов за раз (у цепочки свой остаток бюджета, см.
+    MAX_TOTAL_CALLS_PER_REQUEST), по умолчанию — MAX_CALLS_PER_REQUEST.
     """
+    cap = MAX_CALLS_PER_REQUEST if limit is None else max(0, int(limit))
     results: List[Dict[str, Any]] = []
-    for call in (calls or [])[:MAX_CALLS_PER_REQUEST]:
+    for call in (calls or [])[:cap]:
         if not isinstance(call, dict):
             continue
         server_id = str(call.get("server") or "").strip()
@@ -943,6 +1132,9 @@ def run_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "ok": bool(outcome.get("ok")),
             "text": str(outcome.get("text") or ""),
             "error": str(outcome.get("error") or ""),
+            # Файлы, которые вернул инструмент (xlsx, csv…): чат показывает их
+            # карточками со ссылкой на скачивание (app/ai/attachments.py).
+            "attachments": attach_store.normalize(outcome.get("attachments")),
         })
     return results
 
@@ -957,9 +1149,10 @@ async def async_discover(ids: Optional[List[str]] = None,
     return await asyncio.to_thread(discover_many, ids, force)
 
 
-async def async_run_calls(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def async_run_calls(calls: List[Dict[str, Any]],
+                          limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Асинхронное выполнение вызовов (серверы — в отдельном потоке)."""
-    return await asyncio.to_thread(run_calls, calls)
+    return await asyncio.to_thread(run_calls, calls, limit)
 
 
 # ---------------------------------------------------------------------------
@@ -1132,9 +1325,18 @@ def started_calls(results: Any, tools: List[Dict[str, Any]]) -> List[Dict[str, A
     return out[:MAX_STARTED]
 
 
-def normalize_calls(raw: Any) -> List[Dict[str, Any]]:
-    """Приводит список вызовов к безопасному виду: [{"server","tool","arguments"}]."""
+def normalize_calls(raw: Any, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Приводит список вызовов к безопасному виду: [{"server","tool","arguments"}].
+
+    `limit` — сколько вызовов оставить. По умолчанию предел ЗАПРОСА
+    (MAX_TOTAL_CALLS_PER_REQUEST), а НЕ одного раунда: этот нормализатор
+    применяется к ХРАНИМЫМ вызовам задачи (диалог, повтор, чтение журнала), а в
+    цепочке их до шести. Предел одного раунда живёт там, где вызовы ВЫБИРАЮТСЯ
+    (parse_calls), и молчаливая обрезка здесь теряла бы последний вызов цепочки —
+    например выгрузку файла, из-за чего повтор задачи оставался без свежего файла.
+    """
     out: List[Dict[str, Any]] = []
+    cap = MAX_TOTAL_CALLS_PER_REQUEST if limit is None else max(0, int(limit))
     for item in (raw if isinstance(raw, list) else []):
         if not isinstance(item, dict):
             continue
@@ -1155,7 +1357,9 @@ def normalize_calls(raw: Any) -> List[Dict[str, Any]]:
             call["action"] = True
         if call not in out:
             out.append(call)
-    return out[:MAX_CALLS_PER_REQUEST]
+        if len(out) >= cap:
+            break
+    return out
 
 
 def is_action_tool(tool: Any, tools: List[Dict[str, Any]],
@@ -1219,6 +1423,558 @@ def looks_aggregate(text: Any) -> bool:
     """
     body = " ".join(str(text or "").lower().split())
     return any(marker in body for marker in AGGREGATE_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# ЦЕПОЧКА: признаки, дайджест результатов, защита вызовов
+# ---------------------------------------------------------------------------
+# Пара «ключ: значение» в тексте результата: так из ответа инструмента
+# достаются идентификаторы (dataset_id, watch_id, id), которые нужны следующему
+# вызову. Значения берём только из САМИХ результатов — ничего не досчитываем.
+_ID_PAIR_RE = re.compile(
+    r"[\"']?([A-Za-z_][A-Za-z0-9_]{0,40})[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9][A-Za-z0-9._:-]{1,63})[\"']?"
+)
+
+
+def looks_like_chain(text: Any) -> bool:
+    """Просит ли запрос СДЕЛАТЬ С ДАННЫМИ что-то ещё (сохранить, выгрузить).
+
+    Дешёвый признак (только текст запроса, без вызовов LLM): «сохрани», «отдай в
+    виде эксель таблицы», «затем», «выгрузи файл». Сам по себе он ничего не
+    решает — вместе со структурным признаком (см. chain_signals) он означает
+    «здесь возможна зависимость по данным».
+    """
+    body = " ".join(str(text or "").lower().split())
+    return any(marker in body for marker in CHAIN_MARKERS)
+
+
+def id_required_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Инструменты, у которых ЕСТЬ обязательный аргумент-идентификатор.
+
+    Такой аргумент нельзя вывести из запроса: его значение возвращает другой
+    инструмент (`dataset_id` приходит из сохранения, `id` наблюдения — из
+    запуска сбора). Список строится из схем, объявленных СЕРВЕРОМ, поэтому
+    признак не привязан ни к погоде, ни к конкретному серверу.
+    """
+    out: List[Dict[str, Any]] = []
+    for item in (tools or []):
+        if not isinstance(item, dict):
+            continue
+        schema = item.get("schema") if isinstance(item.get("schema"), dict) else {}
+        required = [str(key) for key in (schema.get("required") or [])]
+        ids = [key for key in required if ID_ARG_RE.search(key)]
+        if ids:
+            out.append({
+                "server": str(item.get("server") or ""),
+                "tool": str(item.get("tool") or ""),
+                "args": ids,
+            })
+    return out
+
+
+def chain_signals(tools: Optional[List[Dict[str, Any]]], text: Any,
+                  expected: int = 0) -> Dict[str, Any]:
+    """Признаки того, что запрос требует ЦЕПОЧКИ вызовов (а не одного раунда).
+
+    Гибридная схема: разовые запросы идут дешёвым путём (один раунд), а в цикл
+    уходят только задачи, где следующий вызов зависит от результата предыдущего.
+    Признаки делятся на дешёвые (текст + схемы инструментов, без вызовов LLM) и
+    модельный (диспетчер сам объявляет режим — см. parse_decision).
+
+    - `markers`   — в запросе просят сохранить/выгрузить/оформить файл или задан
+                    порядок шагов («затем», «после этого»);
+    - `id_tools`  — среди объявленных инструментов есть те, чей ОБЯЗАТЕЛЬНЫЙ
+                    аргумент — идентификатор (его значение даёт другой вызов);
+    - `expected`  — сколько вызовов выбрал диспетчер (веер по нескольким
+                    объектам ≠ цепочка, но повышает шанс, что дальше будет шаг).
+    """
+    markers = looks_like_chain(text)
+    id_tools = id_required_tools(tools)
+    return {
+        "markers": markers,
+        "id_tools": id_tools,
+        "expected": int(expected or 0),
+        # Цепочка оправдана, когда просят «сделать с данными ещё что-то» И в
+        # наборе есть инструмент, которому для этого нужен id из результата.
+        "needed": bool(markers and id_tools),
+    }
+
+
+def chain_reason(signals: Dict[str, Any]) -> str:
+    """Понятная причина решения «идём в цепочку» (для чата и отладки)."""
+    if not signals.get("needed"):
+        return ""
+    tools = ", ".join(f"{item['tool']}({', '.join(item['args'])})"
+                      for item in (signals.get("id_tools") or [])[:3])
+    return ("запрос просит сделать с данными ещё шаг (сохранить/выгрузить), а "
+            f"инструменты требуют идентификатор из результата: {tools}")
+
+
+def call_key(call: Any) -> str:
+    """Ключ вызова для дедупликации: сервер + инструмент + аргументы как есть.
+
+    Один и тот же вызов в цепочке повторять нельзя: результат уже есть, а второй
+    запуск только потратит время (у пишущих инструментов — ещё и создаст дубль).
+    """
+    if not isinstance(call, dict):
+        return ""
+    return "|".join((
+        str(call.get("server") or ""),
+        str(call.get("tool") or ""),
+        json.dumps(call.get("arguments") or {}, ensure_ascii=False, sort_keys=True),
+    ))
+
+
+def extract_ids(results: Any) -> Dict[str, str]:
+    """Идентификаторы из РЕЗУЛЬТАТОВ: {имя аргумента: значение}.
+
+    Источник значения — только текст ответа сервера. Это то, что разрешено
+    подставлять в аргументы-идентификаторы следующего вызова (см. guard_calls):
+    выдуманный id сервер отклонит, и цепочка встанет.
+    """
+    found: Dict[str, str] = {}
+    data = normalize_results(results)
+    for item in data:
+        if not item.get("ok"):
+            continue
+        text = str(item.get("text") or "")
+        for key, value in _ID_PAIR_RE.findall(text):
+            if not ID_ARG_RE.search(key):
+                continue
+            found.setdefault(key, value)
+        for ref in item.get("attachments") or []:
+            if ref.get("id"):
+                found.setdefault("file_id", str(ref["id"]))
+    return found
+
+
+def next_step_hints(tools: Optional[List[Dict[str, Any]]],
+                    ids: Dict[str, str]) -> List[str]:
+    """Подсказки «что теперь можно вызвать»: инструменты, чьи id-аргументы готовы.
+
+    Строятся из объявленных схем и найденных значений. Нужны, чтобы диспетчер не
+    искал зависимость сам: видно, что, например, выгрузка файла требует
+    `dataset_id`, а он уже есть в результатах.
+    """
+    hints: List[str] = []
+    for item in id_required_tools(tools):
+        ready = {key: ids[key] for key in item["args"] if key in ids}
+        if not ready:
+            continue
+        pairs = ", ".join(f"{key}={value}" for key, value in ready.items())
+        hints.append(f"{item['tool']} (сервер {item['server']}) — нужен "
+                     f"{', '.join(item['args'])}; готовое значение: {pairs}")
+    return hints
+
+
+def digest(results: Any, ids: Optional[Dict[str, str]] = None,
+           hints: Optional[List[str]] = None,
+           tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Дайджест УЖЕ ВЫПОЛНЕННЫХ вызовов — то, что видит диспетчер в цепочке.
+
+    Диспетчер первого раунда результатов не видит (он выбирает вызовы до их
+    выполнения). В цикле ему отдают дайджест: что вызвано, чем закончилось,
+    короткий текст ответа, найденные идентификаторы, что из этого следует
+    (`next_step_hints`) и какие объявленные инструменты ЕЩЁ НЕ вызывались.
+
+    Последний список — не украшение: без него диспетчер видит только сделанное и
+    легко решает «данных хватает», хотя пользователь просил, например, сохранить
+    набор и выгрузить файл. Результаты при этом обрезаются первыми: списки
+    идентификаторов и неиспользованных инструментов обязаны дойти целиком.
+    """
+    data = normalize_results(results)
+    lines: List[str] = []
+    for index, item in enumerate(data, 1):
+        status = "OK" if item.get("ok") else "ОШИБКА"
+        args = arguments_text(item.get("arguments"))
+        body = str(item.get("text") if item.get("ok") else item.get("error") or "")
+        lines.append(f"{index}) {item['server']} · {item['tool']}"
+                     + (f"({args})" if args else "") + f" — {status}\n"
+                     + body[:DIGEST_RESULT_CHARS].strip())
+        for ref in item.get("attachments") or []:
+            lines.append(f"   [файл] {ref['name']} ({ref['size_text']}) — {ref['url']}")
+    head = "РЕЗУЛЬТАТЫ УЖЕ ВЫПОЛНЕННЫХ ВЫЗОВОВ:\n" + ("\n\n".join(lines) if lines
+                                                      else "(вызовов ещё не было)")
+    tail = ""
+    found = ids if ids is not None else extract_ids(results)
+    if found:
+        tail += ("\n\nИДЕНТИФИКАТОРЫ ИЗ РЕЗУЛЬТАТОВ (только эти значения допустимы "
+                 "в аргументах-идентификаторах):\n"
+                 + "\n".join(f"- {key} = {value}" for key, value in found.items()))
+    ready = hints if hints is not None else next_step_hints([], found)
+    if ready:
+        tail += "\n\nЧТО ТЕПЕРЬ ВОЗМОЖНО:\n" + "\n".join(f"- {line}" for line in ready)
+    # Инструменты, которые ЕЩЁ НЕ вызывались — см. пояснение в docstring.
+    called = {(item["server"], item["tool"]) for item in data}
+    unused = []
+    for tool in (tools or []):
+        name = str(tool.get("tool") or "")
+        server_id = str(tool.get("server") or "")
+        if not name or (server_id, name) in called:
+            continue
+        unused.append(f"{name} (сервер {server_id})")
+    if unused:
+        tail += ("\n\nИНСТРУМЕНТЫ, КОТОРЫЕ ЕЩЁ НЕ ВЫЗЫВАЛИСЬ (сверь с запросом: "
+                 "не закрывает ли один из них оставшуюся часть работы?):\n"
+                 + "\n".join(f"- {name}" for name in unused))
+    budget = max(800, CHAIN_DIGEST_CHARS - len(tail))
+    return (head[:budget] + tail)[:CHAIN_DIGEST_CHARS]
+
+
+def chain_note(iteration: int, total: int, remaining: int,
+               signals: Optional[Dict[str, Any]] = None) -> str:
+    """Условие для диспетчера в раунде цепочки (идёт в блок «ВАЖНОЕ УСЛОВИЕ»).
+
+    Правила жёсткие, потому что цена ошибки — отказ сервера (выдуманный id) или
+    дубль данных на сервере (повторное сохранение без перезаписи).
+    """
+    hint = chain_reason(signals or {}) or "запрос требует нескольких шагов"
+    return (
+        f"ЭТО ПРОДОЛЖЕНИЕ ЦЕПОЧКИ: раунд {iteration} из {total}, остаток вызовов — "
+        f"{remaining}. Причина: {hint}.\n"
+        "Смотри на РЕЗУЛЬТАТЫ и на список НЕ ВЫЗВАННЫХ инструментов ниже и реши, "
+        "нужен ли СЛЕДУЮЩИЙ вызов.\n"
+        "ПРАВИЛА ЦЕПОЧКИ:\n"
+        "1) Запрос выполняется ЦЕЛИКОМ, а не только чтением данных. Если пользователь "
+        "просил сохранить, записать, экспортировать, выгрузить файлом, сформировать "
+        "таблицу-файл, отчёт или приложить файл — это РАБОТА ИНСТРУМЕНТОВ, и пока "
+        "соответствующий инструмент не вызван, запрос НЕ выполнен. Общее правило "
+        "«вызывай только если без него нельзя ответить» здесь НЕ действует: "
+        "сохранение и выгрузка нужны сами по себе.\n"
+        "2) Не повторяй вызовы, данные которых уже получены: они есть в результатах.\n"
+        "3) Значения аргументов-идентификаторов (dataset_id, watch_id, id, key) бери "
+        "ТОЛЬКО из блока «ИДЕНТИФИКАТОРЫ ИЗ РЕЗУЛЬТАТОВ». Выдуманный идентификатор "
+        "будет отброшен, и вызов не состоится. Если нужного идентификатора нет — "
+        "сначала вызови инструмент, который перечисляет существующее (list_*), а "
+        "уже потом тот, что принимает идентификатор.\n"
+        "4) Значения данных (числа, даты, тексты), которые надо записать, копируй "
+        "из результатов КАК ЕСТЬ, ничего не досчитывая и не округляя.\n"
+        "5) Если для записи нужен постоянный ключ (dataset_id/title/name), задай его "
+        "сам по смыслу задачи (места и даты) и используй ОДИН И ТОТ ЖЕ ключ во всех "
+        "раундах и повторах задачи; при повторной записи того же ключа передавай "
+        "флаг перезаписи (replace/overwrite), если он объявлен в схеме.\n"
+        "6) Пустой список допустим ТОЛЬКО когда запрос выполнен полностью: данные "
+        "получены, всё, о чём просил пользователь, сделано инструментами, и ни один "
+        "невызванный инструмент не продвинет работу. Тогда верни "
+        "{\"done\": true, \"reason\": \"почему больше нечего делать\", \"calls\": []}.\n"
+        "Ответ — ТОЛЬКО JSON: {\"done\": false, \"reason\": \"зачем вызов\", "
+        "\"calls\": [...]}."
+    )
+
+
+def delivery_candidates(tools: Optional[List[Dict[str, Any]]],
+                        done_pairs: Optional[set] = None) -> List[Dict[str, Any]]:
+    """Невызванные инструменты, которые СОЗДАЮТ результат (сохранить, выгрузить).
+
+    Нужны для принудительного уточнения: диспетчер непостоянен — на один и тот же
+    запрос он то строит цепочку, то решает «данных хватает», и задача остаётся
+    без сохранения и файла. Если запрос явно просит сохранить/выгрузить (см.
+    CHAIN_MARKERS), а вызовов для этого не было, агент спрашивает диспетчера ЕЩЁ
+    РАЗ, назвав эти инструменты прямо (см. deliver_note).
+
+    Отбор — по имени инструмента, как пары start_/stop_ выше: схемы MCP описывают
+    только вход, и «этот инструмент создаёт результат» из них не видно. Берём
+    именно СОЗДАЮЩИЕ префиксы (`RESULT_RE`: save_/export_/create_/…), а не любое
+    упоминание слова «report» в имени: читающий `get_weather_watch_report` тоже
+    его содержит, и по нему цепочка считала, что результат ещё не выдан, — лишний
+    полный раунд диспетчера после выгрузки файла.
+    """
+    done = done_pairs if isinstance(done_pairs, set) else set()
+    out: List[Dict[str, Any]] = []
+    for tool in (tools or []):
+        name = str(tool.get("tool") or "")
+        server_id = str(tool.get("server") or "")
+        if not name or (server_id, name) in done:
+            continue
+        if RESULT_RE.match(name):
+            out.append({"server": server_id, "tool": name,
+                        "description": str(tool.get("description") or "")[:200]})
+    return out
+
+
+def auto_followup(tools: Optional[List[Dict[str, Any]]], done_pairs: Optional[set],
+                  known_ids: Optional[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    """Очевидная ДОСТРОЙКА без модели: единственный оставшийся шаг результата.
+
+    Если после создающего вызова остался РОВНО ОДИН невызванный инструмент,
+    который создаёт результат (например, выгрузка файла по сохранённому набору),
+    и все его ОБЯЗАТЕЛЬНЫЕ аргументы — идентификаторы, значения которых уже
+    известны (id пришёл из ответа сервера), решение очевидно: его можно вызвать
+    без вопроса диспетчеру. Это экономит целый вызов LLM — самую дорогую часть
+    задачи (промпт диспетчера: список инструментов, правила, дайджест).
+
+    Возвращает готовый вызов либо None (тогда решает модель, как и раньше).
+    Консервативно: один кандидат, непустые обязательные аргументы, все значения
+    известны. Ничего не выдумывается — иначе вернули бы None.
+    """
+    candidates = delivery_candidates(tools, done_pairs)
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    schema = _schema_for(str(candidate.get("server") or ""),
+                         str(candidate.get("tool") or ""), tools)
+    required = [str(key) for key in (schema.get("required") or [])]
+    if not required:
+        return None
+    arguments: Dict[str, str] = {}
+    known = known_ids or {}
+    for key in required:
+        value = str(known.get(key) or "")
+        if not value:
+            return None
+        arguments[key] = value
+    return {"server": str(candidate.get("server") or ""),
+            "tool": str(candidate.get("tool") or ""), "arguments": arguments}
+
+
+def deliver_note(candidates: List[Dict[str, Any]], request_text: Any = "",
+                 initial: bool = False) -> str:
+    """Уточнение диспетчеру: «запрос просил сохранить/выгрузить — вызова не было».
+
+    Перечисляет невызванные инструменты, которые создают результат, и требует
+    либо вызвать подходящий, либо объяснить, почему ни один не подходит. Так
+    задача не остаётся без файла из-за того, что модель решила «данных хватает».
+
+    `initial` — уточнение ПЕРЕД первым раундом (диспетчер ответил «данные не
+    нужны» на запрос, который явно просит сохранение/выгрузку): тогда данных ещё
+    нет, и вместо «вызови подходящий» нужно «верни ЧТЕНИЕ и режим chain».
+    """
+    if not candidates:
+        return ""
+    lines = [f"- {item['tool']} (сервер {item['server']})"
+             + (f" — {item['description']}" if item.get("description") else "")
+             for item in candidates[:8]]
+    tail = (
+        "Вызови подходящий (данные для его аргументов уже есть в результатах выше) "
+        "или, если ни один не подходит, верни {\"done\": true} и в поле reason "
+        "объясни, почему сохранение/выгрузка невозможны."
+        if not initial else
+        "Верни в этом раунде ЧИТАЮЩИЕ вызовы, которые нужны для этого шага, и "
+        "поставь mode=\"chain\": сохранение и выгрузку выполнишь следующими "
+        "раундами по результатам. Если шаг невозможен объявленными инструментами — "
+        "верни пустой список и объясни это в reason."
+    )
+    return (
+        "ЗАПРОС ВЫПОЛНЕН НЕ ПОЛНОСТЬЮ. Пользователь просил сделать с данными ещё "
+        "шаг (сохранить/записать/выгрузить/отдать файлом), но НИ ОДИН инструмент "
+        "для этого не вызван. Ниже инструменты, которые ещё НЕ вызывались и могут "
+        "закрыть эту часть работы:\n" + "\n".join(lines) + "\n" + tail
+    )
+
+
+def _schema_for(server_id: str, tool: str,
+                tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Схема аргументов инструмента: из переданного списка или из кэша tools/list.
+
+    Нужна там, где список инструментов под рукой не лежит (например, повтор
+    периодической задачи выполняется по сохранённым вызовам БЕЗ обнаружения
+    инструментов). Сбой сервера не должен ломать вызов: нет схемы — нет и
+    решения, которое на неё опирается.
+    """
+    schema = _schema_of(tools or [], server_id, tool)
+    if schema:
+        return schema
+    try:
+        found = discover(server_id)
+    except Exception:  # noqa: BLE001 — недоступный сервер не ломает вызов
+        return {}
+    for item in ((found or {}).get("tools") or []):
+        if str(item.get("name") or "") == tool:
+            schema = item.get("schema")
+            return schema if isinstance(schema, dict) else {}
+    return {}
+
+
+def overwrite_flag(schema: Optional[Dict[str, Any]]) -> str:
+    """Имя флага перезаписи в схеме инструмента ("" — такого флага нет).
+
+    Серверы называют его по-разному (`replace`, `overwrite`, `force`…), поэтому
+    ищем по списку имён, а не по одному. Флаг есть только у инструментов, которые
+    умеют обновлять уже существующее.
+    """
+    props = (schema or {}).get("properties")
+    if not isinstance(props, dict):
+        return ""
+    for name in OVERWRITE_FLAGS:
+        if name in props:
+            return name
+    return ""
+
+
+def enforce_overwrite(calls: Any, tools: Optional[List[Dict[str, Any]]] = None,
+                      known_ids: Optional[Dict[str, str]] = None) -> List[str]:
+    """Ставит флаг перезаписи, когда задача ПОВТОРНО пишет под тем же ключом.
+
+    Живой случай: сервер отказывает в сохранении набора, который уже существует
+    («A dataset with id … already exists. Pass replace: true to overwrite it»), а
+    в повторе периодической задачи диспетчер не спрашивается вовсе — вызовы
+    выполняются как сохранены, и без флага повтор оставался без свежих данных.
+
+    Правило: если у СОЗДАЮЩЕГО инструмента (`save_*`, `create_*`…) есть
+    id-аргумент, значение которого задача УЖЕ использовала (known_ids), и в схеме
+    объявлен флаг перезаписи — ставим его сами. Так повтор обновляет тот же набор
+    (идемпотентность), а не падает и не плодит дубли. Чужие вызовы не трогаем:
+    новый ключ флага не получает.
+
+    Возвращает список правок для строки в чате.
+    """
+    known = {str(value) for value in (known_ids or {}).values()}
+    if not known:
+        return []
+    changed: List[str] = []
+    # Правим ИМЕННО те словари, что лежат в списке вызовов: normalize_calls делает
+    # копии, и флаг, поставленный копии, до выполнения не дошёл бы (как и в
+    # mark_call_kinds, который по этой же причине работает с исходными словарями).
+    for call in (calls if isinstance(calls, list) else []):
+        if not isinstance(call, dict):
+            continue
+        tool = str(call.get("tool") or "")
+        if not PRODUCER_RE.match(tool):
+            continue
+        server_id = str(call.get("server") or "")
+        schema = _schema_for(server_id, tool, tools)
+        flag = overwrite_flag(schema)
+        if not flag:
+            continue
+        arguments = call.get("arguments")
+        if not isinstance(arguments, dict) or arguments.get(flag) is True:
+            continue
+        ids = {str(key): str(value) for key, value in arguments.items()
+               if ID_ARG_RE.search(str(key))}
+        if not any(value in known for value in ids.values()):
+            continue
+        arguments[flag] = True
+        changed.append(f"{tool}: {flag}=true ({', '.join(f'{k}={v}' for k, v in ids.items())})")
+    return changed
+
+
+def produced_result(results: Any) -> bool:
+    """Получен ли по запросу ГОТОВЫЙ РЕЗУЛЬТАТ: файл или сохранённый набор/отчёт.
+
+    Признак успешного РЕЗУЛЬТАТА, а не чтения: среди успешных вызовов есть вложение
+    (файл) или вызов, который что-то СОЗДАЛ (`is_deferred_call`: save_/export_/
+    create_/report_… — по префиксу имени). Обычное чтение отчёта
+    (`get_weather_watch_report`) и запуск сбора результатом не считаются: это лишь
+    данные и подготовка к ним.
+
+    Нужен веб-слою: если работа уже сделана инструментами (в гибридной схеме это
+    возможно только после подтверждения плана), спрашивать подтверждение не о чем —
+    задача висела бы в ожидании при готовом результате.
+    """
+    for item in normalize_results(results):
+        if not item.get("ok"):
+            continue
+        if item.get("attachments"):
+            return True
+        if RESULT_RE.match(str(item.get("tool") or "")):
+            return True
+    return False
+
+
+def produced_ids(calls: Any) -> Dict[str, str]:
+    """Идентификаторы, которые НАЗВАЛИ создающие вызовы (save_/create_/…).
+
+    Их сервер принял (вызов выполнен), значит эти значения существуют и их можно
+    переиспользовать в следующих раундах: например, сохранили набор под ключом
+    `ekb-kzn-27-09` — этот же ключ потом передаём в выгрузку файла и в повторах
+    периодической задачи (иначе каждый повтор заводил бы новый набор).
+    """
+    out: Dict[str, str] = {}
+    for call in normalize_calls(calls, limit=MAX_TOTAL_CALLS_PER_REQUEST):
+        tool = str(call.get("tool") or "")
+        if not PRODUCER_RE.match(tool):
+            continue
+        for arg, value in (call.get("arguments") or {}).items():
+            if ID_ARG_RE.search(str(arg)) and TOKEN_RE.match(str(value) or ""):
+                out.setdefault(str(arg), str(value))
+    return out
+
+
+def guard_calls(calls: Any, results: Any, tools: Optional[List[Dict[str, Any]]],
+                user_text: str = "",
+                done_keys: Optional[set] = None,
+                issued_ids: Optional[Dict[str, str]] = None
+                ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Отбрасывает недопустимые вызовы цепочки; возвращает (допущенные, отказы).
+
+    Четыре проверки (все — про безопасность и осмысленность, а не про удобство):
+
+    1. **Идентификаторы не выдумывают.** Значение аргумента-идентификатора у
+       ЧИТАЮЩЕГО инструмента обязано присутствовать в тексте результатов (или быть
+       названным ранее создающим вызовом — см. `issued_ids`): иначе следующий
+       вызов гарантированно провалится (сервер не знает такого dataset_id), а
+       цепочка сожжёт раунды.
+    2. **Создающему инструменту идентификатор задать можно** (`save_*`, `create_*`):
+       он этот идентификатор и создаёт. Значение при этом должно быть обычным
+       токеном — без путей, пробелов и переводов строк.
+    3. **Разрушительное — только по прямой просьбе.** `delete_*`, `stop_*` и
+       подобные в автоцикле опасны: их вызывают, лишь если пользователь сам
+       просит удалить/остановить.
+    4. **Повторов нет.** Тот же вызов с теми же аргументами не выполняется дважды
+       (результат уже есть; для пишущих инструментов это ещё и дубль на сервере).
+    """
+    allowed: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, str]] = []
+    keys = done_keys if isinstance(done_keys, set) else set()
+    # Текст всех результатов — область, в которой ищем «настоящие» значения.
+    haystack = "\n".join(str(item.get("text") or "") + " " + str(item.get("error") or "")
+                         for item in normalize_results(results))
+    known = set(extract_ids(results).values())
+    issued = {str(value) for value in (issued_ids or {}).values()}
+    body = " ".join(str(user_text or "").lower().split())
+    for call in normalize_calls(calls, limit=MAX_TOTAL_CALLS_PER_REQUEST):
+        server_id, tool = str(call.get("server") or ""), str(call.get("tool") or "")
+        key = call_key(call)
+        if key and key in keys:
+            rejected.append({"server": server_id, "tool": tool,
+                             "reason": "такой вызов уже выполнялся — результат есть"})
+            continue
+        if DESTRUCTIVE_RE.match(tool) and not any(m in body for m in DESTRUCTIVE_MARKERS):
+            rejected.append({"server": server_id, "tool": tool,
+                             "reason": "разрушительный вызов без прямой просьбы "
+                                       "пользователя — отброшен"})
+            continue
+        producer = bool(PRODUCER_RE.match(tool))
+        bad = ""
+        for arg, value in (call.get("arguments") or {}).items():
+            if not ID_ARG_RE.search(str(arg)):
+                continue
+            text = str(value or "")
+            if not text:
+                continue
+            if producer:
+                if not TOKEN_RE.match(text):
+                    bad = (f"значение {arg} не похоже на идентификатор (нужен короткий "
+                           "токен без путей и пробелов)")
+                    break
+                continue
+            if text in known or text in issued or text in haystack:
+                continue
+            bad = (f"значение {arg}={text} не найдено в результатах — идентификатор "
+                   "нельзя выдумывать, сначала вызови инструмент, который его выдаёт "
+                   "или перечисляет (list_*)")
+            break
+        if bad:
+            rejected.append({"server": server_id, "tool": tool, "reason": bad})
+            continue
+        allowed.append(call)
+        if key:
+            keys.add(key)
+        if producer:
+            for arg, value in produced_ids([call]).items():
+                issued.add(value)
+    return allowed, rejected
+
+
+def attachments_of(results: Any) -> List[Dict[str, Any]]:
+    """Все файлы, полученные за запрос (для карточки в чате и системного блока)."""
+    out: List[Dict[str, Any]] = []
+    for item in normalize_results(results):
+        for ref in item.get("attachments") or []:
+            clean = attach_store.public(ref)
+            if clean and clean not in out:
+                out.append(clean)
+    return out
 
 
 def mark_call_kinds(calls: Any, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1326,21 +2082,76 @@ def cancel_note(reports: List[Dict[str, Any]]) -> str:
 # Выбор инструментов служебным вызовом модели
 # ---------------------------------------------------------------------------
 def tools_text(tools: List[Dict[str, Any]]) -> str:
-    """Список инструментов текстом для модели: сервер, имя, описание, схема."""
+    """Список инструментов текстом для модели: сервер, имя, назначение, аргументы.
+
+    АРГУМЕНТЫ ПЕРЕДАЮТСЯ СЖАТО, а не полным JSON-схем: у настоящих серверов схемы
+    многословны (описание каждого поля на 200+ слов), и дамп всех схем занимал
+    ~24 000 символов (~8 000 токенов) НА КАЖДЫЙ вызов диспетчера — при четырёх
+    раундах цепочки это десятки тысяч токенов на одну задачу (панель «Токены»
+    показывала огромные числа). Диспетчеру нужны имена, типы, обязательность и
+    КОРОТКАЯ подсказка по смыслу поля: этого хватает, чтобы заполнить аргументы
+    (в том числе `language`/`countryCode`, из-за которых геокодеры не находили
+    русские названия).
+    """
     lines: List[str] = []
     for tool in tools:
         lines.append(
             f"- сервер: {tool.get('server')} ({tool.get('server_name') or ''}); "
-            f"инструмент: {tool.get('tool')}; назначение: {tool.get('description') or ''}")
-        schema = tool.get("schema")
-        if isinstance(schema, dict) and schema:
-            lines.append("  аргументы: " + json.dumps(schema, ensure_ascii=False))
-    return "\n".join(lines) if lines else "(инструментов нет)"
+            f"инструмент: {tool.get('tool')}; назначение: "
+            f"{_short(str(tool.get('description') or ''), TOOL_DESCRIPTION_CHARS)}")
+        args = _schema_args(tool.get("schema"))
+        if args:
+            lines.append("  аргументы: " + args)
+    text = "\n".join(lines) if lines else "(инструментов нет)"
+    return text[:TOOLS_TEXT_CHARS]
+
+
+def _schema_args(schema: Any) -> str:
+    """Сжатое описание аргументов: `имя: тип (подсказка)` + обязательные.
+
+    Обязательные помечаются `!`. Подсказка — первый осмысленный кусок описания
+    поля (до ~ARG_HINT_CHARS): без него модель путает смысл полей, с полным
+    описанием — платит за него на каждом вызове.
+    """
+    if not isinstance(schema, dict):
+        return ""
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return "(без аргументов)"
+    required = {str(name) for name in (schema.get("required") or [])}
+    parts: List[str] = []
+    for name, spec in list(props.items())[:ARG_LIMIT]:
+        spec = spec if isinstance(spec, dict) else {}
+        kind = str(spec.get("type") or "any")
+        if kind == "array":
+            item = spec.get("items") if isinstance(spec.get("items"), dict) else {}
+            kind = f"array<{item.get('type') or 'any'}>"
+        hint = _short(str(spec.get("description") or ""), ARG_HINT_CHARS)
+        required_mark = "!" if str(name) in required else ""
+        parts.append(f"{name}{required_mark}: {kind}" + (f" — {hint}" if hint else ""))
+    return "; ".join(parts)
+
+
+def _short(text: str, limit: int) -> str:
+    """Первая фраза текста, не длиннее предела (для сжатых подсказок)."""
+    body = " ".join(str(text or "").split())
+    if not body:
+        return ""
+    for stop in (". ", "! ", "? "):
+        cut = body.find(stop)
+        if 0 < cut <= limit:
+            body = body[:cut + 1]
+            break
+    return body[:limit].strip()
 
 
 def build_query(user_message: str, tools: List[Dict[str, Any]],
                 started: Optional[List[Dict[str, Any]]] = None,
-                extra: str = "") -> str:
+                extra: str = "",
+                results: Any = None,
+                ids: Optional[Dict[str, str]] = None,
+                hints: Optional[List[str]] = None,
+                chain_state: Optional[Dict[str, Any]] = None) -> str:
     """Текст запроса к модели: запрос пользователя + доступные инструменты.\n"
 
     `started` — ВНЕШНИЕ СБОРЫ, которые эта задача уже начала (наблюдения,
@@ -1348,6 +2159,13 @@ def build_query(user_message: str, tools: List[Dict[str, Any]],
     повторно нельзя: модель получает их отдельным блоком вместе с аргументами
     отмены (в них — id, по которому читается накопленная сводка). Блок строится
     из ДАННЫХ сервера, а не из имён в коде: имена инструментов код не знает.
+
+    `results` — РЕЗУЛЬТАТЫ уже выполненных вызовов (раунды цепочки): без них
+    следующий вызов нельзя построить по факту, а только угадать. Вместе с ними
+    идут найденные идентификаторы (`ids`), подсказки «что теперь возможно»
+    (`hints`) и состояние цепочки прежних повторов задачи (`chain_state`) — по
+    нему повтор периодической задачи перезаписывает ТОТ ЖЕ набор данных, а не
+    создаёт новый.
     """
     text = (
         "ЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n" + (str(user_message or "").strip() or "(пусто)")
@@ -1374,6 +2192,16 @@ def build_query(user_message: str, tools: List[Dict[str, Any]],
             "накопленные данные читай по их параметрам — например, сводку за "
             "прошедший период):\n" + "\n".join(lines)
         )
+    if results:
+        text += "\n\n" + digest(results, ids=ids, hints=hints, tools=tools)
+    if isinstance(chain_state, dict) and chain_state.get("ids"):
+        # Данные, сохранённые ЭТОЙ задачей в прежних раундах или повторах: ключи
+        # надо переиспользовать (иначе каждый повтор заводил бы новый набор).
+        lines = [f"- {key} = {value}" for key, value in chain_state["ids"].items()]
+        text += ("\n\nСОХРАНЕНО ЭТОЙ ЗАДАЧЕЙ РАНЬШЕ (тот же ключ нужно "
+                 "переиспользовать, а не создавать новый; при повторной записи "
+                 "того же ключа передавай флаг перезаписи, если он есть в схеме):\n"
+                 + "\n".join(lines))
     return text + "\n\nДОСТУПНЫЕ ИНСТРУМЕНТЫ:\n" + tools_text(tools)
 
 
@@ -1401,14 +2229,15 @@ def _load_object(content: str) -> Any:
 
 
 def parse_calls(content: str,
-                tools: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+                tools: Optional[List[Dict[str, Any]]] = None,
+                limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Разбирает ответ модели в вызовы инструментов (пусто — разобрать не удалось).\n"
 
     Принимает и русские ключи («вызовы», «сервер», «инструмент», «аргументы»).
     Вызовы с неизвестным сервером или инструментом ОТБРАСЫВАЮТСЯ: модель может
     придумать инструмент, которого нет, а «вызвать» его нельзя — иначе агент
-    показал бы пользователю данные из ниоткуда.
-    """
+    показал бы пользователю данные из ниоткуда. `limit` — сколько вызовов брать
+    (у цепочки — по остатку бюджета, см. MAX_TOTAL_CALLS_PER_REQUEST)."""
     payload = _load_object(content)
     if isinstance(payload, list):
         payload = {"calls": payload}
@@ -1423,6 +2252,7 @@ def parse_calls(content: str,
     allowed = None
     if tools is not None:
         allowed = {(str(item.get("server")), str(item.get("tool"))) for item in tools}
+    cap = MAX_CALLS_PER_REQUEST if limit is None else max(0, int(limit))
     out: List[Dict[str, Any]] = []
     for item in (raw if isinstance(raw, list) else []):
         if not isinstance(item, dict):
@@ -1443,29 +2273,73 @@ def parse_calls(content: str,
         call = {"server": server_id, "tool": tool, "arguments": arguments}
         if call not in out:
             out.append(call)
-        if len(out) >= MAX_CALLS_PER_REQUEST:
+        if len(out) >= cap:
             break
     return out
 
 
-async def choose(user_message: str, tools: List[Dict[str, Any]],
+def parse_decision(content: str,
+                   tools: Optional[List[Dict[str, Any]]] = None,
+                   limit: Optional[int] = None) -> Dict[str, Any]:
+    """Ответ диспетчера целиком: {"mode", "done", "reason", "calls"}.
+
+    Кроме вызовов модель объявляет РЕЖИМ работы: `single` — запрос закрывается
+    этим раундом, `chain` — нужна цепочка (следующий вызов зависит от результата
+    предыдущего). Режим решает ГИБРИДНУЮ маршрутизацию: разовые запросы не платят
+    за цикл, а многошаговые получают возможность дойти до конца. Непонятный или
+    отсутствующий режим — `single` (дешёвый путь по умолчанию). `done` —
+    «цепочка закончена, больше вызовов не нужно».
+    """
+    calls = parse_calls(content, tools, limit=limit)
+    payload = _load_object(content)
+    mode, done, reason = "single", False, ""
+    if isinstance(payload, dict):
+        raw_mode = str(payload.get("mode") or payload.get("режим") or "").strip().lower()
+        if raw_mode in ("chain", "цепочка", "loop", "multi", "multistep", "multi_step"):
+            mode = "chain"
+        raw_done = payload.get("done")
+        if raw_done is None:
+            raw_done = payload.get("готово")
+        if isinstance(raw_done, bool):
+            done = raw_done
+        reason = str(payload.get("reason") or payload.get("причина") or "").strip()[:200]
+    return {"mode": mode, "done": done, "reason": reason, "calls": calls}
+
+
+async def decide(user_message: str, tools: List[Dict[str, Any]],
                  call: LlmCall,
                  started: Optional[List[Dict[str, Any]]] = None,
-                 extra: str = "") -> List[Dict[str, Any]]:
-    """Служебный вызов: какие инструменты вызвать по запросу пользователя.\n"
+                 extra: str = "",
+                 results: Any = None,
+                 remaining: Optional[int] = None,
+                 chain_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Служебный вызов диспетчера: какие инструменты вызвать и нужна ли цепочка.\n"
 
-    Пустой список означает «внешние данные не нужны» ИЛИ «вызов не удался»: в
-    обоих случаях агент работает как раньше — без данных MCP. Сбой не выдумывает
-    вызовы (как и сбой разбора инвариантов не выдумывает нарушение).
+    Пустой список вызовов означает «внешние данные не нужны» ИЛИ «вызов не
+    удался»: в обоих случаях агент работает как раньше — без данных MCP. Сбой не
+    выдумывает вызовы (как и сбой разбора инвариантов не выдумывает нарушение).
 
     `started` — уже идущие внешние сборы задачи (см. build_query): модель видит
     их и не начинает заново.
+
+    `results` — результаты ПРЕДЫДУЩИХ раундов цепочки: с ними диспетчер решает
+    следующий вызов по факту (идентификаторы берёт из них, а не выдумывает).
+    `remaining` — сколько вызовов ещё можно сделать, `chain_state` — что задача
+    сохраняла раньше (для повторов: тот же ключ, а не новый набор).
     """
+    empty = {"mode": "single", "done": True, "reason": "", "calls": []}
     if not tools:
-        return []
+        return empty
+    ids = extract_ids(results) if results else {}
+    if isinstance(chain_state, dict):
+        for key, value in (chain_state.get("ids") or {}).items():
+            ids.setdefault(str(key), str(value))
+    hints = next_step_hints(tools, ids)
     messages = [
         {"role": "system", "content": TOOLS_PROMPT},
-        {"role": "user", "content": build_query(user_message, tools, started, extra)},
+        {"role": "user", "content": build_query(
+            user_message, tools, started, extra,
+            results=results, ids=ids, hints=hints, chain_state=chain_state)},
     ]
     try:
         content, _metrics = await call(
@@ -1482,17 +2356,35 @@ async def choose(user_message: str, tools: List[Dict[str, Any]],
         )
     except Exception:  # noqa: BLE001 — сбой выбора не должен ломать запрос
         logger.warning("MCP: выбор инструментов не удался", exc_info=True)
-        return []
+        return empty
     if not content:
-        return []
-    return parse_calls(content, tools)
+        return empty
+    return parse_decision(content, tools, limit=remaining)
+
+
+async def choose(user_message: str, tools: List[Dict[str, Any]],
+                 call: LlmCall,
+                 started: Optional[List[Dict[str, Any]]] = None,
+                 extra: str = "") -> List[Dict[str, Any]]:
+    """Совместимая обёртка над decide(): только список вызовов.
+
+    Оставлена для мест, где режим работы не важен (и для прежних проверок в
+    tools/check_mcp.py). Новый код использует decide() — он видит и режим.
+    """
+    decision = await decide(user_message, tools, call, started=started, extra=extra)
+    return decision["calls"]
 
 
 # ---------------------------------------------------------------------------
 # Блок системного промпта с полученными данными
 # ---------------------------------------------------------------------------
 def normalize_results(raw: Any) -> List[Dict[str, Any]]:
-    """Приводит результаты вызовов к безопасному виду (для блока и интерфейса)."""
+    """Приводит результаты вызовов к безопасному виду (для блока и интерфейса).
+
+    Предел — MAX_TOTAL_CALLS_PER_REQUEST, а не число вызовов одного раунда: у
+    цепочки результатов больше, и последний из них (например, выгрузка файла)
+    обязан дойти и до модели, и до интерфейса.
+    """
     out: List[Dict[str, Any]] = []
     for item in (raw if isinstance(raw, list) else []):
         if not isinstance(item, dict):
@@ -1514,8 +2406,11 @@ def normalize_results(raw: Any) -> List[Dict[str, Any]]:
             # ДЕЙСТВИЕ на сервере (запуск/остановка сбора, подписки): ставит
             # mark_actions. Нужно, чтобы модель не выдавала желаемое за сделанное.
             "action": str(item.get("action") or "")[:20],
+            # ФАЙЛЫ, которые вернул инструмент (xlsx, csv…): карточка в чате со
+            # ссылкой на скачивание (app/ai/attachments.py).
+            "attachments": attach_store.normalize(item.get("attachments")),
         })
-    return out[:MAX_CALLS_PER_REQUEST]
+    return out[:MAX_TOTAL_CALLS_PER_REQUEST]
 
 
 def arguments_text(arguments: Any) -> str:
@@ -1523,6 +2418,48 @@ def arguments_text(arguments: Any) -> str:
     if not isinstance(arguments, dict) or not arguments:
         return ""
     return json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+
+
+def review_digest(results: Any) -> str:
+    """КОРОТКАЯ сводка данных для ПРИЁМЩИКА (этап validation).
+
+    Приёмщику не нужны числа из источников: он проверяет, соответствует ли ОТВЕТ
+    запросу и шагам плана, а значения сверяет с текстом ответа. Ему достаточно
+    знать, ЧТО вызывалось, с какими ключевыми аргументами, чем закончилось и какие
+    файлы получены. Полный блок данных (до 12 000 символов) на каждом акте
+    проверки стоил дороже самой проверки: живой замер — 4,7 тыс. входных токенов
+    на акт при ответе модели в 0,4 тыс., и таких актов на задачу бывает три-четыре.
+
+    Заголовок здесь КОРОТКИЙ: длинная инструкция полного блока (про «источник
+    истины» и «не выдумывай числа») занимает почти весь предел сводки — с ней
+    список вызовов обрезался, и приёмщик писал «сохранение и выгрузка не
+    подтверждены ни одним вызовом» при живых вызовах в блоке.
+    """
+    data = normalize_results(results)
+    if not data:
+        return ""
+    lines = ["ДАННЫЕ MCP (факты по этому запросу): ниже — какие внешние "
+             "инструменты вызывались, с какими ключевыми аргументами, чем "
+             "закончились и какие файлы получены. Числа сверяй с ответом "
+             "ассистента: выдуманных значений быть не должно.", ""]
+    for item in data:
+        keys = {str(key): str(value) for key, value in (item.get("arguments") or {}).items()
+                if ID_ARG_RE.search(str(key)) or str(key) in ("file_name", "title", "location")}
+        args = ", ".join(f"{key}={_short(value, 60)}" for key, value in list(keys.items())[:4])
+        status = "OK" if item["ok"] else "ОШИБКА"
+        lines.append(f"- {item['server_name']} · {item['tool']}"
+                     + (f" ({args})" if args else "") + f" — {status}"
+                     + (f"; причина отказа: {item['error'][:160]}"
+                        if not item["ok"] else ""))
+    files = attachments_of(results)
+    if files:
+        lines.append("- получены файлы (уже приложены к ответу карточкой): "
+                     + "; ".join(f"{ref['name']} ({ref['size_text']})"
+                                 for ref in files))
+    if not any(item.get("ok") for item in data):
+        lines.append("")
+        lines.append(NO_DATA_NOTE)
+    return "\n".join(lines)[:REVIEW_BLOCK_CHARS]
 
 
 def block(results: Any) -> str:
@@ -1551,6 +2488,30 @@ def block(results: Any) -> str:
                     else "не выполнялись (были только запросы данных) — значит, "
                          "ничего не запускалось и не регистрировалось"))
     lines.append("")
+    # ЯКОРЬ ДАТЫ: относительные сроки («сегодня», «завтра», «на выходных») в
+    # запросе считаются от СЕГОДНЯШНЕЙ даты, а данные инструментов содержат
+    # диапазон дат и часто НАЧИНАЮТСЯ с сегодняшней. Без этого якоря модель
+    # берёт первую дату из данных как «завтра» — в живой задаче план потребовал
+    # сводку на 26.09, хотя запрос был про «завтра» (27.09), и задача ушла в
+    # бесконечную доработку.
+    lines.append(f"СЕГОДНЯ (дата агента): {datetime.date.today().isoformat()}. "
+                 "Относительные сроки запроса («сегодня», «завтра», «через "
+                 "неделю») считай ОТ ЭТОЙ ДАТЫ; даты в данных ниже — это то, что "
+                 "вернул источник, и они могут относиться к другим дням.")
+    lines.append("")
+    # ФАЙЛЫ, полученные за запрос: пользователь видит их карточками в чате со
+    # ссылкой на скачивание. Модель обязана знать, что файл УЖЕ у пользователя —
+    # иначе она либо выдумает путь, либо скажет «не могу создать файл».
+    files = attachments_of(results)
+    if files:
+        lines.append("ПОЛУЧЕННЫЕ ФАЙЛЫ (уже сохранены и приложены к ответу "
+                     "пользователю карточкой со ссылкой на скачивание — называй "
+                     "имя файла, НЕ выдумывай путь на диске):")
+        for ref in files:
+            origin = f" · источник: {ref['origin']}" if ref.get("origin") else ""
+            lines.append(f"- {ref['name']} ({ref['size_text']}) — скачать: {ref['url']}"
+                         + origin)
+        lines.append("")
     for index, item in enumerate(data, 1):
         args = arguments_text(item["arguments"])
         head = (f"{index}) {item['server_name']} — {item['tool']}"
@@ -1562,6 +2523,8 @@ def block(results: Any) -> str:
             lines.append(item["text"] or "(пустой ответ инструмента)")
         else:
             lines.append("ОШИБКА ИНСТРУМЕНТА: " + (item["error"] or "данных нет"))
+        for ref in item.get("attachments") or []:
+            lines.append(f"[файл] {ref['name']} ({ref['size_text']}) — {ref['url']}")
         lines.append("")
     text = "\n".join(lines).strip()
     return text[:BLOCK_CHARS]
@@ -1584,8 +2547,14 @@ def results_note(results: Any) -> str:
         parts.append(f"{item['server_name']}.{item['tool']}"
                      + (f"({args})" if args else "") + f" — {status}")
     body = "; ".join(parts)
-    return (f"MCP: {body}. Данные уходят в модель отдельным системным блоком: "
+    files = attachments_of(results)
+    tail = (" Данные уходят в модель отдельным системным блоком: "
             "план и ответ строятся по ним, выдумывать значения вместо них нельзя.")
+    if files:
+        tail = (" Получены файлы (приложены к ответу карточкой со ссылкой): "
+                + "; ".join(f"{ref['name']} ({ref['size_text']})" for ref in files)
+                + "." + tail)
+    return f"MCP: {body}.{tail}"
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,10 @@
 от FastAPI, поэтому модуль можно переиспользовать где угодно.
 """
 
+import logging
 import os
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 # Корень проекта: каталог, где лежат main.py, .env, data/ и т.п.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,16 +37,61 @@ def load_dotenv() -> None:
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Настройки реальной LLM (Yandex Cloud / DeepSeek).
-# Значения берутся из переменных окружения (.env) и могут быть переопределены.
+# Провайдеры LLM: endpoint, ключ и модель по умолчанию.
+#
+# У КАЖДОГО провайдера свой адрес и СВОЙ ключ: официальный API DeepSeek и
+# Yandex Cloud AI Studio — разные сервисы, один ключ к другому не подходит,
+# поэтому провайдер выбирается до запроса, а не «одним адресом на всё».
+#
+# Модель по умолчанию — DeepSeek-V4-Flash у провайдера deepseek-official
+# (`agent-default-model`): её обслуживают обычные запросы, экспертные режимы,
+# «Температура», судья-аналитик и AI-агент. Модели старого провайдера (Yandex)
+# остаются РАБОЧИМИ, но выбираются только вручную — в настройке «Тест моделей»
+# (см. app/ai/service.py). Общий выбор делает provider_spec().
 # ---------------------------------------------------------------------------
-LLM_BASE_URL = os.getenv(
-    "LLM_BASE_URL", "https://ai.api.cloud.yandex.net/v1"
+
+# Провайдер обычных запросов (не «Тест моделей») — фиксирован: официальный API
+# DeepSeek. Отдельной переменной окружения для него нет намеренно: старые модели
+# должны выбираться РУЧНО в «Тесте моделей», а не «переключателем по умолчанию»,
+# который к тому же увёл бы к Yandex идентификатор чужой модели.
+DEFAULT_PROVIDER = "deepseek-official"
+
+# --- Провайдер по умолчанию: официальный API DeepSeek (llm-deepseek) ---
+# Адрес, ключ и модель — свои переменные окружения (DEEPSEEK_*), а НЕ
+# исторические LLM_BASE_URL/LLM_MODEL: их значения в старых .env указывают на
+# Yandex, и модель по умолчанию не должна из-за этого «переезжать» на чужой
+# endpoint с чужим ключом.
+LLM_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+LLM_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+LLM_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
+# Reasoning (thinking) у модели по умолчанию выключен ВСЕГДА: «размышления»
+# тратят время и бюджет токенов, а на видимый ответ не влияют. 0 — не
+# выключать принудительно (поле thinking уходит только по общим правилам).
+LLM_DISABLE_THINKING = int(os.getenv("LLM_DISABLE_THINKING", "1"))
+
+# --- Старый провайдер: Yandex Cloud AI Studio (только «Тест моделей») ---
+# Имена переменных — YANDEX_*: прежние LLM_BASE_URL/LLM_MODEL (тогда Yandex был
+# единственным провайдером) больше НЕ читаются — иначе старый .env молча увёл бы
+# запросы к старым моделям на чужой endpoint с чужим ключом.
+YANDEX_BASE_URL = os.getenv("YANDEX_BASE_URL", "https://ai.api.cloud.yandex.net/v1")
+YANDEX_MODEL = os.getenv(
+    "YANDEX_MODEL", "gpt://b1gkm5u908if6dc0focb/deepseek-v4-flash/latest"
 )
-LLM_MODEL = os.getenv(
-    "LLM_MODEL", "gpt://b1gkm5u908if6dc0focb/deepseek-v4-flash/latest"
-)
-LLM_API_KEY = os.getenv("YANDEX_API_KEY", "")
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
+
+# Ключа модели по умолчанию нет (например, .env не обновлён после перехода на
+# официальный DeepSeek): обычные запросы уйдут в демо-режим, а старые модели
+# «Теста моделей» продолжат работать, если задан YANDEX_API_KEY. Пишем об этом
+# в лог при запуске — иначе подмена живого ответа демо-текстом выглядит как
+# «модель не ответила».
+if not LLM_API_KEY:
+    logging.getLogger(__name__).warning(
+        "LLM: не задан DEEPSEEK_API_KEY — модель по умолчанию (%s, %s) недоступна, "
+        "обычные запросы отвечает демо-режим; старым моделям «Теста моделей» "
+        "нужен YANDEX_API_KEY", LLM_MODEL, LLM_BASE_URL,
+    )
+
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2000"))
 
 # Сколько ДОПОЛНИТЕЛЬНЫХ попыток делает клиент модели при сбое (429/5xx/сеть).
@@ -60,24 +108,274 @@ LLM_RETRY_TIMEOUT = int(os.getenv("LLM_RETRY_TIMEOUT", "0"))
 # расход токенов неизвестен, а панель статистики считает именно его.
 LLM_STREAM = int(os.getenv("LLM_STREAM", "0"))
 
-# Тарифы моделей, руб. за 1000 токенов ({"input", "output"}). Нужны, чтобы
-# показать СТОИМОСТЬ запросов: и в таблице аналитики («Тест моделей»,
-# «Температура»), и в панели токенов агента. Цены — оценка по прайсу провайдера:
-# при смене тарифов правится только этот словарь.
-MODEL_PRICING = {
+# ---------------------------------------------------------------------------
+# Тарифы: во что обходится запрос (оценка)
+#
+# Провайдеры считают по-разному, поэтому тариф берётся у ТОГО провайдера,
+# которому ушёл запрос:
+#   * официальный DeepSeek — в ДОЛЛАРАХ за 1M токенов, отдельно за вход с
+#     попаданием в кэш (cache hit), вход без попадания (cache miss) и выход,
+#     и ВДВОЕ дешевле в непиковые часы (см. deepseek_is_peak);
+#   * Yandex Cloud AI Studio — в рублях за 1000 токенов, без разбивки по кэшу.
+# Считает ОДНА функция — usage_cost(): и клиент LLM (метрики вызова), и таблица
+# аналитики, и панель токенов агента берут стоимость оттуда, поэтому числа не
+# расходятся. Тариф показывается в интерфейсе через pricing_info().
+# ---------------------------------------------------------------------------
+
+# --- Официальный DeepSeek: $ за 1M токенов В ПИКОВЫЕ ЧАСЫ ---
+# Прайс: https://api-docs.deepseek.com/quick_start/pricing/
+# В непиковые часы — половина (DEEPSEEK_OFFPEAK_FACTOR).
+DEEPSEEK_USD_PER_MTOK = {
+    # ключ тарифа: (вход из кэша, вход мимо кэша, выход), $ за 1M токенов
+    "flash": {"cache_hit": 0.006, "cache_miss": 0.3, "output": 1.2},
+    "v4-pro": {"cache_hit": 0.044, "cache_miss": 1.32, "output": 3.96},
+}
+DEEPSEEK_OFFPEAK_FACTOR = float(os.getenv("DEEPSEEK_OFFPEAK_FACTOR", "0.5"))
+
+# Пиковые часы DeepSeek (по прайсу) — в UTC: 01:00–04:00 и 06:00–10:00, Пн–Пт,
+# кроме праздников КНР. Всё остальное время, включая выходные целиком, —
+# непиковое. Сайт живёт по Екатеринбургу (UTC+5), поэтому для него пик — это
+# 06:00–09:00 и 11:00–15:00 по местному времени.
+# Праздники КНР не учитываются: в эти дни оценка может быть ЗАВЫШЕНА вдвое
+# (реально действует непиковый тариф), но никогда не занижена.
+DEEPSEEK_PEAK_UTC = ((1, 4), (6, 10))
+SITE_UTC_OFFSET_HOURS = int(os.getenv("SITE_UTC_OFFSET_HOURS", "5"))  # Екатеринбург
+
+# Курс доллара: провайдер выставляет счёт в долларах, а сайт показывает рубли.
+# ОЦЕНКА, обновляется вручную (курс ЦБ РФ на 23.09.2026 — 84,0657 ₽ за $1).
+USD_RUB = float(os.getenv("USD_RUB", "84.0657"))
+
+# --- Старый провайдер (Yandex Cloud AI Studio): руб. за 1000 токенов ---
+# Ключ — ФРАГМЕНТ идентификатора модели (URI). Совпадение ищется по самой
+# ДЛИННОЙ подходящей подстроке — иначе «aliceai-llm-flash» подходил бы под
+# «aliceai-llm» и Flash считался бы по тарифу старшей модели, а URI DeepSeek
+# («gpt://…/deepseek-v4-flash/latest») вообще не находил тарифа и стоил 0.
+YANDEX_MODEL_PRICING = {
+    "aliceai-llm-flash": {"input": 0.1, "output": 0.2},
+    "aliceai-llm": {"input": 0.5, "output": 1.2},
     "deepseek": {"input": 0.3, "output": 0.5},
-    "alice": {"input": 0.5, "output": 1.2},
-    "alice-flash": {"input": 0.1, "output": 0.2},
 }
 
 
-def model_price(model: str) -> dict:
-    """Тариф модели по её идентификатору (неизвестная — нули, без выдумок)."""
+def _yandex_price(model: str) -> dict:
+    """Тариф старого провайдера по идентификатору модели (неизвестная — нули).
+
+    Побеждает САМЫЙ ДЛИННЫЙ подходящий фрагмент: он точнее описывает модель
+    (flash против обычной), поэтому тариф не зависит от порядка ключей.
+    """
     key = str(model or "").lower()
-    for name, price in MODEL_PRICING.items():
-        if name in key:
-            return price
-    return {"input": 0, "output": 0}
+    matched = None
+    for fragment, price in YANDEX_MODEL_PRICING.items():
+        if fragment in key and (matched is None or len(fragment) > len(matched)):
+            matched = fragment
+    if matched is None:
+        return {"input": 0, "output": 0}
+    return dict(YANDEX_MODEL_PRICING[matched])
+
+
+def deepseek_tariff_key(model: str) -> str:
+    """Ключ тарифа официального DeepSeek по идентификатору модели.
+
+    Модель по умолчанию — Flash. `deepseek-v4-flash` — прежнее (легаси) имя той
+    же Flash-модели: провайдер принимает его и считает по тарифу Flash
+    (https://api-docs.deepseek.com/quick_start/pricing/).
+    """
+    return "v4-pro" if "pro" in str(model or "").lower() else "flash"
+
+
+def deepseek_is_peak(when: Optional[Any] = None) -> bool:
+    """Идут ли ПИКОВЫЕ часы DeepSeek прямо сейчас.
+
+    Время считается в UTC (провайдер биллингует по UTC), поэтому результат не
+    зависит от часового пояса сервера. `when` — момент времени (по умолчанию
+    «сейчас»); принимается и наивное время — оно трактуется как UTC.
+    """
+    moment = when or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(timezone.utc)
+    if moment.weekday() >= 5:  # суббота и воскресенье — всегда непиковые
+        return False
+    hour = moment.hour + moment.minute / 60.0
+    return any(start <= hour < end for start, end in DEEPSEEK_PEAK_UTC)
+
+
+def deepseek_peak_windows_local() -> list:
+    """Пиковые окна во времени САЙТА (Екатеринбург, UTC+5) как «06:00–09:00».
+
+    Считается из тех же констант, что и `deepseek_is_peak`, поэтому подпись
+    тарифа в интерфейсе не может разойтись с реальной проверкой часов.
+    """
+    windows = []
+    for start, end in DEEPSEEK_PEAK_UTC:
+        first = (start + SITE_UTC_OFFSET_HOURS) % 24
+        last = (end + SITE_UTC_OFFSET_HOURS) % 24
+        windows.append(f"{first:02d}:00–{last:02d}:00")
+    return windows
+
+
+def deepseek_tariff(model: str, when: Optional[Any] = None) -> Dict[str, float]:
+    """Тариф официального DeepSeek в $ за 1M токенов на момент `when`."""
+    rates = dict(DEEPSEEK_USD_PER_MTOK[deepseek_tariff_key(model)])
+    if not deepseek_is_peak(when):
+        rates = {name: rate * DEEPSEEK_OFFPEAK_FACTOR for name, rate in rates.items()}
+    return rates
+
+
+def usage_cost(
+    model: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cache_hit_tokens: int = 0,
+    provider: Optional[str] = None,
+    when: Optional[Any] = None,
+) -> float:
+    """Стоимость одного вызова LLM в рублях (оценка по тарифу провайдера).
+
+    ЕДИНСТВЕННОЕ место, где считается стоимость: им пользуются метрики клиента,
+    таблица аналитики и панель токенов агента, поэтому числа совпадают.
+
+    prompt_tokens — весь вход запроса; cache_hit_tokens — его часть, пришедшая
+    ИЗ КЭША провайдера (DeepSeek отдаёт её в usage и берёт за неё в разы
+    меньше). Остаток входа считается по цене cache miss. Если провайдер кэш не
+    сообщает (Yandex), весь вход считается обычным.
+
+    provider — имя провайдера; не задан — определяется по модели
+    (provider_for_model). Модели Yandex считаются по рублёвому тарифу
+    MODEL_PRICING, модели официального DeepSeek — по долларовому прайсу с
+    поправкой на пиковые часы и курсом USD_RUB.
+    """
+    prompt = max(0, int(prompt_tokens or 0))
+    completion = max(0, int(completion_tokens or 0))
+    hit = max(0, min(int(cache_hit_tokens or 0), prompt))
+    miss = prompt - hit
+    if (provider or provider_for_model(model)) == "yandex":
+        # Yandex кэш отдельно не тарифицирует: весь вход стоит одинаково,
+        # поэтому переданные кэш-токены здесь игнорируются (иначе вход из
+        # «кэша» оказался бы бесплатным).
+        price = _yandex_price(model)
+        cost = (prompt / 1000.0) * price["input"] + (completion / 1000.0) * price["output"]
+        return round(cost, 5)
+    rates = deepseek_tariff(model, when)
+    usd = (
+        hit * rates["cache_hit"]
+        + miss * rates["cache_miss"]
+        + completion * rates["output"]
+    ) / 1_000_000.0
+    return round(usd * USD_RUB, 5)
+
+
+def model_price(model: str, provider: Optional[str] = None,
+                when: Optional[Any] = None) -> dict:
+    """Тариф модели в рублях за 1000 токенов ({"input", "output"}).
+
+    Для показа «сколько стоит тысяча токенов»: у официального DeepSeek это
+    цена входа мимо кэша и цена выхода на текущий момент (пик/непик), у
+    моделей Yandex — их рублёвый тариф. Неизвестная модель — нули, без выдумок.
+    """
+    if (provider or provider_for_model(model)) == "yandex":
+        return _yandex_price(model)
+    rates = deepseek_tariff(model, when)
+    return {
+        "input": rates["cache_miss"] * USD_RUB / 1000.0,
+        "output": rates["output"] * USD_RUB / 1000.0,
+    }
+
+
+def pricing_info(model: Optional[str] = None, provider: Optional[str] = None,
+                 when: Optional[Any] = None) -> Dict[str, Any]:
+    """Тариф, по которому посчитана стоимость вызова, — для показа в интерфейсе.
+
+    Возвращает {"provider", "model", "peak", "tariff", "usd_rub",
+    "usd_per_mtok"|None, "rub_per_mtok", "peak_note"}: интерфейс показывает
+    строку тарифа под таблицей расхода, чтобы цифра стоимости была объяснимой
+    (какой тариф, пиковый ли, по какому курсу).
+    """
+    used = model or LLM_MODEL
+    name = provider or provider_for_model(used)
+    if name == "yandex":
+        price = _yandex_price(used)
+        return {
+            "provider": "yandex",
+            "model": used,
+            "peak": False,
+            "tariff": "тариф Yandex, руб. за 1000 токенов",
+            "usd_rub": None,
+            "usd_per_mtok": None,
+            "rub_per_mtok": {
+                "cache_hit": price["input"] * 1000.0,
+                "cache_miss": price["input"] * 1000.0,
+                "output": price["output"] * 1000.0,
+            },
+            "peak_note": "",
+        }
+    peak = deepseek_is_peak(when)
+    rates = deepseek_tariff(used, when)
+    return {
+        "provider": "deepseek-official",
+        "model": used,
+        "peak": peak,
+        "tariff": "пиковый тариф" if peak else "непиковый тариф (×0,5)",
+        "usd_rub": USD_RUB,
+        "usd_per_mtok": dict(rates),
+        "rub_per_mtok": {
+            key: rate * USD_RUB for key, rate in rates.items()
+        },
+        "peak_note": (
+            "Пиковые часы DeepSeek: "
+            + " и ".join(deepseek_peak_windows_local())
+            + " по Екатеринбургу (Пн–Пт, UTC "
+            + " и ".join(f"{start:02d}:00–{end:02d}:00" for start, end in DEEPSEEK_PEAK_UTC)
+            + "); в остальное время тариф вдвое ниже."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Выбор провайдера
+# ---------------------------------------------------------------------------
+def provider_spec(name: Optional[str] = None) -> Dict[str, Any]:
+    """Параметры провайдера: адрес, ключ, модель по умолчанию и режим thinking.
+
+    `name` — "deepseek-official" (официальный API DeepSeek, по умолчанию) или
+    "yandex" (Yandex Cloud AI Studio — модели «Теста моделей»). Неизвестное имя
+    трактуется как провайдер по умолчанию: опечатка в ключе модели не должна
+    отправлять запрос «в никуда» с чужим ключом.
+
+    Возвращает словарь с полями provider / title / base_url / api_key / model /
+    thinking, где thinking = "disabled" — reasoning выключать в КАЖДОМ запросе
+    (так работает модель по умолчанию), "auto" — по общим правилам клиента.
+    """
+    key = str(name or DEFAULT_PROVIDER or "").strip()
+    if key == "yandex":
+        return {
+            "provider": "yandex",
+            "title": "Yandex Cloud AI Studio",
+            "base_url": YANDEX_BASE_URL,
+            "api_key": YANDEX_API_KEY,
+            "model": YANDEX_MODEL,
+            "thinking": "auto",
+        }
+    return {
+        "provider": "deepseek-official",
+        "title": "DeepSeek",
+        "base_url": LLM_BASE_URL,
+        "api_key": LLM_API_KEY,
+        "model": LLM_MODEL,
+        "thinking": "disabled" if LLM_DISABLE_THINKING else "auto",
+    }
+
+
+def provider_for_model(model: Optional[str]) -> str:
+    """Имя провайдера по идентификатору модели.
+
+    Модели старого провайдера — URI вида «gpt://…» (Yandex); всё остальное
+    обслуживает провайдер по умолчанию. Нужно там, где модель пришла строкой
+    (агент, история диалога), а адрес и ключ надо выбрать ДО запроса.
+    """
+    if str(model or "").strip().lower().startswith("gpt://"):
+        return "yandex"
+    return DEFAULT_PROVIDER
 
 
 # Предел длины ответа ШАГА агента, если пользователь не задал «Длину» (0 — нет

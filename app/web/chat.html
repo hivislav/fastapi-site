@@ -991,6 +991,36 @@
             gap: 8px;
             margin-top: 10px;
         }
+        /* Карточки ФАЙЛОВ, полученных от внешних инструментов (MCP): под
+           сообщением агента, со ссылкой на скачивание (GET /api/agent/files/…). */
+        .file-cards {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .file-card {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: var(--surface-2);
+            color: var(--text);
+            text-decoration: none;
+            transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+        }
+        .file-card:hover {
+            background: var(--surface-3);
+            border-color: var(--accent);
+            box-shadow: 0 0 14px rgba(34, 211, 238, 0.16);
+        }
+        .file-card-icon { font-size: 1.2rem; line-height: 1; }
+        .file-card-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+        .file-card-name { color: var(--accent); font-weight: 600; word-break: break-all; }
+        .file-card-meta { color: var(--muted); font-size: 0.82rem; }
+        .file-card-action { white-space: nowrap; font-weight: 600; color: var(--accent); }
         .inv-option {
             display: block;
             width: 100%;
@@ -1573,6 +1603,15 @@
             line-height: 1.4;
         }
         .judge-summary b { color: var(--accent-2); }
+        /* Строка тарифа под таблицей расхода: каким тарифом посчитана
+           стоимость (у официального DeepSeek — пиковый/непиковый, ставки и
+           курс). Мелким шрифтом и приглушённо: это пояснение к цифрам, а не
+           сами цифры. */
+        .tariff-note {
+            font-size: 0.75rem;
+            color: var(--muted);
+            margin-bottom: 6px;
+        }
         @media (max-width: 768px) {
             .layout { grid-template-columns: 1fr; }
             .sidebar { display: none; }
@@ -1760,8 +1799,11 @@
                         <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
                     </div>
                     <div class="param-models" id="param-models" hidden>
-                        <p class="modal-hint">Выберите модели — запрос уйдёт в каждую из них.</p>
-                        <label class="model-check"><input type="checkbox" value="deepseek" checked> DeepSeek 4 Flash</label>
+                        <p class="modal-hint">Выберите модели — запрос уйдёт в каждую из них.
+                            DeepSeek-V4-Flash — модель по умолчанию; остальные (Yandex) доступны
+                            только при ручном выборе здесь.</p>
+                        <label class="model-check"><input type="checkbox" value="deepseek" checked> DeepSeek-V4-Flash</label>
+                        <label class="model-check"><input type="checkbox" value="deepseek-yandex"> DeepSeek 4 Flash (Yandex)</label>
                         <label class="model-check"><input type="checkbox" value="alice"> Alice AI LLM</label>
                         <label class="model-check"><input type="checkbox" value="alice-flash"> Alice AI LLM Flash</label>
                     </div>
@@ -2705,14 +2747,25 @@
                 });
             }
             draw(agentTotalBody, totalRows);
-            // Стоимость — оценка по тарифам провайдера (сервер считает её из
+            // Стоимость — оценка по тарифу провайдера (сервер считает её из
             // метрик каждого вызова): видно, во что обходится шаг и диалог.
+            // Рядом — САМ тариф (с событиями замера приходит `pricing`): у
+            // официального DeepSeek он зависит от пиковых часов, поэтому без
+            // подписи цифра в рублях выглядела бы взятой с потолка.
             const costOf = u => Number(u && u.cost_rub) || 0;
             const dialogCost = measured.reduce((sum, u) => sum + costOf(u), 0);
             const stepCost = last ? costOf(last) : 0;
+            const pricing = (last && last.pricing)
+                || (measured.length ? measured[measured.length - 1].pricing : null);
             agentCostEl.textContent = dialogCost || stepCost
-                ? `Стоимость (оценка по тарифам): ${fmtRub(stepCost)} за шаг · `
+                ? `Стоимость (оценка по тарифу): ${fmtRub(stepCost)} за шаг · `
                   + `${fmtRub(dialogCost)} за диалог`
+                  + (pricing ? ` · тариф ${pricing.model}, ${pricing.tariff}` : '')
+                : '';
+            // Полное описание тарифа (ставки и курс) — во всплывающей подсказке,
+            // чтобы не растягивать строку панели.
+            agentCostEl.title = pricing
+                ? [fmtPricing(pricing), pricing.peak_note].filter(Boolean).join(' ')
                 : '';
         }
 
@@ -4579,7 +4632,7 @@
         // (сессии), поэтому в историю введённых данных реплики не пишутся.
         // Под сообщением пользователя и под ответом агента — кнопки добавления
         // этого текста в рабочую/долговременную память.
-        function drawAgentNode(role, text, analysis, at) {
+        function drawAgentNode(role, text, analysis, at, files) {
             if (role === 'user') {
                 addMessage('user', text, true, true, at);
             } else if (role === 'debug') {
@@ -4591,7 +4644,51 @@
                 // Разбор инвариантов: под сообщением — кликабельные варианты
                 // решения (ни один не нарушает правила).
                 if (analysis && analysis.suggestions) drawInvariantOptions(wrap, analysis);
+                // ФАЙЛЫ от внешних инструментов (MCP): карточки со ссылкой на
+                // скачивание. Файл лежит на сервере приложения, поэтому ссылка
+                // ведёт на /api/agent/files/<id> и работает после перезагрузки.
+                if (files && files.length) drawFileCards(wrap, files);
             }
+        }
+
+        // Карточки файлов под сообщением агента: имя, размер, источник и ссылка
+        // «Скачать». Ссылка настоящая (href), а не кнопка с JS: файл можно открыть
+        // и в новой вкладке, и сохранить правой кнопкой.
+        function drawFileCards(wrap, files) {
+            const list = (files || []).filter(item => item && item.name && item.url);
+            if (!list.length) return;
+            const box = document.createElement('div');
+            box.className = 'file-cards';
+            list.forEach(item => {
+                const card = document.createElement('a');
+                card.className = 'file-card';
+                card.href = item.url;
+                card.setAttribute('download', item.name);
+                card.setAttribute('target', '_blank');
+                card.setAttribute('rel', 'noopener');
+                const icon = document.createElement('span');
+                icon.className = 'file-card-icon';
+                icon.textContent = '📄';
+                card.appendChild(icon);
+                const body = document.createElement('span');
+                body.className = 'file-card-body';
+                const name = document.createElement('span');
+                name.className = 'file-card-name';
+                name.textContent = item.name;
+                body.appendChild(name);
+                const meta = document.createElement('span');
+                meta.className = 'file-card-meta';
+                meta.textContent = [item.size_text, item.origin]
+                    .filter(Boolean).join(' · ');
+                body.appendChild(meta);
+                card.appendChild(body);
+                const action = document.createElement('span');
+                action.className = 'file-card-action';
+                action.textContent = '⬇ Скачать';
+                card.appendChild(action);
+                box.appendChild(card);
+            });
+            wrap.appendChild(box);
         }
 
         // Кликабельные варианты решения под сообщением агента. Клик отправляет
@@ -4660,14 +4757,15 @@
         }
 
         // Добавляет реплику в текущее представление и сразу рисует её.
-        function pushAgentNode(role, text, analysis) {
+        function pushAgentNode(role, text, analysis, files) {
             // Живая реплика: время ставим СЕЙЧАС (у служебных строк оно хранится,
             // но не показывается). В файл его запишет сервер со своей меткой — она
             // и будет показана после переключения задачи или перезагрузки.
             const at = new Date().toISOString();
             agentViewMessages().push({ role: role, text: text,
-                                       analysis: analysis || null, at: at });
-            drawAgentNode(role, text, analysis, at);
+                                       analysis: analysis || null,
+                                       files: files || null, at: at });
+            drawAgentNode(role, text, analysis, at, files);
         }
 
         // Полная перерисовка окна чата для текущего представления (после
@@ -4676,7 +4774,8 @@
         function renderAgentDialog() {
             messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
             agentViewMessages().forEach(
-                m => drawAgentNode(m.role, m.text, m.analysis, m.at === undefined ? '' : m.at));
+                m => drawAgentNode(m.role, m.text, m.analysis,
+                                   m.at === undefined ? '' : m.at, m.files));
             // План ветвления показываем в корневом диалоге (он относится к нему).
             if (!agentView && agentAnalysis) renderBranchPlan(agentAnalysis);
             greetingMsg.hidden = !!messagesEl.querySelector('[data-agent]');
@@ -4846,6 +4945,9 @@
                     // Разбор инвариантов хранит варианты решения — их рисуем
                     // заново (кликабельными) после переключения задачи.
                     analysis: item.analysis || null,
+                    // Файлы MCP (xlsx и т. п.): карточки со ссылкой на скачивание
+                    // восстанавливаются вместе с сообщением.
+                    files: item.files || null,
                     // Время сообщения из журнала сервера; у старых записей его нет
                     // — тогда подпись не показываем (выдумывать нельзя).
                     at: item.at || ''
@@ -5647,9 +5749,53 @@
             messagesEl.scrollTop = messagesEl.scrollHeight;
         }
 
-        // Форматирует рубли с запятой (например 2,02 руб).
+        // Форматирует рубли с запятой, подбирая точность по величине суммы:
+        // официальный DeepSeek берёт за вызов тысячные доли рубля, и «0,00 руб»
+        // на месте реального расхода выглядело бы как «запросы бесплатны».
+        // До 0,01 руб. — четыре знака, до 1 руб. — три, дальше два.
         function fmtRub(x) {
-            return x.toFixed(2).replace('.', ',') + ' руб';
+            const v = Number(x) || 0;
+            if (v === 0) return '0 руб';
+            const abs = Math.abs(v);
+            const digits = abs >= 1 ? 2 : (abs >= 0.01 ? 3 : 4);
+            return v.toFixed(digits).replace('.', ',') + ' руб';
+        }
+
+        // Короткое описание тарифа, по которому посчитана стоимость: какой
+        // тариф (у официального DeepSeek — пиковый или непиковый), ставки за
+        // 1M токенов и курс доллара. Данные приходят с сервера (pricing у
+        // строки аналитики и в замере агента), поэтому интерфейс не выдумывает
+        // цены сам.
+        function fmtPricing(p) {
+            if (!p) return '';
+            const m = p.rub_per_mtok || {};
+            const num = (v, d) => (Number(v) || 0).toFixed(d).replace('.', ',');
+            let text = `Тариф ${p.model} — ${p.tariff}: вход ${num(m.cache_miss, 2)}`;
+            if (Number(m.cache_hit) !== Number(m.cache_miss)) {
+                text += ` (из кэша ${num(m.cache_hit, 3)})`;
+            }
+            text += `, выход ${num(m.output, 2)} ₽ за 1M токенов`;
+            if (p.usd_rub) text += ` · курс ${num(p.usd_rub, 2)} ₽/$`;
+            return text;
+        }
+
+        // Рисует пояснение к стоимости под таблицей: строки могут быть у РАЗНЫХ
+        // провайдеров (модель по умолчанию и старые модели Yandex), поэтому
+        // показываем тариф КАЖДОЙ встретившейся комбинации — один раз.
+        function pricingNotes(rows) {
+            const seen = new Set();
+            let html = '';
+            rows.forEach(r => {
+                const p = r && r.pricing;
+                if (!p) return;
+                const key = `${p.provider}|${p.model}|${p.peak}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                const hint = String(p.peak_note || '').replace(/"/g, '&quot;');
+                html += `<div class="judge-summary tariff-note" title="${hint}">`
+                    + `${fmtPricing(p)}</div>`;
+            });
+            return html;
         }
 
         // Рисует таблицу РЕАЛЬНЫХ метрик вызовов модели: время, токены,
@@ -5676,6 +5822,8 @@
                     + `<td>${fmtRub(Number(r.cost_rub) || 0)}</td></tr>`;
             });
             html += '</tbody></table>';
+            // Пояснение к цифрам стоимости: тариф, по которому они посчитаны.
+            html += pricingNotes(rows);
             // Краткое резюме судьи по каждой модели (скорость, стоимость,
             // ресурсоёмкость, качество) — под таблицей.
             rows.forEach(r => {
@@ -5795,7 +5943,9 @@
                             // ждёт выбора пользователя.
                             pushAgentNode('assistant', ev.text, ev.analysis);
                         } else if (ev.type === 'bot') {
-                            pushAgentNode('assistant', ev.text);
+                            // У ответа могут быть ФАЙЛЫ (MCP вернул xlsx): под
+                            // сообщением рисуются карточки со ссылкой на скачивание.
+                            pushAgentNode('assistant', ev.text, null, ev.files);
                         } else if (ev.type === 'error') {
                             pushAgentNode('error', ev.text);
                         } else if (ev.type === 'usage') {

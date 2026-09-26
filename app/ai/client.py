@@ -1,6 +1,10 @@
 """Клиент реальной LLM.
 
-Отправляет запросы к OpenAI-совместимому endпоинту (Yandex Cloud).
+Отправляет запросы к OpenAI-совместимому endпоинту выбранного ПРОВАЙДЕРА:
+официальный API DeepSeek (по умолчанию, модель DeepSeek-V4-Flash) или
+Yandex Cloud AI Studio (модели настройки «Тест моделей»). У провайдеров свои
+адрес и ключ — они выбираются по имени провайдера или по модели
+(config.provider_spec / provider_for_model), а не берутся «одни на всё».
 Не содержит маршрутов и демо-логики — только HTTP-вызов модели.
 
 Особенности слоя (важны для расхода токенов и устойчивости):
@@ -23,6 +27,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import socket
 import ssl
 import threading
@@ -75,6 +80,28 @@ def _split_stop_sequences(stop: Optional[str]) -> Optional[list]:
         return None
     sequences = [s.strip() for s in stop.split(",") if s.strip()]
     return sequences or None
+
+
+def _redact_secrets(text: str, *secrets: str) -> str:
+    """Убирает ключи из текста — тело ошибки провайдера может их содержать.
+
+    Провайдер в ответе 401 нередко печатает присланный ключ целиком или его
+    хвост («Your api key: ****pD7C is invalid»). Тело ошибки уходит и в лог, и
+    в метрики сбоя (`error`), которые показываются в интерфейсе, — ключ не
+    должен попадать ни туда, ни туда. Поэтому текст ошибки чистится СРАЗУ, на
+    входе в клиент.
+    """
+    out = str(text or "")
+    for secret in secrets:
+        if secret and len(secret) >= 8:
+            out = out.replace(secret, "***")
+    # Заодно любые «sk-…»/«Bearer …» — на случай, если провайдер напечатал не
+    # тот ключ, который отправляли мы, а свой/чужой.
+    out = re.sub(r"(?i)\b(sk-[A-Za-z0-9_\-]{4,}|Bearer\s+[A-Za-z0-9_\-\.]{6,})",
+                 "***", out)
+    # И «хвост» ключа, который провайдер печатает сам: «Your api key: ****pD7C
+    # is invalid» — четыре последних символа ключа тоже не наше дело.
+    return re.sub(r"(?i)(api[\s_-]*key[^:\n]{0,40}:\s*)\S+", r"\1***", out)
 
 
 def _supports_thinking(model: str) -> bool:
@@ -208,12 +235,15 @@ def _read_stream(response) -> Tuple[str, Optional[Dict[str, Any]]]:
 
 
 def _post_json(url: str, payload: Dict[str, Any], timeout: float,
-               abort: Optional[_AbortBox]) -> Tuple[int, str, Optional[Tuple[str, Optional[Dict[str, Any]]]], Dict[str, str]]:
+               abort: Optional[_AbortBox], api_key: str) -> Tuple[int, str, Optional[Tuple[str, Optional[Dict[str, Any]]]], Dict[str, str]]:
     """Один HTTP-запрос: (статус, тело ошибки, поток|None, заголовки).
 
     Успешный нестриминговый ответ отдаётся телом (строка), стриминговый —
     парой (содержимое, usage). Тело ошибки читается всегда: без него сбой
     выглядел как «модель не ответила».
+
+    api_key — ключ ТОГО провайдера, к которому идёт запрос (у официального
+    DeepSeek и Yandex Cloud ключи разные), поэтому он не берётся из config здесь.
     """
     parts = urllib.parse.urlsplit(url)
     path = parts.path or "/"
@@ -221,7 +251,7 @@ def _post_json(url: str, payload: Dict[str, Any], timeout: float,
         path = path + "?" + parts.query
     body = json.dumps(payload).encode("utf-8")
     headers = {
-        "Authorization": f"Bearer {config.LLM_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream" if payload.get("stream") else "application/json",
         "Connection": "keep-alive",
@@ -235,7 +265,9 @@ def _post_json(url: str, payload: Dict[str, Any], timeout: float,
         status = int(response.status)
         head = {k.lower(): v for k, v in response.getheaders()}
         if status >= 400:
-            text = response.read().decode("utf-8", "replace")[:500]
+            # Тело ошибки чистим от ключей: оно уходит в лог и в метрики сбоя.
+            text = _redact_secrets(
+                response.read().decode("utf-8", "replace")[:500], api_key)
             return status, text, None, head
         if payload.get("stream"):
             return status, "", _read_stream(response), head
@@ -295,6 +327,7 @@ def call_llm(
     messages: Optional[list] = None,
     timeout: float = HTTP_TIMEOUT,
     stream: Optional[bool] = None,
+    provider: Optional[str] = None,
 ) -> str:
     """Отправляет запрос к реальной модели и возвращает текст ответа.
 
@@ -332,6 +365,10 @@ def call_llm(
     stream — читать ответ потоком (SSE). По умолчанию — настройка окружения
     LLM_STREAM: поток снимает «общий» таймаут на весь ответ, но требует, чтобы
     провайдер отдавал usage в потоке (иначе расход токенов неизвестен).
+
+    provider — имя провайдера ("deepseek-official" — по умолчанию, "yandex" —
+    модели «Теста моделей»); из него берутся адрес и ключ. Не задан — провайдер
+    определяется по модели (config.provider_for_model).
     """
     content, _ = _perform_call(
         user_text,
@@ -345,6 +382,7 @@ def call_llm(
         messages=messages,
         timeout=timeout,
         stream=stream,
+        provider=provider,
     )
     return content
 
@@ -361,6 +399,7 @@ def call_llm_with_metrics(
     messages: Optional[list] = None,
     timeout: float = HTTP_TIMEOUT,
     stream: Optional[bool] = None,
+    provider: Optional[str] = None,
 ) -> tuple:
     """Как call_llm, но дополнительно возвращает метрики запроса.
 
@@ -391,6 +430,7 @@ def call_llm_with_metrics(
         messages=messages,
         timeout=timeout,
         stream=stream,
+        provider=provider,
     )
 
 
@@ -407,6 +447,7 @@ async def call_llm_async(
     omit_default_max_tokens: bool = False,
     timeout: float = HTTP_TIMEOUT,
     stream: Optional[bool] = None,
+    provider: Optional[str] = None,
 ) -> tuple:
     """Асинхронная версия вызова LLM: (content, metrics|None).
 
@@ -440,6 +481,7 @@ async def call_llm_async(
         timeout=timeout,
         stream=stream,
         abort=abort,
+        provider=provider,
     ))
     try:
         return await task
@@ -462,6 +504,7 @@ def _perform_call(
     timeout: float = HTTP_TIMEOUT,
     stream: Optional[bool] = None,
     abort: Optional[_AbortBox] = None,
+    provider: Optional[str] = None,
 ) -> tuple:
     """Низкоуровневый вызов: возвращает (content, metrics|None).
 
@@ -472,8 +515,16 @@ def _perform_call(
     Сбой (ошибка провайдера, сеть, битый JSON) возвращает пустой ответ и
     метрики с пометкой "failed"; причина пишется в лог. Повторы при 429/5xx и
     сетевых сбоях — см. RETRY_ATTEMPTS.
+
+    provider — имя провайдера ("deepseek-official" по умолчанию или "yandex");
+    из него берутся адрес endpoint и КЛЮЧ (у провайдеров они разные). Не задан
+    — провайдер определяется по модели (config.provider_for_model): URI «gpt://…»
+    обслуживает Yandex, остальные модели — провайдер по умолчанию.
     """
-    if not config.LLM_API_KEY:
+    spec = config.provider_spec(provider or config.provider_for_model(model))
+    api_key = spec["api_key"]
+    if not api_key:
+        # Ключа нет — обращения к модели не было (метрик тоже нет).
         return "", None
 
     if messages is None:
@@ -498,7 +549,7 @@ def _perform_call(
         expert_mode = False
         payload_messages = messages
 
-    used_model = model or config.LLM_MODEL
+    used_model = model or spec["model"] or config.LLM_MODEL
     payload: Dict[str, Any] = {"model": used_model, "messages": payload_messages}
 
     # max_tokens уходит ровно тем значением, которое задал пользователь.
@@ -526,9 +577,12 @@ def _perform_call(
     # может потратить бюджет на «размышления» и оставить content пустым.
     # disable_thinking принудительно отключает reasoning (используется в
     # «Тест моделей»), чтобы все модели отвечали сопоставимо и быстро.
+    # У модели по умолчанию (провайдер deepseek-official) reasoning выключен
+    # ВСЕГДА — thinking: disabled уходит в каждом запросе к ней (config.LLM_DISABLE_THINKING).
     # Моделям, которые поля не принимают (alice), оно не отправляется — иначе 400.
     if (
-        max_tokens or stop_sequences or expert_mode or temperature is not None
+        spec["thinking"] == "disabled"
+        or max_tokens or stop_sequences or expert_mode or temperature is not None
         or disable_thinking
     ) and _supports_thinking(used_model):
         payload["thinking"] = {"type": "disabled"}
@@ -540,7 +594,8 @@ def _perform_call(
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
 
-    url = config.LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    # Адрес endpoint — от ВЫБРАННОГО провайдера (у Yandex и DeepSeek они разные).
+    url = str(spec["base_url"]).rstrip("/") + "/chat/completions"
     start = time.perf_counter()
     attempts = RETRY_ATTEMPTS + 1
     timeout_retried = False
@@ -553,7 +608,7 @@ def _perform_call(
         headers: Dict[str, str] = {}
         try:
             status, error_text, streamed, headers = _post_json(
-                url, payload, timeout, abort)
+                url, payload, timeout, abort, api_key)
         except Exception as exc:  # noqa: BLE001 — таймаут, сеть, обрыв соединения
             name = exc.__class__.__name__
             is_timeout = isinstance(exc, (socket.timeout, TimeoutError))
@@ -599,7 +654,8 @@ def _perform_call(
                 metrics["usage_missing"] = True
                 metrics["cost_rub"] = 0.0
                 return _clean_content(content), metrics
-            return _clean_content(content), _usage_metrics(used_model, elapsed, usage)
+            return _clean_content(content), _usage_metrics(
+                used_model, elapsed, usage, provider=spec["provider"])
 
         data = _parse_json(error_text)
         if data is None:
@@ -623,7 +679,7 @@ def _perform_call(
         return "", _failed_metrics(used_model, elapsed, "неожиданная структура ответа")
 
     return _clean_content(msg.get("content")), _usage_metrics(
-        used_model, elapsed, data.get("usage") or {})
+        used_model, elapsed, data.get("usage") or {}, provider=spec["provider"])
 
 
 def _clean_content(content: Any) -> str:
@@ -633,22 +689,50 @@ def _clean_content(content: Any) -> str:
     return content.strip()
 
 
-def _usage_metrics(model: str, elapsed: float, usage: Dict[str, Any]) -> Dict[str, Any]:
+def _cache_hit_tokens(usage: Dict[str, Any]) -> int:
+    """Сколько токенов входа провайдер взял ИЗ КЭША (0 — не сообщил).
+
+    Официальный DeepSeek отдаёт это двумя способами: полем
+    `prompt_cache_hit_tokens` и вложенным `prompt_tokens_details.cached_tokens`.
+    Значение важно для стоимости: вход из кэша стоит в разы дешевле, чем вход
+    мимо кэша.
+    """
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else 0
+    hit = usage.get("prompt_cache_hit_tokens")
+    if hit is None:
+        hit = cached
+    try:
+        return max(0, int(hit or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_metrics(model: str, elapsed: float, usage: Dict[str, Any],
+                   provider: Optional[str] = None) -> Dict[str, Any]:
     """Метрики успешного вызова: время, токены (промпт, ответ, сумма), стоимость.
 
-    Стоимость — ОЦЕНКА по тарифам провайдера (config.MODEL_PRICING): она нужна
+    Стоимость — ОЦЕНКА по тарифу ПРОВАЙДЕРА (config.usage_cost): она нужна
     панели токенов и таблице аналитики, чтобы расход был виден в рублях, а не
-    только в токенах.
+    только в токенах. У официального DeepSeek тариф зависит от пиковых часов и
+    от того, какая часть входа пришла из кэша, поэтому кэш-токены попадают в
+    метрики отдельными полями (cache_hit_tokens / cache_miss_tokens) — по ним
+    видно, почему стоимость именно такая.
     """
     prompt = int(usage.get("prompt_tokens", 0) or 0)
     completion = int(usage.get("completion_tokens", 0) or 0)
-    price = config.model_price(model)
-    cost = (prompt / 1000) * price["input"] + (completion / 1000) * price["output"]
+    hit = min(_cache_hit_tokens(usage), prompt)
+    cost = config.usage_cost(
+        model, prompt_tokens=prompt, completion_tokens=completion,
+        cache_hit_tokens=hit, provider=provider,
+    )
     return {
         "model": model,
         "elapsed_seconds": round(elapsed, 3),
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": int(usage.get("total_tokens", 0) or 0),
-        "cost_rub": round(cost, 5),
+        "cache_hit_tokens": hit,
+        "cache_miss_tokens": prompt - hit,
+        "cost_rub": cost,
     }

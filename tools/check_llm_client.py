@@ -26,8 +26,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Ключ и адрес подставляем ДО импорта клиента: клиент читает config при импорте.
+# Ключи нужны ОБА: модель по умолчанию живёт у провайдера deepseek-official,
+# а модели-URI «gpt://…» — у Yandex (проверки ниже ходят в оба провайдера, но
+# обоим подставлен локальный «провайдер»-заглушка).
+os.environ.setdefault("DEEPSEEK_API_KEY", "test-key")
 os.environ.setdefault("YANDEX_API_KEY", "test-key")
-os.environ["LLM_BASE_URL"] = "http://127.0.0.1:0/v1"
+os.environ["DEEPSEEK_BASE_URL"] = "http://127.0.0.1:0/v1"
+os.environ["YANDEX_BASE_URL"] = "http://127.0.0.1:0/v1"
 
 from app import config  # noqa: E402
 from app.ai import client  # noqa: E402
@@ -159,7 +164,10 @@ def flags(**kwargs):
 
 def main():
     server = start_server()
+    # Оба провайдера смотрят на локальную заглушку: проверяется HTTP-слой, а не
+    # настоящие адреса (внешняя сеть тесту не нужна).
     config.LLM_BASE_URL = f"http://127.0.0.1:{server.server_port}/v1"
+    config.YANDEX_BASE_URL = f"http://127.0.0.1:{server.server_port}/v1"
     print("\n[1] Успешный вызов, метрики и keep-alive")
     SCRIPT["mode"] = "ok"
     SCRIPT["connections"] = 0
@@ -205,8 +213,20 @@ def main():
           metrics and metrics.get("failed") and "400" in str(metrics.get("error")),
           str(metrics))
 
-    print("\n[4] thinking: не уходит моделям, которые его не принимают")
+    print("\n[4] thinking: у модели по умолчанию выключен, alice поля не получает")
     SCRIPT["mode"] = "ok"
+    SCRIPT["payloads"] = []
+    # Модель по умолчанию (провайдер deepseek-official): reasoning выключен
+    # ВСЕГДА — поле thinking уходит даже без max_tokens/stop/temperature.
+    client.call_llm("Привет")
+    check("модель по умолчанию всегда получает thinking: disabled",
+          bool(SCRIPT["payloads"])
+          and SCRIPT["payloads"][0].get("thinking") == {"type": "disabled"},
+          str(SCRIPT["payloads"]))
+    check("модель по умолчанию — deepseek-v4-flash",
+          bool(SCRIPT["payloads"])
+          and SCRIPT["payloads"][0].get("model") == config.LLM_MODEL,
+          str(SCRIPT["payloads"]))
     SCRIPT["payloads"] = []
     client.call_llm("Привет", model="gpt://folder/deepseek-v4-flash/latest",
                     disable_thinking=True)

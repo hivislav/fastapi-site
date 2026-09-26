@@ -439,7 +439,16 @@ async def test_routes():
     check("«ок» → execution, шаг 1 выполнен, текущий шаг 2",
           state and state["stage"] == "execution" and state["current_step"] == "step_2",
           f"({state and state['stage']} / {state and state['current_step']})")
-    check("ответ модели получен", "Ответ модели по текущему шагу." in texts(events, "bot"))
+    # ГИБРИД UX: ответ ПРОМЕЖУТОЧНОГО шага не показывается репликой в чате
+    # (ход работы виден в журнале), но ответ обязан остаться в ПАМЯТИ диалога:
+    # по нему работает следующий шаг и проверка результата.
+    check("ответ модели получен и сохранён в память диалога",
+          any("Ответ модели по текущему шагу." in str(m.get("content") or "")
+              for m in chat._current_session()["dialog"]["messages"]),
+          str(texts(events, "bot"))[:150])
+    check("вместо ответа промежуточного шага — строка в журнале",
+          any("в чате не показываю" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[-200:])
     check("шаг 1 ушёл в модель с блоком состояния",
           any("СОСТОЯНИЕ ЗАДАЧИ" in t for t in texts(events, "debug"))
           or CALLS[-1]["messages"] >= 2)
@@ -906,8 +915,13 @@ async def test_routes():
     check("пауза записана в историю с причиной",
           any("во время выполнения шага" in r["reason"] for r in state["history"]),
           str([r["reason"] for r in state["history"][-2:]]))
-    check("ответ шага при этом не потерян",
-          any("Ответ модели" in item["text"] for item in (await chat.agent_history())["log"]))
+    # Ответ промежуточного шага в журнал чата репликой не пишется (показывается
+    # ход работы), но он обязан остаться в памяти диалога — иначе «Пауза» после
+    # шага потеряла бы результат шага.
+    check("ответ шага при этом не потерян (остался в памяти диалога)",
+          any("Ответ модели" in str(m.get("content") or "")
+              for m in chat._current_session()["dialog"]["messages"]),
+          str([item["kind"] for item in (await chat.agent_history())["log"]][-3:]))
     await chat.state_resume()
 
     # «Пауза» целится в ВЫПОЛНЯЕМУЮ задачу, даже если открыта другая: иначе
@@ -1066,8 +1080,14 @@ async def test_routes():
           str([i["text"][:30] for i in (history_opened.get("log") or [])]))
     await chat.session_select(background)
     history_bg = await chat.agent_history()
-    check("ответ записан в журнал СВОЕЙ задачи",
-          any("Ответ модели" in i["text"] for i in history_bg["log"]),
+    # Ответ промежуточного шага хранится в ПАМЯТИ своей задачи (в журнале — ход
+    # работы): проверяем, что работа легла именно в СВОЮ задачу.
+    check("ответ записан в память СВОЕЙ задачи",
+          any("Ответ модели" in str(m.get("content") or "")
+              for m in chat._current_session()["dialog"]["messages"]),
+          str([i["kind"] for i in history_bg["log"]][-3:]))
+    check("ход работы своей задачи виден в её журнале",
+          any("выполнен" in str(i.get("text") or "") for i in history_bg["log"]),
           str([i["kind"] for i in history_bg["log"]][-3:]))
     check("шаг помечен как реплика автомата",
           any(m.get("source") == "machine"

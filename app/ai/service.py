@@ -17,30 +17,54 @@ from app.ai.json_utils import is_valid_json, repair_json, wrap_as_json
 # в обычные запросы LLM — нужна только судье-аналитику для оценки точности.
 CORRECT_ANSWER_RE = re.compile(r"верный\s+ответ\s*:\s*(.+)$", re.IGNORECASE)
 
-# Модели для настройки «Тест моделей»: ключ настройки -> URI модели.
-# deepseek — LLM по умолчанию (config.LLM_MODEL).
-MODEL_URIS = {
-    "deepseek": None,  # подставляется config.LLM_MODEL
-    "alice": "gpt://b1gkm5u908if6dc0focb/aliceai-llm/latest",
-    "alice-flash": "gpt://b1gkm5u908if6dc0focb/aliceai-llm-flash/latest",
+# Модели настройки «Тест моделей» (значения галочек в #param-models): у каждой
+# свой ПРОВАЙДЕР, идентификатор модели и человекочитаемое имя.
+#
+# "deepseek" — модель по умолчанию: провайдер deepseek-official
+# (agent-default-model), модель провайдера берётся из config.LLM_MODEL.
+# Остальные ключи — СТАРЫЕ модели (Yandex Cloud AI Studio): они остаются
+# рабочими, но запрос уходит в них только при РУЧНОМ выборе в этой настройке:
+# обычные запросы, «Температура», судья и AI-агент идут в модель по умолчанию.
+DEFAULT_MODEL_KEY = "deepseek"
+MODEL_SPECS = {
+    "deepseek": {
+        "provider": "deepseek-official",
+        "model": None,  # None — модель провайдера по умолчанию (config.LLM_MODEL)
+        "name": "DeepSeek-V4-Flash",
+        "supports_thinking": True,
+    },
+    "deepseek-yandex": {
+        "provider": "yandex",
+        "model": config.YANDEX_MODEL,  # URI старого провайдера (был моделью по умолчанию)
+        "name": "DeepSeek 4 Flash (Yandex)",
+        "supports_thinking": True,
+    },
+    "alice": {
+        "provider": "yandex",
+        "model": "gpt://b1gkm5u908if6dc0focb/aliceai-llm/latest",
+        "name": "Alice AI LLM",
+        "supports_thinking": False,
+    },
+    "alice-flash": {
+        "provider": "yandex",
+        "model": "gpt://b1gkm5u908if6dc0focb/aliceai-llm-flash/latest",
+        "name": "Alice AI LLM Flash",
+        "supports_thinking": False,
+    },
 }
 # Человекочитаемые названия моделей (для вывода в ответах).
-MODEL_NAMES = {
-    "deepseek": "DeepSeek 4 Flash",
-    "alice": "Alice AI LLM",
-    "alice-flash": "Alice AI LLM Flash",
-}
-# Цена за 1000 токенов (вход/выход), руб., по тарифам Yandex AI Studio.
-# Тарифы живут в config: их использует и клиент LLM (стоимость запроса в панели
-# токенов агента), и аналитика этой страницы.
-MODEL_PRICING = config.MODEL_PRICING
-# Какие модели поддерживают поле thinking (отключение reasoning).
+MODEL_NAMES = {key: spec["name"] for key, spec in MODEL_SPECS.items()}
+# Тарифы: у модели по умолчанию (официальный DeepSeek) — долларовый прайс с
+# поправкой на пиковые часы и кэш; у старых моделей — рублёвый тариф Yandex
+# (config.YANDEX_MODEL_PRICING). Стоимость считает ровно ОДНА функция —
+# config.usage_cost — а тариф для показа даёт config.pricing_info: своих цен
+# этот модуль не считает, иначе числа в таблице и в панели разошлись бы.
+MODEL_PRICING = config.YANDEX_MODEL_PRICING
+# Какие модели ПРИНИМАЮТ поле thinking (отключение reasoning).
 # DeepSeek — reasoning-модель, поддерживает "thinking": {"type": "disabled"}.
 # Alice-модели это поле НЕ принимают (HTTP 400), потому им его не отправляем.
 MODEL_SUPPORTS_THINKING = {
-    "deepseek": True,
-    "alice": False,
-    "alice-flash": False,
+    key: spec["supports_thinking"] for key, spec in MODEL_SPECS.items()
 }
 
 
@@ -164,26 +188,53 @@ def _extract_correct_answer(user_text: str) -> tuple:
     return cleaned, answer or None
 
 
-def _analytics_row(label: str, model: str, metrics: Optional[dict]) -> dict:
+def _fmt_rub(value) -> str:
+    """Рубли с точностью по величине: мелкие суммы не превращаются в «0.00».
+
+    Официальный DeepSeek берёт за вызов тысячные доли рубля, поэтому для сумм
+    меньше копейки показываем четыре знака — иначе расход выглядел бы нулевым.
+    """
+    amount = float(value or 0.0)
+    return f"{amount:.2f}" if abs(amount) >= 0.01 else f"{amount:.4f}"
+
+
+def _analytics_row(label: str, model: str, metrics: Optional[dict],
+                   provider: Optional[str] = None) -> dict:
     """Строка таблицы метрик: время, токены и стоимость одного вызова LLM.
 
     Аналитика собирается для КАЖДОГО обращения к модели (включая служебные —
     судью), поэтому в таблице видно не только ответы, но и цену их оценки.
+
+    Стоимость НЕ считается здесь заново: её уже посчитал клиент по тарифу
+    провайдера (включая кэш-токены, пиковые часы и курс) и положил в метрики —
+    второй расчёт тех же денег неизбежно разошёлся бы с первым. Пересчёт
+    остаётся только страховкой для метрик без стоимости.
+
+    В строку добавляется `pricing` — тариф, по которому посчитана эта цифра
+    (пиковый/непиковый, ставки, курс): интерфейс показывает его под таблицей,
+    чтобы стоимость была объяснимой.
     """
     if not metrics or metrics.get("failed"):
         return {"label": label, "seconds": 0, "input_tokens": 0,
-                "output_tokens": 0, "cost_rub": 0, "summary": ""}
-    price = config.model_price(model)
+                "output_tokens": 0, "cost_rub": 0, "summary": "",
+                "pricing": config.pricing_info(model, provider)}
     in_tokens = int(metrics.get("prompt_tokens") or 0)
     out_tokens = int(metrics.get("completion_tokens") or 0)
-    cost = (in_tokens / 1000) * price["input"] + (out_tokens / 1000) * price["output"]
+    cost = metrics.get("cost_rub")
+    if cost is None:
+        cost = config.usage_cost(
+            model, prompt_tokens=in_tokens, completion_tokens=out_tokens,
+            cache_hit_tokens=metrics.get("cache_hit_tokens") or 0,
+            provider=provider,
+        )
     return {
         "label": label,
         "seconds": float(metrics.get("elapsed_seconds") or 0),
         "input_tokens": in_tokens,
         "output_tokens": out_tokens,
-        "cost_rub": round(cost, 2),
+        "cost_rub": round(float(cost or 0.0), 5),
         "summary": "",
+        "pricing": config.pricing_info(model, provider),
     }
 
 
@@ -307,9 +358,12 @@ def _judge_model_test(answers: list, analytics: list) -> list:
     )
     blocks = []
     for answer, row in zip(answers, analytics):
+        # Стоимость показываем с достаточной точностью: у официального DeepSeek
+        # вызов стоит тысячные доли рубля, и «0.00» судье ничего не говорит.
         blocks.append(
             f"Модель {row['model']} ({row['seconds']:.2f}с, вход {row['input_tokens']} / "
-            f"выход {row['output_tokens']} токенов, стоимость {row['cost_rub']:.2f} руб.):\n"
+            f"выход {row['output_tokens']} токенов, стоимость "
+            f"{_fmt_rub(row['cost_rub'])} руб.):\n"
             f"{answer['text']}"
         )
     verdict, metrics = client.call_llm_with_metrics(
@@ -360,54 +414,49 @@ def _model_responses(
      "analytics": [{"model", "seconds", "input_tokens", "output_tokens",
                     "cost_rub"}, …]}.
     Каждая модель обрабатывается независимо; заодно собираются метрики
-    (время, входной/выходной токены) и считается стоимость по тарифам
-    MODEL_PRICING — это аналитика судьи-аналитика для вывода таблицей.
+    (время, входной/выходной токены) и берётся стоимость, посчитанная клиентом
+    по тарифу ТОГО провайдера, которому ушёл запрос, — это аналитика
+    судьи-аналитика для вывода таблицей. В строку кладётся и сам тариф
+    (`pricing`): модели живут у разных провайдеров, и одна цифра «по тарифам»
+    на всю таблицу была бы неправдой.
+
+    Модель может жить у РАЗНЫХ провайдеров (по умолчанию — deepseek-official,
+    старые — Yandex): провайдер берётся из описания модели (MODEL_SPECS) и
+    уходит в клиент, потому что адрес и ключ у провайдеров свои. Неизвестный
+    ключ трактуется как модель по умолчанию — запрос не уходит «в никуда».
     """
     answers = []
     analytics = []
     for key in models:
-        uri = MODEL_URIS.get(key)
-        if uri is None:
-            uri = config.LLM_MODEL
-        name = MODEL_NAMES.get(key, key)
+        spec = MODEL_SPECS.get(key) or MODEL_SPECS[DEFAULT_MODEL_KEY]
+        uri = spec["model"] or config.LLM_MODEL
+        name = spec["name"]
         text, metrics = client.call_llm_with_metrics(
             user_text,
             response_format=response_format,
             max_tokens=max_tokens,
             stop=stop,
             model=uri,
+            provider=spec["provider"],
             # Отключаем reasoning только у моделей, которые это поддерживают
             # (deepseek) — остальные (alice) отклоняют поле thinking (HTTP 400).
-            disable_thinking=MODEL_SUPPORTS_THINKING.get(key, False),
+            disable_thinking=spec["supports_thinking"],
         )
         answers.append({"model": name, "text": _normalize_answer(user_text, text, response_format)})
 
-        if metrics:
-            in_tokens = metrics["prompt_tokens"]
-            out_tokens = metrics["completion_tokens"]
-            price = MODEL_PRICING.get(key) or {"input": 0, "output": 0}
-            cost = (in_tokens / 1000) * price["input"] + (out_tokens / 1000) * price["output"]
-            analytics.append(
-                {
-                    "label": name,
-                    "model": name,
-                    "seconds": metrics["elapsed_seconds"],
-                    "input_tokens": in_tokens,
-                    "output_tokens": out_tokens,
-                    "cost_rub": round(cost, 2),
-                }
-            )
-        else:
-            analytics.append(
-                {
-                    "label": name,
-                    "model": name,
-                    "seconds": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cost_rub": 0,
-                }
-            )
+        analytics.append(
+            {
+                "label": name,
+                "model": name,
+                "seconds": float((metrics or {}).get("elapsed_seconds") or 0),
+                "input_tokens": int((metrics or {}).get("prompt_tokens") or 0),
+                "output_tokens": int((metrics or {}).get("completion_tokens") or 0),
+                # Стоимость уже посчитана клиентом (тариф провайдера, кэш,
+                # пиковые часы, курс) — здесь она только переносится.
+                "cost_rub": round(float((metrics or {}).get("cost_rub") or 0.0), 5),
+                "pricing": config.pricing_info(uri, spec["provider"]),
+            }
+        )
     # Резюме судьи-аналитика: краткий разбор каждой модели (скорость, стоимость,
     # ресурсоёмкость, качество). Прикрепляем summary к строкам таблицы.
     if answers:

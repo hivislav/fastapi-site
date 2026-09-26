@@ -2263,6 +2263,61 @@ async function run() {
   check('вместо времени не появляется «NaN»',
     !dom.window.document.getElementById('messages').textContent.includes('NaN'));
 
+  console.log('\n[T] Тарифы и стоимость в интерфейсе');
+  // Стоимость вызова у официального DeepSeek — тысячные доли рубля, поэтому
+  // проверяем, что мелкие суммы НЕ превращаются в «0,00 руб».
+  const rub = v => dom.window.eval('fmtRub(' + JSON.stringify(v) + ')');
+  check('мелкая сумма не показывается нулём', rub(0.0034) === '0,0034 руб', rub(0.0034));
+  check('сумма до рубля — три знака', rub(0.1234) === '0,123 руб', rub(0.1234));
+  check('обычная сумма — два знака', rub(1.2345) === '1,23 руб', rub(1.2345));
+  check('ноль показывается как ноль', rub(0) === '0 руб', rub(0));
+  check('пустое значение не даёт «NaN»', rub(null) === '0 руб', rub(null));
+
+  // Тариф — данные СЕРВЕРА (pricing у строки аналитики): интерфейс не должен
+  // выдумывать цены сам, а обязан показать ставки, пиковость и курс.
+  const dsPricing = {
+    provider: 'deepseek-official', model: 'deepseek-v4-flash', peak: false,
+    tariff: 'непиковый тариф (×0,5)', usd_rub: 84.0657,
+    usd_per_mtok: { cache_hit: 0.003, cache_miss: 0.15, output: 0.6 },
+    rub_per_mtok: { cache_hit: 0.2521971, cache_miss: 12.609855, output: 50.43942 },
+    peak_note: 'Пиковые часы DeepSeek: 06:00–09:00 и 11:00–15:00 по Екатеринбургу',
+  };
+  const yandexPricing = {
+    provider: 'yandex', model: 'gpt://x/aliceai-llm/latest', peak: false,
+    tariff: 'тариф Yandex, руб. за 1000 токенов', usd_rub: null, usd_per_mtok: null,
+    rub_per_mtok: { cache_hit: 500, cache_miss: 500, output: 1200 }, peak_note: '',
+  };
+  const dsText = dom.window.eval('fmtPricing(' + JSON.stringify(dsPricing) + ')');
+  check('в строке тарифа видны ставки за 1M токенов',
+    dsText.includes('12,61') && dsText.includes('50,44'), dsText);
+  check('в строке тарифа видны цена из кэша и курс',
+    dsText.includes('0,252') && dsText.includes('84,07'), dsText);
+  check('в строке тарифа назван сам тариф',
+    dsText.includes('непиковый') && dsText.includes('deepseek-v4-flash'), dsText);
+  const yaText = dom.window.eval('fmtPricing(' + JSON.stringify(yandexPricing) + ')');
+  check('тариф Yandex показывается без курса и без пика',
+    yaText.includes('500,00') && !yaText.includes('курс'), yaText);
+  check('без данных тарифа строка пустая', dom.window.eval('fmtPricing(null)') === '');
+
+  // Пояснения под таблицей: по одной строке на КАЖДЫЙ тариф (модели могут быть
+  // у разных провайдеров), повторы не дублируются.
+  const notesHtml = dom.window.eval('pricingNotes(' + JSON.stringify([
+    { label: 'A', cost_rub: 0.01, pricing: dsPricing },
+    { label: 'B', cost_rub: 0.02, pricing: dsPricing },
+    { label: 'C', cost_rub: 0.03, pricing: yandexPricing },
+    { label: 'D', cost_rub: 0.04 },
+  ]) + ')');
+  const notesCount = (notesHtml.match(/tariff-note/g) || []).length;
+  check('пояснение тарифа — по одному на тариф (не на строку)', notesCount === 2,
+    String(notesCount));
+  check('пояснение помечено классом и не ломает вёрстку',
+    notesHtml.includes('judge-summary tariff-note'));
+  check('часы пика ушли во всплывающую подсказку',
+    notesHtml.includes('title="Пиковые часы DeepSeek'), notesHtml.slice(0, 120));
+  check('строка без тарифа пояснения не создаёт',
+    (dom.window.eval('pricingNotes([{ label: "D", cost_rub: 0.04 }])')
+      .match(/tariff-note/g) || []).length === 0);
+
   console.log('\nИтог: ' + (failures ? 'ПРОВАЛЕНО проверок: ' + failures : 'все проверки пройдены'));
   dom.window.close();
   process.exit(failures ? 1 : 0);

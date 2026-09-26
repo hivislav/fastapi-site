@@ -68,6 +68,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app import config
+from app.ai import attachments as attach_store
 from app.ai import invariants as invariants_store
 from app.ai import mcp as mcp_store
 from app.ai import periodic as periodic_store
@@ -369,6 +370,12 @@ def _clean_log(raw: Any) -> List[Dict[str, Any]]:
             analysis = _clean_analysis(item.get("analysis"))
             if analysis["suggestions"] or analysis["explanation"]:
                 entry["analysis"] = analysis
+        files = _clean_files(item.get("files"))
+        if files:
+            # ФАЙЛЫ, полученные от MCP-инструмента: карточки со ссылкой на
+            # скачивание под сообщением. Хранятся в журнале, поэтому видны и
+            # после переключения задачи/перезагрузки страницы.
+            entry["files"] = files
         clean.append(entry)
     if len(clean) > _MAX_LOG:
         clean = clean[-_MAX_LOG:]
@@ -380,7 +387,7 @@ def _clean_log(raw: Any) -> List[Dict[str, Any]]:
 
 
 def add_log(dialog: Dict[str, Any], kind: str, text: str,
-            at: str = "") -> None:
+            at: str = "", files: Any = None) -> None:
     """Добавляет узел в журнал чата сессии (что пользователь видит в окне).
 
     Пишется веб-слоем по ходу ответа: реплика пользователя, ответ агента,
@@ -391,13 +398,20 @@ def add_log(dialog: Dict[str, Any], kind: str, text: str,
     его у реплик пользователя и ответов агента, как в мессенджерах; служебные
     строки (debug/error) времени не показывают, но оно всё равно хранится —
     по нему видно порядок и когда именно шла работа.
+
+    `files` — вложения MCP (xlsx и т. п.), полученные по этому запросу: узел
+    рисуется с карточками файлов и ссылками на скачивание.
     """
     value = str(text or "").strip()
     if kind not in LOG_KINDS or not value:
         return
     log = dialog.setdefault("log", [])
-    log.append({"kind": kind, "text": value[:_MAX_LOG_TEXT],
-                "at": str(at or "").strip()[:40] or _now()})
+    entry: Dict[str, Any] = {"kind": kind, "text": value[:_MAX_LOG_TEXT],
+                             "at": str(at or "").strip()[:40] or _now()}
+    clean_files = _clean_files(files)
+    if clean_files:
+        entry["files"] = clean_files
+    log.append(entry)
     if len(log) > _MAX_LOG:
         del log[:len(log) - _MAX_LOG]
     total = sum(len(item.get("text") or "") for item in log)
@@ -520,25 +534,68 @@ def normalize_dialog(raw: Any, task_id: str = "") -> Dict[str, Any]:
 
 
 def _normalize_dialog_mcp(raw: Any) -> Dict[str, Any]:
-    """Данные MCP диалога: {"signature", "request", "calls", "results"}.
+    """Данные MCP диалога: {"signature", "request", "calls", "results", "chain"}.
 
     Хранится то, что уже получено: подпись (включённые серверы + исходный запрос
     задачи), САМИ вызовы и их результаты. Вызовы нужны повторам периодической
     задачи: тот же запрос — те же ЧИТАЮЩИЕ вызовы, только данные свежие
     (см. _preflight_mcp); выбор инструментов моделью заново не оплачивается и не
-    «плывёт» от повтора к повтору. Битое — пусто.
+    «плывёт» от повтора к повтору.
+
+    `chain` — состояние ЦЕПОЧКИ вызовов (идентификаторы, ключи вызовов, сколько
+    раундов сделано). Нужно повторам периодической задачи: они перезаписывают ТОТ
+    ЖЕ набор данных (тот же dataset_id + флаг перезаписи), а не создают новый на
+    каждом повторе. Битое — пусто.
     """
     if not isinstance(raw, dict):
         return {}
     signature = str(raw.get("signature") or "").strip()
     if not signature:
         return {}
-    return {
+    out = {
         "signature": signature[:600],
         "request": str(raw.get("request") or "")[:400],
-        "calls": mcp_store.normalize_calls(raw.get("calls")),
+        "calls": mcp_store.normalize_calls(raw.get("calls"),
+                                           limit=mcp_store.MAX_TOTAL_CALLS_PER_REQUEST),
         "results": mcp_store.normalize_results(raw.get("results")),
     }
+    chain = _clean_chain(raw.get("chain"))
+    if chain:
+        out["chain"] = chain
+    return out
+
+
+def _clean_chain(raw: Any) -> Dict[str, Any]:
+    """Состояние цепочки: {"ids", "keys", "iterations", "pending"}.
+
+    `pending` — цепочка НЕ ДОИГРАНА: до подтверждения плана выполнялись только
+    чтения, а вызовы, меняющие что-то на сервере (сохранение набора, выгрузка
+    файла), отложены до первого шага выполнения. По этому признаку `_preflight_mcp`
+    продолжает цепочку после «ок».
+    """
+    if not isinstance(raw, dict):
+        return {}
+    ids: Dict[str, str] = {}
+    for key, value in list((raw.get("ids") or {}).items())[:20]:
+        name = str(key or "").strip()[:60]
+        text = str(value or "").strip()[:80]
+        if name and text:
+            ids[name] = text
+    keys = [str(item)[:300] for item in (raw.get("keys") or []) if str(item or "").strip()]
+    try:
+        iterations = max(0, min(20, int(raw.get("iterations") or 0)))
+    except (TypeError, ValueError):
+        iterations = 0
+    pending = bool(raw.get("pending"))
+    if not ids and not keys and not pending:
+        return {}
+    return {"ids": ids, "keys": list(dict.fromkeys(keys))[:20],
+            "iterations": iterations, "pending": pending}
+
+
+def _clean_files(raw: Any) -> List[Dict[str, Any]]:
+    """Вложения MCP для журнала чата (карточки файлов со ссылкой на скачивание)."""
+    return attach_store.normalize(raw)
 
 
 def dialog_mcp(dialog: Dict[str, Any]) -> Dict[str, Any]:
@@ -612,19 +669,34 @@ def clear_mcp_started(dialog: Dict[str, Any], entries: Any = None) -> List[Dict[
 
 
 def set_dialog_mcp(dialog: Dict[str, Any], signature: str, request: str,
-                   results: Any, calls: Any = None) -> Dict[str, Any]:
+                   results: Any, calls: Any = None,
+                   chain: Any = None) -> Dict[str, Any]:
     """Запоминает данные MCP текущего запроса задачи: подпись, вызовы, результаты.
 
     Вызовы (`calls`) хранятся, чтобы повтор периодической задачи выполнил те же
     ЧИТАЮЩИЕ вызовы со свежими данными, а не спрашивал модель заново: выбор
     инструментов иначе «плыл» бы от повтора к повтору (в живой задаче повтор
     решил, что данные не нужны, и ответ ушёл без погоды).
+
+    `chain` — состояние цепочки (идентификаторы сохранённых наборов, ключи вызовов
+    и признак «цепочка не доиграна, ждёт подтверждения плана»). None — не трогаем
+    прежнее состояние: промежуточные сохранения раундов не должны его терять.
+
+    Состояние цепочки НЕ переносится на другой запрос: если подпись сменилась
+    (пользователь поправил запрос), отложенная часть прежнего запроса не должна
+    «дотянуться» до нового — иначе после «ок» по новому запросу выполнялись бы
+    сохранение и выгрузка прежнего.
     """
+    previous = dialog.get("mcp") if isinstance(dialog.get("mcp"), dict) else {}
+    same_request = str(previous.get("signature") or "") == str(signature or "")
+    keep_chain = chain if chain is not None else (
+        previous.get("chain") if same_request else None)
     dialog["mcp"] = _normalize_dialog_mcp({
         "signature": signature,
         "request": request,
         "calls": calls if calls is not None else [],
         "results": results,
+        "chain": keep_chain,
     })
     return dialog["mcp"]
 
