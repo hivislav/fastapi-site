@@ -1387,7 +1387,8 @@ def _mcp_tools(found: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: str,
                          analyzer: Agent, state: "task_state.TaskState",
                          machine_step: bool = False, reuse: bool = False,
-                         fresh: bool = False, approved: bool = False
+                         fresh: bool = False, approved: bool = False,
+                         resume_chain: bool = False
                          ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str], bool]:
     """Данные внешних инструментов MCP по запросу — ДО этапа планирования.
 
@@ -1415,6 +1416,12 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
     выгрузка файла, запуск сбора). До подтверждения выполняется ТОЛЬКО ЧТЕНИЕ —
     данные для плана, без побочных эффектов и без файла в чате; отложенная часть
     доигрывается на первом шаге выполнения (см. `_resume_mcp_chain`).
+
+    `resume_chain` — план подтверждён, поэтому НЕДОИГРАННУЮ цепочку можно
+    продолжать (добирать данные по зависимостям) уже на ТЕКУЩЕМ шаге. Это
+    отдельный флаг, а не тот же `approved`: «эффекты разрешены» и «цепочку можно
+    продолжать» — разные вещи. Продолжение идёт в режиме чтений, а сохранение и
+    выгрузка по-прежнему ждут последнего шага.
     """
     dialog = session["dialog"]
     enabled = workspace_store.mcp_enabled(task)
@@ -1442,8 +1449,17 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
     chain_state = stored.get("chain") or {}
     same_request = bool(stored.get("signature")) and stored.get("signature") == signature
     # ЦЕПОЧКА НЕ ДОИГРАНА: до подтверждения плана выполнены только чтения, а
-    # сохранение и выгрузка ждали «ок». Теперь их пора выполнить — доигрываем.
-    resume = bool(approved and chain_state.get("pending") and same_request)
+    # зависимые вызовы (в том числе ЧТЕНИЯ по найденным данным) ждали «ок».
+    # Доигрываем её сразу после подтверждения — на ПЕРВОМ же шаге выполнения, а не
+    # только на последнем: шаг плана «получить данные» обязан идти с данными.
+    # Иначе он отвечал «данных нет», этот ответ попадал в контекст следующего шага,
+    # и модель противоречила уже полученным данным (живая задача: «проверь прогноз в
+    # городах Славы и Ивана» — прогноз добывался на последнем шаге, шаг 1 отвечал
+    # без погоды, шаг 2 повторил его вывод и проверка отклонила оба шага).
+    # ПОБОЧНЫЕ ЭФФЕКТЫ по-прежнему только при `approved` (последний шаг): цепочка
+    # продолжается в режиме чтений, а сохранение и выгрузка ждут своего шага.
+    resume = bool((approved or resume_chain) and chain_state.get("pending")
+                  and same_request)
     if not fresh and same_request and not resume:
         # Данные по этому запросу уже собраны (шаг плана, проверка результата или
         # повтор того же запроса) — служебного вызова и обращений к серверам нет.
@@ -1517,11 +1533,13 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
     # бы новое наблюдение на сервере (см. started_calls).
     started = workspace_store.mcp_started(dialog)
     if resume:
-        # ПЛАН ПОДТВЕРЖДЁН, а цепочка осталась не доигранной: до «ок» выполнялись
-        # только чтения, сохранение и выгрузка ждали подтверждения. Доигрываем.
+        # ЦЕПОЧКА ОСТАЛАСЬ НЕ ДОИГРАННОЙ: до «ок» выполнялись только чтения, а
+        # зависимые вызовы ждали подтверждения. Доигрываем её — с этого шага.
+        # `approved` решает, разрешены ли ПОБОЧНЫЕ ЭФФЕКТЫ (последний шаг плана):
+        # продолжение цепочки на промежуточном шаге идёт в режиме чтений.
         return await _resume_mcp_chain(dialog, signature, request_text, tools,
                                        analyzer, stored, deadline, started,
-                                       lines_pre)
+                                       lines_pre, approved=approved)
     # РЕШЕНИЕ ДИСПЕТЧЕРА + МАРШРУТИЗАЦИЯ (гибридная схема). Разовый запрос идёт
     # одним раундом — дешёвым путём, как раньше. Многошаговый (следующий вызов
     # зависит от результата предыдущего: сохранить прочитанное, выгрузить файл по
@@ -1559,15 +1577,21 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                     f"{call['server']} · {call['tool']}"
                     for call in mcp_store.read_calls(retry, tools)) + ").")
             calls = retry
-    if not calls and chain_mode:
+    if not calls and (chain_mode or mcp_store.requested_kinds(request_text)):
         # ДИСПЕТЧЕР ОТВЕТИЛ «ДАННЫЕ НЕ НУЖНЫ» на запрос, который явно просит
         # сохранить/выгрузить. Это живой случай: на один и тот же запрос модель то
         # строит цепочку, то возвращает пустой список — и задача остаётся без
         # данных и без файла. Переспрашиваем ОДИН раз, назвав невызванные
         # инструменты, которые создают результат (см. deliver_note): нужен
         # читающий вызов и режим chain, дальше цепочка дойдёт сама.
+        #
+        # Условие — ВИД просьбы, а не режим цепочки: запрос «запиши, что Иван
+        # живёт в Москве» закрывается одним вызовом и цепочки не требует, но
+        # страховка «просили записать, а не вызвано ничего» нужна ему ровно так
+        # же. Иначе флаки-диспетчер оставил бы такую задачу без записи.
         candidates = mcp_store.delivery_candidates(
-            tools, {(str(c.get("server") or ""), str(c.get("tool") or "")) for c in calls})
+            tools, {(str(c.get("server") or ""), str(c.get("tool") or "")) for c in calls},
+            kinds=mcp_store.unsatisfied_kinds(request_text, calls))
         if candidates:
             retry = await analyzer.decide_mcp_tools(
                 request_text, tools, started=started,
@@ -1710,17 +1734,23 @@ async def _resume_mcp_chain(dialog: Dict[str, Any], signature: str, request_text
                             tools: List[Dict[str, Any]], analyzer: Agent,
                             stored: Dict[str, Any], deadline: float,
                             started: Optional[List[Dict[str, Any]]] = None,
-                            lines_pre: Optional[List[str]] = None
+                            lines_pre: Optional[List[str]] = None,
+                            approved: bool = True
                             ) -> Tuple[List[Dict[str, Any]], Dict[str, Any],
                                        List[str], bool]:
-    """Доигрывает цепочку ПОСЛЕ подтверждения плана.
+    """Доигрывает цепочку после подтверждения плана — на текущем шаге выполнения.
 
     Гибридная схема: до «ок» выполнялись только ЧТЕНИЯ (по ним построен план), а
-    вызовы, меняющие что-то на сервере (сохранение набора, выгрузка файла),
-    остались отложенными. Теперь план подтверждён — цепочка продолжается с того же
-    места: диспетчер видит прежние результаты и выбирает следующие вызовы сам
-    (сохранение, затем выгрузка по идентификатору из ответа сервера). Границы,
-    защита и идемпотентность — те же (см. `_mcp_chain`).
+    зависимые вызовы остались отложенными. План подтверждён — цепочка продолжается
+    с того же места: диспетчер видит прежние результаты и выбирает следующие вызовы
+    сам (прогноз по городам из реестра, сохранение, затем выгрузка по id из ответа
+    сервера). Границы, защита и идемпотентность — те же (см. `_mcp_chain`).
+
+    Доигрывается на ПЕРВОМ шаге выполнения, а не на последнем: шаг «получить
+    данные» обязан идти с данными. `approved` решает только одно — разрешены ли
+    вызовы с побочными эффектами (сохранение, выгрузка): они ждут последнего шага
+    плана, а чтения добываются сразу. Если эффект выбран на промежуточном шаге, он
+    снова откладывается, и цепочка остаётся не доигранной до последнего шага.
 
     Результаты и вызовы прежней фазы берутся из диалога, поэтому чтения не
     повторяются: их ключи уже в `done_keys`.
@@ -1730,12 +1760,13 @@ async def _resume_mcp_chain(dialog: Dict[str, Any], signature: str, request_text
     calls = list(stored.get("calls") or [])
     signals = mcp_store.chain_signals(tools, request_text, expected=len(calls))
     lines = list(lines_pre or [])
-    lines.append("MCP: план подтверждён — доигрываю цепочку: выполняю отложенные "
-                 "шаги (сохранение результата и выгрузка файла).")
+    lines.append("MCP: план подтверждён — доигрываю цепочку: добираю данные по "
+                 "зависимостям" + ("" if approved else
+                                   ", побочные эффекты ждут последнего шага") + ".")
     results, calls, usage, lines = await _mcp_chain(
         dialog, request_text, tools, results, calls, analyzer, {}, signals,
         signature, deadline=deadline, started=started,
-        chain_state=chain_state, lines=lines, approved=True)
+        chain_state=chain_state, lines=lines, approved=approved)
     return results, usage, lines, True
 
 
@@ -1840,8 +1871,11 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
             if effects:
                 names = mcp_store.calls_note(effects)
                 deferred_names.extend(str(call.get("tool") or "") for call in effects)
-                lines.append("MCP: до подтверждения плана изменения не выполняю — "
-                             f"отложено до «ок»: {names}.")
+                # Формулировка честна в обоих случаях: до «ок» (плана ещё нет) и на
+                # промежуточном шаге после «ок» — изменения в любом случае ждут
+                # ПОСЛЕДНЕГО шага плана.
+                lines.append("MCP: изменения сейчас не выполняю — сохранение и "
+                             f"выгрузка идут на последнем шаге плана: {names}.")
             allowed = reads
         allowed = allowed[:remaining]
         if not allowed:
@@ -1863,10 +1897,18 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
             # спрашиваем диспетчера ЕЩЁ РАЗ, назвав невызванные инструменты, которые
             # создают результат (файл, набор, отчёт). Один раз на цепочку — иначе
             # это превратилось бы в цикл уговоров.
-            if not nudged and not rejected:
+            #
+            # ТОЛЬКО ПРИ `approved` (последний шаг плана). Уточнение требует
+            # СОЗДАТЬ результат, а эффекты на промежуточном шаге всё равно
+            # откладываются: уточнение там просило бы то, что нельзя выполнить, и —
+            # так как `nudged` живёт в пределах одного запроса — повторялось бы на
+            # КАЖДОМ шаге, сжигая самый дорогой вызов LLM.
+            if approved and not nudged and not rejected:
                 done_pairs = {(str(call.get("server") or ""), str(call.get("tool") or ""))
                               for call in calls}
-                candidates = mcp_store.delivery_candidates(tools, done_pairs)
+                candidates = mcp_store.delivery_candidates(
+                    tools, done_pairs,
+                    kinds=mcp_store.unsatisfied_kinds(request_text, calls))
                 if candidates:
                     nudged = True
                     nudge_pending = mcp_store.deliver_note(candidates, request_text)
@@ -1906,10 +1948,15 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
             keep_ids.setdefault(key, value)
         # Сохраняем ПОСЛЕ каждого раунда: шаги плана и проверка результата видят
         # всю цепочку, а повтор периодической задачи — её идентификаторы.
+        # `pending` остаётся True, если раунд отложил СОЗДАЮЩИЕ вызовы: иначе
+        # отложенный эффект потерялся бы — цепочка считалась бы доигранной, и на
+        # последнем шаге её уже никто не продолжил бы (живой случай: раунд прочитал
+        # данные И попросил сохранение — сохранение не выполнялось никогда).
         stored = workspace_store.set_dialog_mcp(
             dialog, signature, request_text, results, calls=calls,
             chain={"ids": keep_ids, "keys": sorted(done_keys),
-                   "iterations": round_number, "pending": False})
+                   "iterations": round_number,
+                   "pending": bool(deferred_names) and not approved})
         mcp_store.mark_actions(stored.get("results") or [], tools)
         fresh_started = mcp_store.started_calls(stored.get("results") or [], tools)
         if fresh_started:
@@ -1935,11 +1982,15 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
                 break
         # Осталась одна очевидная достройка результата? Выполним её без модели
         # (см. auto_followup): решение однозначно, а вызов диспетчера — самый
-        # дорогой вызов задачи.
+        # дорогой вызов задачи. Берём только те виды результата, которые запрос
+        # ещё ждёт: иначе второй включённый сервер со своим невызванным
+        # save-инструментом делал кандидатов «двумя», и достройка не срабатывала.
         if approved and not pending:
             done_pairs = {(str(call.get("server") or ""), str(call.get("tool") or ""))
                           for call in calls}
-            auto_call = mcp_store.auto_followup(tools, done_pairs, keep_ids)
+            auto_call = mcp_store.auto_followup(
+                tools, done_pairs, keep_ids,
+                kinds=mcp_store.unsatisfied_kinds(request_text, calls))
     else:
         lines.append(f"MCP: исчерпан предел раундов цепочки "
                      f"({mcp_store.MAX_CHAIN_ITERATIONS}) — останавливаюсь на "
@@ -3143,7 +3194,15 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # таблицу, а не наоборот. До последнего шага и до «ок»
                         # результат откладывается (см. `_resume_mcp_chain`).
                         approved=bool((confirmed or machine_step or autonomous
-                                       or periodic_run) and last_step))
+                                       or periodic_run) and last_step),
+                        # А ЦЕПОЧКУ продолжаем сразу после подтверждения — на любом
+                        # шаге: шаг «получить данные» обязан идти с данными, иначе
+                        # он отвечает «данных нет», и этот ответ уходит в контекст
+                        # следующего шага (живая задача: прогноз добывался только на
+                        # последнем шаге, шаг 1 ответил без погоды, шаг 2 повторил
+                        # его вывод, и проверка отклонила оба шага).
+                        resume_chain=bool(confirmed or machine_step or autonomous
+                                          or periodic_run))
                     if mcp_usage:
                         usage = merge_usage(usage, mcp_usage)
                     for line in mcp_lines:

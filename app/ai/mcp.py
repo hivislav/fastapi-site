@@ -136,14 +136,42 @@ DIGEST_RESULT_CHARS = 1500       # сколько символов одного 
 # Признаки «нужна цепочка» в тексте запроса: просьба СОХРАНИТЬ/ВЫГРУЗИТЬ (сделать
 # с данными что-то ЕЩЁ) либо явная последовательность шагов. Слова нейтральны к
 # предметной области: подходят любому серверу и инструменту.
-CHAIN_MARKERS = (
-    "сохран", "запиши", "записать", "занеси", "сложи в",
+#
+# Маркеры разделены ПО ВИДУ РЕЗУЛЬТАТА, и это не косметика. Вид отвечает на
+# вопрос «что именно просили сделать», поэтому просьба «запиши в реестр»,
+# закрытая любым создающим вызовом ЛЮБОГО сервера, не считается невыполненной
+# только потому, что у другого включённого сервера есть свой невызванный
+# save-инструмент. Без такого разделения агент требовал «сохранить» повторно и
+# называл диспетчеру инструменты чужого сервера (живой случай: запрос про реестр
+# городов уходил в цепочку из-за погодных наблюдений, а после save_city агент
+# уточнял про save_weather_summary). Цепочки при этом остаются КРОСС-СЕРВЕРНЫМИ:
+# вид сравнивается с видом, а не сервер с сервером.
+SAVE_MARKERS = (
+    "сохран", "запиши", "записать", "занеси", "сложи в", "save",
+)
+EXPORT_MARKERS = (
     "экспорт", "выгруз", "скач", "файл", "xlsx", "excel", "эксель",
     "таблиц", "отчёт", "отчет", "сформируй", "сделай в виде", "оформи",
-    "затем", "потом", "после этого", "на основе получ", "из полученн",
-    "сравни", "для каждого", "обоих", "сводн", "приложи",
-    "export", "download", "save", "spreadsheet", "attach",
+    "приложи", "export", "download", "spreadsheet", "attach",
 )
+# Порядок шагов и сводки: просьбы «сделать ещё шаг» без своего вида результата.
+SEQUENCE_MARKERS = (
+    "затем", "потом", "после этого", "на основе получ", "из полученн",
+    "сравни", "для каждого", "обоих", "сводн",
+)
+CHAIN_MARKERS = SAVE_MARKERS + EXPORT_MARKERS + SEQUENCE_MARKERS
+
+# ВИД РЕЗУЛЬТАТА по имени инструмента. Тот же приём, что у RESULT_RE: схемы MCP
+# описывают только вход, и «что этот инструмент создаёт» из них не видно, поэтому
+# вид берётся из имени. Список префиксов совпадает с RESULT_RE, только разбит на
+# две группы: SAVE создаёт запись/набор (его ключ можно ЗАДАТЬ), EXPORT отдаёт
+# готовый файл/отчёт (его ключ обязан прийти из результата).
+SAVE_NAME_RE = re.compile(
+    r"^(save|create|add|register|write|store|put|upsert|import|upload|publish)_")
+EXPORT_NAME_RE = re.compile(
+    r"^(export|download|send|submit|generate|build|render|report|attach)_")
+# Файл в имени — тоже выгрузка, даже если префикс не из списка выше.
+FILE_NAME_RE = re.compile(r"(excel|xlsx|csv|pdf|sheet|file)", re.IGNORECASE)
 
 # Аргумент, значение которого НЕЛЬЗЯ придумать: оно приходит из результата
 # другого инструмента (dataset_id, watch_id, key, ref…). Значение такого
@@ -260,13 +288,21 @@ WEATHER = "weather"
 CURRENCY = "currency"
 CRYPTO = "crypto"
 OPEN_METEO = "open_meteo"
+CITY_REGISTRY = "city_registry"
 
-# Свой сервер на VPS: адрес туннеля и ИМЯ переменной с токеном (не сам токен).
-# Туннель (launchd на Mac) поднимает 127.0.0.1:3000 -> loopback VPS; сам сервер
-# снаружи недоступен, поэтому в записи стоит адрес туннеля, а не адрес VPS.
+# Свои серверы на VPS: адрес туннеля и ИМЯ переменной с токеном (не сам токен).
+# Туннели (launchd на Mac) поднимают локальные порты -> loopback VPS; сами серверы
+# снаружи недоступны, поэтому в записи стоит адрес туннеля, а не адрес VPS.
+# У каждого сервера СВОЙ токен: они не взаимозаменяемы, поэтому и переменные
+# разные — общее имя молча отправило бы одному из серверов чужой секрет (401).
 OPEN_METEO_URL_ENV = "OPEN_METEO_MCP_URL"
 OPEN_METEO_TOKEN_ENV = "OPEN_METEO_MCP_TOKEN"
 OPEN_METEO_DEFAULT_URL = "http://127.0.0.1:3000/mcp"
+
+# Второй свой сервер на VPS — реестр городов и жителей.
+CITY_REGISTRY_URL_ENV = "CITY_REGISTRY_MCP_URL"
+CITY_REGISTRY_TOKEN_ENV = "CITY_REGISTRY_MCP_TOKEN"
+CITY_REGISTRY_DEFAULT_URL = "http://127.0.0.1:3001/mcp"
 
 SERVERS: List[Dict[str, Any]] = [
     {
@@ -313,6 +349,22 @@ SERVERS: List[Dict[str, Any]] = [
         "url": OPEN_METEO_DEFAULT_URL,
         "url_env": OPEN_METEO_URL_ENV,
         "token_env": OPEN_METEO_TOKEN_ENV,
+    },
+    {
+        "id": CITY_REGISTRY,
+        "name": "Реестр городов (свой сервер на VPS)",
+        "description": (
+            "Записать, что человек живёт в городе, и показать все такие записи. "
+            "Ключ записи — пара (город, житель), поэтому в одном городе может "
+            "быть много жителей, а одно имя — в разных городах; повторное "
+            "сохранение той же пары обновляет запись, а не дублирует её. Данные "
+            "отдаёт свой сервер city-registry-mcp на VPS (через SSH-туннель)."
+        ),
+        "source": "city-registry-mcp (свой сервер на VPS)",
+        "transport": HTTP_TRANSPORT,
+        "url": CITY_REGISTRY_DEFAULT_URL,
+        "url_env": CITY_REGISTRY_URL_ENV,
+        "token_env": CITY_REGISTRY_TOKEN_ENV,
     },
 ]
 
@@ -1448,6 +1500,67 @@ def looks_like_chain(text: Any) -> bool:
     return any(marker in body for marker in CHAIN_MARKERS)
 
 
+def result_kind(tool: Any) -> str:
+    """ВИД РЕЗУЛЬТАТА, который создаёт инструмент: «save», «export» или пусто.
+
+    Пусто — инструмент ничего не создаёт (чтение, поиск, удаление). Вид нужен,
+    чтобы сверять ПРОСЬБУ с ФАКТОМ, а не имена инструментов между собой: просьба
+    «запиши» закрывается любым создающим вызовом любого сервера, и наоборот —
+    невызванный создающий инструмент ЧУЖОГО сервера не делает просьбу
+    невыполненной. Так кросс-серверные цепочки остаются возможными, а чужие
+    инструменты не подмешиваются в уточнения.
+    """
+    name = str(tool or "").strip()
+    if not name:
+        return ""
+    if SAVE_NAME_RE.match(name):
+        return "save"
+    if EXPORT_NAME_RE.match(name):
+        return "export"
+    if RESULT_RE.match(name) and FILE_NAME_RE.search(name):
+        return "export"
+    return ""
+
+
+def requested_kinds(text: Any) -> List[str]:
+    """Какие ВИДЫ результата просит запрос: «save», «export» (в этом порядке).
+
+    Дешёвый признак по тексту запроса, без вызовов LLM. Пустой список — запрос не
+    просит ничего создавать (тогда и уточнять нечего). Это то, что отличает
+    «запиши данные о пользователе» от «сохрани прогноз и отдай файлом Excel»:
+    в первом случае вид ровно один, и закрывает его один вызов.
+    """
+    body = " ".join(str(text or "").lower().split())
+    kinds: List[str] = []
+    if any(marker in body for marker in SAVE_MARKERS):
+        kinds.append("save")
+    if any(marker in body for marker in EXPORT_MARKERS):
+        kinds.append("export")
+    return kinds
+
+
+def satisfied_kinds(calls: Any) -> List[str]:
+    """Виды результата, которые УЖЕ созданы выполненными вызовами (любых серверов)."""
+    kinds: List[str] = []
+    for call in (calls or []):
+        if not isinstance(call, dict):
+            continue
+        kind = result_kind(call.get("tool"))
+        if kind and kind not in kinds:
+            kinds.append(kind)
+    return kinds
+
+
+def unsatisfied_kinds(text: Any, calls: Any) -> List[str]:
+    """Виды, которые запрос просит, но выполненные вызовы ещё не создали.
+
+    Именно этот список (а не «все невызванные создающие инструменты набора»)
+    решает, о чём уточнять диспетчера: просьба уже закрыта — уточнять не о чем.
+    """
+    done = satisfied_kinds(calls)
+    return [kind for kind in requested_kinds(text) if kind not in done]
+
+
 def id_required_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """Инструменты, у которых ЕСТЬ обязательный аргумент-идентификатор.
 
@@ -1490,24 +1603,49 @@ def chain_signals(tools: Optional[List[Dict[str, Any]]], text: Any,
     """
     markers = looks_like_chain(text)
     id_tools = id_required_tools(tools)
+    kinds = requested_kinds(text)
+    # ПОПРАВКА НА ВИД: инструмент с обязательным id считается доводом за цепочку
+    # только если он создаёт ТОТ вид результата, который просит запрос. Иначе
+    # доводом становились наблюдения погоды на запрос «запиши данные в реестр»:
+    # маркер «запиши» находился, а id-инструменты брались из всего набора, включая
+    # чужие серверы. Виды нет у запроса (просят только «затем», «сравни») —
+    # оставляем прежнее поведение и смотрим на весь набор.
+    if kinds:
+        id_tools_relevant = [item for item in id_tools
+                             if result_kind(item.get("tool")) in kinds]
+    else:
+        id_tools_relevant = list(id_tools)
     return {
         "markers": markers,
+        "kinds": kinds,
         "id_tools": id_tools,
+        "id_tools_relevant": id_tools_relevant,
         "expected": int(expected or 0),
         # Цепочка оправдана, когда просят «сделать с данными ещё что-то» И в
-        # наборе есть инструмент, которому для этого нужен id из результата.
-        "needed": bool(markers and id_tools),
+        # наборе есть подходящий по виду инструмент, которому для этого нужен id
+        # из результата.
+        "needed": bool(markers and id_tools_relevant),
     }
 
 
 def chain_reason(signals: Dict[str, Any]) -> str:
-    """Понятная причина решения «идём в цепочку» (для чата и отладки)."""
+    """Понятная причина решения «идём в цепочку» (для чата и отладки).
+
+    Называем инструменты, ПОДХОДЯЩИЕ по виду результата (см. id_tools_relevant):
+    иначе причина объясняла цепочку инструментами чужого сервера — например,
+    наблюдениями погоды в запросе про реестр городов.
+    """
     if not signals.get("needed"):
         return ""
+    relevant = signals.get("id_tools_relevant") or signals.get("id_tools") or []
     tools = ", ".join(f"{item['tool']}({', '.join(item['args'])})"
-                      for item in (signals.get("id_tools") or [])[:3])
-    return ("запрос просит сделать с данными ещё шаг (сохранить/выгрузить), а "
-            f"инструменты требуют идентификатор из результата: {tools}")
+                      for item in relevant[:3])
+    kinds = signals.get("kinds") or []
+    what = " и ".join({"save": "сохранить", "export": "выгрузить"}[kind]
+                      for kind in kinds if kind in ("save", "export")) or \
+        "сохранить/выгрузить"
+    return (f"запрос просит {what}, а инструменты требуют идентификатор из "
+            f"результата: {tools}")
 
 
 def call_key(call: Any) -> str:
@@ -1663,7 +1801,8 @@ def chain_note(iteration: int, total: int, remaining: int,
 
 
 def delivery_candidates(tools: Optional[List[Dict[str, Any]]],
-                        done_pairs: Optional[set] = None) -> List[Dict[str, Any]]:
+                        done_pairs: Optional[set] = None,
+                        kinds: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Невызванные инструменты, которые СОЗДАЮТ результат (сохранить, выгрузить).
 
     Нужны для принудительного уточнения: диспетчер непостоянен — на один и тот же
@@ -1678,22 +1817,34 @@ def delivery_candidates(tools: Optional[List[Dict[str, Any]]],
     упоминание слова «report» в имени: читающий `get_weather_watch_report` тоже
     его содержит, и по нему цепочка считала, что результат ещё не выдан, — лишний
     полный раунд диспетчера после выгрузки файла.
+
+    `kinds` — какие ВИДЫ результата запрос ещё ждёт (см. unsatisfied_kinds).
+    `None` — не фильтровать по виду (нужно там, где вопрос не «что просил
+    запрос», а «остались ли вообще создающие инструменты»). Пустой список —
+    запрос не просил ничего создавать, значит и уточнять не о чем: иначе агент
+    требовал «сохранить» у сервера, которого запрос не касался.
     """
     done = done_pairs if isinstance(done_pairs, set) else set()
+    wanted = None if kinds is None else {str(kind) for kind in kinds}
     out: List[Dict[str, Any]] = []
     for tool in (tools or []):
         name = str(tool.get("tool") or "")
         server_id = str(tool.get("server") or "")
         if not name or (server_id, name) in done:
             continue
-        if RESULT_RE.match(name):
-            out.append({"server": server_id, "tool": name,
-                        "description": str(tool.get("description") or "")[:200]})
+        if not RESULT_RE.match(name):
+            continue
+        if wanted is not None and result_kind(name) not in wanted:
+            continue
+        out.append({"server": server_id, "tool": name,
+                    "kind": result_kind(name),
+                    "description": str(tool.get("description") or "")[:200]})
     return out
 
 
 def auto_followup(tools: Optional[List[Dict[str, Any]]], done_pairs: Optional[set],
-                  known_ids: Optional[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+                  known_ids: Optional[Dict[str, str]],
+                  kinds: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Очевидная ДОСТРОЙКА без модели: единственный оставшийся шаг результата.
 
     Если после создающего вызова остался РОВНО ОДИН невызванный инструмент,
@@ -1703,11 +1854,16 @@ def auto_followup(tools: Optional[List[Dict[str, Any]]], done_pairs: Optional[se
     без вопроса диспетчеру. Это экономит целый вызов LLM — самую дорогую часть
     задачи (промпт диспетчера: список инструментов, правила, дайджест).
 
+    `kinds` ограничивает достройку тем, что запрос ДЕЙСТВИТЕЛЬНО просил (см.
+    unsatisfied_kinds). Без этого «ровно один кандидат» ломалось о любой второй
+    включённый сервер: у него находится свой невызванный save-инструмент, и
+    очевидная выгрузка переставала выполняться без модели.
+
     Возвращает готовый вызов либо None (тогда решает модель, как и раньше).
     Консервативно: один кандидат, непустые обязательные аргументы, все значения
     известны. Ничего не выдумывается — иначе вернули бы None.
     """
-    candidates = delivery_candidates(tools, done_pairs)
+    candidates = delivery_candidates(tools, done_pairs, kinds=kinds)
     if len(candidates) != 1:
         return None
     candidate = candidates[0]

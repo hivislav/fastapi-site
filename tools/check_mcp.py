@@ -833,17 +833,17 @@ async def test_dialog():
     check("сбой выбора не оставляет блок данных",
           "ДАННЫЕ MCP" not in system_texts(), system_texts()[-200:])
 
-    # 5.6 Реестр проекта: три локальных сервера без ключей и свой сервер на VPS.
+    # 5.6 Реестр проекта: три локальных сервера без ключей и ДВА своих на VPS.
     restore_registry()
     registry = mcp_store.servers()
-    check("к проекту подключены четыре MCP-сервера", len(registry) == 4,
+    check("к проекту подключены пять MCP-серверов", len(registry) == 5,
           str([entry["id"] for entry in registry]))
     check("у каждого есть название и краткое описание",
           all(entry["name"] and entry["description"] for entry in registry),
           str(registry)[:200])
-    check("id серверов — погода, курсы валют, криптовалюты, свой Open-Meteo",
+    check("id серверов — погода, курсы валют, криптовалюты, свой Open-Meteo и реестр городов",
           [entry["id"] for entry in registry]
-          == ["weather", "currency", "crypto", "open_meteo"],
+          == ["weather", "currency", "crypto", "open_meteo", "city_registry"],
           str([entry["id"] for entry in registry]))
     local = [entry for entry in registry
              if mcp_store.transport_of(entry) == mcp_store.STDIO_TRANSPORT]
@@ -861,6 +861,23 @@ async def test_dialog():
     check("секрет в реестре не хранится: только ИМЯ переменной окружения",
           remote.get("token_env") == "OPEN_METEO_MCP_TOKEN" and "token" not in remote,
           str(sorted(remote))[:200])
+    cities = mcp_store.find_server("city_registry") or {}
+    check("пятый сервер — удалённый, транспорт http",
+          mcp_store.transport_of(cities) == mcp_store.HTTP_TRANSPORT,
+          str(cities)[:200])
+    check("адрес реестра городов — свой туннель на 3001, не адрес VPS",
+          str(cities.get("url") or "").startswith("http://127.0.0.1:3001"),
+          str(cities.get("url")))
+    check("секрет реестра городов в реестре тоже не хранится",
+          cities.get("token_env") == "CITY_REGISTRY_MCP_TOKEN"
+          and "token" not in cities,
+          str(sorted(cities))[:200])
+    # Ловушка: оба .env.vps называют свой токен MCP_AUTH_TOKEN. Общая переменная
+    # в приложении отправила бы одному из серверов чужой секрет — и это выглядело
+    # бы как сломанный туннель (401), а не как ошибка настройки.
+    check("у двух серверов на VPS РАЗНЫЕ переменные с токеном",
+          bool(remote.get("token_env")) and remote.get("token_env") != cities.get("token_env"),
+          "%s vs %s" % (remote.get("token_env"), cities.get("token_env")))
     saved_token = os.environ.pop("OPEN_METEO_MCP_TOKEN", "")
     try:
         gap = mcp_store.availability_error(remote)
@@ -1439,12 +1456,22 @@ async def test_chain():
     reset_calls()
     CHAIN_CALLS.clear()
     MCP_DECISIONS[:] = [
+        # ШАГ 1 (не последний): цепочка продолжается и на нём — но в режиме
+        # чтений. Новых чтений диспетчер не предлагает, цепочка на этом шаге
+        # закрывается, а сохранение и выгрузка ждут последнего шага.
+        {"done": True, "reason": "данных для шага хватает", "calls": []},
+        # ПОСЛЕДНИЙ шаг: первый ответ диспетчера — «данных достаточно» (отказ),
+        # значит агент обязан переспросить (уточнение бывает только там, где
+        # разрешены эффекты, — на промежуточном шаге оно просило бы невозможное).
         {"done": True, "reason": "данных достаточно для ответа", "calls": []},
         {"done": False, "reason": "сохраняю прогнозы",
          "calls": [{"server": CHAIN_ID, "tool": "save_weather_summary",
                     "arguments": {"dataset_id": DATASET_ID, "replace": True,
                                   "entries": [{"location": "Екатеринбург"},
                                               {"location": "Казань"}]}}]},
+        {"done": False, "reason": "выгружаю файл",
+         "calls": [{"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                    "arguments": {"dataset_id": DATASET_ID}}]},
     ]
     await run_chat("ок")
     approve_events = await run_chat("", continue_step=True)
@@ -1514,6 +1541,11 @@ async def test_chain():
     reset_calls()
     CHAIN_CALLS.clear()
     MCP_DECISIONS[:] = [
+        # ШАГ 1 (не последний): цепочка продолжается здесь, но только чтениями —
+        # эффекты ждут последнего шага, поэтому решений на нём не спрашивается.
+        {"done": True, "reason": "данных для шага хватает", "calls": []},
+        # ПОСЛЕДНИЙ шаг: сохранение, а выгрузку агент достраивает сам
+        # (auto_followup — единственный оставшийся вид результата).
         {"done": False, "reason": "сохраняю",
          "calls": [{"server": CHAIN_ID, "tool": "save_weather_summary",
                     "arguments": {"dataset_id": DATASET_ID, "replace": True,
@@ -1612,6 +1644,282 @@ async def test_chain():
           full_block[full_block.find("СЕГОДНЯ"):full_block.find("СЕГОДНЯ") + 120])
 
 
+# ---------------------------------------------------------------------------
+# 8. НЕСКОЛЬКО СЕРВЕРОВ: чужие инструменты не подмешиваются, а цепочки
+#    остаются КРОСС-СЕРВЕРНЫМИ (запрос может читать одним сервером, а
+#    записывать другим).
+# ---------------------------------------------------------------------------
+REGISTRY_ID = "city_registry"
+REGISTRY_REQUEST = "запиши данные о пользователе Иван, живёт в Москве"
+CROSS_REQUEST = ("получи прогноз погоды в Москве и запиши в реестр городов, "
+                 "что я живу в Москве")
+REGISTRY_TOOLS = [
+    {"name": "save_city", "title": "Записать жителя",
+     "description": "Записывает, что человек живёт в городе",
+     "schema": {"type": "object",
+                "properties": {"city": {"type": "string"},
+                               "resident": {"type": "string"}},
+                "required": ["city", "resident"]}},
+    {"name": "list_cities", "title": "Показать записи",
+     "description": "Возвращает все записи реестра",
+     "schema": {"type": "object", "properties": {}, "required": []}},
+]
+
+
+def flat_registry_tools():
+    return [{"server": REGISTRY_ID, "server_name": "city-registry-mcp",
+             "tool": tool["name"], "description": tool.get("description") or "",
+             "schema": tool.get("schema") or {}}
+            for tool in REGISTRY_TOOLS]
+
+
+def test_multi_server():
+    print("\n[8] Несколько серверов: чужие инструменты не подмешиваются")
+    both = flat_chain_tools() + flat_registry_tools()
+    save_city = {"server": REGISTRY_ID, "tool": "save_city",
+                 "arguments": {"city": "Москва", "resident": "Иван"}}
+
+    # 8.1 Запрос «запиши в реестр» закрывается ОДНИМ вызовом, даже когда рядом
+    # включён погодный сервер, у которого есть инструменты с обязательным id.
+    save_only = mcp_store.chain_signals(both, REGISTRY_REQUEST, expected=1)
+    check("запись в реестр не уходит в цепочку из-за чужого сервера",
+          not save_only["needed"], str(save_only.get("id_tools_relevant")))
+    check("виды результата берутся из запроса",
+          mcp_store.requested_kinds(REGISTRY_REQUEST) == ["save"],
+          str(mcp_store.requested_kinds(REGISTRY_REQUEST)))
+
+    # 8.2 Просьба уже закрыта — уточнять про чужие save-инструменты нечего.
+    left = mcp_store.unsatisfied_kinds(REGISTRY_REQUEST, [save_city])
+    check("выполненная запись закрывает просьбу «запиши»", left == [], str(left))
+    check("уточнение не называет инструменты чужого сервера",
+          mcp_store.delivery_candidates(both, {(REGISTRY_ID, "save_city")},
+                                        kinds=left) == [],
+          str(mcp_store.delivery_candidates(both, {(REGISTRY_ID, "save_city")},
+                                            kinds=left)))
+
+    # 8.3 Кросс-серверная цепочка НЕ сужена: после чтения погоды диспетчеру
+    # видны создающие инструменты обоих серверов.
+    read_only = [{"server": CHAIN_ID, "tool": "get_forecast",
+                  "arguments": {"location": "Москва"}}]
+    cross_left = mcp_store.unsatisfied_kinds(CROSS_REQUEST, read_only)
+    cross = mcp_store.delivery_candidates(both, {(CHAIN_ID, "get_forecast")},
+                                          kinds=cross_left)
+    pairs = {(item["server"], item["tool"]) for item in cross}
+    check("в кросс-серверном запросе видны создающие инструменты обоих серверов",
+          (CHAIN_ID, "save_weather_summary") in pairs
+          and (REGISTRY_ID, "save_city") in pairs,
+          str(sorted(pairs)))
+    check("чужая выгрузка в кросс-серверный запрос не подмешивается",
+          all(item["kind"] == "save" for item in cross),
+          str([(item["tool"], item["kind"]) for item in cross]))
+
+    # 8.4 Очевидная достройка снова срабатывает при двух включённых серверах:
+    # ожидаемый вид остаётся один, и «ровно один кандидат» не ломается.
+    after_save = [{"server": CHAIN_ID, "tool": "get_forecast", "arguments": {}},
+                  {"server": CHAIN_ID, "tool": "save_weather_summary",
+                   "arguments": {"dataset_id": DATASET_ID}}]
+    export_left = mcp_store.unsatisfied_kinds(DELIVER_REQUEST, after_save)
+    done = {(CHAIN_ID, "get_forecast"), (CHAIN_ID, "save_weather_summary")}
+    auto = mcp_store.auto_followup(both, done, {"dataset_id": DATASET_ID},
+                                   kinds=export_left)
+    check("очевидная выгрузка выполняется без диспетчера и при втором сервере",
+          bool(auto) and auto["tool"] == "export_weather_summary_excel"
+          and auto["server"] == CHAIN_ID, str(auto))
+    check("после сохранения ожидается ровно выгрузка", export_left == ["export"],
+          str(export_left))
+
+    # 8.5 Погодная цепочка не потеряла ни маршрут, ни правдивую причину.
+    weather = mcp_store.chain_signals(both, DELIVER_REQUEST, expected=2)
+    check("погодная цепочка при двух серверах по-прежнему нужна",
+          weather["needed"], str(weather.get("id_tools_relevant")))
+    check("в причине цепочки нет инструментов чужого сервера",
+          [item["tool"] for item in weather["id_tools_relevant"]]
+          == ["export_weather_summary_excel"],
+          mcp_store.chain_reason(weather))
+
+    # 8.6 Глобальная проверка «остались ли создающие инструменты» (после выдачи
+    # файла) по-прежнему видит весь набор: вид её не сужает.
+    names = {item["tool"] for item in mcp_store.delivery_candidates(both, set())}
+    check("без ограничения по виду видны создающие инструменты всех серверов",
+          names >= {"save_weather_summary", "export_weather_summary_excel",
+                    "save_city"},
+          str(sorted(names)))
+
+
+def use_two_server_registry() -> None:
+    """Реестр проекта из ДВУХ серверов: погодный и реестр городов."""
+    mcp_store.SERVER_IDS = [CHAIN_ID, REGISTRY_ID]
+    mcp_store.forget()
+
+
+def install_two_server_stubs() -> None:
+    """Заглушки обоих серверов: инструменты отвечают локально, без процессов."""
+    table = {CHAIN_ID: ("chain-mcp", CHAIN_TOOLS),
+             REGISTRY_ID: ("city-registry-mcp", REGISTRY_TOOLS)}
+
+    def entry(server_id):
+        name, tools = table.get(str(server_id), ("", []))
+        if not name:
+            return {"id": str(server_id), "ok": False, "error": "нет такого сервера",
+                    "server_name": "", "server_version": "", "tools": []}
+        return {"id": str(server_id), "ok": True, "error": "", "server_name": name,
+                "server_version": "0.1", "tools": [dict(tool) for tool in tools]}
+
+    async def fake_discover(ids=None, force=False):
+        return [entry(server_id) for server_id in (CHAIN_ID, REGISTRY_ID)]
+
+    def fake_discover_sync(server_id=None, force=False):
+        return entry(server_id)
+
+    async def fake_run_calls(calls, limit=None):
+        cap = mcp_store.MAX_CALLS_PER_REQUEST if limit is None else max(0, int(limit))
+        calls = list(calls)[:cap]
+        CHAIN_CALLS.append(list(calls))
+        out = []
+        for call in calls:
+            tool = str(call.get("tool") or "")
+            server_id = str(call.get("server") or "")
+            arguments = dict(call.get("arguments") or {})
+            name = table.get(server_id, ("", []))[0]
+            if tool == "save_city":
+                text = (f"Сохранено: {arguments.get('resident')} — "
+                        f"{arguments.get('city')}.")
+            elif tool == "list_cities":
+                text = "Записей нет."
+            elif tool == "get_forecast":
+                text = (f"Прогноз для города {arguments.get('location')}: "
+                        "2026-09-27, минимум 6.9, максимум 17.5")
+            else:
+                text = f"{tool}: готово."
+            out.append({"server": server_id, "server_name": name,
+                        "source": "локальный тест", "tool": tool,
+                        "arguments": arguments, "ok": True, "text": text,
+                        "error": "", "attachments": []})
+        return out
+
+    mcp_store.async_discover = fake_discover
+    mcp_store.async_run_calls = fake_run_calls
+    mcp_store.discover = fake_discover_sync
+    chat.mcp_store.async_discover = fake_discover
+    chat.mcp_store.async_run_calls = fake_run_calls
+    chat.mcp_store.discover = fake_discover_sync
+
+
+async def test_two_servers_flow():
+    """Живой случай: запрос-запись при ДВУХ включённых серверах.
+
+    Проверяется не эвристика, а весь ход диалога: запись выполняется после
+    подтверждения плана, лишнего уточнения про инструменты чужого сервера нет, а
+    в отладке не появляются погодные имена (раньше запрос про реестр городов
+    уходил в цепочку из-за погодных наблюдений, а после save_city агент уточнял
+    про save_weather_summary).
+    """
+    print("\n[9] Живой случай: запись в реестр при двух включённых серверах")
+    await chat.task_create(chat.TaskCreate(name="Проект: погода и реестр городов"))
+    await chat.session_create()
+    use_two_server_registry()
+    await chat.mcp_apply(McpApply(enabled=[CHAIN_ID, REGISTRY_ID]))
+    install_two_server_stubs()
+    reset_calls()
+    CHAIN_CALLS.clear()
+
+    save_call = {"server": REGISTRY_ID, "tool": "save_city",
+                 "arguments": {"city": "Москва", "resident": "Иван"}}
+    MCP_DECISIONS[:] = [
+        # ЗАПРОС: диспетчер выбирает запись — до «ок» она откладывается.
+        {"mode": "single", "reason": "нужно записать", "calls": [dict(save_call)]},
+        # ШАГ 1 (не последний): цепочка продолжается и здесь, но только чтениями —
+        # запись снова откладывается до последнего шага.
+        {"done": True, "reason": "для этого шага данных хватает", "calls": []},
+        # ПОСЛЕДНИЙ шаг: запись выполняется именно здесь.
+        {"mode": "single", "reason": "записываю", "calls": [dict(save_call)]},
+        # ...и цепочка закрывается: без этого решения стенд уходит в ЗАПАСНОЙ
+        # ответ диспетчера (список MCP_CALLS), где лежат вызовы прежних проверок.
+        {"done": True, "reason": "запись выполнена", "calls": []},
+    ]
+    request_events = await run_chat(REGISTRY_REQUEST)
+    await run_chat("ок")
+    step_events = await run_chat("", continue_step=True)
+
+    executed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("запись в реестр выполнена после подтверждения плана",
+          executed == ["save_city"], str(executed))
+    nudges = [payload for payload in MCP_PAYLOADS
+              if "ЗАПРОС ВЫПОЛНЕН НЕ ПОЛНОСТЬЮ" in payload]
+    check("уточнения про чужие инструменты нет (запись уже сделана)",
+          nudges == [], str(nudges)[:200])
+    debug = texts(request_events, "debug") + texts(step_events, "debug")
+    noisy = [line for line in debug
+             if "weather" in line.lower() or "наблюдени" in line.lower()]
+    check("в отладке нет погодных инструментов", not noisy, str(noisy)[:200])
+    check("запись в реестр не объявлена многошаговой цепочкой",
+          not any("многошаговая" in line for line in debug),
+          str([line for line in debug if "многошаговая" in line])[:200])
+    MCP_DECISIONS.clear()
+
+
+async def test_chain_data_on_step():
+    """Зависимые ЧТЕНИЯ добываются на ТОМ шаге, который их требует.
+
+    Живой случай: «проверь прогноз погоды в городах Славы и Ивана» — план из двух
+    шагов («получить прогноз» → «сообщить кратко»). До «ок» цепочка успела только
+    прочитать реестр городов, а прогноз по найденным городам (зависимый вызов)
+    добывался лишь на ПОСЛЕДНЕМ шаге. Шаг 1 отвечал «данных о погоде нет», этот
+    ответ уходил в контекст шага 2, и модель противоречила уже полученным данным:
+    проверка отклоняла оба шага, задача уходила на доработку и выполнялась только
+    со второго раза. Здесь проверяется, что данные приходят на ПЕРВОМ шаге.
+    """
+    print("\n[10] Цепочка из разных MCP: данные приходят на нужный шаг")
+    await chat.task_create(chat.TaskCreate(name="Проект: прогноз по городам"))
+    await chat.session_create()
+    use_two_server_registry()
+    await chat.mcp_apply(McpApply(enabled=[CHAIN_ID, REGISTRY_ID]))
+    install_two_server_stubs()
+    reset_calls()
+    CHAIN_CALLS.clear()
+
+    MCP_DECISIONS[:] = [
+        # ЗАПРОС: до «ок» читается реестр городов — из него находятся города Славы
+        # и Ивана. Цепочка остаётся не доигранной: зависимые чтения ждут «ок».
+        {"mode": "chain", "reason": "нужен реестр городов",
+         "calls": [{"server": REGISTRY_ID, "tool": "list_cities",
+                    "arguments": {}}]},
+        # ШАГ 1: цепочка продолжается ЗДЕСЬ и добирает прогнозы по обоим городам.
+        {"mode": "chain", "reason": "нужны прогнозы по обоим городам",
+         "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Москва"}},
+                   {"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Екатеринбург"}}]},
+        # ШАГ 2 (последний): данных уже хватает, к серверам не ходим.
+        {"done": True, "reason": "данные получены", "calls": []},
+    ]
+    await run_chat("прогноз для городов Славы и Ивана")
+    reset_calls()
+    CHAIN_CALLS.clear()
+
+    ok_events = await run_chat("ок")
+    ok_calls = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("прогноз добыт на ПЕРВОМ шаге, а не только на последнем",
+          ok_calls == ["get_forecast", "get_forecast"], str(ok_calls))
+    check("цепочка продолжилась именно на шаге выполнения",
+          any("раунд 1 цепочки" in line for line in texts(ok_events, "debug")),
+          str(texts(ok_events, "debug"))[-200:])
+    check("шаг, которому нужны данные, получает их в контекст модели",
+          "Прогноз для города Москва" in all_context()
+          and "Прогноз для города Екатеринбург" in all_context(),
+          all_context()[-300:])
+
+    reset_calls()
+    CHAIN_CALLS.clear()
+    await run_chat("", continue_step=True)
+    step2_calls = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("на последнем шаге новых вызовов не требуется", not step2_calls,
+          str(step2_calls))
+    check("ответ последнего шага строится по полученным данным",
+          "Прогноз для города Москва" in all_context(), all_context()[-200:])
+    MCP_DECISIONS.clear()
+
+
 def main():
     print("Проверка MCP (внешних инструментов агента) — без сети и ключей")
     _write_fake_servers()
@@ -1623,6 +1931,9 @@ def main():
     loop.run_until_complete(test_dialog())
     test_http()
     loop.run_until_complete(test_chain())
+    test_multi_server()
+    loop.run_until_complete(test_two_servers_flow())
+    loop.run_until_complete(test_chain_data_on_step())
     print("\nИтог: " + (f"ПРОВАЛЕНО проверок: {len(FAILURES)} → {FAILURES}"
                        if FAILURES else "все проверки пройдены"))
     return 1 if FAILURES else 0

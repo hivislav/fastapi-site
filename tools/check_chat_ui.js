@@ -10,6 +10,10 @@
  * блокировка ввода и подсказка без задачи. Раздел [P] проверяет MCP: кнопку
  * «MCP» рядом с шестерёнкой проекта, диалог со списком серверов (название,
  * описание, инструменты, причина недоступности), галочки и «применить».
+ * КАТАЛОГ СЕРВЕРОВ ДЛЯ [P] берётся из реального реестра проекта
+ * (app/ai/mcp.py, SERVERS) через ./venv/bin/python, а ожидания считаются от
+ * него: серверы добавляются и убираются, и фикстур не должен от них отставать
+ * (раньше здесь лежал список из четырёх серверов, и число 6 инструментов).
  *
  * Запуск (нужен jsdom — в зависимостях проекта его нет, ставится отдельно):
  *     npm install --no-save jsdom      # в корне проекта (node_modules не в git)
@@ -21,6 +25,7 @@
  * ненулевой код выхода, если хоть одна проверка провалилась.
  */
 const fs = require('fs');
+const { execFileSync } = require('child_process');
 const { JSDOM } = require('jsdom');
 
 const HTML = fs.readFileSync(
@@ -185,52 +190,85 @@ function invPayload(sessionId) {
 // Последний разбор запроса на соответствие инвариантам (заглушка арбитра).
 let LAST_ANALYSIS = { verdict: '', kind: '', explanation: '', suggestions: [] };
 
-// MCP (внешние инструменты проекта): набор включённых серверов + каталог с
-// инструментами. Заглушка повторяет сервер: GET отдаёт серверы с описанием,
-// инструментами и состоянием галочек; POST применяет ПОЛНЫЙ набор галочек
-// (неизвестные id отбрасываются) и возвращает тот же снимок.
-let MCP = {
-  enabled: [],
-  servers: [
-    {
-      id: 'weather', name: 'Погода', source: '7timer.info',
-      description: 'Текущая погода и прогноз по дням для любого города.',
-      available: true, error: '',
-      tools: [{ name: 'get_weather', title: 'Погода сейчас',
-                description: 'Текущая погода в городе' }],
-    },
-    {
-      id: 'currency', name: 'Курсы валют', source: 'cbr.ru',
-      description: 'Официальные курсы Банка России к рублю.',
-      available: true, error: '',
-      tools: [{ name: 'get_rate', title: 'Курс валюты',
-                description: 'Курс валюты к рублю' }],
-    },
-    {
-      id: 'crypto', name: 'Криптовалюты', source: 'CoinGecko',
-      description: 'Цены криптовалют и обзор рынка.',
-      available: false, error: 'не найден node',
-      tools: [],
-    },
-    {
-      id: 'open_meteo', name: 'Погода Open-Meteo (свой сервер на VPS)',
-      source: 'Open-Meteo (свой сервер на VPS)',
-      description: 'Текущая погода, прогноз, качество воздуха и координаты '
-        + 'по названию места. Данные отдаёт свой сервер open-meteo-mcp на VPS.',
-      available: true, error: '',
-      tools: [
-        { name: 'geocode_location', title: 'Координаты места',
-          description: 'Координаты по названию места' },
-        { name: 'get_current_weather', title: 'Погода сейчас',
-          description: 'Текущая погода' },
-        { name: 'get_weather_forecast', title: 'Прогноз по дням',
-          description: 'Прогноз погоды по дням' },
-        { name: 'get_air_quality', title: 'Качество воздуха',
-          description: 'Качество воздуха' },
-      ],
-    },
-  ],
-};
+// --- Каталог MCP: из РЕАЛЬНОГО реестра проекта ------------------------------
+// Серверы добавляются и убираются (три локальных на stdio плюс свои на VPS),
+// поэтому список берётся из app/ai/mcp.py (SERVERS), а НЕ переписывается здесь:
+// иначе фикстур отстаёт от реестра, и проверка «зеленеет» на устаревших данных.
+// Инструменты — СИНТЕТИЧЕСКИЕ: их объявляет живой сервер по сети, а интерфейсу
+// важен сам список и число строк, поэтому сеть тут не нужна.
+const ROOT = require('path').join(__dirname, '..');
+const UNAVAILABLE_REASON = 'туннель не поднят (заглушка UI-проверки)';
+
+function readRegistryServers() {
+  // Переопределение каталога — чтобы проверить САМУ эту проверку на другом
+  // наборе серверов (в реестре стало больше или меньше серверов):
+  //   CHECK_CHAT_UI_REGISTRY=/tmp/servers.json node tools/check_chat_ui.js
+  // Файл — массив записей {id, name, description, source, transport}.
+  const fromFile = process.env.CHECK_CHAT_UI_REGISTRY;
+  if (fromFile) {
+    const servers = JSON.parse(fs.readFileSync(fromFile, 'utf8'));
+    if (Array.isArray(servers) && servers.length) return servers;
+    console.log('  FAIL каталог из ' + fromFile + ' пуст — серверы нужны хотя бы');
+    console.log('       для одной строки списка.');
+    process.exit(1);
+  }
+  const code = [
+    'import json, sys',
+    "sys.path.insert(0, '.')",
+    'from app.ai import mcp',
+    'print(json.dumps([{',
+    "    'id': entry['id'],",
+    "    'name': entry.get('name') or entry['id'],",
+    "    'description': entry.get('description') or '',",
+    "    'source': entry.get('source') or '',",
+    "    'transport': mcp.transport_of(entry),",
+    '} for entry in mcp.SERVERS], ensure_ascii=False))',
+  ].join('\n');
+  let lastError = '';
+  for (const bin of [require('path').join(ROOT, 'venv', 'bin', 'python'), 'python3']) {
+    try {
+      const out = execFileSync(bin, ['-c', code], {
+        cwd: ROOT, stdio: ['ignore', 'pipe', 'ignore'],
+      }).toString('utf8').trim();
+      const servers = JSON.parse(out);
+      if (Array.isArray(servers) && servers.length) return servers;
+      lastError = 'реестр пуст';
+    } catch (err) {
+      lastError = String(err && err.message ? err.message : err);
+    }
+  }
+  console.log('  FAIL каталог MCP не прочитан из app/ai/mcp.py — ' + lastError);
+  console.log('       UI-проверка берёт список серверов из реестра, поэтому он');
+  console.log('       должен читаться: ./venv/bin/python (см. SESSION_PROMPT §7).');
+  process.exit(1);
+}
+
+const REGISTRY = readRegistryServers();
+const MCP_SERVERS = REGISTRY.map((server, index) => {
+  // Один сервер показываем недоступным (последний в реестре): интерфейс обязан
+  // показать ПРИЧИНУ, а не молчать. В реестре из одного сервера он остаётся
+  // рабочим — тогда проверка причины пропускается, а не падает.
+  const down = REGISTRY.length > 1 && index === REGISTRY.length - 1;
+  const count = down ? 0 : (server.transport === 'http' ? 3 : 1);
+  return {
+    id: server.id, name: server.name, source: server.source,
+    description: server.description,
+    transport: server.transport,
+    available: !down,
+    error: down ? UNAVAILABLE_REASON : '',
+    tools: Array.from({ length: count }, (unused, i) => ({
+      name: server.id + '_tool_' + (i + 1),
+      title: 'Инструмент ' + (i + 1),
+      description: 'Демонстрационный инструмент ' + (i + 1)
+        + ' сервера ' + server.id,
+    })),
+  };
+});
+
+// Заглушка повторяет сервер: GET отдаёт серверы с описанием, инструментами и
+// состоянием галочек; POST применяет ПОЛНЫЙ набор галочек (неизвестные id
+// отбрасываются) и возвращает тот же снимок.
+let MCP = { enabled: [], servers: MCP_SERVERS };
 function mcpPayload() {
   const servers = MCP.servers.map(server => Object.assign({}, server, {
     enabled: MCP.enabled.indexOf(server.id) >= 0,
@@ -1904,58 +1942,90 @@ async function run() {
 
   await click($('project-mcp'), 60);
   check('нажатие открывает диалог со списком MCP', $('mcp-modal').hidden === false);
+  // Ожидания ВЫЧИСЛЯЮТСЯ из фикстура (а он собран из реестра проекта): добавили
+  // или убрали сервер — проверка это увидит, а не завалится на старом числе.
   const items = q('#mcp-list .mcp-item');
-  check('в диалоге перечислены все серверы проекта', items.length === 4,
-    'серверов: ' + items.length);
+  check('в диалоге перечислены все серверы проекта',
+    items.length === MCP.servers.length,
+    'на экране: ' + items.length + ', в реестре: ' + MCP.servers.length);
   const names = q('#mcp-list .mcp-name').map(el => el.textContent);
   check('у каждого сервера есть название',
-    names.join('|') === 'Погода|Курсы валют|Криптовалюты|'
-      + 'Погода Open-Meteo (свой сервер на VPS)', names.join('|'));
+    names.join('|') === MCP.servers.map(s => s.name).join('|'), names.join('|'));
   const descs = q('#mcp-list .mcp-desc').map(el => el.textContent);
   check('у каждого сервера есть краткое описание',
-    descs.length === 4 && descs.every(text => text.length > 10), JSON.stringify(descs));
+    descs.length === MCP.servers.filter(s => s.description).length
+    && descs.every(text => text.length > 10), JSON.stringify(descs));
+  const toolNames = MCP.servers.reduce(
+    (all, server) => all.concat(server.tools.map(tool => tool.name)), []);
   check('серверы показаны с инструментами',
-    q('#mcp-list .mcp-tools li').length === 6
-    && $('mcp-list').textContent.indexOf('get_weather') >= 0,
-    String(q('#mcp-list .mcp-tools li').length));
-  check('удалённый сервер показывает свои инструменты',
-    $('mcp-list').textContent.indexOf('get_current_weather') >= 0
-    && $('mcp-list').textContent.indexOf('доступен · инструментов: 4') >= 0,
-    $('mcp-list').textContent.slice(0, 120));
-  check('недоступный сервер показан причиной, а не молчанием',
-    $('mcp-list').textContent.indexOf('недоступен') >= 0
-    && $('mcp-list').textContent.indexOf('не найден node') >= 0);
+    q('#mcp-list .mcp-tools li').length === toolNames.length
+    && toolNames.every(name => $('mcp-list').textContent.indexOf(name) >= 0),
+    'на экране: ' + q('#mcp-list .mcp-tools li').length
+      + ', в фикстуре: ' + toolNames.length);
+  // Сверка фикстура с реестром: добавили или убрали сервер — видно здесь, и
+  // дальше все ожидания считаются от этого же списка.
+  check('в фикстуре ровно те серверы, что в реестре',
+    MCP.servers.map(s => s.id).join('|') === REGISTRY.map(s => s.id).join('|')
+    && MCP.servers.map(s => s.transport).join('|')
+      === REGISTRY.map(s => s.transport).join('|'),
+    MCP.servers.map(s => s.id + ':' + s.transport).join(', '));
+  const remote = MCP.servers.filter(s => s.available && s.transport === 'http')[0];
+  if (remote) {
+    check('удалённый сервер показывает свои инструменты',
+      remote.tools.length > 0
+      && remote.tools.every(tool => $('mcp-list').textContent.indexOf(tool.name) >= 0)
+      && $('mcp-list').textContent.indexOf(
+        'доступен · инструментов: ' + remote.tools.length) >= 0,
+      remote.id);
+  } else {
+    // Реестр без своих серверов на VPS (или единственный такой показан
+    // недоступным) — проверять нечего, и падать из-за этого нельзя.
+    console.log('  --   доступных серверов на VPS в фикстуре нет — '
+      + 'проверка их инструментов пропущена');
+  }
+  const down = MCP.servers.filter(s => !s.available);
+  if (down.length) {
+    check('недоступный сервер показан причиной, а не молчанием',
+      $('mcp-list').textContent.indexOf('недоступен') >= 0
+      && down.every(s => $('mcp-list').textContent.indexOf('Причина: ' + s.error) >= 0),
+      $('mcp-list').textContent.slice(0, 120));
+  } else {
+    console.log('  --   недоступных серверов в фикстуре нет — причина не проверяется');
+  }
   check('у серверов есть галочки',
-    q('#mcp-list input[type=checkbox]').length === 4);
+    q('#mcp-list input[type=checkbox]').length === MCP.servers.length);
   check('галочки сняты, пока MCP выключен',
     q('#mcp-list input[type=checkbox]').every(box => box.checked === false));
 
-  // Включаем погоду и валюты, применяем: на сервер уходит полный набор.
+  // Включаем ДВА доступных сервера, применяем: на сервер уходит полный набор.
   const boxes = q('#mcp-list input[type=checkbox]');
-  boxes[0].checked = true;
-  boxes[1].checked = true;
+  const indexOfServer = id => MCP.servers.findIndex(server => server.id === id);
+  const picked = MCP.servers.filter(s => s.available).map(s => s.id).slice(0, 2);
+  picked.forEach(id => { boxes[indexOfServer(id)].checked = true; });
   const mcpPostsBefore = calls.filter(c => c === 'POST /api/agent/mcp').length;
   await click($('mcp-apply'), 80);
   check('«применить» отправил набор на сервер',
     calls.filter(c => c === 'POST /api/agent/mcp').length === mcpPostsBefore + 1,
     calls.slice(-3).join(' | '));
   check('на сервер ушёл полный список галочек',
-    JSON.stringify(MCP.enabled) === JSON.stringify(['weather', 'currency']),
+    JSON.stringify(MCP.enabled) === JSON.stringify(picked),
     JSON.stringify(MCP.enabled));
   check('после «применить» диалог закрывается', $('mcp-modal').hidden === true);
   check('включённый MCP помечает кнопку проекта',
     $('project-mcp').classList.contains('on') === true
-    && $('project-mcp').title.indexOf('включено 2 из 4') > 0,
+    && $('project-mcp').title.indexOf(
+      'включено ' + picked.length + ' из ' + MCP.servers.length) > 0,
     $('project-mcp').className + ' / ' + $('project-mcp').title);
   check('в чате сказано, что MCP включён',
     q('#messages .msg.bot').some(el => el.textContent.indexOf('MCP включён') >= 0));
 
   // Повторное открытие показывает сохранённые галочки (снимок с сервера).
   await click($('project-mcp'), 60);
+  const checkedNow = q('#mcp-list input[type=checkbox]').map(box => box.checked);
   check('повторное открытие показывает включённые серверы',
-    q('#mcp-list input[type=checkbox]').filter(box => box.checked).length === 2
-    && q('#mcp-list input[type=checkbox]')[2].checked === false,
-    JSON.stringify(q('#mcp-list input[type=checkbox]').map(b => b.checked)));
+    JSON.stringify(checkedNow)
+      === JSON.stringify(MCP.servers.map(s => picked.indexOf(s.id) >= 0)),
+    JSON.stringify(checkedNow) + ' при выбранных ' + JSON.stringify(picked));
 
   // Выключаем всё: набор снова пуст, кнопка без пометки.
   q('#mcp-list input[type=checkbox]').forEach(box => { box.checked = false; });
