@@ -351,6 +351,25 @@
             color: var(--accent-2);
             box-shadow: inset 0 0 0 1px var(--line-strong);
         }
+        /* Кнопка «RAG» — соседка «MCP»: та же короткая подпись, но свой цвет
+           (зелёный), чтобы кнопки не путались: MCP — внешние источники, RAG —
+           локальный индекс своих документов. */
+        .icon-btn.rag-btn {
+            width: auto;
+            min-width: 30px;
+            padding: 0 6px;
+            font-family: var(--mono);
+            font-size: 0.6rem;
+            letter-spacing: 0.04em;
+            color: var(--accent-2);
+        }
+        /* Включена хотя бы одна база знаний: кнопка помечена, как у MCP, —
+           видно, что у проекта есть работающие базы, не открывая диалог. */
+        .icon-btn.rag-btn.on {
+            background: rgba(0, 255, 157, 0.16);
+            color: var(--accent-2);
+            box-shadow: inset 0 0 0 1px var(--line-strong);
+        }
         .task-select,
         .task-new,
         .session-new {
@@ -1218,6 +1237,324 @@
         }
         .mcp-status { margin-top: 10px; color: var(--muted); }
 
+        /* ---------- RAG: базы знаний проекта (кнопка «RAG») ------------------ */
+        .modal-box.rag-modal {
+            width: 900px !important;
+            max-width: 94vw;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 26px 28px;
+            box-sizing: border-box;
+        }
+        .rag-modal h3 { font-size: 1.25rem; margin-bottom: 10px; }
+        .rag-modal h4 {
+            font-size: 1rem;
+            color: var(--accent-2);
+            margin: 0 0 10px;
+        }
+        .rag-modal .modal-hint { font-size: 0.85rem; line-height: 1.55; }
+        .rag-list { margin: 16px 0 4px; }
+        .rag-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 13px 15px;
+            margin-bottom: 10px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: var(--surface-2);
+        }
+        .rag-item.off { opacity: 0.72; }
+        .rag-item input[type="checkbox"] {
+            width: 17px;
+            height: 17px;
+            flex: none;
+            margin-top: 2px;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+        .rag-body { flex: 1; min-width: 0; }
+        .rag-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+        .rag-name { font-size: 1rem; color: var(--accent-2); font-weight: 600; }
+        .rag-badge {
+            font-size: 0.74rem;
+            padding: 2px 7px;
+            border-radius: 6px;
+            border: 1px solid var(--line-soft);
+            color: var(--text-dim);
+            white-space: nowrap;
+        }
+        .rag-badge.ok { color: var(--accent-2); border-color: var(--line-strong); }
+        .rag-badge.warn { color: var(--warn); border-color: var(--warn); }
+        /* Метрики базы: подпись + значение. Сетка, а не строка текста, — числа
+           должны читаться столбцом, иначе «чанков 42, средний 780» сливается. */
+        .rag-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+            gap: 6px 14px;
+            margin: 9px 0 0;
+        }
+        .rag-metric { font-size: 0.8rem; color: var(--text-dim); line-height: 1.45; }
+        .rag-metric b { color: var(--text); font-weight: 600; }
+        .rag-metric span { color: var(--muted); }
+        .rag-sources { margin: 9px 0 0; padding: 0; list-style: none; }
+        .rag-sources li {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            line-height: 1.5;
+            padding: 3px 0 3px 12px;
+            border-left: 1px solid var(--line);
+            word-break: break-word;
+        }
+        .rag-sources .rag-src-name { font-family: var(--mono); color: var(--accent); font-size: 0.76rem; }
+        .rag-note { font-size: 0.78rem; color: var(--warn); margin: 6px 0 0; line-height: 1.45; }
+        .rag-empty {
+            font-size: 0.86rem;
+            color: var(--muted);
+            padding: 10px 12px;
+            border: 1px dashed var(--line);
+            border-radius: 10px;
+        }
+        .rag-status { margin-top: 10px; color: var(--muted); }
+        /* Кнопки строки базы: «чанки» и удаление — столбиком у правого края,
+           чтобы не растягивать строку и не ломать сетку метрик. */
+        .rag-actions { display: flex; flex-direction: column; gap: 6px; flex: none; }
+        .rag-delete, .rag-view {
+            border: 1px solid var(--line-soft);
+            background: transparent;
+            color: var(--muted);
+            border-radius: 8px;
+            padding: 4px 8px;
+            font-size: 0.78rem;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: color 0.15s, border-color 0.15s;
+        }
+        .rag-delete:hover { color: var(--danger); border-color: var(--danger); }
+        .rag-view:hover { color: var(--accent); border-color: var(--line-strong); }
+
+        /* ---------- Просмотр чанков базы (кнопка «чанки» у базы) ------------ */
+        .modal-box.rag-chunks-modal {
+            width: 900px !important;
+            max-width: 94vw;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 24px 26px;
+            box-sizing: border-box;
+        }
+        .rag-chunks-modal h3 { font-size: 1.2rem; margin-bottom: 8px; }
+        .rag-chunks-modal h3 span { color: var(--accent-2); }
+        .rag-chunks-meta { font-size: 0.82rem; color: var(--text-dim); margin: 0 0 12px; line-height: 1.5; }
+        /* Фильтры: документ и поиск по тексту. Сетка — чтобы поля не «плыли»
+           друг относительно друга, как это было в загрузке базы. */
+        .rag-chunks-filters {
+            display: grid;
+            grid-template-columns: minmax(0, 240px) minmax(0, 1fr) auto;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .rag-chunks-filters select,
+        .rag-chunks-filters input {
+            background: var(--surface-2);
+            border: 1px solid var(--line-soft);
+            border-radius: 8px;
+            color: var(--text);
+            padding: 7px 9px;
+            font-size: 0.84rem;
+            font-family: inherit;
+            width: 100%;
+            min-width: 0;
+        }
+        .rag-chunks-filters select:focus, .rag-chunks-filters input:focus {
+            outline: none;
+            border-color: var(--line-strong);
+        }
+        .rag-chunks-status { font-size: 0.8rem; color: var(--muted); margin: 0 0 10px; }
+        .rag-chunks-list { display: flex; flex-direction: column; gap: 10px; }
+        .rag-chunk {
+            border: 1px solid var(--line);
+            border-left: 3px solid var(--line-strong);
+            border-radius: 10px;
+            background: var(--surface-2);
+            padding: 11px 13px;
+        }
+        .rag-chunk-head {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px 10px;
+            align-items: baseline;
+            margin-bottom: 8px;
+        }
+        .rag-chunk-num { font-family: var(--mono); font-size: 0.8rem; color: var(--accent); font-weight: 600; }
+        .rag-chunk-chip {
+            font-size: 0.72rem;
+            color: var(--text-dim);
+            border: 1px solid var(--line-soft);
+            border-radius: 6px;
+            padding: 1px 6px;
+            white-space: nowrap;
+        }
+        .rag-chunk-chip.id { font-family: var(--mono); color: var(--muted); }
+        .rag-chunk-chip.section { color: var(--accent-2); border-color: var(--line); }
+        /* Текст чанка — КАК ЕСТЬ: переносы строк показывают, поймала ли
+           стратегия границы абзацев, и ломать их нельзя. */
+        .rag-chunk-text {
+            margin: 0;
+            font-family: var(--mono);
+            font-size: 0.78rem;
+            line-height: 1.5;
+            color: var(--text);
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 240px;
+            overflow-y: auto;
+        }
+        .rag-chunk-empty {
+            font-size: 0.86rem;
+            color: var(--muted);
+            padding: 12px;
+            border: 1px dashed var(--line);
+            border-radius: 10px;
+        }
+        @media (max-width: 880px) {
+            .rag-chunks-filters { grid-template-columns: minmax(0, 1fr); }
+        }
+        /* Загрузка своей базы: отдельный блок под списком — параметры разбиения
+           задаются здесь же, при загрузке, а не «где-то в настройках». */
+        .rag-upload {
+            margin: 18px 0 0;
+            padding: 16px 18px 14px;
+            border: 1px solid var(--line);
+            border-left: 3px solid var(--accent);
+            border-radius: 10px;
+            background: var(--surface-3);
+        }
+        /* Ряды полей — СЕТКА, а не flex. При flex широкое поле (стратегия)
+           забирало всё свободное место, а два числовых оставались фиксированной
+           ширины: ряд выглядел перекошенным, а подписи разной высоты («Размер
+           чанка, символов» переносилась на две строки) сдвигали поля по
+           вертикали — «размер чанка» и «перекрытие» стояли на разной высоте. */
+        .rag-row {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 14px;
+            /* Поля выровнены по НИЖНЕМУ краю: подпись в одну и в две строки не
+               сдвигает поле ввода относительно соседнего. */
+            align-items: end;
+            margin-bottom: 12px;
+        }
+        /* Ряд настроек разбиения: стратегия занимает остаток ширины, а «размер
+           чанка» и «перекрытие» — ДВЕ РАВНЫЕ колонки. Это и есть симметрия:
+           одинаковые подписи переносятся одинаково, поля одной ширины и на
+           одной линии. */
+        .rag-row.params { grid-template-columns: minmax(0, 1fr) 176px 176px; }
+        .rag-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+        .rag-field label {
+            font-size: 0.78rem;
+            color: var(--muted);
+            line-height: 1.3;
+            /* Подпись в одну строку занимает столько же места, сколько в две:
+               высота ряда не прыгает, а подписи выровнены по нижнему краю. */
+            min-height: 2.6em;
+            display: flex;
+            align-items: flex-end;
+        }
+        .rag-field input[type="text"],
+        .rag-field input[type="number"],
+        .rag-field select,
+        .rag-modal input[type="file"] {
+            background: var(--surface-2);
+            border: 1px solid var(--line-soft);
+            border-radius: 8px;
+            color: var(--text);
+            padding: 7px 9px;
+            font-size: 0.86rem;
+            font-family: inherit;
+            width: 100%;
+            min-width: 0;
+        }
+        .rag-field input:focus, .rag-field select:focus {
+            outline: none;
+            border-color: var(--line-strong);
+        }
+        .rag-field input[type="file"] { padding: 5px 7px; font-size: 0.8rem; }
+        .rag-strategy-hint { font-size: 0.78rem; color: var(--muted); margin: 0 0 10px; line-height: 1.5; }
+        .rag-upload-status { margin: 8px 0 0; font-size: 0.82rem; color: var(--accent-2); line-height: 1.5; }
+        .rag-upload-status.bad { color: var(--warn); }
+        .rag-upload .modal-actions { margin-top: 6px; }
+        /* Полоса прогресса индексации: идёт в фоне, поэтому её видно и после
+           закрытия диалога — на самой кнопке «RAG» (см. renderRagMarks). */
+        .rag-progress {
+            margin: 12px 0 0;
+            padding: 12px 14px;
+            border: 1px solid var(--line);
+            border-left: 3px solid var(--accent);
+            border-radius: 10px;
+            background: var(--surface-2);
+        }
+        .rag-progress-head {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }
+        .rag-progress-stage {
+            font-size: 0.86rem;
+            color: var(--accent-2);
+            font-weight: 600;
+            flex: 1;
+            min-width: 0;
+        }
+        .rag-progress-percent {
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            color: var(--accent);
+        }
+        .rag-progress-head button {
+            border: 1px solid var(--line-soft);
+            background: transparent;
+            color: var(--muted);
+            border-radius: 8px;
+            padding: 3px 9px;
+            font-size: 0.76rem;
+            cursor: pointer;
+        }
+        .rag-progress-head button:hover { color: var(--danger); border-color: var(--danger); }
+        .rag-progress-bar {
+            height: 6px;
+            border-radius: 4px;
+            background: var(--surface-3);
+            overflow: hidden;
+        }
+        .rag-progress-bar span {
+            display: block;
+            height: 100%;
+            width: 0;
+            background: linear-gradient(90deg, var(--accent), var(--accent-2));
+            transition: width 0.3s ease;
+        }
+        /* Пока общее число шагов неизвестно, полоса «дышит» — так видно, что
+           работа идёт, а не замерла на нуле. */
+        .rag-progress-bar.unknown span {
+            width: 35% !important;
+            animation: rag-slide 1.2s ease-in-out infinite alternate;
+        }
+        @keyframes rag-slide {
+            from { margin-left: 0; }
+            to { margin-left: 65%; }
+        }
+        .rag-progress-detail { font-size: 0.78rem; color: var(--text-dim); margin: 8px 0 0; line-height: 1.5; }
+        .rag-progress-queue { font-size: 0.76rem; color: var(--muted); margin: 6px 0 0; }
+        .rag-embed-note { font-size: 0.78rem; color: var(--muted); margin: 10px 0 0; line-height: 1.5; }
+        .rag-embed-note.warn { color: var(--warn); }
+        /* Узкое окно: поля встают в один столбик — фиксированные колонки ряда
+           настроек иначе не влезли бы и появилась горизонтальная прокрутка. */
+        @media (max-width: 880px) {
+            .rag-row, .rag-row.params { grid-template-columns: minmax(0, 1fr); }
+            .rag-field label { min-height: 0; }
+        }
+
         /* ---------- Периодическая задача (кнопка 🔁 у задачи в списке) -------- */
         .modal-box.periodic-modal {
             width: 560px !important;
@@ -1654,6 +1991,13 @@
                              отвечает по фактическим данным. -->
                         <button type="button" class="icon-btn mcp-btn" id="project-mcp"
                                 title="MCP-инструменты проекта: внешние источники данных для агента">MCP</button>
+                        <!-- RAG ПРОЕКТА: базы знаний — загруженные документы,
+                             разбитые на чанки и проиндексированные локально
+                             (эмбеддинги + метаданные). Галочка включает базу у
+                             проекта; пока это подготовка — агент по базам ещё
+                             не отвечает. -->
+                        <button type="button" class="icon-btn rag-btn" id="project-rag"
+                                title="Базы знаний проекта: локальный индекс загруженных документов (RAG)">RAG</button>
                         <button type="button" class="icon-btn" id="task-rename" title="Переименовать проект">✏️</button>
                         <button type="button" class="icon-btn" id="task-delete" title="Удалить проект">🗑</button>
                     </span>
@@ -1910,6 +2254,119 @@
                         <button type="button" class="clear" id="mcp-refresh">обновить список</button>
                         <button type="button" class="clear" id="mcp-close">закрыть</button>
                         <button type="button" class="accept" id="mcp-apply">применить</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- RAG (кнопка «RAG» рядом с «MCP»). RAG — Retrieval-Augmented
+                 Generation: ответы агента по СВОИМ документам. Сегодняшний шаг —
+                 индексация: загруженный файл разбирается на текст, режется на
+                 чанки выбранной стратегией, каждый чанк получает эмбеддинг и
+                 метаданные (источник, заголовок, раздел, chunk_id), и всё это
+                 ложится локальным индексом в data/rag (SQLite — рабочее
+                 хранилище, JSON — выгрузка). Галочка включает базу у ПРОЕКТА — как у MCP сервер.
+                 Список баз, метрики и стратегии приходят с сервера
+                 (GET /api/agent/rag); модель здесь не загружается. -->
+            <div class="modal-overlay" id="rag-modal" hidden>
+                <div class="modal-box rag-modal">
+                    <h3>Базы знаний проекта</h3>
+                    <p class="modal-hint">RAG (Retrieval-Augmented Generation) —
+                        ответы по вашим документам. Файл разбирается на текст,
+                        режется на чанки, каждый чанк получает вектор (эмбеддинг) и
+                        метаданные: источник, заголовок, раздел и номер чанка. Индекс
+                        лежит ЛОКАЛЬНО, в проекте, и никуда не отправляется.
+                        Галочка включает базу у этого проекта. Сейчас настраивается
+                        только индексация — в ответы агента базы пока не подмешиваются.</p>
+                    <div class="rag-list" id="rag-list"></div>
+                    <p class="modal-hint rag-status" id="rag-status" hidden></p>
+
+                    <div class="rag-upload">
+                        <h4>Загрузить свою базу знаний</h4>
+                        <p class="rag-strategy-hint">Параметры разбиения ниже задают НОВУЮ базу.
+                            У уже собранных баз своя стратегия и свой размер чанка — они
+                            написаны в строке каждой базы.</p>
+                        <div class="rag-row">
+                            <div class="rag-field">
+                                <label for="rag-name">Название базы</label>
+                                <input type="text" id="rag-name" autocomplete="off"
+                                       placeholder="Например: Инструкции оператора">
+                            </div>
+                            <div class="rag-field">
+                                <label for="rag-file">Файлы: PDF (в том числе сканы), DOCX, ODT, текст, Markdown, CSV, JSON, картинки</label>
+                                <input type="file" id="rag-file" multiple>
+                            </div>
+                        </div>
+                        <!-- Ряд настроек разбиения: две числовые колонки РАВНОЙ
+                             ширины (класс rag-row.params), поэтому «размер
+                             чанка» и «перекрытие» стоят симметрично. -->
+                        <div class="rag-row params">
+                            <div class="rag-field">
+                                <label for="rag-strategy">Стратегия разбиения</label>
+                                <select id="rag-strategy"></select>
+                            </div>
+                            <div class="rag-field">
+                                <label for="rag-size">Размер чанка, символов</label>
+                                <input type="number" id="rag-size" min="100" max="8000" step="50">
+                            </div>
+                            <div class="rag-field">
+                                <label for="rag-overlap">Перекрытие, символов</label>
+                                <input type="number" id="rag-overlap" min="0" step="10">
+                            </div>
+                        </div>
+                        <p class="rag-strategy-hint" id="rag-strategy-hint"></p>
+                        <p class="modal-hint" id="rag-upload-status" hidden></p>
+
+                        <!-- Прогресс фоновой индексации. Работа идёт на сервере
+                             и НЕ привязана к этому диалогу: закрыть его можно, а
+                             полоса останется на кнопке «RAG» и в подсказке. -->
+                        <div class="rag-progress" id="rag-progress" hidden>
+                            <div class="rag-progress-head">
+                                <span class="rag-progress-stage" id="rag-progress-stage"></span>
+                                <span class="rag-progress-percent" id="rag-progress-percent"></span>
+                                <button type="button" id="rag-progress-cancel">остановить</button>
+                            </div>
+                            <div class="rag-progress-bar" id="rag-progress-bar">
+                                <span id="rag-progress-fill"></span>
+                            </div>
+                            <p class="rag-progress-detail" id="rag-progress-detail"></p>
+                            <p class="rag-progress-queue" id="rag-progress-queue" hidden></p>
+                        </div>
+
+                        <div class="modal-actions">
+                            <button type="button" class="accept" id="rag-upload">загрузить и проиндексировать</button>
+                        </div>
+                    </div>
+
+                    <p class="rag-embed-note" id="rag-embed-note" hidden></p>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="rag-refresh">обновить</button>
+                        <button type="button" class="clear" id="rag-close">закрыть</button>
+                        <button type="button" class="accept" id="rag-apply">применить</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Просмотр чанков базы (кнопка «чанки» в строке базы). Показывает,
+                 КАК стратегия порезала документ: текст чанка как есть, его номер
+                 в базе и в документе, источник, раздел и границы символов. Это
+                 и есть способ проверить настройки разбиения своими глазами —
+                 видно, не разорван ли раздел и не состоит ли чанк из заголовка.
+                 Список постраничный: база на 20 000 чанков в диалог не влезет. -->
+            <div class="modal-overlay" id="rag-chunks-modal" hidden>
+                <div class="modal-box rag-chunks-modal">
+                    <h3>Чанки базы: <span id="rag-chunks-name"></span></h3>
+                    <p class="rag-chunks-meta" id="rag-chunks-meta"></p>
+                    <div class="rag-chunks-filters">
+                        <select id="rag-chunks-source" title="Показать чанки одного документа"></select>
+                        <input type="text" id="rag-chunks-query" autocomplete="off"
+                               placeholder="поиск по тексту чанка (например: резервное копирование)">
+                        <button type="button" class="clear" id="rag-chunks-find">найти</button>
+                    </div>
+                    <p class="rag-chunks-status" id="rag-chunks-status"></p>
+                    <div class="rag-chunks-list" id="rag-chunks-list"></div>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="rag-chunks-more" hidden>показать ещё</button>
+                        <button type="button" class="accept" id="rag-chunks-close">закрыть</button>
                     </div>
                 </div>
             </div>
@@ -4381,6 +4838,9 @@
             // То же для кнопки «MCP»: вне режима агента внешние инструменты не
             // работают, поэтому диалог закрываем вместе с панелью проекта.
             if (!on) closeMcpModal();
+            // И для кнопки «RAG»: базы знаний — настройка проекта, вне режима
+            // агента её открывать неоткуда (вместе с ней — просмотр чанков).
+            if (!on) { closeRagModal(); closeChunks(); }
             if (!on) {
                 // Обычный режим контекст не хранит: убираем агентский диалог
                 // (восстановленный + реплики сеанса агента) из окна чата, а
@@ -4966,6 +5426,10 @@
             // MCP — настройка ПРОЕКТА: при переключении проекта «MCP» должен
             // показывать набор ЭТОГО проекта, а не прежнего.
             await loadMcp(false);
+            // Базы знаний — тоже настройка проекта: у каждого проекта свой
+            // набор включённых баз (и свои параметры разбиения).
+            await loadRag(false);
+            await resumeRagJobs();
             // Вернулись в задачу с неотработанной командой остановки — доводим её.
             if (stopRequest && stopRequest.session === workspace.active_session) {
                 reconcilePendingStop();
@@ -5439,6 +5903,855 @@
         });
         mcpModal.addEventListener('click', (e) => {
             if (e.target === mcpModal) closeMcpModal();
+        });
+
+        // ---------- RAG: базы знаний проекта (кнопка «RAG») ------------------
+        // База знаний — это ЗАГРУЖЕННЫЕ документы, разбитые на чанки и
+        // проиндексированные локально: у каждого чанка есть вектор (эмбеддинг) и
+        // метаданные (источник, заголовок, раздел, номер чанка). Галочка
+        // включает базу у ТЕКУЩЕГО проекта — как галочка MCP включает сервер.
+        // Снимок приходит с сервера (GET /api/agent/rag) вместе с метриками
+        // (сколько чанков, каков средний размер, сколько весит база) и
+        // состоянием бэкенда эмбеддингов, поэтому в диалоге видно не «галочку»,
+        // а что за ней стоит. Интерфейс НИЧЕГО не считает сам: он показывает то,
+        // что посчитал сервер.
+        const projectRagBtn = document.getElementById('project-rag');
+        const ragModal = document.getElementById('rag-modal');
+        const ragListEl = document.getElementById('rag-list');
+        const ragStatusEl = document.getElementById('rag-status');
+        const ragStrategyEl = document.getElementById('rag-strategy');
+        const ragStrategyHintEl = document.getElementById('rag-strategy-hint');
+        const ragSizeEl = document.getElementById('rag-size');
+        const ragOverlapEl = document.getElementById('rag-overlap');
+        const ragNameEl = document.getElementById('rag-name');
+        const ragFileEl = document.getElementById('rag-file');
+        const ragUploadBtn = document.getElementById('rag-upload');
+        const ragUploadStatusEl = document.getElementById('rag-upload-status');
+        const ragEmbedNoteEl = document.getElementById('rag-embed-note');
+        const ragChunksModal = document.getElementById('rag-chunks-modal');
+        const ragChunksListEl = document.getElementById('rag-chunks-list');
+        const ragChunksSourceEl = document.getElementById('rag-chunks-source');
+        const ragChunksQueryEl = document.getElementById('rag-chunks-query');
+        const ragChunksStatusEl = document.getElementById('rag-chunks-status');
+        const ragChunksMetaEl = document.getElementById('rag-chunks-meta');
+        const ragChunksMoreBtn = document.getElementById('rag-chunks-more');
+        // Последний снимок баз знаний с сервера: базы, метрики, настройки.
+        let ragData = null;
+        // Состояние просмотра чанков: какую базу смотрим, сколько уже
+        // показано и с каким фильтром (сервер отдаёт страницу и общее число).
+        let ragChunks = { base: null, offset: 0, total: 0, source: '', query: '' };
+        const ragProgressEl = document.getElementById('rag-progress');
+        const ragProgressStageEl = document.getElementById('rag-progress-stage');
+        const ragProgressPercentEl = document.getElementById('rag-progress-percent');
+        const ragProgressBarEl = document.getElementById('rag-progress-bar');
+        const ragProgressFillEl = document.getElementById('rag-progress-fill');
+        const ragProgressDetailEl = document.getElementById('rag-progress-detail');
+        const ragProgressQueueEl = document.getElementById('rag-progress-queue');
+
+        // ФОНОВАЯ ИНДЕКСАЦИЯ. Сервер принимает файл и заводит задачу, а работа
+        // идёт дальше без нас: интерфейс опрашивает состояние (раз в секунду) и
+        // рисует прогресс. Файлы отправляются ПО ОДНОМУ: первый создаёт базу,
+        // остальные дописываются в неё — так крупный документ не занимает память
+        // ни в браузере, ни на сервере.
+        const RAG_POLL_MS = 1000;
+        let ragQueue = [];               // файлы, ждущие своей очереди
+        let ragQueueBaseId = '';         // база, в которую дописываем очередной файл
+        let ragQueueName = '';           // название новой базы (для первого файла)
+        let ragActiveJob = null;         // последний снимок идущей задачи
+        let ragPollTimer = null;         // опрос состояния задач
+        // Идёт загрузка/индексация: кнопка занята, повторный запуск запрещён
+        // (индексация одной базы — это разбор файла и работа модели).
+        let ragBusy = false;
+
+        function fmtNum(value) {
+            const number = Number(value || 0);
+            return number.toLocaleString('ru-RU');
+        }
+
+        async function ragRequest(url, options) {
+            try {
+                const res = await fetch(url, options);
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    addMessage('bot', '⚠️ ' + (detail || 'Не удалось выполнить запрос баз знаний.'), true);
+                    return null;
+                }
+                return await res.json();
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+                return null;
+            }
+        }
+
+        // Строка базы знаний: галочка, название, стратегия, метрики, документы.
+        function ragItemNode(base) {
+            const row = document.createElement('div');
+            row.className = 'rag-item' + (base.enabled ? '' : ' off');
+
+            const check = document.createElement('input');
+            check.type = 'checkbox';
+            check.checked = !!base.enabled;
+            check.dataset.base = base.id;
+            check.id = 'rag-check-' + base.id;
+            check.addEventListener('change', () => {
+                // Класс строки — только подсказка «включено/нет»; на сервер набор
+                // уходит при «применить».
+                row.classList.toggle('off', !check.checked);
+            });
+
+            const body = document.createElement('div');
+            body.className = 'rag-body';
+
+            const head = document.createElement('div');
+            head.className = 'rag-head';
+            const name = document.createElement('label');
+            name.className = 'rag-name';
+            name.htmlFor = check.id;
+            name.textContent = base.name || base.id;
+            head.appendChild(name);
+            const strategy = document.createElement('span');
+            strategy.className = 'rag-badge ok';
+            strategy.textContent = `${base.strategy_name} · чанк ${fmtNum(base.chunk_size)}`
+                + (base.overlap ? ` / перекрытие ${fmtNum(base.overlap)}` : '');
+            head.appendChild(strategy);
+            const size = document.createElement('span');
+            size.className = 'rag-badge';
+            size.textContent = `вес ${base.size_human}`
+                + (base.share ? ` · ${Math.round(base.share * 100)}% баз` : '');
+            head.appendChild(size);
+            body.appendChild(head);
+
+            // Метрики базы: то, по чему видно, годная она или нет.
+            const metrics = document.createElement('div');
+            metrics.className = 'rag-metrics';
+            const items = [
+                ['Документов', fmtNum(base.documents)],
+                ['Чанков', fmtNum(base.chunks)],
+                ['Средний чанк', `${fmtNum(base.chars_avg)} симв.`],
+                ['Чанк от/до', `${fmtNum(base.chars_min)}–${fmtNum(base.chars_max)}`],
+                ['Разделов', fmtNum(base.sections)],
+                ['Текста', `${fmtNum(base.chars_total)} симв.`],
+                ['Токенов (оценка)', fmtNum(base.est_tokens)],
+                ['Эмбеддинги', base.dim ? `${fmtNum(base.dim)} чисел` : '—'],
+            ];
+            items.forEach(pair => {
+                const cell = document.createElement('div');
+                cell.className = 'rag-metric';
+                const label = document.createElement('span');
+                label.textContent = pair[0] + ': ';
+                const value = document.createElement('b');
+                value.textContent = pair[1];
+                cell.appendChild(label);
+                cell.appendChild(value);
+                metrics.appendChild(cell);
+            });
+            body.appendChild(metrics);
+
+            // Чем посчитаны векторы: модель важна — базы разных моделей
+            // несравнимы между собой.
+            const model = document.createElement('p');
+            model.className = 'rag-metric';
+            model.textContent = 'Модель: ' + (base.model
+                ? `${base.model} (${base.backend})`
+                : (base.backend || 'неизвестно'))
+                + (base.created ? ` · создана ${base.created.replace('T', ' ')}` : '');
+            body.appendChild(model);
+
+            if (base.fallback) {
+                const note = document.createElement('p');
+                note.className = 'rag-note';
+                note.textContent = '⚠️ База посчитана запасным офлайн-бэкендом: ' + base.fallback;
+                body.appendChild(note);
+            }
+
+            const sources = base.sources || [];
+            if (sources.length) {
+                const list = document.createElement('ul');
+                list.className = 'rag-sources';
+                sources.forEach(item => {
+                    const li = document.createElement('li');
+                    const fileName = document.createElement('span');
+                    fileName.className = 'rag-src-name';
+                    fileName.textContent = item.source;
+                    li.appendChild(fileName);
+                    const parts = [`${item.format || 'файл'}`,
+                                   `${fmtNum(item.chunks)} чанк.`,
+                                   `${fmtNum(item.chars)} симв.`];
+                    if (item.pages) parts.push(`страниц: ${fmtNum(item.pages)}`);
+                    li.appendChild(document.createTextNode(' — ' + parts.join(' · ')));
+                    if (item.warning) {
+                        const warn = document.createElement('span');
+                        warn.className = 'rag-note';
+                        warn.textContent = ' — ' + item.warning;
+                        li.appendChild(warn);
+                    }
+                    list.appendChild(li);
+                });
+                body.appendChild(list);
+            }
+            (base.failures || []).forEach(failure => {
+                const note = document.createElement('p');
+                note.className = 'rag-note';
+                note.textContent = '⚠️ Не прочитан файл: ' + failure;
+                body.appendChild(note);
+            });
+
+            const actions = document.createElement('div');
+            actions.className = 'rag-actions';
+            // «чанки» — просмотр того, КАК нарезан документ: единственный
+            // способ убедиться, что выбранная стратегия и размер подходят.
+            const view = document.createElement('button');
+            view.type = 'button';
+            view.className = 'rag-view';
+            view.textContent = 'чанки';
+            view.title = 'Посмотреть чанки базы: текст, раздел, номер и границы в документе';
+            view.addEventListener('click', () => openChunks(base));
+            actions.appendChild(view);
+
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'rag-delete';
+            remove.textContent = '🗑';
+            remove.title = 'Удалить базу знаний вместе с её индексом';
+            remove.addEventListener('click', () => deleteRag(base));
+            actions.appendChild(remove);
+
+            row.appendChild(check);
+            row.appendChild(body);
+            row.appendChild(actions);
+            return row;
+        }
+
+        function renderRag() {
+            const data = ragData || { bases: [] };
+            ragListEl.innerHTML = '';
+            const bases = data.bases || [];
+            if (!bases.length) {
+                const empty = document.createElement('div');
+                empty.className = 'rag-empty';
+                empty.textContent = 'Баз знаний пока нет: загрузите документ ниже — '
+                    + 'он разобьётся на чанки, посчитается индекс.';
+                ragListEl.appendChild(empty);
+            } else {
+                bases.forEach(base => ragListEl.appendChild(ragItemNode(base)));
+            }
+
+            renderRagSettings(data);
+
+            // Состояние эмбеддингов: каким бэкендом считаются векторы и почему
+            // именно им — от этого зависит, найдёт ли поиск синонимы.
+            const embedding = data.embedding || {};
+            const note = ragEmbedNoteEl;
+            note.hidden = false;
+            note.className = 'rag-embed-note' + (embedding.reason ? ' warn' : '');
+            note.textContent = 'Эмбеддинги: ' + (embedding.backend_name || embedding.backend || '—')
+                + (embedding.model ? `, модель ${embedding.model}` : '')
+                + (embedding.dim ? `, ${embedding.dim} чисел на чанк` : '')
+                + '. ' + (embedding.reason || '')
+                + ' Поиск по базе: '
+                + (((data.storage || {}).vectors_name) || 'перебор')
+                + '. ' + (((data.storage || {}).vectors_reason) || '');
+
+            // Распознавание сканов: включено ли, чем и на каких языках. Это то,
+            // что определяет, можно ли загрузить скан вообще.
+            const ocr = data.ocr || {};
+            if (ocr.available) {
+                note.textContent += ` Сканы: распознавание включено (OCR, macOS Vision; `
+                    + `языки ${(ocr.languages || []).join(', ') || '—'}).`
+                    + (ocr.build_required ? ' Хелпер соберётся при первой загрузке скана.' : '');
+            } else {
+                note.className = 'rag-embed-note warn';
+                note.textContent += ` Сканы: распознавание недоступно — `
+                    + `${ocr.reason || 'причина неизвестна'}.`;
+            }
+
+            const counts = data.counts || {};
+            const settings = data.settings || {};
+            ragStatusEl.hidden = false;
+            // Только про СПИСОК баз: сколько их, сколько включено, сколько в них
+            // чанков и документов. Параметры разбиения сюда НЕ входят — они
+            // относятся к настройке проекта (и к будущей базе), а у уже собранных
+            // баз стратегии могут быть РАЗНЫЕ; подпись «стратегия: …» в этой
+            // строке читалась как свойство всех баз сразу. Стратегия каждой базы
+            // написана в её строке, а параметры новой задаются в загрузке ниже.
+            ragStatusEl.textContent = counts.bases
+                ? `Баз: ${counts.bases}, включено: ${counts.enabled} · чанков: `
+                  + `${fmtNum(counts.chunks)}, документов: ${fmtNum(counts.documents)}, `
+                  + `объём: ${counts.size_human || '0 Б'}`
+                : 'Баз знаний пока нет.';
+            if (!data.project_id) {
+                ragStatusEl.textContent += ' Проект не выбран: база сохранится в вашем '
+                    + 'списке, включить её можно будет в проекте.';
+            }
+            renderRagMarks();
+        }
+
+        // Настройки разбиения: список стратегий и пределы приходят С СЕРВЕРА —
+        // интерфейс не выдумывает ни названий, ни границ.
+        function renderRagSettings(data) {
+            const settings = data.settings || {};
+            const limits = data.limits || {};
+            ragStrategyEl.innerHTML = '';
+            (data.strategies || []).forEach(item => {
+                const option = document.createElement('option');
+                option.value = item.id;
+                option.textContent = item.name;
+                option.title = item.description || '';
+                if (item.id === settings.strategy) option.selected = true;
+                ragStrategyEl.appendChild(option);
+            });
+            const sizeLimits = limits.chunk_size || {};
+            const overlapLimits = limits.overlap || {};
+            if (sizeLimits.min) ragSizeEl.min = sizeLimits.min;
+            if (sizeLimits.max) ragSizeEl.max = sizeLimits.max;
+            if (overlapLimits.max) ragOverlapEl.max = overlapLimits.max;
+            // Поля не перетираются, если пользователь уже что-то ввёл в открытом
+            // диалоге: снимок приходит и после «применить», и после загрузки.
+            if (!ragSizeEl.value) ragSizeEl.value = settings.chunk_size || '';
+            if (!ragOverlapEl.value) ragOverlapEl.value = settings.overlap || '';
+            if (limits.file_size_human) {
+                ragFileEl.title = `До ${limits.file_size_human} на файл, `
+                    + `до ${limits.files_per_upload || 20} файлов за раз. `
+                    + `Крупные файлы (больше ${limits.json_file_size_human || ''}) `
+                    + 'загружаются по одному, потоком.';
+            }
+            renderRagStrategyHint();
+        }
+
+        function strategyName(id) {
+            const list = (ragData && ragData.strategies) || [];
+            const found = list.find(item => item.id === id);
+            return found ? found.name : (id || '—');
+        }
+
+        function renderRagStrategyHint() {
+            const list = (ragData && ragData.strategies) || [];
+            const found = list.find(item => item.id === ragStrategyEl.value);
+            ragStrategyHintEl.textContent = found ? (found.description || '') : '';
+        }
+
+        // Подпись кнопки «RAG»: сколько баз включено у текущего проекта.
+        function renderRagMarks() {
+            const data = ragData || {};
+            const counts = data.counts || {};
+            const total = Number(counts.bases || 0);
+            const enabled = Number(counts.enabled || 0);
+            projectRagBtn.classList.toggle('on', enabled > 0);
+            const job = ragActiveJob;
+            const busy = job && job.state === 'running';
+            projectRagBtn.classList.toggle('on', enabled > 0 || Boolean(busy));
+            projectRagBtn.title = 'Базы знаний проекта: локальный индекс загруженных '
+                + 'документов (RAG)'
+                + (total ? ` (включено ${enabled} из ${total}, чанков ${fmtNum(counts.chunks)})` : '')
+                + (busy ? ` — идёт индексация: ${job.stage_name || job.stage}`
+                          + (job.total ? `, ${job.percent}%` : '') : '');
+        }
+
+        async function loadRag(force) {
+            try {
+                const res = await fetch('/api/agent/rag' + (force ? '?force=1' : ''));
+                if (!res.ok) { renderRagMarks(); return; }
+                ragData = await res.json();
+            } catch (e) {
+                // Эндпоинта нет (старый сервер) — просто не помечаем кнопку.
+                ragData = null;
+            }
+            renderRagMarks();
+            if (!ragModal.hidden) renderRag();
+        }
+
+        async function openRagModal() {
+            ragModal.hidden = false;
+            // Задача индексации живёт на СЕРВЕРЕ: если страницу перезагрузили,
+            // работа продолжается, и её прогресс надо подхватить снова.
+            if (ragActiveJob && ragActiveJob.state === 'running') ensureRagPoll();
+            ragListEl.innerHTML = '';
+            ragStatusEl.hidden = false;
+            ragStatusEl.textContent = 'Читаю список баз знаний…';
+            ragSizeEl.value = '';
+            ragOverlapEl.value = '';
+            setRagUploadStatus('', false);
+            await loadRag(false);
+        }
+
+        function closeRagModal() {
+            ragModal.hidden = true;
+        }
+
+        function setRagUploadStatus(text, bad) {
+            ragUploadStatusEl.hidden = !text;
+            ragUploadStatusEl.className = 'rag-upload-status' + (bad ? ' bad' : '');
+            ragUploadStatusEl.textContent = text || '';
+        }
+
+        // «Применить»: уходит ПОЛНЫЙ набор галочек (база, которой нет в списке,
+        // выключается) и выбранные параметры разбиения — сервер запоминает их на
+        // проекте, чтобы следующая загрузка шла с ними же.
+        async function applyRag() {
+            const enabled = Array.from(
+                ragListEl.querySelectorAll('input[type=checkbox]'))
+                .filter(check => check.checked)
+                .map(check => check.dataset.base);
+            const data = await ragRequest('/api/agent/rag', jsonOptions('POST', {
+                enabled: enabled,
+                strategy: ragStrategyEl.value,
+                chunk_size: Number(ragSizeEl.value) || null,
+                overlap: Number(ragOverlapEl.value) || null,
+            }));
+            if (!data) return;
+            ragData = data;
+            renderRag();
+            closeRagModal();
+            const counts = data.counts || {};
+            addMessage('bot', counts.enabled
+                ? `✅ Базы знаний включены у проекта: ${counts.enabled} из ${counts.bases} `
+                  + `(чанков ${fmtNum(counts.chunks)}, документов ${fmtNum(counts.documents)}). `
+                  + 'Параметры разбиения запомнены.'
+                : '✅ Базы знаний выключены у проекта: агент отвечает без ваших документов.',
+                true);
+        }
+
+        async function deleteRag(base) {
+            const data = await ragRequest('/api/agent/rag/' + encodeURIComponent(base.id),
+                { method: 'DELETE' });
+            if (!data) return;
+            ragData = data;
+            renderRag();
+            addMessage('bot', `🗑 База знаний «${base.name}» удалена вместе с индексом.`, true);
+        }
+
+        // «Загрузить и проиндексировать»: файлы уходят на сервер ПО ОДНОМУ
+        // (телом запроса, без base64), сервер заводит ФОНОВУЮ задачу, а мы
+        // опрашиваем её состояние и рисуем прогресс. Первый файл создаёт базу,
+        // каждый следующий дописывается в неё — поэтому база на файл не
+        // заводится, а крупный документ не занимает память целиком нигде.
+        // Длительность человеческим языком: секунды до минуты, минуты до часа,
+        // дальше часы с минутами. Сканы считаются десятками минут, и «1107 с»
+        // ничего не говорит.
+        function fmtDuring(seconds) {
+            const value = Math.max(0, Math.round(Number(seconds) || 0));
+            if (value < 60) return value + ' с';
+            const minutes = Math.floor(value / 60);
+            if (minutes < 60) return minutes + ' мин';
+            const hours = Math.floor(minutes / 60);
+            const rest = minutes % 60;
+            return rest ? `${hours} ч ${rest} мин` : hours + ' ч';
+        }
+
+        function fileSizeHuman(size) {
+            const value = Number(size || 0);
+            if (value < 1024) return value + ' Б';
+            if (value < 1024 * 1024) return (value / 1024).toFixed(0) + ' КБ';
+            if (value < 1024 * 1024 * 1024) return (value / 1048576).toFixed(1) + ' МБ';
+            return (value / 1073741824).toFixed(2) + ' ГБ';
+        }
+
+        function uploadUrl(file) {
+            return '/api/agent/rag/upload/stream?' + new URLSearchParams({
+                filename: file.name,
+                // Название и параметры разбиения нужны только ПЕРВОМУ файлу:
+                // остальные дописываются в уже созданную базу, и её паспорт
+                // (стратегия, размер чанка) при добавлении не меняется.
+                name: ragQueueBaseId ? '' : ragQueueName,
+                strategy: ragQueueBaseId ? '' : (ragStrategyEl.value || ''),
+                chunk_size: ragQueueBaseId ? '' : String(Number(ragSizeEl.value) || ''),
+                overlap: ragQueueBaseId ? '' : String(Number(ragOverlapEl.value) || ''),
+                base_id: ragQueueBaseId || '',
+            }).toString();
+        }
+
+        async function startNextUpload() {
+            if ((ragActiveJob && ragActiveJob.state === 'running') || !ragQueue.length) return;
+            const file = ragQueue[0];
+            setRagUploadStatus(
+                `Отправляю файл «${file.name}» (${fileSizeHuman(file.size)})…`, false);
+            try {
+                const res = await fetch(uploadUrl(file), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/octet-stream' },
+                    body: file,       // браузер отдаёт файл потоком, base64 не строится
+                });
+                let data = null;
+                try { data = await res.json(); } catch (e) { data = null; }
+                if (!res.ok) {
+                    const detail = (data && data.detail) || 'Загрузка не удалась.';
+                    addMessage('bot', '⚠️ ' + detail, true);
+                    setRagUploadStatus(detail, true);
+                    ragQueue = [];
+                    return;
+                }
+                ragQueue.shift();
+                ragActiveJob = data.job;
+                if (data.view) { ragData = data.view; renderRag(); }
+                setRagUploadStatus(
+                    'Индексация идёт в фоне: диалог можно закрыть, работа продолжится.', false);
+                renderRagProgress();
+                ensureRagPoll();
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+                setRagUploadStatus('Загрузка не удалась — причина в чате.', true);
+                ragQueue = [];
+            }
+        }
+
+        function renderRagProgress() {
+            const job = ragActiveJob;
+            if (!job) {
+                ragProgressEl.hidden = true;
+                document.getElementById('rag-progress-cancel').hidden = true;
+                return;
+            }
+            ragProgressEl.hidden = false;
+            const running = job.state === 'running';
+            ragProgressStageEl.textContent = running
+                ? ('Индексация: ' + (job.stage_name || job.stage))
+                : (job.state === 'done' ? 'Индексация завершена'
+                   : (job.state === 'cancelled' ? 'Индексация остановлена'
+                      : 'Индексация не удалась'));
+            ragProgressPercentEl.textContent = running
+                ? (job.total ? job.percent + '%' : '')
+                : (job.state === 'done' ? '100%' : '');
+            // Полоса неопределённая, пока сервер не знает общего числа шагов:
+            // так видно, что работа идёт, а не замерла на нуле.
+            const unknown = running && !job.total;
+            ragProgressBarEl.classList.toggle('unknown', unknown);
+            ragProgressFillEl.style.width = unknown ? '' : (job.percent || 0) + '%';
+            const parts = [];
+            if (job.detail) parts.push(job.detail);
+            if (job.chunks) parts.push('чанков: ' + fmtNum(job.chunks));
+            if (job.elapsed) parts.push('прошло ' + fmtDuring(job.elapsed));
+            // ОЦЕНКА ОСТАТКА — самое нужное при долгом распознавании скана:
+            // «1% полторы минуты» без неё выглядит поломкой, а «осталось ~18 мин»
+            // объясняет, что работа идёт.
+            if (running && job.eta) {
+                parts.push('осталось примерно ' + fmtDuring(job.eta) + ' (этот этап)');
+            }
+            ragProgressDetailEl.textContent = job.error
+                ? ('Причина: ' + job.error)
+                : parts.join(' · ');
+            document.getElementById('rag-progress-cancel').hidden = !running;
+            ragProgressQueueEl.hidden = !ragQueue.length;
+            ragProgressQueueEl.textContent = ragQueue.length
+                ? ('В очереди ещё файлов: ' + ragQueue.length + ' — отправлю по одному')
+                : '';
+        }
+
+        function ensureRagPoll() {
+            if (ragPollTimer) return;
+            ragPollTimer = setInterval(pollRagJobs, RAG_POLL_MS);
+        }
+
+        function stopRagPoll() {
+            if (ragPollTimer) {
+                clearInterval(ragPollTimer);
+                ragPollTimer = null;
+            }
+        }
+
+        async function pollRagJobs() {
+            const watched = ragActiveJob ? ragActiveJob.id : '';
+            let data = null;
+            try {
+                const res = await fetch('/api/agent/rag/jobs?active=' + (watched ? '0' : '1'));
+                if (res.ok) data = await res.json();
+            } catch (e) { data = null; }
+            if (!data) return;
+            const jobs = data.jobs || [];
+            const mine = watched
+                ? (jobs.filter(item => item.id === watched)[0] || null)
+                : (jobs.filter(item => item.state === 'running')[0] || null);
+            if (mine) {
+                ragActiveJob = mine;
+                renderRagProgress();
+                renderRagMarks();
+            }
+            if (mine && mine.state === 'running') return;
+            if (mine && mine.state !== 'running' && watched) {
+                await settleRagJob(mine);
+                return;
+            }
+            if (!jobs.some(item => item.state === 'running')) {
+                stopRagPoll();
+                renderRagMarks();
+            }
+        }
+
+        // Завершение задачи: включаем базу у проекта (только теперь у неё есть
+        // идентификатор), сообщаем в чат и отправляем следующий файл очереди.
+        async function settleRagJob(job) {
+            ragActiveJob = job;
+            renderRagProgress();
+            if (job.state === 'done') {
+                const applied = await ragRequest('/api/agent/rag/jobs/finish',
+                    jsonOptions('POST', { job_id: job.id, enabled: true }));
+                if (applied && applied.view) {
+                    ragData = applied.view;
+                    if (applied.base_id) ragQueueBaseId = applied.base_id;
+                }
+                const result = job.result || {};
+                addMessage('bot', `✅ База знаний «${result.name || job.name}» `
+                    + `проиндексирована: чанков ${fmtNum(result.chunks)}, `
+                    + `документов ${fmtNum(result.documents)}, средний чанк `
+                    + `${fmtNum(result.chars_avg)} симв., стратегия `
+                    + `«${result.strategy_name || ''}», индекс сохранён локально `
+                    + `(${result.size_human || ''}).`, true);
+                (result.failures || []).forEach(failure => {
+                    addMessage('bot', '⚠️ Не прочитан файл: ' + failure, true);
+                });
+                setRagUploadStatus(`Готово: «${result.name || job.name}» — чанков `
+                    + `${fmtNum(result.chunks)}, документов ${fmtNum(result.documents)}.`, false);
+                ragNameEl.value = '';
+            } else if (job.state === 'cancelled') {
+                setRagUploadStatus('Индексация остановлена. Индекс не изменён.', false);
+                ragQueue = [];
+            } else {
+                setRagUploadStatus('Индексация не удалась: ' + (job.error || 'причина неизвестна'), true);
+                addMessage('bot', '⚠️ Индексация не удалась: ' + (job.error || 'причина неизвестна'), true);
+                ragQueue = [];
+            }
+            await loadRag(false);
+            if (ragQueue.length) {
+                ragActiveJob = null;
+                renderRagProgress();
+                await startNextUpload();
+                return;
+            }
+            stopRagPoll();
+            ragFileEl.value = '';
+            if (job.state === 'done') {
+                // УСПЕХ убирает за собой сам: база уже в списке, числа — в отчёте
+                // чата, и оставленная полоса «загрузки» только сбивала с толку.
+                ragActiveJob = null;
+                setRagUploadStatus('', false);
+            } else {
+                // СБОЙ и ОТМЕНУ оставляем на экране: причину надо прочитать,
+                // и убрать её пользователь может сам — новой загрузкой.
+                ragActiveJob = job;
+            }
+            renderRagProgress();
+            renderRagMarks();
+        }
+
+        async function cancelRagJob() {
+            if (!ragActiveJob || ragActiveJob.state !== 'running') return;
+            ragQueue = [];
+            ragActiveJob = Object.assign({}, ragActiveJob, { detail: 'останавливаю…' });
+            await ragRequest('/api/agent/rag/jobs/'
+                + encodeURIComponent(ragActiveJob.id) + '/cancel', { method: 'POST' });
+            renderRagProgress();
+        }
+
+        // Подхват фоновых индексаций после перезагрузки страницы: сервер о них
+        // знает, интерфейс — нет, и без этого полоса прогресса не появилась бы,
+        // хотя работа идёт.
+        async function resumeRagJobs() {
+            let data = null;
+            try {
+                const res = await fetch('/api/agent/rag/jobs');
+                if (res.ok) data = await res.json();
+            } catch (e) { data = null; }
+            if (!data) return;
+            const running = (data.jobs || []).filter(item => item.state === 'running');
+            if (!running.length) return;
+            ragActiveJob = running[0];
+            renderRagProgress();
+            renderRagMarks();
+            ensureRagPoll();
+        }
+
+        async function uploadRag() {
+            // Мешает только ИДУЩАЯ задача: снимок завершённой остаётся в
+            // интерфейсе, пока показывается итог, и запускать новую он не должен.
+            if (ragActiveJob && ragActiveJob.state === 'running') {
+                setRagUploadStatus('Индексация уже идёт — дождитесь окончания '
+                    + 'или нажмите «остановить».', true);
+                return;
+            }
+            if (ragActiveJob) {
+                ragActiveJob = null;
+                renderRagProgress();
+            }
+            const files = Array.from(ragFileEl.files || []);
+            if (!files.length) {
+                setRagUploadStatus('Выберите хотя бы один файл.', true);
+                return;
+            }
+            const limits = (ragData || {}).limits || {};
+            const maxBytes = Number(limits.file_bytes || 0);
+            const tooBig = maxBytes ? files.find(file => file.size > maxBytes) : null;
+            if (tooBig) {
+                setRagUploadStatus(
+                    `Файл «${tooBig.name}» весит ${fileSizeHuman(tooBig.size)} — это больше `
+                    + `предела ${limits.file_size_human || ''}. Предел поднимается `
+                    + 'переменной RAG_MAX_FILE_BYTES.', true);
+                return;
+            }
+            if (files.length > Number(limits.files_per_upload || 20)) {
+                setRagUploadStatus('За одну загрузку принимается не больше '
+                    + fmtNum(limits.files_per_upload || 20) + ' файлов.', true);
+                return;
+            }
+            ragQueue = files.slice();
+            ragQueueBaseId = '';
+            ragQueueName = ragNameEl.value || '';
+            setRagUploadStatus('Файлов в очереди: ' + files.length
+                + '. Индексация идёт в фоне — прогресс ниже.', false);
+            await startNextUpload();
+        }
+
+        // ---------- Просмотр чанков: «как стратегия порезала документ» ------
+        // Список постраничный, с фильтром по документу и поиском по тексту —
+        // сервер считает и страницу, и общее число под фильтром, поэтому
+        // интерфейс ничего не додумывает и не держит базу в памяти.
+        const CHUNK_PAGE = 10;
+
+        function chunkNode(chunk) {
+            const box = document.createElement('div');
+            box.className = 'rag-chunk';
+
+            const head = document.createElement('div');
+            head.className = 'rag-chunk-head';
+            const number = document.createElement('span');
+            number.className = 'rag-chunk-num';
+            number.textContent = '№ ' + fmtNum(Number(chunk.index) + 1);
+            head.appendChild(number);
+
+            const chips = [
+                { text: chunk.chunk_id, cls: 'id' },
+                { text: 'файл: ' + chunk.source, cls: 'chunk' },
+                { text: chunk.section ? 'раздел: ' + chunk.section : 'без раздела',
+                  cls: chunk.section ? 'section' : 'chunk' },
+                { text: fmtNum(chunk.chars) + ' симв.', cls: 'chunk' },
+                { text: 'в документе № ' + fmtNum(Number(chunk.position) + 1), cls: 'chunk' },
+                { text: 'символы ' + fmtNum(chunk.start) + '–' + fmtNum(chunk.end),
+                  cls: 'chunk' },
+            ];
+            chips.forEach(item => {
+                const chip = document.createElement('span');
+                chip.className = 'rag-chunk-chip ' + item.cls;
+                chip.textContent = item.text;
+                head.appendChild(chip);
+            });
+            box.appendChild(head);
+
+            // Текст — КАК ЕСТЬ: по переносам строк видно, поймала ли стратегия
+            // границы абзацев и не разорван ли раздел посередине.
+            const text = document.createElement('pre');
+            text.className = 'rag-chunk-text';
+            text.textContent = chunk.text;
+            box.appendChild(text);
+            return box;
+        }
+
+        async function loadChunks(reset) {
+            const base = ragChunks.base;
+            if (!base) return;
+            if (reset) {
+                ragChunks.offset = 0;
+                ragChunksListEl.innerHTML = '';
+            }
+            const params = new URLSearchParams({
+                offset: String(ragChunks.offset),
+                limit: String(CHUNK_PAGE),
+                source: ragChunks.source || '',
+                q: ragChunks.query || '',
+            });
+            const data = await ragRequest(
+                `/api/agent/rag/${encodeURIComponent(base.id)}/chunks?` + params.toString());
+            if (!data) {
+                ragChunksStatusEl.textContent = 'Не удалось прочитать чанки — причина в чате.';
+                return;
+            }
+            ragChunks.total = Number(data.total || 0);
+            (data.chunks || []).forEach(chunk => {
+                ragChunksListEl.appendChild(chunkNode(chunk));
+            });
+            ragChunks.offset += (data.chunks || []).length;
+            if (!ragChunks.total) {
+                const empty = document.createElement('div');
+                empty.className = 'rag-chunk-empty';
+                empty.textContent = (ragChunks.query || ragChunks.source)
+                    ? 'По этому фильтру чанков нет.'
+                    : 'В базе нет чанков.';
+                ragChunksListEl.appendChild(empty);
+            }
+            ragChunksStatusEl.textContent = ragChunks.total
+                ? `Показано ${fmtNum(ragChunks.offset)} из ${fmtNum(ragChunks.total)} чанков`
+                  + (ragChunks.source ? ` · документ: ${ragChunks.source}` : '')
+                  + (ragChunks.query ? ` · поиск: «${ragChunks.query}»` : '')
+                : 'Ничего не найдено.';
+            ragChunksMoreBtn.hidden = !data.has_more;
+        }
+
+        async function openChunks(base) {
+            ragChunks = { base: base, offset: 0, total: 0, source: '', query: '' };
+            ragChunksModal.hidden = false;
+            document.getElementById('rag-chunks-name').textContent = base.name || base.id;
+            ragChunksMetaEl.textContent =
+                `${base.strategy_name} · чанк ${fmtNum(base.chunk_size)} симв.`
+                + (base.overlap ? ` / перекрытие ${fmtNum(base.overlap)}` : '')
+                + ` · чанков ${fmtNum(base.chunks)}, средний ${fmtNum(base.chars_avg)} симв.`
+                + (base.dim ? ` · эмбеддинги ${fmtNum(base.dim)} чисел` : '');
+            ragChunksQueryEl.value = '';
+            ragChunksSourceEl.innerHTML = '';
+            const all = document.createElement('option');
+            all.value = '';
+            all.textContent = 'все документы';
+            ragChunksSourceEl.appendChild(all);
+            (base.sources || []).forEach(item => {
+                const option = document.createElement('option');
+                option.value = item.source;
+                option.textContent = `${item.source} (${fmtNum(item.chunks)})`;
+                ragChunksSourceEl.appendChild(option);
+            });
+            ragChunksListEl.innerHTML = '';
+            ragChunksStatusEl.textContent = 'Читаю чанки…';
+            ragChunksMoreBtn.hidden = true;
+            await loadChunks(true);
+        }
+
+        function closeChunks() {
+            ragChunksModal.hidden = true;
+            ragChunks.base = null;
+        }
+
+        projectRagBtn.addEventListener('click', openRagModal);
+        document.getElementById('rag-close').addEventListener('click', closeRagModal);
+        document.getElementById('rag-apply').addEventListener('click', applyRag);
+        ragUploadBtn.addEventListener('click', uploadRag);
+        document.getElementById('rag-progress-cancel')
+            .addEventListener('click', cancelRagJob);
+        ragStrategyEl.addEventListener('change', renderRagStrategyHint);
+        document.getElementById('rag-refresh').addEventListener('click', async () => {
+            ragStatusEl.hidden = false;
+            ragStatusEl.textContent = 'Читаю список баз знаний…';
+            await loadRag(true);
+        });
+        ragModal.addEventListener('click', (e) => {
+            if (e.target === ragModal) closeRagModal();
+        });
+
+        // Просмотр чанков: фильтры применяются сразу (сброс на первую страницу),
+        // «показать ещё» догружает следующую.
+        ragChunksSourceEl.addEventListener('change', () => {
+            ragChunks.source = ragChunksSourceEl.value;
+            loadChunks(true);
+        });
+        document.getElementById('rag-chunks-find').addEventListener('click', () => {
+            ragChunks.query = ragChunksQueryEl.value.trim();
+            loadChunks(true);
+        });
+        ragChunksQueryEl.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                ragChunks.query = ragChunksQueryEl.value.trim();
+                loadChunks(true);
+            }
+        });
+        ragChunksMoreBtn.addEventListener('click', () => loadChunks(false));
+        document.getElementById('rag-chunks-close').addEventListener('click', closeChunks);
+        ragChunksModal.addEventListener('click', (e) => {
+            if (e.target === ragChunksModal) closeChunks();
         });
 
         // ---------- Периодические задачи: расписание, опрос, обновление чата ----

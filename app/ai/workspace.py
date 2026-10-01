@@ -62,6 +62,7 @@
 import json
 import logging
 import os
+import shutil
 import tempfile
 import uuid
 from datetime import datetime
@@ -72,6 +73,8 @@ from app.ai import attachments as attach_store
 from app.ai import invariants as invariants_store
 from app.ai import mcp as mcp_store
 from app.ai import periodic as periodic_store
+from app.ai import rag_chunking
+from app.ai import rag_store
 from app.ai import task_state
 
 logger = logging.getLogger(__name__)
@@ -162,6 +165,17 @@ _MAX_MCP_STARTED = 20
 # Сколько серверов может быть включено одновременно (серверов в реестре
 # app/ai/mcp.py сейчас три; запас на будущее — как MAX_INVARIANTS).
 MAX_MCP_SERVERS = 10
+
+# RAG (базы знаний проекта) — см. app/ai/rag.py, кнопка «RAG» рядом с
+# кнопкой «MCP». Настройка ПРОЕКТА, как и MCP: поле "rag" задачи-workspace хранит, какие
+# базы знаний включены у проекта, и последние выбранные параметры разбиения на
+# чанки (стратегия, размер чанка, перекрытие) — их диалог подставляет при
+# следующем открытии. САМИ базы знаний живут отдельно (data/rag, см.
+# app/ai/rag_store.py) и принадлежат профилю: включить можно только свою базу,
+# поэтому здесь проверяется ФОРМА идентификатора, а существование и владельца
+# проверяет маршрут (app/ai/rag.py: filter_enabled).
+RAG_FIELD = "rag"
+MAX_RAG_BASES = 50
 
 # Заголовок пустой сессии (пока пользователь не отправил ни одного запроса).
 EMPTY_SESSION_TITLE = "Новая задача"
@@ -966,6 +980,91 @@ def set_mcp_enabled(task: Dict[str, Any], enabled: Any) -> List[str]:
     return list(task[MCP_FIELD]["enabled"])
 
 
+def _normalize_rag(raw: Any) -> Dict[str, Any]:
+    """Приводит настройку баз знаний проекта к рабочему виду.
+
+    Формат: {"enabled": [<id базы>], "strategy": "structure", "chunk_size": 1000,
+    "overlap": 150}. Стратегия и размеры проверяются по общим правилам разбиения
+    (app/ai/rag_chunking.py), поэтому «настройка из файла» не может дать чанк
+    нулевой длины или перекрытие больше размера.
+
+    Существование базы здесь НЕ проверяется: список баз читается с диска, а
+    нормализация вызывается на каждой записи workspace. Отсеивает чужие и
+    удалённые базы маршрут — там же, где известен профиль (rag.filter_enabled).
+    """
+    if isinstance(raw, list):        # запасной формат: голый список включённых баз
+        raw = {"enabled": raw}
+    data = raw if isinstance(raw, dict) else {}
+    enabled: List[str] = []
+    for item in (data.get("enabled") if isinstance(data.get("enabled"), list) else []):
+        key = str(item or "").strip().lower()
+        if rag_store.valid_id(key) and key not in enabled:
+            enabled.append(key)
+    settings = rag_chunking.chunk_settings(
+        data.get("strategy"), data.get("chunk_size"), data.get("overlap"))
+    return {
+        "enabled": enabled[-MAX_RAG_BASES:],
+        "strategy": settings["strategy"],
+        "chunk_size": settings["chunk_size"],
+        "overlap": settings["overlap"],
+    }
+
+
+def rag_settings(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Настройка баз знаний проекта (нормализует поле на месте, если его нет).
+
+    Как mcp_settings(): задача, созданная в памяти и ещё не записанная в файл,
+    не имеет поля — оно появляется при первом обращении, а не падает с KeyError.
+    """
+    if not isinstance(task.get(RAG_FIELD), dict):
+        task[RAG_FIELD] = _normalize_rag(task.get(RAG_FIELD))
+    return task[RAG_FIELD]
+
+
+def rag_enabled(task: Optional[Dict[str, Any]]) -> List[str]:
+    """Включённые базы знаний проекта (пустой список — RAG у проекта выключен)."""
+    if not task:
+        return []
+    return list(rag_settings(task)["enabled"])
+
+
+def set_rag_enabled(task: Dict[str, Any], enabled: Any) -> List[str]:
+    """Записывает набор включённых баз знаний и возвращает его.
+
+    Идентификаторы уже отфильтрованы маршрутом по фактическому списку баз
+    профиля (rag.filter_enabled) — здесь остаётся нормализация и хранение.
+    """
+    settings = rag_settings(task)
+    task[RAG_FIELD] = _normalize_rag({
+        "enabled": enabled,
+        "strategy": settings.get("strategy"),
+        "chunk_size": settings.get("chunk_size"),
+        "overlap": settings.get("overlap"),
+    })
+    return list(task[RAG_FIELD]["enabled"])
+
+
+def set_rag_chunking(task: Dict[str, Any], strategy: Any = None,
+                     chunk_size: Any = None, overlap: Any = None) -> Dict[str, Any]:
+    """Запоминает параметры разбиения, выбранные в диалоге «База знаний».
+
+    Настройка ЗАПОМИНАЕТСЯ на проекте: пользователь задаёт размер чанка один раз,
+    а не заново при каждой загрузке. Незаданные поля (None) остаются прежними.
+    """
+    settings = rag_settings(task)
+    next_settings = rag_chunking.chunk_settings(
+        settings.get("strategy") if strategy is None else strategy,
+        settings.get("chunk_size") if chunk_size is None else chunk_size,
+        settings.get("overlap") if overlap is None else overlap)
+    task[RAG_FIELD] = _normalize_rag({
+        "enabled": settings.get("enabled"),
+        "strategy": next_settings["strategy"],
+        "chunk_size": next_settings["chunk_size"],
+        "overlap": next_settings["overlap"],
+    })
+    return dict(task[RAG_FIELD])
+
+
 def exceptions(dialog: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Решения пользователя по противоречиям правил (нормализует поле на месте).
 
@@ -1303,6 +1402,11 @@ def _normalize_task(raw: Any) -> Optional[Dict[str, Any]]:
         # MCP ПРОЕКТА: какие внешние инструменты (погода, курсы валют, …) агент
         # может вызывать в задачах этого проекта (см. app/ai/mcp.py).
         "mcp": _normalize_mcp(raw.get("mcp")),
+        # RAG ПРОЕКТА: какие базы знаний включены у проекта и с какими
+        # параметрами разбиения на чанки (см. app/ai/rag.py). Без этой строки
+        # ключ молча терялся бы при первой же записи workspace — как это было бы
+        # с "mcp".
+        "rag": _normalize_rag(raw.get("rag")),
     }
 
 
@@ -1447,11 +1551,52 @@ def workspace_payload(workspace: Dict[str, Any]) -> str:
                       separators=(",", ":"))
 
 
+# При каком уменьшении записи сохраняется копия прежнего файла. Файл workspace —
+# единственное место, где живёт вся история задач и диалогов: он не в git и не в
+# резервных копиях, поэтому РЕЗКОЕ уменьшение (больше чем втрое) считается
+# подозрительным и оставляет .bak рядом. Обычные правки (удаление одной задачи,
+# добавление реплики) сюда не попадают.
+BACKUP_RATIO = 3.0
+BACKUP_MIN_BYTES = 4096
+
+
+def _keep_backup(file_path: str, payload: str) -> str:
+    """Сохраняет копию прежнего файла, если новая запись РЕЗКО меньше.
+
+    Возвращает путь к копии ("" — копия не нужна). Зачем: история задач и
+    диалогов пользователя не восстановима ничем (data/ в .gitignore, файл один),
+    а путей, которыми запись может «похудеть» сразу в разы, несколько — включая
+    разбор битого файла как пустого. Одна копия прежнего состояния делает такую
+    потерю видимой и обратимой, а места занимает столько же, сколько сам файл.
+    """
+    try:
+        if not os.path.isfile(file_path):
+            return ""
+        previous = os.path.getsize(file_path)
+        if previous < BACKUP_MIN_BYTES or len(payload) * BACKUP_RATIO > previous:
+            return ""
+        backup = file_path + ".bak"
+        shutil.copy2(file_path, backup)
+        logger.warning(
+            "Workspace AI-агента: запись уменьшилась в %.1f раз (%d → %d байт) — "
+            "прежнее состояние сохранено в %s",
+            previous / float(max(1, len(payload))), previous, len(payload), backup)
+        return backup
+    except OSError as exc:              # копия не должна мешать самой записи
+        logger.warning("Workspace AI-агента: копию сделать не удалось: %s", exc)
+        return ""
+
+
 def write_payload(payload: str, path: Optional[str] = None) -> None:
-    """Пишет готовый JSON в файл атомарно (временный файл + os.replace)."""
+    """Пишет готовый JSON в файл атомарно (временный файл + os.replace).
+
+    Перед записью проверяется, не стала ли запись РЕЗКО меньше прежнего файла: в
+    этом случае рядом остаётся копия `.bak` (см. _keep_backup).
+    """
     file_path = path or config.AGENT_WORKSPACE_FILE
     directory = os.path.dirname(file_path) or "."
     os.makedirs(directory, exist_ok=True)
+    _keep_backup(file_path, payload)
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".workspace-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

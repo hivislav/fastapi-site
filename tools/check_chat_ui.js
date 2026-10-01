@@ -14,6 +14,13 @@
  * (app/ai/mcp.py, SERVERS) через ./venv/bin/python, а ожидания считаются от
  * него: серверы добавляются и убираются, и фикстур не должен от них отставать
  * (раньше здесь лежал список из четырёх серверов, и число 6 инструментов).
+ * Раздел [S] проверяет RAG: кнопку «RAG» рядом с «MCP», диалог со списком баз
+ * знаний (стратегия, чанки, средний размер чанка, вес базы, документы,
+ * предупреждения по файлам), галочки-переключатели, «применить» вместе с
+ * параметрами разбиения и ЗАГРУЗКУ своей базы: файл читается в base64,
+ * уходит на индексацию, новая база появляется в списке, в чате — отчёт о
+ * чанках. Стратегии и пределы размеров заглушка отдаёт как сервер
+ * (app/ai/rag.py), поэтому интерфейс проверяется на реальном контракте.
  *
  * Запуск (нужен jsdom — в зависимостях проекта его нет, ставится отдельно):
  *     npm install --no-save jsdom      # в корне проекта (node_modules не в git)
@@ -286,6 +293,251 @@ function mcpPayload() {
   };
 }
 
+// --- Базы знаний (RAG): снимок «сервера» -------------------------------------
+// Заглушка повторяет /api/agent/rag: список баз профиля с метриками, галочки
+// проекта, доступные стратегии, пределы и состояние эмбеддингов. Метрики здесь
+// НАРОЧНО разные у двух баз — интерфейс обязан показать их по каждой базе, а не
+// одной строкой на всех.
+const RAG_STRATEGIES = [
+  { id: 'structure', name: 'По структуре (заголовки/разделы/файлы)',
+    description: 'Режет по заголовкам и разделам документа.' },
+  { id: 'fixed', name: 'Фиксированный размер',
+    description: 'Режет текст окнами по N символов с перекрытием.' },
+];
+
+function ragBase(overrides) {
+  return Object.assign({
+    id: 'kb-00000001', name: 'Инструкции оператора', enabled: false,
+    strategy: 'structure', strategy_name: 'По структуре (заголовки/разделы/файлы)',
+    chunk_size: 1000, overlap: 150,
+    chunks: 42, documents: 2, chars_total: 32768, chars_avg: 780,
+    chars_min: 210, chars_max: 1180, sections: 11, est_tokens: 8192,
+    vectors_bytes: 64512, dim: 384, backend: 'sentence-transformers',
+    model: 'paraphrase-multilingual-MiniLM-L12-v2', fallback: '',
+    size_bytes: 262144, size_human: '256.0 КБ', share: 0.6,
+    created: '2026-01-02T10:00:00', updated: '2026-01-02T10:05:00',
+    storage: { sqlite: true, json: true },
+    sources: [
+      { source: 'guide.md', format: 'Markdown', chunks: 30, chars: 24000,
+        pages: 0, warning: '' },
+      { source: 'scan.pdf', format: 'PDF', chunks: 12, chars: 8768,
+        pages: 4, warning: 'в PDF нет текстового слоя' },
+    ],
+    failures: [],
+  }, overrides || {});
+}
+
+let RAG = {
+  bases: [ragBase({}), ragBase({
+    id: 'kb-00000002', name: 'Регламенты', strategy: 'fixed',
+    strategy_name: 'Фиксированный размер', chunk_size: 500, overlap: 50,
+    chunks: 17, documents: 1, chars_avg: 470, chars_min: 300, chars_max: 500,
+    sections: 0, size_bytes: 131072, size_human: '128.0 КБ', share: 0.4,
+    fallback: 'модель недоступна: нет сети',
+    sources: [{ source: 'rules.docx', format: 'Word (DOCX)', chunks: 17,
+                chars: 7990, pages: 0, warning: '' }],
+    failures: ['bad.pdf — PDF защищён паролем'],
+  })],
+  enabled: [],
+  uploads: [],
+  streams: [],
+  settings: { strategy: 'structure', chunk_size: 1000, overlap: 150 },
+};
+
+// Чанки базы для проверки просмотра: 25 штук с разными документами и текстом,
+// чтобы работали и страницы, и фильтр по документу, и поиск по тексту.
+function ragChunkSet(base) {
+  const names = (base.sources || []).map(item => item.source);
+  const list = names.length ? names : ['guide.md'];
+  const chunks = [];
+  for (let i = 0; i < 25; i += 1) {
+    const source = list[i % list.length];
+    chunks.push({
+      chunk_id: base.id + '-' + (i % 2) + '-' + String(i).padStart(4, '0'),
+      index: i, doc_index: i % 2, position: i, source: source,
+      title: source.replace(/\.[a-z]+$/, ''),
+      section: i % 3 === 0 ? 'Глава 1 › Установка' : '',
+      kind: 'section', start: i * 500, end: i * 500 + 420, chars: 420,
+      text: 'Фрагмент № ' + (i + 1) + ' из ' + source
+        + '. Резервное копирование выполняется командой backup.sh.',
+    });
+  }
+  return chunks;
+}
+
+function ragChunksPayload(baseId, url) {
+  const base = RAG.bases.filter(item => item.id === baseId)[0] || RAG.bases[0];
+  const query = new URLSearchParams(url.split('?')[1] || '');
+  const offset = Number(query.get('offset') || 0);
+  const limit = Number(query.get('limit') || 10);
+  const source = query.get('source') || '';
+  const text = query.get('q') || '';
+  let all = ragChunkSet(base);
+  if (source) all = all.filter(chunk => chunk.source === source);
+  if (text) {
+    const needle = text.toLowerCase();
+    all = all.filter(chunk => chunk.text.toLowerCase().indexOf(needle) >= 0);
+  }
+  const page = all.slice(offset, offset + limit);
+  return {
+    base: { id: base.id, name: base.name, strategy: base.strategy,
+            strategy_name: base.strategy_name, chunk_size: base.chunk_size,
+            overlap: base.overlap, chunks: base.chunks, chars_avg: base.chars_avg,
+            dim: base.dim, backend: base.backend, model: base.model,
+            sources: (base.sources || []).map(item => item.source) },
+    chunks: page, total: all.length, offset: offset, limit: limit,
+    has_more: offset + page.length < all.length,
+    filter: { source: source, query: text },
+  };
+}
+
+// Фоновые задачи индексации: заглушка повторяет сервер — задача заводится на
+// загрузку, «идёт» несколько опросов (чтобы интерфейс успел показать прогресс),
+// затем завершается. Прогресс выдаётся РАЗНЫЙ, иначе проверка не отличила бы
+// живую полосу от застывшей.
+let RAG_JOBS = [];
+let RAG_JOB_SEQ = 0;
+
+function ragStartJob(filename, baseId, name) {
+  RAG_JOB_SEQ += 1;
+  const job = {
+    id: 'job-' + String(RAG_JOB_SEQ).padStart(8, '0'),
+    state: 'running', stage: 'extract', stage_name: 'разбор документов',
+    done: 0, total: 4, percent: 10,
+    detail: '«' + filename + '»: страница 1 из 4',
+    base_id: baseId || '', name: baseId ? '' : (name || 'База задач'),
+    append: Boolean(baseId), chunks: 0, documents: 0, error: '',
+    cancel_requested: false, started: '2026-01-02T10:00:00', finished: '',
+    elapsed: 0.5, result: null,
+    _startedAt: Date.now(), _filename: filename, _baseId: baseId || '',
+  };
+  RAG_JOBS.push(job);
+  return job;
+}
+
+// Этапы задачи считаются ОТ ВРЕМЕНИ старта: 1.2 с разбор, потом эмбеддинги,
+// потом запись, к 3 с — готово. Так проверка знает, что увидит в любой момент,
+// и не зависит от того, сколько раз успел сработать таймер опроса.
+const RAG_JOB_STAGES = [
+  [2000, 'extract', 'разбор документов', 10, 0, 4, '«%s»: страница 1 из 4'],
+  [4000, 'embed', 'эмбеддинги', 65, 2, 4, 'векторы: 2 из 4 чанков'],
+  [5000, 'save', 'запись индекса', 97, 1, 1, 'пишу индекс: 3 чанков'],
+];
+
+function ragAdvanceJobs() {
+  RAG_JOBS.forEach(job => {
+    if (job.state !== 'running') return;
+    if (job.cancel_requested) {
+      job.state = 'cancelled';
+      job.detail = 'отменено';
+      job.elapsed = 3.0;
+      return;
+    }
+    const age = Date.now() - job._startedAt;
+    const stage = RAG_JOB_STAGES.filter(item => age < item[0])[0];
+    if (stage) {
+      job.stage = stage[1];
+      job.stage_name = stage[2];
+      job.percent = stage[3];
+      job.done = stage[4];
+      job.total = stage[5];
+      job.detail = stage[6].replace('%s', job._filename);
+      job.elapsed = Number((age / 1000).toFixed(1));
+      return;
+    }
+    // Все этапы прошли — задача завершается и СОЗДАЁТ базу (или дописывает в неё).
+    const target = job._baseId
+      ? RAG.bases.filter(base => base.id === job._baseId)[0]
+      : ragBase({ id: 'kb-0000000' + (RAG.bases.length + 1),
+                  name: job.name || job._filename, chunks: 3, documents: 1,
+                  chars_avg: 700, sections: 1 });
+    if (job._baseId && target) {
+      target.documents += 1;
+      target.chunks += 3;
+    } else if (target) {
+      RAG.bases.push(target);
+      RAG.enabled.push(target.id);
+    }
+    job.state = 'done';
+    job.stage = 'save';
+    job.percent = 100;
+    job.detail = 'готово';
+    job.elapsed = 3.0;
+    job.base_id = target ? target.id : '';
+    job.chunks = 3;
+    job.documents = 1;
+    job.result = {
+      id: job.base_id, name: (target || {}).name || job.name,
+      strategy_name: (target || {}).strategy_name || '',
+      chunk_size: (target || {}).chunk_size || 0,
+      overlap: (target || {}).overlap || 0,
+      chunks: 3, documents: 1, chars_avg: 700,
+      size_human: (target || {}).size_human || '10.0 КБ', failures: [],
+    };
+  });
+}
+
+// Проверке нужно уметь останавливать опрос задач индексации: он идёт по
+// таймеру страницы и мешал бы следующим разделам (страница живёт одна на весь
+// прогон). Останавливаем ШТАТНОЙ функцией страницы — своего таймера у проверки
+// нет и быть не может.
+function stopRagPollForCheck() {
+  try { dom.window.eval('stopRagPoll()'); } catch (e) { /* страница ещё не готова */ }
+}
+
+function ragJobsPayload(activeOnly) {
+  const jobs = activeOnly
+    ? RAG_JOBS.filter(job => job.state === 'running')
+    : RAG_JOBS.slice();
+  return {
+    jobs: jobs.slice().reverse(),
+    active: RAG_JOBS.filter(job => job.state === 'running').length,
+    summary: { jobs: [], active: 0, running: false, percent: 0 },
+  };
+}
+
+function ragPayload() {
+  const bases = RAG.bases.map(base => Object.assign({}, base, {
+    enabled: RAG.enabled.indexOf(base.id) >= 0,
+  }));
+  const sum = key => bases.reduce((total, base) => total + Number(base[key] || 0), 0);
+  return {
+    bases: bases,
+    enabled: RAG.enabled.slice(),
+    project_id: workspace.active_task,
+    counts: {
+      bases: bases.length,
+      enabled: bases.filter(base => base.enabled).length,
+      chunks: sum('chunks'), documents: sum('documents'),
+      chars_total: sum('chars_total'), est_tokens: sum('est_tokens'),
+      size_bytes: sum('size_bytes'), size_human: '384.0 КБ',
+    },
+    strategies: RAG_STRATEGIES,
+    settings: Object.assign({}, RAG.settings),
+    defaults: { strategy: 'structure', chunk_size: 1000, overlap: 150 },
+    limits: {
+      chunk_size: { min: 100, max: 8000 }, overlap: { min: 0, max: 4000 },
+      file_bytes: 268435456, file_size_human: '256.0 МБ',
+      // Предел JSON-пути НАРОЧНО маленький: тогда проверка может показать
+      // выбор транспорта на файле в пару килобайт, не выделяя 30 МБ в jsdom.
+      json_file_bytes: 1024, json_file_size_human: '1.0 КБ',
+      files_per_upload: 20, bases: 50, chunks_page: 10, chunks_page_max: 50,
+    },
+    formats: ['pdf', 'docx', 'md', 'txt'],
+    embedding: {
+      requested: 'auto', backend: 'sentence-transformers',
+      backend_name: 'sentence-transformers (семантические эмбеддинги)',
+      model: 'paraphrase-multilingual-MiniLM-L12-v2', dim: 384,
+      sbert_installed: true, reason: '', cache_dir: 'data/rag/models',
+      backends: [],
+    },
+    storage: { sqlite: true, json: true, vectors: 'numpy',
+               vectors_name: 'numpy — счёт близости матрицей',
+               vectors_reason: '', dir: 'data/rag' },
+    dir: 'data/rag',
+  };
+}
+
 // --- Периодические задачи: расписания на «сервере» ---------------------------
 // Заглушка повторяет поведение сервера (app/ai/periodic.py, /api/agent/periodic):
 // расписание есть у задачи, созданной кнопкой «Новая периодическая задача»; его
@@ -444,7 +696,10 @@ function makeFetch() {
   return async (url, options) => {
     const method = ((options && options.method) || 'GET').toUpperCase();
     calls.push(method + ' ' + url);
-    const body = options && options.body ? JSON.parse(options.body) : {};
+    // Тело бывает ДВУХ видов: строка JSON (обычные запросы) и сам файл
+    // (потоковая загрузка). Разбирать второе как JSON нельзя — это Blob.
+    const rawBody = options && options.body ? options.body : null;
+    const body = typeof rawBody === 'string' ? JSON.parse(rawBody) : {};
 
     if (url === '/api/agent/workspace') return jsonResponse(workspacePayload());
     if (url === '/api/agent/periodic') return jsonResponse(periodicPayload());
@@ -532,6 +787,108 @@ function makeFetch() {
         MCP.enabled = (body.enabled || []).filter(id => known.indexOf(id) >= 0);
       }
       return jsonResponse(mcpPayload());
+    }
+    if (url.indexOf('/api/agent/rag') === 0) {
+      if (url === '/api/agent/rag/upload' && method === 'POST') {
+        // Загрузка базы: заглушка повторяет сервер — файлы приходят в base64,
+        // разбираются, режутся на чанки и получают эмбеддинги. Числа чанков
+        // считаются от РАЗМЕРА текста и размера чанка, как у настоящего
+        // пайплайна, поэтому проверка видит согласованные метрики.
+        const files = body.files || [];
+        RAG.uploads.push(body);
+        const size = Number(body.chunk_size) || RAG.settings.chunk_size || 1000;
+        const strategy = body.strategy || RAG.settings.strategy || 'structure';
+        let chars = 0;
+        const sources = files.map(item => {
+          const text = Buffer.from(String(item.content_base64 || ''), 'base64')
+            .toString('utf8');
+          chars += text.length;
+          return {
+            source: item.filename, format: 'Markdown',
+            chunks: Math.max(1, Math.ceil(text.length / size)),
+            chars: text.length, pages: 0, warning: '',
+          };
+        });
+        const chunks = sources.reduce((total, item) => total + item.chunks, 0);
+        const id = 'kb-0000000' + (RAG.bases.length + 1);
+        const base = ragBase({
+          id: id, name: body.name || (files[0] || {}).filename || 'База знаний',
+          strategy: strategy,
+          strategy_name: (RAG_STRATEGIES.filter(s => s.id === strategy)[0] || {}).name,
+          chunk_size: size, overlap: Number(body.overlap) || 0,
+          chunks: chunks, documents: files.length, chars_total: chars,
+          chars_avg: chunks ? Math.round(chars / chunks) : 0,
+          chars_min: size, chars_max: size, sections: 0,
+          sources: sources, failures: [], fallback: '',
+        });
+        RAG.bases.push(base);
+        RAG.enabled.push(id);
+        RAG.settings = { strategy: strategy, chunk_size: size,
+                         overlap: Number(body.overlap) || 0 };
+        return jsonResponse({ base: Object.assign({}, base, { enabled: true }),
+                              view: ragPayload() });
+      }
+      if (url.indexOf('/api/agent/rag/') === 0 && url.indexOf('/chunks') > 0) {
+        const id = decodeURIComponent(url.split('/')[4]);
+        return jsonResponse(ragChunksPayload(id, url));
+      }
+      if (url.indexOf('/api/agent/rag/jobs') === 0) {
+        if (url.indexOf('/jobs/finish') > 0 && method === 'POST') {
+          const job = RAG_JOBS.filter(item => item.id === body.job_id)[0];
+          if (job && job.base_id && RAG.enabled.indexOf(job.base_id) < 0) {
+            RAG.enabled.push(job.base_id);
+          }
+          return jsonResponse({ applied: Boolean(job), base_id: job ? job.base_id : '',
+                                view: ragPayload() });
+        }
+        if (url.indexOf('/jobs/') > 0 && url.endsWith('/cancel') && method === 'POST') {
+          const id = decodeURIComponent(url.split('/')[5]);
+          const job = RAG_JOBS.filter(item => item.id === id)[0];
+          if (job) job.cancel_requested = true;
+          return jsonResponse({ job: job || null });
+        }
+        if (url.indexOf('/jobs/') > 0) {
+          const id = decodeURIComponent(url.split('/')[5]);
+          const job = RAG_JOBS.filter(item => item.id === id)[0];
+          if (!job) return jsonResponse({ detail: 'Задача индексации не найдена' }, false);
+          return jsonResponse({ job: job });
+        }
+        // Опрос списка: каждый опрос двигает задачи вперёд (как идёт время).
+        ragAdvanceJobs();
+        return jsonResponse(ragJobsPayload(url.indexOf('active=1') > 0));
+      }
+      if (url.indexOf('/api/agent/rag/upload/stream') === 0 && method === 'POST') {
+        // Потоковая загрузка: тело — сам файл (не JSON!), параметры — в строке
+        // запроса. Заглушка повторяет сервер: создаёт базу или дописывает файл.
+        const query = new URLSearchParams(url.split('?')[1] || '');
+        const filename = query.get('filename') || 'file.bin';
+        const baseId = query.get('base_id') || '';
+        const size = Number((options && options.body && options.body.size) || 0);
+        RAG.streams.push({ filename: filename, baseId: baseId, size: size,
+                           strategy: query.get('strategy') || '',
+                           chunk_size: query.get('chunk_size') || '',
+                           overlap: query.get('overlap') || '' });
+        const job = ragStartJob(filename, baseId, query.get('name'));
+        return jsonResponse({ job: job, view: ragPayload() });
+      }
+      if (url.indexOf('/api/agent/rag/') === 0 && method === 'DELETE') {
+        const id = decodeURIComponent(url.split('/')[4]);
+        RAG.bases = RAG.bases.filter(base => base.id !== id);
+        RAG.enabled = RAG.enabled.filter(item => item !== id);
+        return jsonResponse(ragPayload());
+      }
+      if (method === 'POST') {
+        // Применяется ПОЛНЫЙ набор галочек (неизвестная база не включается) и
+        // параметры разбиения — как на сервере они запоминаются на проекте.
+        const known = RAG.bases.map(base => base.id);
+        RAG.enabled = (body.enabled || []).filter(id => known.indexOf(id) >= 0);
+        RAG.settings = {
+          strategy: body.strategy || RAG.settings.strategy,
+          chunk_size: Number(body.chunk_size) || RAG.settings.chunk_size,
+          overlap: Number(body.overlap) || 0,
+        };
+      }
+      return jsonResponse(ragPayload());
     }
     if (url === '/api/agent/state') {
       return jsonResponse({ state: snapshot(), session: { id: 's-1', title: 'Диалог' } });
@@ -1562,14 +1919,15 @@ async function run() {
     'display=' + dom.window.getComputedStyle($('project-invariants')).display
       + ', hidden=' + $('project-invariants').hidden
       + ', class=' + $('project-invariants').className);
-  check('порядок иконок проекта: шестерёнка, MCP, карандаш, корзина',
+  check('порядок иконок проекта: шестерёнка, MCP, RAG, карандаш, корзина',
     (function () {
       const actions = $('project-invariants').closest('.task-actions');
-      return actions.children.length === 4
+      return actions.children.length === 5
         && actions.children[0] === $('project-invariants')
         && actions.children[1] === $('project-mcp')
-        && actions.children[2] === $('task-rename')
-        && actions.children[3] === $('task-delete');
+        && actions.children[2] === $('project-rag')
+        && actions.children[3] === $('task-rename')
+        && actions.children[4] === $('task-delete');
     })());
   check('отдельной кнопки «Инварианты» больше нет',
     dom.window.document.getElementById('invariants-btn') === null);
@@ -2043,6 +2401,479 @@ async function run() {
   await wait(60);
   check('вне режима агента диалог MCP закрыт', $('mcp-modal').hidden === true);
   check('кнопка «MCP» скрыта вместе с блоком проекта', $('task-block').hidden === true);
+  dom.window.eval('setAgentMode(true)');
+  await wait(40);
+
+  // ---------------------------------------------------------------------
+  // [S] БАЗЫ ЗНАНИЙ (RAG): кнопка рядом с MCP, список баз с метриками,
+  // переключатели, загрузка своей базы со стратегией и размерами чанка.
+  console.log('\n[S] RAG: базы знаний — список, переключатели, загрузка, стратегии');
+  dom.window.eval('setExpertMode(false); setAgentMode(true)');
+  await wait(60);
+  RAG.enabled = [];
+  RAG.bases = [ragBase({}), ragBase({
+    id: 'kb-00000002', name: 'Регламенты', strategy: 'fixed',
+    strategy_name: 'Фиксированный размер', chunk_size: 500, overlap: 50,
+    chunks: 17, documents: 1, chars_avg: 470, chars_min: 300, chars_max: 500,
+    sections: 0, size_bytes: 131072, size_human: '128.0 КБ', share: 0.4,
+    fallback: 'модель недоступна: нет сети',
+    sources: [{ source: 'rules.docx', format: 'Word (DOCX)', chunks: 17,
+                chars: 7990, pages: 0, warning: '' }],
+    failures: ['bad.pdf — PDF защищён паролем'],
+  })];
+  RAG.uploads = [];
+  await dom.window.eval('loadRag(false)');
+  await wait(40);
+
+  check('кнопка «RAG» стоит рядом с кнопкой «MCP»',
+    $('project-rag') !== null
+    && $('project-rag').previousElementSibling === $('project-mcp')
+    && $('project-rag').closest('.task-actions') !== null);
+  check('кнопка «RAG» действительно видна',
+    $('project-rag').hidden === false
+    && dom.window.getComputedStyle($('project-rag')).display !== 'none',
+    'display=' + dom.window.getComputedStyle($('project-rag')).display);
+  check('диалог баз знаний закрыт до нажатия', $('rag-modal').hidden === true);
+  check('выключенные базы не помечают кнопку',
+    $('project-rag').classList.contains('on') === false,
+    $('project-rag').className + ' / ' + $('project-rag').title);
+
+  await click($('project-rag'), 80);
+  check('нажатие открывает диалог со списком баз знаний',
+    $('rag-modal').hidden === false);
+
+  const ragItems = q('#rag-list .rag-item');
+  check('в диалоге перечислены все базы профиля',
+    ragItems.length === RAG.bases.length,
+    'на экране: ' + ragItems.length + ', в фикстуре: ' + RAG.bases.length);
+  check('у каждой базы есть название',
+    q('#rag-list .rag-name').map(el => el.textContent).join('|')
+      === RAG.bases.map(base => base.name).join('|'),
+    q('#rag-list .rag-name').map(el => el.textContent).join('|'));
+  check('у каждой базы есть галочка-переключатель',
+    q('#rag-list input[type=checkbox]').length === RAG.bases.length);
+  check('галочки сняты, пока базы выключены',
+    q('#rag-list input[type=checkbox]').every(box => box.checked === false));
+
+  // Метрики: стратегия, чанки, средний размер, вес — по КАЖДОЙ базе, своими
+  // числами (две базы в фикстуре нарочно разные).
+  const firstText = (ragItems[0] ? ragItems[0].textContent : '').replace(/\u00a0/g, ' ');
+  const secondText = (ragItems[1] ? ragItems[1].textContent : '').replace(/\u00a0/g, ' ');
+  check('в строке базы названа стратегия разбиения',
+    firstText.indexOf(RAG.bases[0].strategy_name) >= 0
+    && secondText.indexOf(RAG.bases[1].strategy_name) >= 0,
+    firstText.slice(0, 80));
+  check('в строке базы показано число чанков',
+    firstText.indexOf(String(RAG.bases[0].chunks)) >= 0);
+  check('в строке базы показан средний размер чанка',
+    firstText.indexOf('Средний чанк') >= 0
+    && firstText.indexOf(String(RAG.bases[0].chars_avg)) >= 0);
+  check('в строке базы показан вес базы и её доля',
+    firstText.indexOf(RAG.bases[0].size_human) >= 0
+    && firstText.indexOf('60% баз') >= 0, firstText.slice(0, 120));
+  check('в строке базы показано число документов и разделов',
+    firstText.indexOf('Документов') >= 0 && firstText.indexOf('Разделов') >= 0);
+  check('в строке базы показана размерность эмбеддингов',
+    firstText.indexOf(String(RAG.bases[0].dim)) >= 0);
+  check('документы базы перечислены с форматом и числом чанков',
+    firstText.indexOf('guide.md') >= 0 && firstText.indexOf('24 000') >= 0,
+    firstText.slice(0, 200));
+  check('предупреждение по документу видно (скан без текстового слоя)',
+    firstText.indexOf('нет текстового слоя') >= 0, firstText.slice(-160));
+  check('непрочитанный файл показан причиной, а не молчанием',
+    secondText.indexOf('PDF защищён паролем') >= 0, secondText.slice(-120));
+  check('база, посчитанная запасным бэкендом, помечена',
+    secondText.indexOf('запасным офлайн-бэкендом') >= 0);
+
+  // Настройки разбиения: стратегии и пределы приходят С СЕРВЕРА.
+  const strategyOptions = Array.from($('rag-strategy').options).map(o => o.value);
+  check('в списке стратегий — обе стратегии с сервера',
+    JSON.stringify(strategyOptions) === JSON.stringify(RAG_STRATEGIES.map(s => s.id)),
+    JSON.stringify(strategyOptions));
+  check('выбрана стратегия из настроек проекта',
+    $('rag-strategy').value === RAG.settings.strategy, $('rag-strategy').value);
+  check('под стратегией видно её описание',
+    $('rag-strategy-hint').textContent.length > 10,
+    $('rag-strategy-hint').textContent);
+  check('размер чанка подставлен из настроек проекта',
+    $('rag-size').value === String(RAG.settings.chunk_size), $('rag-size').value);
+  check('перекрытие подставлено из настроек проекта',
+    $('rag-overlap').value === String(RAG.settings.overlap), $('rag-overlap').value);
+  check('пределы размеров взяты с сервера',
+    $('rag-size').min === '100' && $('rag-size').max === '8000',
+    $('rag-size').min + '…' + $('rag-size').max);
+
+  // ВЫРАВНИВАНИЕ НАСТРОЕК: «размер чанка» и «перекрытие» обязаны стоять
+  // симметрично. Раскладку задаёт СЕТКА (jsdom считает computed style), поэтому
+  // проверяется не «как выглядит», а чем это обеспечено: один ряд, равные
+  // колонки, выравнивание по нижнему краю и одинаковая подпись-обёртка.
+  const paramsRow = $('rag-size').closest('.rag-row');
+  check('настройки разбиения стоят в одном ряду',
+    paramsRow !== null && paramsRow === $('rag-overlap').closest('.rag-row')
+    && paramsRow === $('rag-strategy').closest('.rag-row'),
+    paramsRow ? paramsRow.className : 'ряд не найден');
+  const paramsStyle = paramsRow ? dom.window.getComputedStyle(paramsRow) : {};
+  check('ряд настроек разложен сеткой, а не flex-переносами',
+    paramsStyle.display === 'grid', String(paramsStyle.display));
+  check('поля ряда выровнены по нижнему краю (подпись не сдвигает поле)',
+    paramsStyle.alignItems === 'end', String(paramsStyle.alignItems));
+  // Колонки разбираем с учётом скобок: «minmax(0, 1fr)» — одна колонка, а не
+  // две (иначе проверка ломалась бы на самой записи правила).
+  const columns = String(paramsStyle.gridTemplateColumns || '')
+    .match(/minmax\([^)]*\)|[^\s]+/g) || [];
+  const fixed = columns
+    .map(value => (/^[\d.]+px$/.test(value) ? parseFloat(value) : 0))
+    .filter(value => value > 0);
+  check('ряд настроек — три колонки, из них две РАВНЫЕ фиксированные',
+    columns.length === 3 && fixed.length === 2 && fixed[0] === fixed[1],
+    columns.length + ' колонок: ' + JSON.stringify(paramsStyle.gridTemplateColumns));
+  check('оба числовых поля одинаковой ширины (нет narrow/wide у одного из них)',
+    $('rag-size').closest('.rag-field').className
+      === $('rag-overlap').closest('.rag-field').className
+    && $('rag-size').closest('.rag-field').className === 'rag-field',
+    $('rag-size').closest('.rag-field').className + ' / '
+      + $('rag-overlap').closest('.rag-field').className);
+  const labelHeights = ['rag-strategy', 'rag-size', 'rag-overlap'].map(id => {
+    const label = $(id).closest('.rag-field').querySelector('label');
+    return label ? dom.window.getComputedStyle(label).minHeight : '';
+  });
+  check('у каждого поля есть подпись, и высота подписей одинакова',
+    ['rag-strategy', 'rag-size', 'rag-overlap'].every(id => {
+      const label = $(id).closest('.rag-field').querySelector('label');
+      return label && label.textContent.trim().length > 3;
+    })
+    // Высота подписи зарезервирована под ДВЕ строки и у всех полей одна: иначе
+    // односложная подпись «вытягивала» своё поле вверх относительно соседнего.
+    && labelHeights.every(height => parseFloat(height) >= 20)
+    && new Set(labelHeights).size === 1,
+    labelHeights.join(' | '));
+  check('в подписи числовых полей названы единицы измерения',
+    $('rag-size').closest('.rag-field').querySelector('label')
+      .textContent.indexOf('символов') >= 0
+    && $('rag-overlap').closest('.rag-field').querySelector('label')
+      .textContent.indexOf('символов') >= 0);
+
+  // Включаем одну базу и меняем стратегию с размерами — «применить».
+  const ragBoxes = q('#rag-list input[type=checkbox]');
+  ragBoxes[0].checked = true;
+  $('rag-strategy').value = 'fixed';
+  $('rag-size').value = '600';
+  $('rag-overlap').value = '90';
+  const ragPostsBefore = calls.filter(c => c === 'POST /api/agent/rag').length;
+  await click($('rag-apply'), 80);
+  check('«применить» отправил набор на сервер',
+    calls.filter(c => c === 'POST /api/agent/rag').length === ragPostsBefore + 1,
+    calls.slice(-3).join(' | '));
+  check('на сервер ушёл полный список галочек',
+    JSON.stringify(RAG.enabled) === JSON.stringify([RAG.bases[0].id]),
+    JSON.stringify(RAG.enabled));
+  check('стратегия и размеры чанка ушли вместе с набором',
+    RAG.settings.strategy === 'fixed' && RAG.settings.chunk_size === 600
+    && RAG.settings.overlap === 90, JSON.stringify(RAG.settings));
+  check('после «применить» диалог закрывается', $('rag-modal').hidden === true);
+  check('включённая база помечает кнопку проекта',
+    $('project-rag').classList.contains('on') === true
+    && $('project-rag').title.indexOf('включено 1 из ' + RAG.bases.length) > 0,
+    $('project-rag').className + ' / ' + $('project-rag').title);
+  check('в чате сказано, что базы знаний включены',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('Базы знаний включены') >= 0));
+
+  // Повторное открытие показывает сохранённые галочки (снимок с сервера).
+  await click($('project-rag'), 80);
+  check('повторное открытие показывает включённые базы',
+    JSON.stringify(q('#rag-list input[type=checkbox]').map(box => box.checked))
+      === JSON.stringify(RAG.bases.map(base => RAG.enabled.indexOf(base.id) >= 0)),
+    JSON.stringify(q('#rag-list input[type=checkbox]').map(box => box.checked)));
+
+  // ---------------------------------------------------------------------
+  // ПРОСМОТР ЧАНКОВ: у каждой базы есть кнопка, диалог показывает текст
+  // чанков с адресом, работает фильтр по документу, поиск и «показать ещё».
+  check('в строке базы есть кнопка просмотра чанков',
+    q('#rag-list .rag-view').length === RAG.bases.length,
+    'кнопок: ' + q('#rag-list .rag-view').length);
+  check('просмотр чанков закрыт до нажатия', $('rag-chunks-modal').hidden === true);
+  await click(q('#rag-list .rag-view')[0], 120);
+  check('кнопка «чанки» открывает диалог просмотра', $('rag-chunks-modal').hidden === false);
+  check('в заголовке просмотра названа база',
+    $('rag-chunks-name').textContent === RAG.bases[0].name,
+    $('rag-chunks-name').textContent);
+  check('в шапке просмотра видны стратегия и размер чанка',
+    $('rag-chunks-meta').textContent.indexOf(RAG.bases[0].strategy_name) >= 0
+    && $('rag-chunks-meta').textContent.indexOf('чанк') >= 0,
+    $('rag-chunks-meta').textContent);
+  check('на первой странице показана ровно страница чанков',
+    q('#rag-chunks-list .rag-chunk').length === 10,
+    'чанков: ' + q('#rag-chunks-list .rag-chunk').length);
+  check('в строке чанка есть номер, идентификатор и источник',
+    q('#rag-chunks-list .rag-chunk-num')[0].textContent.indexOf('№ 1') >= 0
+    && q('#rag-chunks-list .rag-chunk-chip.id')[0].textContent.length > 4
+    && q('#rag-chunks-list .rag-chunk')[0].textContent.indexOf('guide.md') >= 0,
+    q('#rag-chunks-list .rag-chunk')[0].textContent.slice(0, 120));
+  check('в строке чанка виден раздел и границы символов',
+    q('#rag-chunks-list .rag-chunk')[0].textContent.indexOf('раздел:') >= 0
+    && q('#rag-chunks-list .rag-chunk')[0].textContent.indexOf('символы') >= 0);
+  check('текст чанка показан как есть (переносы не потеряны)',
+    q('#rag-chunks-list .rag-chunk-text').length === 10
+    && q('#rag-chunks-list .rag-chunk-text')[0].textContent.indexOf('Резервное') >= 0);
+  check('в статусе видно, сколько показано и сколько всего',
+    $('rag-chunks-status').textContent.indexOf('Показано 10 из 25') >= 0,
+    $('rag-chunks-status').textContent);
+  check('кнопка «показать ещё» доступна, пока есть что показать',
+    $('rag-chunks-more').hidden === false);
+
+  await click($('rag-chunks-more'), 120);
+  check('«показать ещё» догружает следующую страницу',
+    q('#rag-chunks-list .rag-chunk').length === 20
+    && $('rag-chunks-status').textContent.indexOf('Показано 20 из 25') >= 0,
+    q('#rag-chunks-list .rag-chunk').length + ' / ' + $('rag-chunks-status').textContent);
+  await click($('rag-chunks-more'), 120);
+  check('на последней странице «показать ещё» скрывается',
+    q('#rag-chunks-list .rag-chunk').length === 25 && $('rag-chunks-more').hidden === true);
+
+  // Фильтр по документу: сервер отдаёт только чанки этого файла.
+  const sourceOptions = Array.from($('rag-chunks-source').options).map(o => o.value);
+  check('в фильтре перечислены документы базы',
+    sourceOptions[0] === '' && sourceOptions.length === 1 + (RAG.bases[0].sources || []).length,
+    JSON.stringify(sourceOptions));
+  // Меняем выбор КАК ПОЛЬЗОВАТЕЛЬ — событием change: прямая установка value
+  // обработчик не вызывает, и проверка прошла бы на невызванном фильтре.
+  const pickedSource = sourceOptions[1];
+  $('rag-chunks-source').value = pickedSource;
+  $('rag-chunks-source').dispatchEvent(new dom.window.Event('change'));
+  await wait(150);
+  check('фильтр по документу показывает только его чанки',
+    q('#rag-chunks-list .rag-chunk').length > 0
+    && q('#rag-chunks-list .rag-chunk').every(el =>
+      el.textContent.indexOf(pickedSource) >= 0),
+    'фильтр ' + pickedSource + ', чанков: ' + q('#rag-chunks-list .rag-chunk').length);
+  check('в статусе назван выбранный документ',
+    $('rag-chunks-status').textContent.indexOf(pickedSource) >= 0,
+    $('rag-chunks-status').textContent);
+
+  // Поиск по тексту чанка.
+  $('rag-chunks-query').value = 'backup';
+  await click($('rag-chunks-find'), 120);
+  check('поиск по тексту возвращает найденные чанки',
+    q('#rag-chunks-list .rag-chunk').length > 0
+    && $('rag-chunks-status').textContent.indexOf('поиск:') >= 0,
+    $('rag-chunks-status').textContent);
+  $('rag-chunks-query').value = 'такого-текста-нет';
+  await click($('rag-chunks-find'), 120);
+  check('поиск без совпадений говорит об этом прямо',
+    q('#rag-chunks-list .rag-chunk').length === 0
+    && q('#rag-chunks-list .rag-chunk-empty').length === 1
+    && $('rag-chunks-more').hidden === true,
+    $('rag-chunks-status').textContent);
+
+  await click($('rag-chunks-close'), 40);
+  check('кнопка «закрыть» закрывает просмотр чанков',
+    $('rag-chunks-modal').hidden === true);
+
+  // ---------------------------------------------------------------------
+  // ФОНОВАЯ ИНДЕКСАЦИЯ: файл уходит потоком, сервер заводит задачу, интерфейс
+  // опрашивает её состояние и рисует прогресс. Прежде чем начать, важно, чтобы
+  // фоновых задач не осталось от прошлых проверок.
+  stopRagPollForCheck();
+  await click($('project-rag'), 80);
+  check('диалог баз знаний открыт для проверки фоновой индексации',
+    $('rag-modal').hidden === false);
+  check('полоса прогресса скрыта, пока ничего не индексируется',
+    $('rag-progress').hidden === true);
+
+  const bigBlob = 'П'.repeat(4096);
+  const bigFile = new dom.window.File([bigBlob], 'big.pdf', { type: 'application/pdf' });
+  Object.defineProperty($('rag-file'), 'files', { value: [bigFile], configurable: true });
+  $('rag-name').value = 'Крупная база';
+  const streamsBefore = RAG.streams.length;
+  const jobsBefore = RAG_JOBS.length;
+  await click($('rag-upload'), 200);
+
+  check('файл ушёл ПОТОКОМ (телом запроса, без base64)',
+    RAG.streams.length === streamsBefore + 1
+    && RAG.streams[RAG.streams.length - 1].filename === 'big.pdf',
+    JSON.stringify(RAG.streams.slice(streamsBefore)));
+  check('сервер завёл задачу индексации, а не ждал её в запросе',
+    RAG_JOBS.length === jobsBefore + 1
+    && RAG_JOBS[RAG_JOBS.length - 1].state === 'running',
+    JSON.stringify(RAG_JOBS.slice(jobsBefore)));
+  check('полоса прогресса появилась сразу после старта',
+    $('rag-progress').hidden === false);
+  const stageText = $('rag-progress-stage').textContent;
+  check('на полосе назван этап индексации',
+    stageText.indexOf('Индексация:') >= 0
+    && ['разбор', 'эмбеддинги', 'запись'].some(word => stageText.indexOf(word) >= 0),
+    stageText);
+  check('в подробностях видно, ЧТО именно делается',
+    $('rag-progress-detail').textContent.indexOf('big.pdf') >= 0
+    || $('rag-progress-detail').textContent.indexOf('векторы') >= 0
+    || $('rag-progress-detail').textContent.indexOf('пишу индекс') >= 0,
+    $('rag-progress-detail').textContent);
+  check('во время индексации доступна кнопка «остановить»',
+    $('rag-progress-cancel').hidden === false);
+  check('кнопка «RAG» помечена и показывает ход в подсказке',
+    $('project-rag').classList.contains('on') === true
+    && $('project-rag').title.indexOf('идёт индексация') > 0,
+    $('project-rag').title);
+
+  // Опрос двигает прогресс: этап, проценты и подробности меняются.
+  await wait(2100);
+  const stageAfterPoll = $('rag-progress-stage').textContent;
+  const percentAfterPoll = $('rag-progress-percent').textContent;
+  check('опрос обновляет этап и проценты (полоса не застывает)',
+    stageAfterPoll.indexOf('эмбеддинги') >= 0 || stageAfterPoll.indexOf('запись') >= 0,
+    stageAfterPoll + ' / ' + percentAfterPoll);
+  check('проценты растут вместе с этапом',
+    parseInt(percentAfterPoll, 10) > 40, percentAfterPoll);
+  check('подробности меняются на ходу',
+    $('rag-progress-detail').textContent.indexOf('векторы') >= 0
+    || $('rag-progress-detail').textContent.indexOf('пишу индекс') >= 0,
+    $('rag-progress-detail').textContent);
+
+  // Завершение: база включается у проекта, в чате — отчёт, а полоса и строка
+  // загрузки убираются СРАЗУ: результат уже виден (база в списке, числа в чате),
+  // и оставленная «загрузка» выглядела как незаконченное действие (живое
+  // замечание: базы в списке есть, а информация о загрузке не исчезает).
+  await wait(3600);
+  check('по завершении полоса прогресса убрана', $('rag-progress').hidden === true,
+    'полоса hidden=' + $('rag-progress').hidden
+      + ', этап=' + $('rag-progress-stage').textContent);
+  check('по завершении кнопка «остановить» убрана', $('rag-progress-cancel').hidden === true);
+  check('по завершении строка загрузки очищена',
+    $('rag-upload-status').hidden === true, $('rag-upload-status').textContent);
+  check('по завершении база появилась в списке диалога',
+    q('#rag-list .rag-name').map(el => el.textContent).indexOf('Крупная база') >= 0,
+    q('#rag-list .rag-name').map(el => el.textContent).join('|'));
+  check('по завершении база включена у проекта', RAG.enabled.length > 0,
+    JSON.stringify(RAG.enabled));
+  check('после успеха поля загрузки очищены (имя и выбранные файлы)',
+    $('rag-name').value === '' && $('rag-file').value === '',
+    'имя=' + JSON.stringify($('rag-name').value));
+  check('в чате появился отчёт об индексации с числами',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('проиндексирована') >= 0
+      && el.textContent.indexOf('чанков') >= 0));
+  check('опрос остановлен — фоновых задач нет', RAG_JOBS.every(j => j.state !== 'running'));
+
+  // НЕСКОЛЬКО ФАЙЛОВ: идут по одному, каждый следующий ДОПИСЫВАЕТСЯ в базу.
+  const second = new dom.window.File(['П'.repeat(2048)], 'second.pdf',
+    { type: 'application/pdf' });
+  Object.defineProperty($('rag-file'), 'files',
+    { value: [bigFile, second], configurable: true });
+  $('rag-name').value = 'Два файла';
+  const basesBefore = RAG.bases.length;
+  const streamsBefore2 = RAG.streams.length;
+  const jobsBefore2 = RAG_JOBS.length;
+  await click($('rag-upload'), 200);
+  check('первый файл уходит сразу, второй ждёт в очереди',
+    RAG.streams.length === streamsBefore2 + 1
+    && $('rag-progress-queue').textContent.indexOf('1') >= 0,
+    RAG.streams.length - streamsBefore2 + ' / ' + $('rag-progress-queue').textContent);
+  await wait(6500);            // первый файл доиндексировался, ушёл второй
+  const paired = RAG.streams.slice(streamsBefore2);
+  check('оба файла ушли по одному: первый создаёт базу, второй дописывается',
+    paired.length === 2 && paired[0].baseId === '' && paired[1].baseId !== ''
+    && paired[1].baseId === RAG.bases[RAG.bases.length - 1].id,
+    JSON.stringify(paired.map(s => [s.filename, s.baseId])));
+  await wait(6500);            // второй файл тоже доиндексировался
+  check('два файла дали ОДНУ новую базу, а не две',
+    RAG.bases.length === basesBefore + 1,
+    'баз было ' + basesBefore + ', стало ' + RAG.bases.length);
+  check('оба файла доиндексировались в одну базу',
+    RAG_JOBS.length >= jobsBefore2 + 2
+    && RAG_JOBS.filter(job => job.state === 'done').length >= jobsBefore2 + 2,
+    JSON.stringify(RAG_JOBS.map(job => job.state)));
+  check('очередь опустела', $('rag-progress-queue').hidden === true,
+    $('rag-progress-queue').textContent);
+
+  // ОТМЕНА: остановка задачи, индекс не меняется.
+  Object.defineProperty($('rag-file'), 'files', { value: [bigFile], configurable: true });
+  $('rag-name').value = 'Отменяемая';
+  await click($('rag-upload'), 200);
+  check('задача снова идёт', RAG_JOBS.some(j => j.state === 'running'));
+  await click($('rag-progress-cancel'), 1200);
+  await wait(1800);
+  check('«остановить» отменяет задачу',
+    RAG_JOBS.filter(j => j.state === 'cancelled').length === 1,
+    JSON.stringify(RAG_JOBS.map(j => j.state)));
+  check('после отмены полоса говорит об остановке, а не о завершении',
+    $('rag-progress-stage').textContent.indexOf('остановлена') >= 0,
+    $('rag-progress-stage').textContent);
+  check('после отмены база НЕ включается и в чате нет отчёта об успехе',
+    !q('#messages .msg.bot').some(el =>
+      el.textContent.indexOf('Отменяемая') >= 0
+      && el.textContent.indexOf('проиндексирована') >= 0));
+
+  // Файл больше общего предела отклоняется ДО отправки, с числами в подсказке.
+  const huge = { name: 'huge.pdf', size: 999 * 1024 * 1024 };
+  Object.defineProperty($('rag-file'), 'files', { value: [huge], configurable: true });
+  const streamsBefore3 = RAG.streams.length;
+  await click($('rag-upload'), 120);
+  check('файл больше общего предела не отправляется вовсе',
+    RAG.streams.length === streamsBefore3
+    && $('rag-upload-status').textContent.indexOf('huge.pdf') >= 0
+    && $('rag-upload-status').textContent.indexOf('RAG_MAX_FILE_BYTES') >= 0,
+    $('rag-upload-status').textContent);
+
+  await click($('rag-close'), 40);
+  // СТРОКА СОСТОЯНИЯ — ПРО СПИСОК БАЗ, а не про настройку проекта: у баз
+  // стратегии могут быть РАЗНЫЕ, и подпись «стратегия: …» здесь читалась как
+  // свойство сразу всех баз (живое замечание: две базы с разными стратегиями).
+  const statusText = $('rag-status').textContent;
+  check('в строке состояния нет параметров разбиения (у баз они разные)',
+    statusText.indexOf('стратегия') < 0 && statusText.indexOf('перекрытие') < 0,
+    statusText);
+  check('в строке состояния есть счётчики баз, чанков, документов и объём',
+    statusText.indexOf('Баз:') >= 0 && statusText.indexOf('чанков') >= 0
+    && statusText.indexOf('документов') >= 0 && statusText.indexOf('объём') >= 0,
+    statusText);
+  check('стратегия каждой базы видна в ЕЁ строке, а не общим текстом',
+    q('#rag-list .rag-item').length > 0
+    && q('#rag-list .rag-item').every(item => item.textContent.indexOf('чанк') >= 0),
+    q('#rag-list .rag-item').map(item => item.textContent.slice(0, 50)).join(' | '));
+
+  // Чем считаются векторы и чем идёт поиск — это видно в диалоге (свойство
+  // машины: с numpy счёт близости в разы быстрее, без него — перебор).
+  check('в диалоге сказано, чем считаются эмбеддинги',
+    $('rag-embed-note').textContent.indexOf('sentence-transformers') >= 0
+    && $('rag-embed-note').textContent.indexOf('384') >= 0,
+    $('rag-embed-note').textContent);
+  check('в диалоге сказано, чем считается близость при поиске',
+    $('rag-embed-note').textContent.indexOf('Поиск по базе:') >= 0
+    && $('rag-embed-note').textContent.indexOf('numpy') >= 0,
+    $('rag-embed-note').textContent);
+
+  // УДАЛЕНИЕ базы: она уходит из списка, а в чате появляется строка об этом.
+  const basesBeforeDelete = RAG.bases.length;
+  await click(q('#rag-list .rag-delete')[0], 140);
+  check('кнопка 🗑 удаляет базу знаний',
+    RAG.bases.length === basesBeforeDelete - 1
+    && q('#rag-list .rag-item').length === RAG.bases.length,
+    'баз было ' + basesBeforeDelete + ', стало ' + RAG.bases.length);
+  check('в чате сказано об удалении базы',
+    q('#messages .msg.bot').some(el =>
+      el.textContent.indexOf('удалена вместе с индексом') >= 0));
+
+  // ЗАГРУЗКА БЕЗ ФАЙЛА: на сервер ничего не уходит, а пользователь видит причину.
+  Object.defineProperty($('rag-file'), 'files', { value: [], configurable: true });
+  const streamsBeforeEmpty = RAG.streams.length;
+  await click($('rag-upload'), 80);
+  check('загрузка без файла на сервер не уходит',
+    RAG.streams.length === streamsBeforeEmpty
+    && $('rag-upload-status').textContent.indexOf('Выберите') >= 0,
+    $('rag-upload-status').textContent);
+
+  // ПОСЛЕ ОТМЕНЫ имя базы ОСТАЁТСЯ в поле: загрузку логично повторить с тем же
+  // именем (а файл всё равно придётся выбрать заново — поле файла не восстановить).
+  check('после отмены имя базы остаётся в поле (повтор без набора заново)',
+    $('rag-name').value !== '',
+    JSON.stringify($('rag-name').value));
+
+  check('кнопка «закрыть» закрывает диалог баз знаний', $('rag-modal').hidden === true);
+
+  // Вне режима агента кнопка скрыта вместе с блоком проекта.
+  await click($('project-rag'), 60);
+  dom.window.eval('setAgentMode(false)');
+  await wait(60);
+  check('вне режима агента диалог баз знаний закрыт', $('rag-modal').hidden === true);
   dom.window.eval('setAgentMode(true)');
   await wait(40);
 

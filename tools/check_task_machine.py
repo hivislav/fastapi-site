@@ -407,6 +407,49 @@ def test_workspace():
     check("этап пережил запись/чтение", loaded_state["stage"] == "execution")
     check("история переходов пережила запись/чтение", len(loaded_state["history"]) >= 2)
 
+    # ПРЕДОХРАНИТЕЛЬ ОТ ПОТЕРИ ИСТОРИИ. Файл workspace — единственное место, где
+    # живут задачи и диалоги пользователя (не в git, копий нет), а запись может
+    # «похудеть» сразу в разы — например, если битый файл прочитан как пустой и
+    # пустое состояние тут же записано поверх. Резкое уменьшение обязано оставить
+    # копию прежнего состояния рядом.
+    guard_path = os.path.join(_TMP, "ws-guard.json")
+    fat = workspace_store.normalize_workspace({"tasks": [
+        {"id": "t-fat%d" % index, "name": "Проект %d" % index,
+         "sessions": [{"id": "s-fat%d" % index,
+                       # Формат реплики диалога — {"role", "content"}:
+                       # «text» здесь не сохраняется (см. _clean_messages).
+                       "dialog": {"messages": [{"role": "user",
+                                                "content": "длинная реплика " * 100}] * 30}}]}
+        for index in range(6)]})
+    workspace_store.save_workspace(fat, guard_path)
+    fat_size = os.path.getsize(guard_path)
+    if os.path.exists(guard_path + ".bak"):
+        os.unlink(guard_path + ".bak")
+    workspace_store.save_workspace(
+        workspace_store.normalize_workspace({"tasks": [{"id": "t-one", "name": "Одна"}]}),
+        guard_path)
+    check("резкое уменьшение записи сохраняет копию прежнего файла",
+          os.path.isfile(guard_path + ".bak")
+          and os.path.getsize(guard_path + ".bak") == fat_size,
+          "копия: %s" % os.path.isfile(guard_path + ".bak"))
+    recovered = workspace_store.load_workspace(guard_path + ".bak")
+    check("в копии лежит ПРЕЖНЕЕ состояние (задачи и их диалоги)",
+          len(recovered["tasks"]) == 6
+          and len(recovered["tasks"][0]["sessions"][0]["dialog"]["messages"]) == 30,
+          "задач в копии: %d" % len(recovered["tasks"]))
+    check("копия — валидный workspace (её можно просто вернуть на место)",
+          recovered["tasks"][0]["name"] == "Проект 0")
+    # Обычная правка копий не плодит: файл небольшой и меняется не в разы.
+    if os.path.exists(guard_path + ".bak"):
+        os.unlink(guard_path + ".bak")
+    workspace_store.save_workspace(
+        workspace_store.normalize_workspace({"tasks": [{"id": "t-one", "name": "Одна"},
+                                                       {"id": "t-two", "name": "Две"}]}),
+        guard_path)
+    check("небольшая правка копию не создаёт", not os.path.isfile(guard_path + ".bak"))
+    check("маленький файл копий не плодит (терять нечего)",
+          not os.path.isfile(os.path.join(_TMP, "ws-roundtrip.json") + ".bak"))
+
 
 # ---------------------------------------------------------------------------
 # 3. Контроллер и маршруты

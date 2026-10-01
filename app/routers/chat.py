@@ -25,16 +25,18 @@ chat.py (агент получает состояние готовым и пок
 """
 
 import asyncio
+import base64
 import contextlib
 import contextvars
 import json
 import logging
 import os
 import re
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.ai import attachments as attach_store
@@ -44,6 +46,10 @@ from app.ai import invariants as invariants_store
 from app.ai import mcp as mcp_store
 from app.ai import periodic as periodic_store
 from app.ai import profiles as profile_store
+from app.ai import rag
+from app.ai import rag_documents
+from app.ai import rag_jobs
+from app.ai import rag_store
 from app.ai import task_state
 from app.ai import workspace as workspace_store
 from app.ai.agent import (
@@ -52,12 +58,17 @@ from app.ai.agent import (
 from app.schemas import (
     ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
     McpApply, MemoryEntryCreate, NameUpdate, PeriodicUpdate, PlanUpdate, ProfileCreate,
-    ProfileFields, SessionCreate, TaskCreate,
+    ProfileFields, RagApply, RagJobDone, RagUpload, SessionCreate, TaskCreate,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
+
+# Каталог незавершённых ПОТОКОВЫХ загрузок внутри RAG_DIR. Имя намеренно не
+# похоже на идентификатор базы («kb-…»): список баз проверяет шаблон и этот
+# каталог просто не увидит, а мусор от оборванной загрузки не станет «базой».
+_INCOMING_DIR = ".incoming"
 
 # Рабочее пространство режима «AI-агент»: задачи с их сессиями-диалогами.
 # При старте процесса восстанавливается из JSON-файла (data/agent_workspace.json),
@@ -2620,6 +2631,368 @@ async def mcp_apply(payload: McpApply) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# RAG: базы знаний проекта (кнопка «RAG» рядом с «MCP»)
+#
+# Задача дня — ИНДЕКСАЦИЯ: пользователь загружает документы, они разбиваются на
+# чанки, считается эмбеддинг каждого чанка, и всё это ложится локальным индексом
+# (SQLite — рабочее, JSON — выгрузка) с метаданными. Сам RAG к агенту пока НЕ
+# подключён: включённая база ничего не добавляет в контекст модели — она просто
+# готова к этому (см. app/ai/rag.py, rag_store.search).
+# ---------------------------------------------------------------------------
+def _rag_view(task: Optional[Dict[str, Any]], force: bool = False) -> Dict[str, Any]:
+    """Снимок баз знаний для интерфейса (диалог «База знаний»).
+
+    Отдаёт базы ТЕКУЩЕГО профиля с метриками и галочками проекта, доступные
+    стратегии разбиения, состояние бэкенда эмбеддингов и хранилищ, пределы
+    размеров. Ни модели, ни сети здесь нет: список баз читается с диска, поэтому
+    диалог открывается мгновенно. `force` — кнопка «обновить»: перепроверить
+    доступность модели эмбеддингов (см. rag.snapshot).
+    """
+    profile = _current_profile_id()
+    settings = workspace_store.rag_settings(task) if task else {}
+    data = rag.snapshot(profile=profile,
+                        enabled_ids=workspace_store.rag_enabled(task),
+                        settings=settings, force=force)
+    data["project_id"] = (task or {}).get("id")
+    return data
+
+
+@router.get("/agent/rag")
+async def rag_get(force: int = 0) -> dict:
+    """Базы знаний профиля: метрики, галочки проекта, стратегии и пределы.
+
+    Снимок живёт в диалоге «База знаний» и в подписи кнопки: сколько баз
+    включено у проекта и сколько в них чанков. force=1 (кнопка «обновить»)
+    заставляет перепроверить доступность модели эмбеддингов — если она
+    появилась после запуска приложения, это видно без перезапуска.
+    """
+    return _rag_view(_current_task(), force=bool(force))
+
+
+@router.post("/agent/rag")
+async def rag_apply(payload: RagApply) -> dict:
+    """Применяет набор включённых баз знаний проекта и параметры разбиения.
+
+    Приходит ПОЛНЫЙ список галочек: база, которой в нём нет, выключается.
+    Несуществующие и ЧУЖИЕ (другого профиля) базы отбрасываются — включить то,
+    чего у профиля нет, нельзя. Обращений к модели нет: настройка — это данные.
+    """
+    task = _current_task()
+    if task is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Сначала создайте проект — базы знаний привязаны к проекту")
+    async with _workspace_lock:
+        enabled = rag.filter_enabled(payload.enabled, profile=_current_profile_id())
+        workspace_store.set_rag_enabled(task, enabled)
+        workspace_store.set_rag_chunking(task, payload.strategy,
+                                         payload.chunk_size, payload.overlap)
+        await _persist()
+    return _rag_view(task)
+
+
+@router.post("/agent/rag/upload")
+async def rag_upload(payload: RagUpload) -> dict:
+    """Загружает свою базу знаний: файлы → индекс (чанки + эмбеддинги + метаданные).
+
+    Индексация синхронная и может занять время (разбор PDF, работа модели), но
+    она НЕ держит блокировку workspace и идёт в отдельном потоке: цикл событий
+    остаётся свободным, и параллельные запросы других профилей не ждут.
+
+    Файл, который не прочитался (скан без текста, битый формат), НЕ роняет
+    загрузку — его причина попадает в метаданные базы и видна в диалоге; если не
+    прочитался ни один файл, приходит 400 с причинами.
+    """
+    profile = _current_profile_id()
+    if not payload.files:
+        raise HTTPException(status_code=400, detail="Не передан ни один файл")
+    files = _decode_upload_files(payload.files)
+
+    task = _current_task()
+    settings = workspace_store.rag_settings(task) if task else {}
+    try:
+        rag.ensure_capacity(profile=profile)
+    except rag.RagError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:                       # pragma: no cover - защита
+        logger.warning("RAG: проверка вместимости не удалась — %s", str(exc)[:150])
+    strategy = payload.strategy if payload.strategy is not None else settings.get("strategy")
+    chunk_size = payload.chunk_size if payload.chunk_size is not None else settings.get("chunk_size")
+    overlap = payload.overlap if payload.overlap is not None else settings.get("overlap")
+
+    try:
+        meta = await asyncio.to_thread(
+            rag.index_files, files, name=payload.name, profile=profile,
+            strategy=strategy, chunk_size=chunk_size, overlap=overlap)
+    except rag.RagError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("RAG: индексация не удалась")
+        raise HTTPException(status_code=500, detail="Индексация не удалась: %s" % str(exc)[:200])
+
+    # Новая база сразу включается у проекта (её для того и загружали) — и
+    # параметры разбиения запоминаются, чтобы следующая загрузка шла с ними.
+    if task is not None and payload.enabled:
+        async with _workspace_lock:
+            enabled = workspace_store.rag_enabled(task)
+            if meta["id"] not in enabled:
+                enabled.append(meta["id"])
+            workspace_store.set_rag_enabled(task, enabled)
+            workspace_store.set_rag_chunking(task, meta.get("strategy"),
+                                             meta.get("chunk_size"), meta.get("overlap"))
+            await _persist()
+    return {"base": rag.base_view(meta, enabled=bool(payload.enabled and task)),
+            "view": _rag_view(task)}
+
+
+@router.delete("/agent/rag/{base_id}")
+async def rag_delete(base_id: str) -> dict:
+    """Удаляет базу знаний вместе с её индексом (кнопка 🗑 в диалоге).
+
+    Удалить можно только СВОЮ базу: чужую профиль не видит вовсе, поэтому для
+    него её не существует (404). Из настроек проектов профиля база убирается
+    сразу — иначе в них осталась бы галочка несуществующей базы.
+    """
+    profile = _current_profile_id()
+    if not rag.delete_base(base_id, profile=profile):
+        raise HTTPException(status_code=404, detail="База знаний не найдена")
+    async with _workspace_lock:
+        for task in workspace_store.profile_tasks(_workspace, profile):
+            settings = workspace_store.rag_settings(task)
+            if base_id in settings.get("enabled", []):
+                workspace_store.set_rag_enabled(
+                    task, [item for item in settings["enabled"] if item != base_id])
+        await _persist()
+    return _rag_view(_current_task())
+
+
+@router.post("/agent/rag/upload/stream")
+async def rag_upload_stream(request: Request, filename: str = "", name: str = "",
+                            strategy: str = "", chunk_size: Optional[int] = None,
+                            overlap: Optional[int] = None, base_id: str = "",
+                            enabled: int = 1) -> dict:
+    """ПОТОКОВАЯ загрузка одного файла: тело запроса — сам файл, без base64.
+
+    Зачем отдельный маршрут: через base64 в JSON крупный файл проходит плохо.
+    На 250 МБ браузер собирает строку в сотни мегабайт, она же уезжает в теле
+    запроса, сервер разбирает её целиком — и всё это ради того, чтобы получить
+    те же байты. Здесь тело пишется на диск КУСКАМИ (`request.stream()`): ни
+    браузер, ни сервер не держат документ в памяти целиком, а разбор PDF потом
+    идёт постранично прямо из файла (см. rag_documents.extract_path).
+
+    `base_id` (необязательный) — ДОПИСАТЬ файл в существующую базу: так
+    интерфейс грузит несколько крупных файлов по одному, не заводя базу на
+    каждый. Параметры разбиения при добавлении берутся из паспорта базы.
+
+    Временный файл удаляется ВСЕГДА (в finally): незавершённая загрузка не
+    должна оставлять мусор в каталоге баз.
+    """
+    profile = _current_profile_id()
+    task = _current_task()
+    source = rag.sanitize_source(filename)
+    incoming = os.path.join(rag_store.directory(), _INCOMING_DIR)
+    try:
+        os.makedirs(incoming, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500,
+                            detail="Не удалось подготовить каталог загрузки: %s"
+                                   % str(exc)[:120])
+    handle, temp_path = tempfile.mkstemp(dir=incoming, suffix=".part")
+    size = 0
+    try:
+        with os.fdopen(handle, "wb") as target:
+            async for piece in request.stream():
+                size += len(piece)
+                if size > rag_documents.MAX_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Файл больше %s — такой документ не индексируется. "
+                               "Предел меняется переменной RAG_MAX_FILE_BYTES."
+                               % rag_documents.human_bytes(rag_documents.MAX_FILE_BYTES))
+                target.write(piece)
+        if not size:
+            raise HTTPException(status_code=400,
+                                detail="Файл «%s» передан пустым" % source)
+
+        settings = workspace_store.rag_settings(task) if task else {}
+        # ИНДЕКСАЦИЯ УХОДИТ В ФОН, а не выполняется прямо в этом запросе: у
+        # крупного документа это минуты, и держать на них HTTP-соединение нельзя
+        # (обрыв браузера или посредника убил бы работу, а пользователь всё это
+        # время не видел бы ничего, кроме «индексирую…»). Запрос отдаёт задачу,
+        # интерфейс опрашивает её состояние и рисует прогресс.
+        if not base_id:
+            rag.ensure_capacity(profile=profile)
+        try:
+            job = await rag_jobs.start(
+                profile=profile, files=[{"filename": source, "path": temp_path}],
+                name=name, strategy=strategy or settings.get("strategy"),
+                chunk_size=chunk_size if chunk_size is not None else settings.get("chunk_size"),
+                overlap=overlap if overlap is not None else settings.get("overlap"),
+                base_id=base_id)
+        except rag.RagError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.exception("RAG: не удалось завести задачу индексации")
+            raise HTTPException(status_code=500,
+                                detail="Индексация не запущена: %s" % str(exc)[:200])
+    except HTTPException:
+        # Задачу не завели — временный файл остаётся за нами.
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+    # Настройки проекта запоминаются СРАЗУ (они не зависят от исхода индексации),
+    # а включение новой базы произойдёт по завершении задачи: её id появляется
+    # только после записи индекса.
+    if task is not None and enabled:
+        async with _workspace_lock:
+            workspace_store.set_rag_chunking(task, strategy or settings.get("strategy"),
+                                             chunk_size, overlap)
+            await _persist()
+    return {"job": job, "view": _rag_view(task)}
+
+
+@router.get("/agent/rag/jobs")
+async def rag_jobs_list(active: int = 0) -> dict:
+    """Состояние фоновых индексаций: что идёт, как далеко, чем закончилось.
+
+    Опрос раз в секунду — этим живёт полоса прогресса в диалоге. active=1 отдаёт
+    только идущие задачи (интерфейсу в опросе нужны они одни).
+    """
+    profile = _current_profile_id()
+    return {"jobs": rag_jobs.listing(profile=profile, active_only=bool(active)),
+            "active": rag_jobs.active_count(),
+            "summary": rag_jobs.summary(profile=profile)}
+
+
+@router.get("/agent/rag/jobs/{job_id}")
+async def rag_job_get(job_id: str) -> dict:
+    """Одна задача индексации (чужая или неизвестная — 404)."""
+    job = rag_jobs.get(job_id, profile=_current_profile_id())
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача индексации не найдена")
+    return {"job": job}
+
+
+@router.post("/agent/rag/jobs/{job_id}/cancel")
+async def rag_job_cancel(job_id: str) -> dict:
+    """Просит остановить индексацию.
+
+    Остановка происходит между страницами и батчами (работник проверяет флаг в
+    отчёте о ходе), и до записи индекса она безопасна: прежний индекс остаётся
+    целым, а временный файл удаляется самой задачей.
+    """
+    job = rag_jobs.cancel(job_id, profile=_current_profile_id())
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача индексации не найдена")
+    return {"job": job}
+
+
+@router.post("/agent/rag/jobs/finish")
+async def rag_job_finish(payload: RagJobDone) -> dict:
+    """Применяет ИТОГ завершённой индексации к настройкам проекта.
+
+    Новая база включается у проекта ТОЛЬКО здесь: её идентификатор появляется
+    после записи индекса, и раньше включать было нечего. Интерфейс зовёт маршрут
+    один раз, когда опрос показал завершение, — тогда включение не может
+    потеряться, даже если пользователь закрыл диалог.
+    """
+    job = rag_jobs.get(payload.job_id, profile=_current_profile_id())
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача индексации не найдена")
+    task = _current_task()
+    if task is None or job["state"] != "done" or not job["base_id"]:
+        return {"applied": False, "view": _rag_view(task)}
+    async with _workspace_lock:
+        ids = workspace_store.rag_enabled(task)
+        if payload.enabled and job["base_id"] not in ids:
+            ids.append(job["base_id"])
+            workspace_store.set_rag_enabled(task, ids)
+        result = (job.get("result") or {})
+        workspace_store.set_rag_chunking(task, None,
+                                         result.get("chunk_size"), result.get("overlap"))
+        await _persist()
+    return {"applied": True, "base_id": job["base_id"], "view": _rag_view(task)}
+
+
+@router.get("/agent/rag/{base_id}/chunks")
+async def rag_chunks(base_id: str, offset: int = 0, limit: int = 10,
+                     source: str = "", q: str = "") -> dict:
+    """Страница чанков базы: посмотреть своими глазами, как нарезан документ.
+
+    Отдаёт текст чанков с их адресом (источник, раздел, номер, границы в
+    документе) и общее число под фильтром. Фильтры: по документу (`source`) и
+    по тексту (`q`). Постранично — база на 20 000 чанков в диалог не поместится.
+
+    Чужую базу профиль не видит (404): просмотр — такая же работа с базой, как
+    и удаление.
+    """
+    if not rag_store.valid_id(base_id):
+        raise HTTPException(status_code=404, detail="База знаний не найдена")
+    try:
+        return rag.chunks_view(base_id, profile=_current_profile_id(),
+                               offset=offset, limit=limit, source=source, query=q)
+    except rag.RagError:
+        raise HTTPException(status_code=404, detail="База знаний не найдена")
+
+
+def _too_big_detail(name: str, size: int, limit: int) -> str:
+    """Понятный отказ по размеру: сколько весит, каков предел и что делать.
+
+    «Размер превышен» без чисел и без выхода из положения бесполезен: у
+    пользователя остаётся только догадываться, где предел и можно ли его
+    поднять. Поэтому в отказе — ФАКТИЧЕСКИЙ вес файла, предел, имя переменной
+    окружения и подсказка про потоковую загрузку.
+    """
+    return ("Файл «%s» весит %s — это больше предела %s. Предел поднимается "
+            "переменной %s; крупные файлы интерфейс отправляет потоком "
+            "(до %s), поэтому обычно достаточно выбрать файл заново."
+            % (name, rag_documents.human_bytes(size), rag_documents.human_bytes(limit),
+               "RAG_MAX_JSON_FILE_BYTES", rag_documents.human_bytes(
+                   rag_documents.MAX_FILE_BYTES)))
+
+
+def _decode_upload_files(items: List[Any]) -> List[Dict[str, Any]]:
+    """Разбирает загруженные файлы: base64 → байты с проверкой размера.
+
+    Предел здесь свой и МЕНЬШИЙ, чем у потоковой загрузки (`MAX_JSON_FILE_BYTES`):
+    этот путь держит файл в памяти ТРИЖДЫ — тело запроса, строка base64 и
+    декодированные байты, — поэтому большие документы идут потоком
+    (`/agent/rag/upload/stream`), а тут остаются небольшие файлы.
+
+    Размер проверяется ДО декодирования (по длине base64): принимать в память
+    десятки мегабайт, чтобы потом отказать, незачем. Ошибка формата у одного
+    файла не отменяет остальные — как и ошибка разбора на сервере.
+    """
+    limit = rag_documents.MAX_JSON_FILE_BYTES
+    files: List[Dict[str, Any]] = []
+    for item in items:
+        name = rag.sanitize_source(getattr(item, "filename", ""))
+        raw = str(getattr(item, "content_base64", "") or "").strip()
+        if not raw:
+            raise HTTPException(status_code=400,
+                                detail="Файл «%s» передан без содержимого" % name)
+        # Оценка размера до декодирования: 4 символа base64 ≈ 3 байта.
+        estimated = len(raw) // 4 * 3
+        if estimated > limit:
+            raise HTTPException(status_code=400,
+                                detail=_too_big_detail(name, estimated, limit))
+        try:
+            data = base64.b64decode(raw, validate=False)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400,
+                                detail="Содержимое файла «%s» не разобрано: %s"
+                                       % (name, str(exc)[:120]))
+        if len(data) > limit:
+            raise HTTPException(status_code=400,
+                                detail=_too_big_detail(name, len(data), limit))
+        files.append({"filename": name, "data": data})
+    return files
+
+
+# ---------------------------------------------------------------------------
 # Профиль пользователя: сведения о юзере уходят в системный промпт сессии
 # ---------------------------------------------------------------------------
 def _profile_fields(payload: ProfileFields) -> Dict[str, Any]:
@@ -2701,7 +3074,8 @@ async def profile_delete(profile_id: str) -> dict:
     Если удалён текущий профиль, текущим становится соседний; когда профилей не
     осталось, создаётся новый пустой с идентификатором «user_<цифры>» — чтобы
     диалог в режиме агента всегда был с профилем. Данные профиля удаляются ВМЕСТЕ
-    с ним: его задачи со всеми диалогами, рабочая и долговременная память.
+    с ним: его задачи со всеми диалогами, рабочая и долговременная память, а
+    также его БАЗЫ ЗНАНИЙ (индексы RAG на диске).
     """
     async with _workspace_lock:
         if not profile_store.delete_profile(_profiles, profile_id):
@@ -2714,6 +3088,12 @@ async def profile_delete(profile_id: str) -> dict:
         for task in workspace_store.profile_tasks(_workspace, profile_id):
             for session in list(task.get("sessions", [])):
                 await _stop_mcp_started(session, "профиль удалён")
+        # БАЗЫ ЗНАНИЙ профиля удаляются вместе с ним: после удаления профиля они
+        # не видны никому (список читается по владельцу), то есть остались бы
+        # навсегда лежать на диске мусором, который нельзя удалить через
+        # интерфейс, — а «удаление профиля» и означает «удаление его данных».
+        for meta in rag_store.list_bases(profile=profile_id, with_meta=False):
+            rag.delete_base(meta.get("id"), profile=profile_id)
         # Данные профиля уходят вместе с ним: его задачи с диалогами, рабочая и
         # долговременная память. Иначе в файле оставался бы мусор, который уже
         # никому не виден и не удаляется через интерфейс.
