@@ -342,7 +342,16 @@ let RAG = {
   uploads: [],
   streams: [],
   settings: { strategy: 'structure', chunk_size: 1000, overlap: 150 },
+  // Настройки ПОИСКА для ответов (app/ai/rag_search.py): по ним строка состояния
+  // диалога говорит, что базы подключены к ответам, а не просто лежат списком.
+  search: { top_k: 5, max_hits: 12, min_score: 0.1, block_chars: 12000,
+            chunk_chars: 2200 },
 };
+
+// Источники под ответом агента (RAG): что сервер передаёт вместе с ответом
+// последнего шага (событие bot с полем sources). Проверка подставляет их в
+// заглушку потока и смотрит, что интерфейс рисует карточки.
+let RAG_SOURCES = null;
 
 // Чанки базы для проверки просмотра: 25 штук с разными документами и текстом,
 // чтобы работали и страницы, и фильтр по документу, и поиск по тексту.
@@ -514,6 +523,7 @@ function ragPayload() {
     },
     strategies: RAG_STRATEGIES,
     settings: Object.assign({}, RAG.settings),
+    search: Object.assign({}, RAG.search),
     defaults: { strategy: 'structure', chunk_size: 1000, overlap: 150 },
     limits: {
       chunk_size: { min: 100, max: 8000 }, overlap: { min: 0, max: 4000 },
@@ -551,6 +561,7 @@ const PERIODIC_LABELS = {
   '3600': 'раз в час', '10800': 'каждые 3 часа', '21600': 'каждые 6 часов',
   '43200': 'каждые 12 часов', '86400': 'раз в сутки', '604800': 'раз в неделю',
 };
+const ragTests = [];          // тела POST /api/agent/rag/test
 const periodicBodies = [];    // тела POST /api/agent/sessions
 const periodicUpdates = [];   // тела POST /api/agent/periodic/{id}
 
@@ -672,8 +683,12 @@ async function runStep() {
   const sessionId = requestSession || workspace.active_session;
   // Текст «итог задачи» — только у ОБЫЧНОЙ задачи: периодическая не завершается.
   const finalStep = last && !CHECK_BLOCKED && !periodicSession;
+  // Источники (RAG) приходят с ответом ПОСЛЕДНЕГО шага — как на сервере, где
+  // они висят на событии bot и попадают в журнал вместе с ним.
+  const stepSources = finalStep && RAG_SOURCES ? RAG_SOURCES : null;
   logs[sessionId] = (logs[sessionId] || []).concat([
-    { kind: 'assistant', text: finalStep ? 'Шаг выполнен: итог задачи.' : 'Шаг выполнен.' },
+    { kind: 'assistant', text: finalStep ? 'Шаг выполнен: итог задачи.' : 'Шаг выполнен.',
+      sources: stepSources },
   ]);  const blockedEvent = CHECK_BLOCKED && last ? {
     type: 'error',
     text: '⚠️ Проверку результата выполнить не удалось: модель не ответила. Задачу '
@@ -682,7 +697,8 @@ async function runStep() {
   } : null;
   return streamResponse([
     { type: 'state', state: snapshot() },
-    { type: 'bot', text: finalStep ? 'Задача выполнена.' : 'Шаг выполнен.' },
+    { type: 'bot', text: finalStep ? 'Задача выполнена.' : 'Шаг выполнен.',
+      sources: stepSources },
     { type: 'state', state: snapshot() },
     // Уточнённый замер: автомат сделал служебный вызов (проверка результата) —
     // фронт обязан ЗАМЕНИТЬ замер запроса, а не добавить второй.
@@ -787,6 +803,23 @@ function makeFetch() {
         MCP.enabled = (body.enabled || []).filter(id => known.indexOf(id) >= 0);
       }
       return jsonResponse(mcpPayload());
+    }
+    if (url === '/api/agent/rag/test') {
+      // Заглушка контрольного прогона RAG: сервер отвечает потоком тех же
+      // событий, что и в жизни (см. app/routers/chat.py, rag_test).
+      ragTests.push(body || {});
+      return streamResponse([
+        { type: 'test_start', total: 2, bases: ['Инструкции оператора'] },
+        { type: 'test_question', n: 1, total: 2, text: 'Кто автор статьи про Найт-Сити?' },
+        { type: 'debug', text: '1. Найдено фрагментов: 2; лучший — guide.md · чанк № 1081' },
+        { type: 'bot', text: 'Автор — **Исида Бес** (guide.md, чанк № 1081).', test: 1 },
+        { type: 'test_question', n: 2, total: 2, text: 'Что даёт антибиотик?' },
+        { type: 'bot', text: 'Бонус к спас-броску против заражения.', test: 2 },
+        { type: 'test_error', n: 0, text: '⚠ Вопрос 3 остался без ответа: таймаут' },
+        { type: 'test_verdict', text: '🧪 Оценка ответов\nВерных ответов: 1 из 2.\n1. ✅ верно',
+          items: [{ n: 1, ok: true, comment: 'сходится' }], summary: 'почти всё верно' },
+        { type: 'done', usage: { calls: 3, prompt_tokens: 100, completion_tokens: 20 } },
+      ]);
     }
     if (url.indexOf('/api/agent/rag') === 0) {
       if (url === '/api/agent/rag/upload' && method === 'POST') {
@@ -2869,6 +2902,114 @@ async function run() {
 
   check('кнопка «закрыть» закрывает диалог баз знаний', $('rag-modal').hidden === true);
 
+  // ---------------------------------------------------------------------
+  // [S2] RAG В ОТВЕТЕ: источники под ответом агента и строка «поиск включён».
+  //      Базы включены — значит документы идут в ответ, и это должно быть
+  //      ВИДНО: карточки «файл · раздел · близость» под ответом ПОСЛЕДНЕГО шага
+  //      (и после перечитывания диалога — они лежат в журнале задачи).
+  // ---------------------------------------------------------------------
+  console.log('\n[S2] RAG в ответе: источники под ответом и строка «поиск включён»');
+  RAG.enabled = [RAG.bases[0].id];
+  RAG_SOURCES = [
+    { base: 'Инструкции оператора', source: 'guide.md', number: 1081,
+      section: 'Глава 2 › Резервное копирование', score: 1.16,
+      vector_score: 0.33, lexical: 0.82, chars: 420,
+      snippet: 'Резервное копирование выполняется командой backup.sh.' },
+    { base: 'Регламенты', source: 'rules.docx', number: 42, section: '',
+      score: 0.31, vector_score: 0.31, lexical: 0, chars: 500,
+      snippet: 'Копии хранятся тридцать дней.' },
+    // СОСЕДНИЙ фрагмент (продолжение таблицы, разрезанной границей чанка):
+    // приходит без оценки — подписывается как продолжение, а не релевантностью.
+    { base: 'Регламенты', source: 'rules.docx', number: 43, section: '',
+      score: 0, vector_score: 0, lexical: 0, chars: 500, neighbour: true,
+      parent_chunk: 42, snippet: 'Остальные строки той же таблицы.' },
+  ];
+  PLAN = ['Один шаг: ответить по документам'];
+  STEP_DELAY = 5;
+  await sendRequest('Как делается резервное копирование?');
+  await click($('tm-confirm'), 60);
+  for (let i = 0; i < 60 && state.stage !== 'done'; i++) await wait(20);
+  const srcBox = q('#messages .rag-sources');
+  check('под ответом появился ОДИН блок источников', srcBox.length === 1,
+    'блоков: ' + srcBox.length);
+  check('источники — одно сообщение со списком, а не отдельные блоки',
+    !!srcBox[0] && srcBox[0].querySelectorAll('.rag-sources-head').length === 1
+      && srcBox[0].querySelectorAll('.rag-sources-body').length === 1,
+    srcBox[0] ? srcBox[0].innerHTML.slice(0, 120) : '(нет блока)');
+  const srcCards = q('#messages .rag-source');
+  check('в списке столько строк, сколько фрагментов передано модели',
+    srcCards.length === RAG_SOURCES.length, 'строк: ' + srcCards.length);
+  check('у строки есть имя файла и адрес раздела',
+    !!srcCards[0]
+      && srcCards[0].querySelector('.rag-source-name').textContent.indexOf('guide.md') >= 0
+      && srcCards[0].querySelector('.rag-source-meta').textContent
+        .indexOf('Резервное копирование') >= 0,
+    srcCards[0] ? srcCards[0].textContent : '(нет строки)');
+  check('в строке виден НОМЕР чанка (как в окне «чанки» базы)',
+    !!srcCards[0] && srcCards[0].querySelector('.rag-source-name').textContent
+      .indexOf('№ 1') >= 0
+      && srcCards[0].querySelector('.rag-source-name').textContent.indexOf('081') >= 0,
+    srcCards[0] ? srcCards[0].querySelector('.rag-source-name').textContent : '');
+  check('строки пронумерованы по порядку',
+    srcCards.length > 1 && srcCards[1].querySelector('.rag-source-num').textContent === '2.',
+    srcCards[1] ? srcCards[1].querySelector('.rag-source-num').textContent : '');
+  check('соседний фрагмент подписан как продолжение, а не релевантностью',
+    srcCards.length > 2
+    && srcCards[2].querySelector('.rag-source-meta').textContent
+      .indexOf('продолжение фрагмента № 42') >= 0
+    && srcCards[2].querySelector('.rag-source-meta').textContent
+      .indexOf('релевантность') < 0,
+    srcCards[2] ? srcCards[2].querySelector('.rag-source-meta').textContent : '');
+  check('в подписи строки видна релевантность фрагмента запросу',
+    !!srcCards[0] && srcCards[0].querySelector('.rag-source-meta').textContent
+      .indexOf('релевантность 1.16') >= 0,
+    srcCards[0] ? srcCards[0].querySelector('.rag-source-meta').textContent : '');
+  check('в подсказке строки — отрывок фрагмента',
+    !!srcCards[0] && srcCards[0].title.indexOf('backup.sh') >= 0,
+    srcCards[0] ? srcCards[0].title : '');
+  check('в подсказке видно, из чего сложилась оценка (вектор + текст)',
+    !!srcCards[0] && srcCards[0].title.indexOf('вектор 0.33') >= 0
+      && srcCards[0].title.indexOf('текст 0.82') >= 0,
+    srcCards[0] ? srcCards[0].title : '');
+  check('подпись блока честная: «подобраны по запросу», а не «использованы в ответе»',
+    !!srcBox[0] && srcBox[0].querySelector('.rag-sources-head').textContent
+      .indexOf('подобранные по этому запросу') >= 0,
+    srcBox[0] ? srcBox[0].querySelector('.rag-sources-head').textContent : '');
+  check('под служебными строками источников нет',
+    q('#messages .msg.debug .rag-sources').length === 0);
+  // ИСТОЧНИКИ ЖИВУТ В ЖУРНАЛЕ: после перечитывания диалога карточки на месте.
+  await dom.window.eval('loadActiveDialog()');
+  await wait(80);
+  check('после перечитывания диалога источники восстанавливаются из журнала',
+    q('#messages .rag-source').length === RAG_SOURCES.length,
+    'строк: ' + q('#messages .rag-source').length);
+  // Ответ БЕЗ источников (базы выключены) рисуется как обычно — блока нет.
+  RAG_SOURCES = null;
+  await sendRequest('Ответ без документов');
+  await click($('tm-confirm'), 60);
+  for (let i = 0; i < 60 && state.stage !== 'done'; i++) await wait(20);
+  check('без источников нового блока под ответом не появляется',
+    q('#messages .rag-sources').length === 1,
+    'блоков: ' + q('#messages .rag-sources').length);
+
+  // СТРОКА СОСТОЯНИЯ ДИАЛОГА: с включённой базой она говорит, что поиск идёт в
+  // ответы (сколько фрагментов и с какой близостью), а без баз — что базу можно
+  // включить галочкой. Иначе «включено: 1» ничего не сообщает о подключении.
+  await click($('project-rag'), 60);
+  await wait(60);
+  check('строка состояния говорит, что поиск подключён к ответам',
+    $('rag-status').textContent.indexOf('Поиск включён') >= 0
+      && $('rag-status').textContent.indexOf('12') >= 0
+      && $('rag-status').textContent.indexOf('0,10') >= 0,
+    $('rag-status').textContent);
+  RAG.enabled = [];
+  await dom.window.eval('loadRag(false)');
+  await wait(60);
+  check('без включённых баз строка подсказывает включить базу галочкой',
+    $('rag-status').textContent.indexOf('Включите базу галочкой') >= 0,
+    $('rag-status').textContent);
+  await click($('rag-close'), 40);
+
   // Вне режима агента кнопка скрыта вместе с блоком проекта.
   await click($('project-rag'), 60);
   dom.window.eval('setAgentMode(false)');
@@ -3163,6 +3304,134 @@ async function run() {
     oldMsg ? oldMsg.textContent : '(нет реплики)');
   check('вместо времени не появляется «NaN»',
     !dom.window.document.getElementById('messages').textContent.includes('NaN'));
+
+  // ---------------------------------------------------------------------
+  // [U] РАЗМЕТКА ОТВЕТА: модель пишет выделения звёздочками («погибли **три
+  //     человека**»), и пользователь читал их символами. Разметка собирается
+  //     УЗЛАМИ (никакого innerHTML с текстом модели) и только для двух случаев:
+  //     «**жирный**» → <strong> и «* пункт» в начале строки → «• пункт».
+  // ---------------------------------------------------------------------
+  console.log('\n[U] Разметка ответа: жирный вместо звёздочек');
+  const markdown = 'Слава, по вашему вопросу: погибли **три человека**, в том числе '
+    + 'владелец станции **Марк Спрингфилд**.\n'
+    + '* первый пункт списка\n'
+    + '  * вложенный пункт\n'
+    + 'если 1 < 2 и <b>не тег</b> — как есть';
+  dom.window.eval('pushAgentNode("assistant", ' + JSON.stringify(markdown) + ')');
+  await wait(40);
+  const richNode = q('#messages .msg.bot').slice(-1)[0];
+  const bolds = richNode ? Array.from(richNode.querySelectorAll('strong')) : [];
+  check('выделение модели рисуется жирным, а не звёздочками',
+    bolds.length === 2 && richNode.textContent.indexOf('**') < 0,
+    richNode ? richNode.textContent.slice(0, 90) : '(нет ответа)');
+  check('жирным стало именно выделенное (текст внутри сохранён)',
+    bolds.map(el => el.textContent).join('|') === 'три человека|Марк Спрингфилд',
+    bolds.map(el => el.textContent).join('|'));
+  check('звёздочка-маркер списка превращается в точку',
+    richNode.textContent.indexOf('• первый пункт') >= 0
+    && richNode.textContent.indexOf('• вложенный пункт') >= 0,
+    richNode.textContent.slice(0, 120));
+  check('угловые скобки и теги в ответе остаются ТЕКСТОМ (разметку не подставляем)',
+    richNode.querySelectorAll('b').length === 0
+    && richNode.textContent.indexOf('<b>не тег</b>') >= 0,
+    richNode.textContent.slice(-40));
+  check('переводы строк в ответе сохранены (bubble рисуется pre-wrap)',
+    richNode.textContent.split('\n').length === 4,
+    JSON.stringify(richNode.textContent.split('\n').length));
+  check('одиночная звёздочка в тексте не съедается',
+    (function () {
+      dom.window.eval('pushAgentNode("assistant", "2 * 3 = 6 и *не курсив*")');
+      const node = q('#messages .msg.bot').slice(-1)[0];
+      // Сравниваем ПУЗЫРЬ, а не узел целиком: в узле ещё время и кнопки памяти.
+      return node.querySelector('.bubble').textContent === '2 * 3 = 6 и *не курсив*';
+    })(),
+    q('#messages .msg.bot').slice(-1)[0].querySelector('.bubble').textContent);
+  // ВОССТАНОВЛЕНИЕ ИЗ ЖУРНАЛА: тот же текст приходит с сервера — разметка та же.
+  const markSession = workspace.active_session;
+  logs[markSession] = [{ kind: 'assistant', text: 'Итог: **два слова**\n* пункт' }];
+  await dom.window.eval('loadActiveDialog()');
+  await wait(80);
+  const restored = q('#messages .msg.bot').slice(-1)[0];
+  const restoredText = restored ? restored.querySelector('.bubble').textContent : '';
+  check('в восстановленном из журнала ответе разметка тоже рисуется',
+    !!restored && restored.querySelectorAll('strong').length === 1
+    && restoredText.indexOf('**') < 0
+    && restoredText.indexOf('• пункт') >= 0,
+    restoredText || '(нет ответа)');
+
+  // ---------------------------------------------------------------------
+  // [V] КОМАНДА /test_rag: контрольный прогон вопросов по базам знаний.
+  //     Идёт МИМО пайплайна задачи (свой маршрут, без плана и подтверждения):
+  //     в чате по очереди видны вопрос, ответ модели и в конце — оценка судьи.
+  // ---------------------------------------------------------------------
+  console.log('\n[V] Команда /test_rag: вопросы, ответы и оценка');
+  const suiteChatCalls = chatCalls();
+  const suiteStepCalls = stepCalls();
+  RAG_SOURCES = null;
+  await sendRequest('/test_rag', 80);
+  await wait(120);
+  check('команда ушла в СВОЙ маршрут, а не в чат агента',
+    ragTests.length === 1 && chatCalls() === suiteChatCalls,
+    'тестов: ' + ragTests.length + ', вызовов чата: ' + (chatCalls() - suiteChatCalls));
+  check('команда не запустила шаги плана задачи', stepCalls() === suiteStepCalls,
+    'шагов: ' + (stepCalls() - suiteStepCalls));
+  const testNodes = q('#messages .msg.test');
+  check('вопросы теста нарисованы отдельными узлами (не репликами пользователя)',
+    testNodes.length === 2
+    && testNodes[0].textContent.indexOf('Кто автор статьи') >= 0
+    && testNodes[0].textContent.indexOf('1/2') >= 0,
+    testNodes.length ? testNodes[0].textContent.slice(0, 70) : '(нет узлов)');
+  check('у вопроса теста нет кнопок памяти (это не реплика переписки)',
+    !!testNodes[0] && testNodes[0].querySelectorAll('.mem-btn').length === 0,
+    testNodes[0] ? String(testNodes[0].querySelectorAll('.mem-btn').length) : '');
+  check('реплик пользователя команда не добавила',
+    !q('#messages .msg.user').some(el => el.textContent.indexOf('/test_rag') >= 0));
+  const testAnswers = q('#messages .msg.bot').filter(
+    el => el.textContent.indexOf('Исида Бес') >= 0
+      || el.textContent.indexOf('спас-броску') >= 0);
+  check('ответы модели нарисованы под вопросами', testAnswers.length === 2,
+    'ответов: ' + testAnswers.length);
+  check('разметка ответа теста тоже разбирается (жирный вместо звёздочек)',
+    !!testAnswers[0] && testAnswers[0].querySelectorAll('strong').length === 1
+    && testAnswers[0].textContent.indexOf('**') < 0,
+    testAnswers[0] ? testAnswers[0].textContent.slice(0, 60) : '');
+  check('вопрос без ответа показан предупреждением, а не пустым ответом',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('остался без ответа') >= 0));
+  const verdict = q('#messages .msg.bot').filter(
+    el => el.textContent.indexOf('Оценка ответов') >= 0);
+  check('в конце пришла оценка ответов', verdict.length === 1,
+    'оценок: ' + verdict.length);
+  check('в оценке видно «верных ответов» и разметка по вопросам',
+    !!verdict[0] && verdict[0].textContent.indexOf('Верных ответов: 1 из 2') >= 0
+    && verdict[0].textContent.indexOf('✅ верно') >= 0,
+    verdict[0] ? verdict[0].textContent.slice(0, 80) : '');
+  check('после прогона поле ввода свободно', $('input').disabled === false);
+  // ВОССТАНОВЛЕНИЕ: вопросы и ответы теста лежат в журнале задачи, поэтому после
+  // перечитывания диалога видны заново (вопросы — как служебные реплики с 🧪).
+  const suiteSession = workspace.active_session;
+  logs[suiteSession] = [
+    { kind: 'user', text: '🧪 Вопрос 1/2: Кто автор статьи про Найт-Сити?' },
+    { kind: 'assistant', text: 'Автор — **Исида Бес** (guide.md, чанк № 1081).' },
+  ];
+  await dom.window.eval('loadActiveDialog()');
+  await wait(80);
+  // КОМАНДА РАБОТАЕТ В ЛЮБОМ РЕЖИМЕ: это тестовый прогон, а не запрос к модели,
+  // поэтому переключение режима её не отключает (проект нужен — базы у проекта).
+  dom.window.eval('setAgentMode(false)');
+  await wait(40);
+  const chatCallsPlain = chatCalls();
+  const testsPlain = ragTests.length;
+  await sendRequest('/test_rag', 80);
+  await wait(80);
+  check('команда работает и вне режима агента (идёт в свой маршрут)',
+    ragTests.length === testsPlain + 1 && chatCalls() === chatCallsPlain,
+    'тестов: ' + (ragTests.length - testsPlain));
+  dom.window.eval('setAgentMode(true)');
+  await wait(40);
+  check('после перечитывания диалога вопросы и ответы теста на месте',
+    q('#messages .msg.user').some(el => el.textContent.indexOf('🧪 Вопрос 1/2') >= 0)
+    && q('#messages .msg.bot').some(el => el.querySelectorAll('strong').length === 1),
+    JSON.stringify(q('#messages .msg.bot').map(el => el.textContent.slice(0, 24))));
 
   console.log('\n[T] Тарифы и стоимость в интерфейсе');
   // Стоимость вызова у официального DeepSeek — тысячные доли рубля, поэтому

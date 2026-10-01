@@ -818,6 +818,16 @@
            их положение и размер не зависят от длины сообщения. */
         .msg { display: flex; flex-wrap: wrap; }
         .msg.user { justify-content: flex-end; }
+        /* Вопрос контрольного прогона RAG (/test_rag): не реплика пользователя и
+           не ответ агента — отдельная рамка, чтобы не путать с перепиской. */
+        .msg.test { justify-content: flex-start; }
+        .msg.test .bubble {
+            background: var(--surface-2);
+            border: 1px dashed var(--accent);
+            color: var(--accent);
+            border-bottom-left-radius: 4px;
+            font-weight: 600;
+        }
         .msg.bot { justify-content: flex-start; }
         .bubble {
             max-width: 70%;
@@ -835,6 +845,10 @@
             box-shadow: 0 0 18px rgba(0, 255, 157, 0.08);
             border-bottom-right-radius: 4px;
         }
+        /* Разметка внутри ответа (см. renderMessageText): жирный — акцентом темы, а
+           не жирной гарнитурой по умолчанию, и маркер списка вместо звёздочки. */
+        .bubble strong { color: var(--accent-2); font-weight: 700; }
+        .bubble .msg-bullet { color: var(--accent-2); }
         .msg.bot .bubble {
             background: var(--surface-3);
             border: 1px solid var(--line-soft);
@@ -1040,6 +1054,36 @@
         .file-card-name { color: var(--accent); font-weight: 600; word-break: break-all; }
         .file-card-meta { color: var(--muted); font-size: 0.82rem; }
         .file-card-action { white-space: nowrap; font-weight: 600; color: var(--accent); }
+        /* ИСТОЧНИКИ из баз знаний (RAG): под ОТВЕТОМ агента — какие фрагменты
+           документов подобраны по запросу и переданы модели. Это ОДНО сообщение
+           со списком, а не отдельные карточки: фрагментов бывает десять, и десять
+           блоков под ответом читались как десять разных сообщений. Наведение на
+           строку показывает отрывок и из чего сложилась оценка. */
+        .rag-sources {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            margin-top: 10px;
+            padding-top: 8px;
+            border-top: 1px dashed var(--line-soft);
+            font-size: 0.85rem;
+            line-height: 1.5;
+        }
+        .rag-sources-head {
+            color: var(--muted);
+            font-size: 0.82rem;
+        }
+        .rag-sources-body { display: flex; flex-direction: column; gap: 2px; }
+        .rag-source {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 6px;
+            padding: 1px 0;
+        }
+        .rag-source-num { color: var(--muted); font-family: var(--mono); min-width: 18px; }
+        .rag-source-name { color: var(--accent-2); font-weight: 600; word-break: break-all; }
+        .rag-source-meta { color: var(--muted); font-size: 0.8rem; }
         .inv-option {
             display: block;
             width: 100%;
@@ -2275,8 +2319,13 @@
                         режется на чанки, каждый чанк получает вектор (эмбеддинг) и
                         метаданные: источник, заголовок, раздел и номер чанка. Индекс
                         лежит ЛОКАЛЬНО, в проекте, и никуда не отправляется.
-                        Галочка включает базу у этого проекта. Сейчас настраивается
-                        только индексация — в ответы агента базы пока не подмешиваются.</p>
+                        Галочка включает базу у этого проекта: перед каждым запросом
+                        агент ищет в ней фрагменты по вопросу и отвечает по ним —
+                        под ответом видны источники. Документы не смешиваются с
+                        перепиской: они уходят в модель только на время запроса.
+                        <b>Проверка:</b> введите в чат команду <b>/test_rag</b> —
+                        прогон контрольных вопросов по включённым базам; ответы
+                        сверяются эталонами, выписанными из самой базы.</p>
                     <div class="rag-list" id="rag-list"></div>
                     <p class="modal-hint rag-status" id="rag-status" hidden></p>
 
@@ -5051,7 +5100,7 @@
             if (agentMsg) wrap.setAttribute('data-agent', '1');
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
-            bubble.textContent = text;
+            renderMessageText(bubble, text);
             wrap.appendChild(bubble);
             // Время — у реплик пользователя и ответов агента; у служебной строки
             // (role="debug") его не показываем.
@@ -5067,6 +5116,59 @@
             if (agentMsg) greetingMsg.hidden = true;
             messagesEl.scrollTop = messagesEl.scrollHeight;
             return wrap;
+        }
+
+        // ---------- Разметка текста ответа (жирный) ----------
+        // Модель пишет выделения звёздочками: «погибли **три человека**». Показывать
+        // их символами нельзя — пользователь читает звёздочки вместо выделения, — а
+        // вставлять ответ модели как HTML нельзя тем более: в тексте документов и
+        // ответов встречаются угловые скобки и теги, и они стали бы разметкой
+        // страницы. Поэтому разметка собирается УЗЛАМИ и всего для двух случаев:
+        //   * «**жирный**» → <strong>жирный</strong>;
+        //   * «* пункт» в начале строки → «• пункт» (звёздочка как маркер списка).
+        // Всё остальное (одиночные звёздочки, решётки, таблицы, отступы) остаётся
+        // текстом как есть: выдумывать разметку, которой модель не писала, нельзя.
+        const BOLD_RE = /\*\*([^*\n]+)\*\*/g;
+        const BULLET_RE = /^(\s*)\*\s+/;
+
+        function renderMessageText(node, text) {
+            const lines = String(text == null ? '' : text).split('\n');
+            lines.forEach((line, index) => {
+                if (index) node.appendChild(document.createTextNode('\n'));
+                const bullet = BULLET_RE.exec(line);
+                if (bullet) {
+                    node.appendChild(document.createTextNode(bullet[1]));
+                    const marker = document.createElement('span');
+                    marker.className = 'msg-bullet';
+                    marker.textContent = '• ';
+                    node.appendChild(marker);
+                    line = line.slice(bullet[0].length);
+                }
+                appendBold(node, line);
+            });
+            return node;
+        }
+
+        // Разбор строки на куски: обычный текст — текстовыми узлами, «**…**» — жирным.
+        function appendBold(node, line) {
+            const text = String(line == null ? '' : line);
+            let last = 0;
+            BOLD_RE.lastIndex = 0;
+            let match = BOLD_RE.exec(text);
+            while (match) {
+                if (match.index > last) {
+                    node.appendChild(document.createTextNode(text.slice(last, match.index)));
+                }
+                const strong = document.createElement('strong');
+                strong.textContent = match[1];
+                node.appendChild(strong);
+                last = match.index + match[0].length;
+                match = BOLD_RE.exec(text);
+            }
+            if (last < text.length) {
+                node.appendChild(document.createTextNode(text.slice(last)));
+            }
+            return node;
         }
 
         // ---------- Диалог агента: корень и ветки плана ----------
@@ -5092,9 +5194,13 @@
         // (сессии), поэтому в историю введённых данных реплики не пишутся.
         // Под сообщением пользователя и под ответом агента — кнопки добавления
         // этого текста в рабочую/долговременную память.
-        function drawAgentNode(role, text, analysis, at, files) {
+        function drawAgentNode(role, text, analysis, at, files, sources) {
             if (role === 'user') {
                 addMessage('user', text, true, true, at);
+            } else if (role === 'test') {
+                // ВОПРОС КОНТРОЛЬНОГО ПРОГОНА (/test_rag): это не реплика
+                // пользователя, а вопрос теста — своя рамка, без кнопок памяти.
+                addMessage('test', text, true, false, at);
             } else if (role === 'debug') {
                 addMessage('debug', text, true);
             } else if (role === 'error') {
@@ -5108,7 +5214,68 @@
                 // скачивание. Файл лежит на сервере приложения, поэтому ссылка
                 // ведёт на /api/agent/files/<id> и работает после перезагрузки.
                 if (files && files.length) drawFileCards(wrap, files);
+                // ИСТОЧНИКИ из баз знаний (RAG): какие фрагменты документов были
+                // подобраны по этому запросу и переданы модели (см. app/ai/rag_search.py).
+                if (sources && sources.length) drawSourceCards(wrap, sources);
             }
+        }
+
+        // Источники под ответом — ОДНИМ сообщением: заголовок и нумерованный
+        // список «номер чанка · файл · раздел · база · релевантность». В подсказке
+        // строки — отрывок фрагмента и из чего сложилась оценка (вектор + текст).
+        // Подпись честно говорит «подобраны по запросу»: попали ли эти фрагменты
+        // в текст ответа, решает модель.
+        function drawSourceCards(wrap, sources) {
+            const list = (sources || []).filter(item => item && item.source);
+            if (!list.length) return;
+            const box = document.createElement('div');
+            box.className = 'rag-sources';
+            const head = document.createElement('div');
+            head.className = 'rag-sources-head';
+            head.textContent = 'Фрагменты баз знаний, подобранные по этому запросу '
+                + '(переданы модели):';
+            box.appendChild(head);
+            const body = document.createElement('div');
+            body.className = 'rag-sources-body';
+            list.forEach((item, index) => {
+                const line = document.createElement('div');
+                line.className = 'rag-source';
+                const num = document.createElement('span');
+                num.className = 'rag-source-num';
+                num.textContent = (index + 1) + '.';
+                line.appendChild(num);
+                const name = document.createElement('span');
+                name.className = 'rag-source-name';
+                // Номер чанка — тот же, что в окне «чанки» базы: по нему фрагмент
+                // находится глазами.
+                name.textContent = (item.number ? '№ ' + fmtNum(item.number) + ' · ' : '')
+                    + item.source;
+                line.appendChild(name);
+                const meta = document.createElement('span');
+                meta.className = 'rag-source-meta';
+                const score = (typeof item.score === 'number') ? item.score : null;
+                // СОСЕДНИЙ фрагмент (продолжение таблицы/списка) оценки не имеет:
+                // он не проходил отбор, поэтому подписываем его как продолжение.
+                meta.textContent = [
+                    item.section || '',
+                    item.base ? 'база «' + item.base + '»' : '',
+                    item.neighbour
+                        ? 'продолжение фрагмента № ' + fmtNum(item.parent_chunk)
+                        : (score === null ? '' : 'релевантность ' + score.toFixed(2))
+                ].filter(Boolean).join(' · ');
+                line.appendChild(meta);
+                const parts = [];
+                if (typeof item.vector_score === 'number' || typeof item.lexical === 'number') {
+                    parts.push('оценка: вектор ' + Number(item.vector_score || 0).toFixed(2)
+                        + ' + текст ' + Number(item.lexical || 0).toFixed(2)
+                        + (score === null ? '' : ' = ' + score.toFixed(2)));
+                }
+                if (item.snippet) parts.push(item.snippet);
+                if (parts.length) line.title = parts.join('\n\n');
+                body.appendChild(line);
+            });
+            box.appendChild(body);
+            wrap.appendChild(box);
         }
 
         // Карточки файлов под сообщением агента: имя, размер, источник и ссылка
@@ -5217,15 +5384,16 @@
         }
 
         // Добавляет реплику в текущее представление и сразу рисует её.
-        function pushAgentNode(role, text, analysis, files) {
+        function pushAgentNode(role, text, analysis, files, sources) {
             // Живая реплика: время ставим СЕЙЧАС (у служебных строк оно хранится,
             // но не показывается). В файл его запишет сервер со своей меткой — она
             // и будет показана после переключения задачи или перезагрузки.
             const at = new Date().toISOString();
             agentViewMessages().push({ role: role, text: text,
                                        analysis: analysis || null,
-                                       files: files || null, at: at });
-            drawAgentNode(role, text, analysis, at, files);
+                                       files: files || null,
+                                       sources: sources || null, at: at });
+            drawAgentNode(role, text, analysis, at, files, sources);
         }
 
         // Полная перерисовка окна чата для текущего представления (после
@@ -5235,7 +5403,8 @@
             messagesEl.querySelectorAll('[data-agent]').forEach(el => el.remove());
             agentViewMessages().forEach(
                 m => drawAgentNode(m.role, m.text, m.analysis,
-                                   m.at === undefined ? '' : m.at, m.files));
+                                   m.at === undefined ? '' : m.at, m.files,
+                                   m.sources));
             // План ветвления показываем в корневом диалоге (он относится к нему).
             if (!agentView && agentAnalysis) renderBranchPlan(agentAnalysis);
             greetingMsg.hidden = !!messagesEl.querySelector('[data-agent]');
@@ -5408,6 +5577,9 @@
                     // Файлы MCP (xlsx и т. п.): карточки со ссылкой на скачивание
                     // восстанавливаются вместе с сообщением.
                     files: item.files || null,
+                    // ИСТОЧНИКИ из баз знаний (RAG): фрагменты документов, которые
+                    // были у модели в этом ответе, — карточки под сообщением.
+                    sources: item.sources || null,
                     // Время сообщения из журнала сервера; у старых записей его нет
                     // — тогда подпись не показываем (выдумывать нельзя).
                     at: item.at || ''
@@ -6180,6 +6352,21 @@
                   + `${fmtNum(counts.chunks)}, документов: ${fmtNum(counts.documents)}, `
                   + `объём: ${counts.size_human || '0 Б'}`
                 : 'Баз знаний пока нет.';
+            // Поиск подключён к ОТВЕТАМ: перед каждым запросом агент ищет во
+            // включённых базах фрагменты по вопросу и отвечает по ним (сколько
+            // фрагментов и с какой релевантностью — настройки сервера, см.
+            // app/ai/rag_search.py). Без этой строки «включено: 1» ничего не
+            // говорит о том, попадают ли документы в ответ.
+            const search = data.search || {};
+            if (counts.enabled && search.max_hits) {
+                ragStatusEl.textContent += ` Поиск включён: до ${search.max_hits} `
+                    + `фрагментов на запрос, релевантность от `
+                    + `${Number(search.min_score || 0).toFixed(2).replace('.', ',')}. `
+                    + 'Под ответом видны источники.';
+            } else if (counts.bases) {
+                ragStatusEl.textContent += ' Включите базу галочкой — её документы '
+                    + 'пойдут в ответы агента.';
+            }
             if (!data.project_id) {
                 ragStatusEl.textContent += ' Проект не выбран: база сохранится в вашем '
                     + 'списке, включить её можно будет в проекте.';
@@ -7175,6 +7362,89 @@
         // Отправка в режиме «AI-агент»: сервер отвечает NDJSON-потоком событий.
         // Каждое debug-событие показываем отдельным сообщением по мере прихода,
         // затем — финальный ответ (bot). Событие 'done' служебное — не рисуем.
+        // ---------------------------------------------------------------------
+        // КОНТРОЛЬНЫЙ ПРОГОН RAG (команда /test_rag) — ТЕСТОВЫЙ КЕЙС.
+        // Вопросы набора уходят на сервер по одному; сервер ищет фрагменты в
+        // базах проекта, получает ответ модели и в конце отдаёт ответы судье.
+        // Пайплайн задачи (план, подтверждение, шаги, автомат) НЕ участвует: это
+        // проверка поиска и ответа по документам, а не работы агента.
+        // ---------------------------------------------------------------------
+        async function runRagTest() {
+            if (requestBusyHere()) return;
+            const sessionId = workspace.active_session || null;
+            const streamSession = sessionId;
+            const streamEpoch = viewEpoch;
+            // Узлы кладём в представление диалога (как pushAgentNode): тогда
+            // перерисовка окна (ветка, возврат в задачу) их не потеряет.
+            const push = (role, text) => {
+                const at = new Date().toISOString();
+                agentViewMessages().push({ role: role, text: text, at: at });
+                drawAgentNode(role, text, null, at);
+            };
+            push('debug', '🧪 Запускаю контрольный прогон RAG: вопросы пойдут '
+                + 'поочерёдно, планирование и автомат задачи не участвуют.');
+            foregroundRequests.add(streamSession);
+            updateComposerState();
+            updateTyping();
+            try {
+                const res = await fetch('/api/agent/rag/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId })
+                });
+                if (!res.ok) {
+                    const text = await res.text();
+                    push('error', text || 'Тест не запустился.');
+                    return;
+                }
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    let nl;
+                    while ((nl = buf.indexOf('\n')) !== -1) {
+                        const line = buf.slice(0, nl).trim();
+                        buf = buf.slice(nl + 1);
+                        if (!line) continue;
+                        let ev;
+                        try { ev = JSON.parse(line); } catch (e) { continue; }
+                        // События рисуем только в СВОЁМ диалоге: переключились —
+                        // поток дочитываем (сервер всё сохранит в журнал), но в
+                        // чужое окно ничего не пишем.
+                        if (!agentModeOn() || streamEpoch !== viewEpoch
+                                || streamSession !== workspace.active_session) continue;
+                        if (ev.type === 'test_start') {
+                            push('debug', '🧪 Тест RAG: ' + ev.total + ' контрольных '
+                                + 'вопросов по базам: ' + (ev.bases || []).join(', ')
+                                + '. Ответы проверю эталонами из самой базы.');
+                        } else if (ev.type === 'test_question') {
+                            push('test', '🧪 Вопрос ' + ev.n + '/' + ev.total + ': ' + ev.text);
+                        } else if (ev.type === 'bot') {
+                            push('assistant', ev.text);
+                        } else if (ev.type === 'test_error') {
+                            push('error', ev.text);
+                        } else if (ev.type === 'debug') {
+                            push('debug', ev.text);
+                        } else if (ev.type === 'test_verdict') {
+                            push('assistant', ev.text);
+                        }
+                    }
+                }
+            } catch (err) {
+                push('error', 'Тест прерван: ' + (err && err.message ? err.message : err));
+            } finally {
+                foregroundRequests.delete(streamSession);
+                updateComposerState();
+                updateTyping();
+                // Прогон писал в журнал СВОЕЙ задачи: если пользователь успел
+                // переключиться, окно открытой задачи перечитывать не нужно —
+                // достаточно было не рисовать чужие события (см. выше).
+            }
+        }
+
         async function sendAgentRequest(body, background) {
             // Поколение вида фиксируем ДО запроса: ответ относится к диалогу,
             // который открыт сейчас. Если пользователь успеет переключиться, пока
@@ -7258,7 +7528,10 @@
                         } else if (ev.type === 'bot') {
                             // У ответа могут быть ФАЙЛЫ (MCP вернул xlsx): под
                             // сообщением рисуются карточки со ссылкой на скачивание.
-                            pushAgentNode('assistant', ev.text, null, ev.files);
+                            // У ответа могут быть и ИСТОЧНИКИ (RAG): фрагменты
+                            // документов, подобранные по запросу, — под сообщением
+                            // рисуются строки «№ чанка · файл · раздел · релевантность».
+                            pushAgentNode('assistant', ev.text, null, ev.files, ev.sources);
                         } else if (ev.type === 'error') {
                             pushAgentNode('error', ev.text);
                         } else if (ev.type === 'usage') {
@@ -7371,6 +7644,21 @@
             // ЭТОЙ задачи: чужие задачи не помеха (они на своих блокировках).
             if (requestBusyHere()) return;
             if (chains.has(workspace.active_session)) return;
+
+            // КОМАНДА /test_rag — контрольный прогон вопросов по базам знаний.
+            // Это НЕ запрос к модели, а тестовый кейс (см. app/ai/rag_suite.py),
+            // поэтому команда перехватывается в любом режиме и уходит в свой
+            // маршрут: пайплайн задачи (план, подтверждение, шаги) не участвует.
+            if (content.trim().toLowerCase() === '/test_rag') {
+                if (!workspace.active_task) {
+                    addMessage('bot', '⚠️ Тест RAG идёт по базам знаний проекта — '
+                        + 'сначала создайте проект (кнопка «Новый проект»).', true);
+                    return;
+                }
+                input.value = '';
+                await runRagTest();
+                return;
+            }
 
             // Режим «AI-агент»: длина проверяется как обычно; эксперт/параметры
             // не участвуют, ответ приходит потоком debug-сообщений агента.

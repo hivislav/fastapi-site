@@ -29,6 +29,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.ai import rag_chunking, rag_documents, rag_embedding, rag_ocr
+from app.ai import rag_search
 from app.ai import rag_store
 
 logger = logging.getLogger(__name__)
@@ -517,6 +518,10 @@ def snapshot(profile: Optional[str] = None, enabled_ids: Optional[List[str]] = N
         },
         "formats": list(rag_documents.SUPPORTED_EXTENSIONS),
         "embedding": rag_embedding.backend_status(force=force),
+        # Настройки ПОИСКА (сколько фрагментов уходит в ответ и с какой близостью,
+        # см. app/ai/rag_search.py): интерфейс подписывает ими строку «поиск
+        # подключён к ответам», чтобы связь баз со ответами агента была видна.
+        "search": rag_search.settings(),
         "storage": rag_store.storage_report(),
         # Распознавание сканов: доступно ли и чем (см. app/ai/rag_ocr.py).
         "ocr": rag_ocr.status(),

@@ -437,11 +437,12 @@ def _encode_sbert(model: Any, items: List[str],
 
 
 def embed_query(text: str, backend: Optional[str] = None) -> Tuple[List[float], Dict[str, Any]]:
-    """Вектор одного запроса тем же бэкендом, что и база (задел под поиск).
+    """Вектор одного запроса тем же бэкендом, что и база (для поиска).
 
     Отдельная функция нужна потому, что запрос обязан считаться ТЕМ ЖЕ
     бэкендом и той же моделью, что и чанки: вектор запроса от другой модели
-    геометрически несравним с индексом.
+    геометрически несравним с индексом. Так его и считает поиск по базам
+    (app/ai/rag_search.py), беря бэкенд из паспорта базы.
     """
     vectors, info = embed_texts([text], backend=backend)
     return (vectors[0] if vectors else []), info

@@ -44,6 +44,7 @@ from typing import (
 
 from app import config
 from app.ai import client, demo, invariants as invariants_store, json_utils, mcp as mcp_store
+from app.ai import rag_search
 from app.ai import task_state
 
 logger = logging.getLogger(__name__)
@@ -230,7 +231,15 @@ PLAN_PROMPT = (
     "конкретную дату. Даты в блоке данных могут относиться к другому дню "
     "(сегодня, послезавтра), и подмена срока делает шаг противоречащим запросу: "
     "приёмщик такой шаг не примет, и задача уйдёт в доработку (живой случай: "
-    "план требовал сводку на 26.09, а запрос был про «завтра» — 27.09).\n\n"
+    "план требовал сводку на 26.09, а запрос был про «завтра» — 27.09).\n"
+    "11) ДАННЫЕ УЖЕ ДОБЫТЫ ДО ТЕБЯ — НЕ ИЩИ ИХ СНОВА. Блоки «ДАННЫЕ MCP» и "
+    "«ФРАГМЕНТЫ ИЗ БАЗ ЗНАНИЙ» собраны ДО планирования, по этому самому запросу. "
+    "Шага «найти в базе знаний», «поискать в документах», «запросить погоду» в "
+    "плане быть НЕ ДОЛЖНО: сразу работай по тому, что в блоках. Если в блоке "
+    "сказано, что фрагментов не нашлось — значит поиск уже сделан и в документах "
+    "этого нет: план не должен отправлять искать их заново (живой случай: "
+    "фрагменты с ответом уже были в контексте, а план требовал «найти автора "
+    "во фрагментах базы знаний»).\n\n"
     "ОТВЕТ — ТОЛЬКО один JSON-объект, без markdown и пояснений:\n"
     '{"steps": ["шаг 1", "шаг 2"]}'
 )
@@ -535,6 +544,15 @@ class Agent:
         # блоком (см. _memory_blocks) вместе с планом, ответом и проверкой
         # результата: иначе агент «забыл бы» полученные числа на следующем шаге.
         self.mcp: List[Dict[str, Any]] = []
+        # ФРАГМЕНТЫ БАЗ ЗНАНИЙ (RAG, §5.13): выдержки из документов
+        # пользователя, подобранные векторным поиском по текущему запросу (см.
+        # app/ai/rag_search.py). Собираются веб-слоем ДО планирования, хранятся
+        # в диалоге под подписью «базы + запрос + отпечаток индексов» и уходят в
+        # модель СВОИМ системным блоком (см. _memory_blocks) — вместе с планом,
+        # ответом и проверкой результата. В messages они не пишутся: это не
+        # реплики диалога, а справочный материал по запросу, и в истории он
+        # занимал бы место навсегда.
+        self.rag: Dict[str, Any] = {}
         # Компактный вид данных MCP: True — в системный блок идёт КОРОТКАЯ сводка
         # (имена вызовов, исход, файлы) вместо полного блока со значениями.
         # Включает приёмщик результата (review_result): значения он сверяет с
@@ -603,6 +621,7 @@ class Agent:
         state: Optional["task_state.TaskState"] = None,
         invariants: Optional[Dict[str, Any]] = None,
         mcp: Optional[List[Dict[str, Any]]] = None,
+        rag: Optional[Dict[str, Any]] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
@@ -626,6 +645,10 @@ class Agent:
         план и текущий шаг. Уходит в модель системным блоком (см. _memory_blocks),
         поэтому агент видит, какой шаг плана выполняется сейчас; None — состояния
         нет, блока тоже нет.
+        rag — фрагменты баз знаний проекта (RAG, см. app/ai/rag_search.py):
+        выдержки из документов пользователя, подобранные поиском по этому
+        запросу. Уходят отдельным системным блоком; None — поиска не было,
+        используется прежний блок.
 
         Собирает все debug-события в result.debug — пригодится, когда
         показывать их по одному не нужно (например, в API-ответах).
@@ -637,7 +660,7 @@ class Agent:
 
         await self._process(
             user_message, history, sink, summary, facts, branches, branch, covered,
-            working_memory, long_term_memory, profile, state, invariants, mcp,
+            working_memory, long_term_memory, profile, state, invariants, mcp, rag,
         )
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
@@ -665,6 +688,7 @@ class Agent:
         state: Optional["task_state.TaskState"] = None,
         invariants: Optional[Dict[str, Any]] = None,
         mcp: Optional[List[Dict[str, Any]]] = None,
+        rag: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -695,7 +719,7 @@ class Agent:
         runner = asyncio.create_task(
             self._process(
                 user_message, history, sink, summary, facts, branches, branch, covered,
-                working_memory, long_term_memory, profile, state, invariants, mcp,
+                working_memory, long_term_memory, profile, state, invariants, mcp, rag,
             )
         )
         try:
@@ -731,6 +755,7 @@ class Agent:
         state: Optional["task_state.TaskState"] = None,
         invariants: Optional[Dict[str, Any]] = None,
         mcp: Optional[List[Dict[str, Any]]] = None,
+        rag: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -778,6 +803,11 @@ class Agent:
             # и ответу, и проверке результата.
             if mcp is not None:
                 self.mcp = mcp_store.normalize_results(mcp)
+            # Фрагменты баз знаний по этому запросу (см. app/ai/rag_search.py):
+            # тоже уходят отдельным системным блоком — иначе ответ строился бы
+            # «по памяти», а не по документам пользователя.
+            if rag is not None:
+                self.rag = rag_search.normalize(rag)
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
@@ -805,6 +835,14 @@ class Agent:
                 await emit(self._step(
                     "debug",
                     f"{self.name}: " + mcp_store.results_note(self.mcp),
+                ))
+            if rag_search.has_hits(self.rag):
+                count = len(rag_search.hits_of(self.rag))
+                await emit(self._step(
+                    "debug",
+                    f"{self.name}: в модель уходит {count} "
+                    f"{'фрагмент' if count == 1 else 'фрагментов'} баз знаний "
+                    "— системным блоком, ответ строится по документам пользователя.",
                 ))
             if self.task_state is not None:
                 # Коротко и без повтора: этап, шаг и ожидаемое действие уже
@@ -975,6 +1013,7 @@ class Agent:
         invariants: Optional[Dict[str, Any]] = None,
         note: Optional[str] = None,
         mcp: Optional[List[Dict[str, Any]]] = None,
+        rag: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """Строит план задачи (шаги) служебным вызовом LLM — этап planning.
 
@@ -1017,6 +1056,11 @@ class Agent:
         # бы шаг «узнать погоду» вместо работы по фактическим данным.
         if mcp is not None:
             self.mcp = mcp_store.normalize_results(mcp)
+        # Фрагменты баз знаний — тоже часть контекста планирования: шаг «найти
+        # требования в регламенте» не нужен, если фрагменты уже получены, а шаг
+        # «сделать по регламенту» без них был бы выдумкой.
+        if rag is not None:
+            self.rag = rag_search.normalize(rag)
         # Пустой запрос планировать нечего — один шаг «уточнить запрос».
         if not text:
             return ["Уточнить у пользователя, что именно нужно сделать"]
@@ -1218,6 +1262,7 @@ class Agent:
         profile: Optional[str] = None,
         invariants: Optional[Dict[str, Any]] = None,
         mcp: Optional[List[Dict[str, Any]]] = None,
+        rag: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Содержательная проверка результата (этап validation) — служебный вызов.
 
@@ -1252,6 +1297,11 @@ class Agent:
         # выдуманное число).
         if mcp is not None:
             self.mcp = mcp_store.normalize_results(mcp)
+        # Фрагменты баз знаний уходят и в проверку: приёмщик обязан видеть, какие
+        # источники у модели БЫЛИ, — иначе ссылку на документ он счёл бы
+        # выдуманной (или, наоборот, пропустил бы выдуманную).
+        if rag is not None:
+            self.rag = rag_search.normalize(rag)
         # У приёмщика данных ровно столько, сколько нужно для проверки: полный
         # блок (до 12 000 символов) на каждом акте стоил дороже самой проверки.
         self.compact_data = True
@@ -1603,6 +1653,15 @@ class Agent:
                      else mcp_store.block(self.mcp))
         if mcp_block:
             blocks.append({"role": "system", "content": mcp_block})
+        # ФРАГМЕНТЫ БАЗ ЗНАНИЙ — сразу после данных внешних инструментов: и то и
+        # другое суть факты по текущему запросу, на которые опираются план,
+        # ответ и проверка. Приёмщику (validation) вместо полного блока (до
+        # 12 000 символов на каждый акт проверки) идёт короткая сводка адресов:
+        # текст документов он не сверяет, а ссылки — сверяет.
+        rag_block = (rag_search.digest(self.rag) if self.compact_data
+                     else rag_search.block(self.rag))
+        if rag_block:
+            blocks.append({"role": "system", "content": rag_block})
         if self.task_state is not None:
             blocks.append({"role": "system", "content": task_state.state_block(self.task_state)})
         if self.long_term_memory:

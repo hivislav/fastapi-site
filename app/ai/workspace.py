@@ -74,6 +74,7 @@ from app.ai import invariants as invariants_store
 from app.ai import mcp as mcp_store
 from app.ai import periodic as periodic_store
 from app.ai import rag_chunking
+from app.ai import rag_search
 from app.ai import rag_store
 from app.ai import task_state
 
@@ -236,6 +237,14 @@ def empty_dialog(task_id: str = "") -> Dict[str, Any]:
         # по ним отмена/удаление задачи останавливает работу на САМОМ сервере —
         # иначе сбор остался бы висеть там навсегда.
         "mcp_started": [],
+        # ФРАГМЕНТЫ БАЗ ЗНАНИЙ (RAG) по ТЕКУЩЕМУ запросу задачи (см.
+        # app/ai/rag_search.py): подпись «базы + их отпечаток + запрос» и сами
+        # найденные фрагменты. Живут в диалоге по той же причине, что и данные
+        # MCP: шаг плана и проверка результата приходят ОТДЕЛЬНЫМИ запросами, а
+        # векторный поиск стоит времени — искать заново на каждом шаге незачем.
+        # Новый запрос (или переиндексация базы) меняет подпись, и поиск идёт
+        # заново.
+        "rag": {},
     }
 
 
@@ -390,6 +399,11 @@ def _clean_log(raw: Any) -> List[Dict[str, Any]]:
             # скачивание под сообщением. Хранятся в журнале, поэтому видны и
             # после переключения задачи/перезагрузки страницы.
             entry["files"] = files
+        sources = _clean_sources(item.get("sources"))
+        if sources:
+            # ФРАГМЕНТЫ баз знаний, которые были у модели в этом ответе: под
+            # сообщением рисуются карточки источников (файл, раздел, близость).
+            entry["sources"] = sources
         clean.append(entry)
     if len(clean) > _MAX_LOG:
         clean = clean[-_MAX_LOG:]
@@ -401,7 +415,7 @@ def _clean_log(raw: Any) -> List[Dict[str, Any]]:
 
 
 def add_log(dialog: Dict[str, Any], kind: str, text: str,
-            at: str = "", files: Any = None) -> None:
+            at: str = "", files: Any = None, sources: Any = None) -> None:
     """Добавляет узел в журнал чата сессии (что пользователь видит в окне).
 
     Пишется веб-слоем по ходу ответа: реплика пользователя, ответ агента,
@@ -415,6 +429,8 @@ def add_log(dialog: Dict[str, Any], kind: str, text: str,
 
     `files` — вложения MCP (xlsx и т. п.), полученные по этому запросу: узел
     рисуется с карточками файлов и ссылками на скачивание.
+    `sources` — фрагменты баз знаний, которые были у модели в этом ответе:
+    узел рисуется с карточками источников (файл, раздел, близость к запросу).
     """
     value = str(text or "").strip()
     if kind not in LOG_KINDS or not value:
@@ -425,6 +441,9 @@ def add_log(dialog: Dict[str, Any], kind: str, text: str,
     clean_files = _clean_files(files)
     if clean_files:
         entry["files"] = clean_files
+    clean_sources = _clean_sources(sources)
+    if clean_sources:
+        entry["sources"] = clean_sources
     log.append(entry)
     if len(log) > _MAX_LOG:
         del log[:len(log) - _MAX_LOG]
@@ -542,6 +561,10 @@ def normalize_dialog(raw: Any, task_id: str = "") -> Dict[str, Any]:
     # Данные внешних инструментов MCP по текущему запросу задачи (см.
     # app/ai/mcp.py): подпись + результаты вызовов.
     dialog["mcp"] = _normalize_dialog_mcp(raw.get("mcp"))
+    # Фрагменты баз знаний (RAG) по текущему запросу задачи: подпись + сами
+    # фрагменты (см. app/ai/rag_search.py). Без подписи запись не хранится —
+    # значит, неизвестно, к какому запросу эти фрагменты.
+    dialog["rag"] = _normalize_dialog_rag(raw.get("rag"))
     # Внешние сборы, запущенные задачей: их отменяет отмена/удаление задачи.
     dialog["mcp_started"] = _normalize_started(raw.get("mcp_started"))
     return dialog
@@ -713,6 +736,108 @@ def set_dialog_mcp(dialog: Dict[str, Any], signature: str, request: str,
         "chain": keep_chain,
     })
     return dialog["mcp"]
+
+
+def _normalize_dialog_rag(raw: Any) -> Dict[str, Any]:
+    """Фрагменты баз знаний диалога: {"signature", "request", "query", "bases", "hits", "notes"}.
+
+    Ровно то, что уже найдено поиском (см. app/ai/rag_search.py): подпись
+    (включённые базы + отпечаток их индексов + запрос задачи) и сами фрагменты с
+    адресами файлов и разделов. Держится в диалоге, чтобы шаг плана и проверка
+    результата — а это ОТДЕЛЬНЫЕ HTTP-запросы — видели те же документы, а не
+    искали заново и не отвечали «в документах этого нет».
+
+    Запись БЕЗ подписи не хранится: по ней не понять, к какому запросу относятся
+    фрагменты, и она «переехала» бы на чужой запрос.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    clean = rag_search.normalize(raw)
+    return clean if clean.get("signature") else {}
+
+
+def dialog_rag(dialog: Dict[str, Any]) -> Dict[str, Any]:
+    """Фрагменты баз знаний диалога (нормализует поле на месте, если оно битое).
+
+    Наружу отдаётся либо ПУСТАЯ запись, либо запись с подписью: по записи без
+    подписи нельзя понять, к какому запросу относятся фрагменты, и она «переехала»
+    бы на чужой запрос. Поэтому проверка стоит и на чтении, а не только при
+    загрузке файла (диалог мог прийти из памяти процесса, а не с диска).
+    """
+    current = dialog.get("rag")
+    if not isinstance(current, dict) or not str(current.get("signature") or "").strip():
+        dialog["rag"] = _normalize_dialog_rag(current)
+    return dialog["rag"]
+
+
+def set_dialog_rag(dialog: Dict[str, Any], signature: str, request: str,
+                   result: Any) -> Dict[str, Any]:
+    """Запоминает фрагменты RAG текущего запроса задачи (подпись + что нашлось).
+
+    `result` — результат `rag_search.search` (или уже нормализованная запись):
+    запрос, состояние каждой базы и найденные фрагменты. Пустой результат —
+    законный случай («искали, ничего не нашлось»): он тоже хранится под подписью,
+    иначе на каждом шаге поиск повторялся бы впустую.
+    """
+    data = rag_search.normalize(result)
+    dialog["rag"] = _normalize_dialog_rag({
+        "signature": signature,
+        "request": request,
+        "query": data.get("query") or request,
+        "bases": data.get("bases") or [],
+        "hits": data.get("hits") or [],
+        "notes": data.get("notes") or [],
+    })
+    return dialog["rag"]
+
+
+def _clean_sources(raw: Any) -> List[Dict[str, Any]]:
+    """Источники под ответом агента (список «что подобрано из баз знаний»).
+
+    Хранятся в журнале чата вместе с ответом: так они видны и после переключения
+    задачи или перезагрузки страницы. Отрывок фрагмента обрезается — журнал не
+    должен расти вместе с документами пользователя.
+
+    Хранится и НОМЕР ЧАНКА, и разбор оценки (вектор + текст): без них после
+    перезагрузки список терял бы самое полезное — по какому именно фрагменту базы
+    получен ответ и почему он оказался вверху (эту потерю нашла живая проверка на
+    настоящей базе: в событии номер был, а в журнале — уже нет).
+    """
+    out: List[Dict[str, Any]] = []
+    for item in (raw if isinstance(raw, list) else [])[:rag_search.MAX_HITS]:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "").strip()[:160]
+        if not source:
+            continue
+        out.append({
+            "base": str(item.get("base") or "").strip()[:120],
+            "source": source,
+            "section": str(item.get("section") or "").strip()[:200],
+            "number": _positive_int(item.get("number")),
+            "score": _round3(item.get("score")),
+            "vector_score": _round3(item.get("vector_score")),
+            "lexical": _round3(item.get("lexical")),
+            "chars": _positive_int(item.get("chars")),
+            "snippet": str(item.get("snippet") or "").strip()[:400],
+        })
+    return out
+
+
+def _round3(value: Any) -> float:
+    """Число оценки с тремя знаками (битое — 0.0)."""
+    try:
+        return round(float(value or 0.0), 3)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _positive_int(value: Any) -> int:
+    """Неотрицательное целое из значения любого вида (битое — 0)."""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _clean_plan_signature(raw: Any) -> Dict[str, str]:

@@ -46,6 +46,7 @@ import heapq
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -463,6 +464,59 @@ def load_chunks(base_id: Any, with_vectors: bool = False,
     return chunks
 
 
+def neighbours(base_id: Any, indexes: Any, profile: Optional[str] = None
+               ) -> List[Dict[str, Any]]:
+    """Фрагменты, СОСЕДНИЕ с указанными по номеру (без векторов).
+
+    ЗАЧЕМ. Разбиение режет таблицы, списки и пошаговые правила по границе чанка,
+    и половина ответа остаётся в соседнем фрагменте. Живой случай: вопрос про
+    зарплаты по «Таблице профессии» — в найденном чанке №237 были городской
+    полицейский (1 200) и ассистент корпората (1 500), а строка «Репортёр на
+    зарплате 1 200 / месяц» лежала в продолжении таблицы, чанке №238, который в
+    топ не попал: модель честно ответила «в документах этого нет», и ответ был
+    неполным не по её вине.
+
+    Возвращаются чанки БЕЗ векторов (они идут как дополнение к найденному, а не
+    как самостоятельные попадания) в порядке номеров. Чужие документы не
+    подмешиваются: границы файлов не смешиваются (см. §5.13).
+    """
+    keys = []
+    for item in (indexes if isinstance(indexes, list) else []):
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0 and value not in keys:
+            keys.append(value)
+    folder = base_path(base_id)
+    path = os.path.join(folder, SQLITE_FILE) if folder else ""
+    if not keys or not path or not os.path.isfile(path):
+        return []
+    meta = get_base(base_id, profile=profile)
+    if meta is None:
+        return []
+    placeholders = ",".join("?" for _ in keys)
+    try:
+        connection = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT chunk_id, chunk_index, doc_index, position, source, title,"
+                " section, kind, start, end, chars, text, dim FROM chunks"
+                " WHERE chunk_index IN (%s) ORDER BY chunk_index, id" % placeholders,
+                keys).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        logger.warning("RAG: соседние чанки %s не прочитаны — %s", base_id, str(exc)[:150])
+        return []
+    return [{
+        "chunk_id": row[0], "index": row[1], "doc_index": row[2], "position": row[3],
+        "source": row[4], "title": row[5], "section": row[6], "kind": row[7],
+        "start": row[8], "end": row[9], "chars": row[10], "text": row[11],
+        "dim": row[12],
+    } for row in rows]
+
+
 def chunks_page(base_id: Any, offset: int = 0, limit: int = 10,
                 source: str = "", query: str = "") -> Tuple[List[Dict[str, Any]], int]:
     """Страница чанков базы для просмотра: (чанки, всего подходящих).
@@ -555,19 +609,67 @@ def present_files(base_id: Any) -> Dict[str, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Поиск (задел под подключение RAG к агенту)
+# Поиск (точка подключения RAG к агенту — см. app/ai/rag_search.py)
 # ---------------------------------------------------------------------------
+# ЛЕКСИЧЕСКАЯ СОСТАВЛЯЮЩАЯ ОЦЕНКИ — не украшение, а лечение измеренного перекоса.
+# Живой случай: база из скана (1188 чанков), запрос «автор статьи БАНДИТСКОЕ
+# НАСИЛИЕ ПОЛЫХАЕТ НА УЛИЦАХ НАЙТ-СИТИ», а чанк с этим заголовком и подписью
+# «Автор Исида Бес» стоял 211-м из 1188 — в топ-5 не попадал вообще. Причина не в
+# индексе (сохранённые векторы совпадают со свежими), а в самом векторе: короткие
+# чанки-заголовки («2 ЗАРЯДНЫЙ КОНДЕНСАТОРНЫЙ ЛАЗЕР», 141 символ) лежат близко к
+# центру облака векторов и потому похожи на ЛЮБОЙ запрос — 0,84 против 0,33 у
+# нужного длинного чанка. Это известная болезнь плотных моделей (hubness): чем
+# короче текст, тем ближе его вектор к среднему.
+#
+# Поэтому к косинусу добавляется ДОЛЯ СЛОВ ЗАПРОСА, найденных в тексте, взвешенная
+# по IDF: редкое слово весит много, служебное («как», «про») — почти ноль.
+# Замер на том же случае: нужный чанк 0,33 + 0,82 = 1,16 — первое место; короткий
+# заголовок остаётся при своих 0,84 и в контекст не попадает. Вес настраивается
+# (RAG_LEXICAL_WEIGHT), ноль возвращает прежний чистый векторный поиск.
+LEXICAL_ENV = "RAG_LEXICAL_WEIGHT"
+DEFAULT_LEXICAL_WEIGHT = 1.0
+# «Основа» слова — первые LEXICAL_STEM_CHARS символов: русские слова склоняются
+# («лазер» — «лазера», «статья» — «статьями»), и сравнение слов целиком находило бы
+# только ту же форму, что стоит в запросе. Совпадением считается общее НАЧАЛО
+# основы длиной LEXICAL_MATCH_CHARS символов — этого хватает, чтобы «статьи» и
+# «статья» сошлись, а «полыхает» и «полынь» — нет.
+LEXICAL_STEM_CHARS = 6
+LEXICAL_MATCH_CHARS = 5
+LEXICAL_MIN_TOKEN = 3
+_LEXICAL_TOKEN_RE = re.compile(r"[0-9a-zа-яё]+", re.IGNORECASE)
+
+
+def lexical_weight() -> float:
+    """Вес лексического совпадения в итоговой оценке (RAG_LEXICAL_WEIGHT)."""
+    raw = (os.getenv(LEXICAL_ENV) or "").strip().replace(",", ".")
+    if not raw:
+        return DEFAULT_LEXICAL_WEIGHT
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_LEXICAL_WEIGHT
+    return max(0.0, min(10.0, value))
+
+
 def search(base_id: Any, query_vector: List[float], top_k: int = 5,
-           profile: Optional[str] = None) -> List[Dict[str, Any]]:
+           profile: Optional[str] = None, query_text: str = "") -> List[Dict[str, Any]]:
     """Ближайшие чанки базы по вектору запроса. Возвращает список попаданий.
 
     Вектор запроса обязан быть посчитан ТЕМ ЖЕ бэкендом, что и база (это
     проверяет `rag_embedding.check_compatible`): иначе близость бессмысленна.
 
-    Считается косинусная близость — обычное скалярное произведение: векторы
-    нормированные, поэтому угол между ними и есть их произведение. Агент этим
-    пока НЕ пользуется: задача дня — индексация, а поиск здесь как готовая
-    точка подключения.
+    Ранжирование — ГИБРИД: косинусная близость векторов + лексическое совпадение
+    слов запроса с текстом чанка (см. LEXICAL_ENV выше: без второго слагаемого
+    нужный чанк проигрывал коротким заголовкам). `query_text` — сам запрос: по
+    нему считается лексическая часть. Пустой текст (или вес 0) оставляет прежний
+    чистый векторный поиск.
+
+    В попадании видны ОБЕ части: `score` (итог, по нему идёт отбор),
+    `vector_score` (косинус) и `lexical` (доля слов запроса) — по ним видно,
+    почему чанк оказался вверху, и это же показывает интерфейс.
+
+    Пользуется этим `rag_search.search`: он ищет по НЕСКОЛЬКИМ базам сразу,
+    отбирает фрагменты по порогу релевантности и собирает блок для модели.
     """
     if not valid_id(base_id):
         return []
@@ -579,11 +681,11 @@ def search(base_id: Any, query_vector: List[float], top_k: int = 5,
         return []
     vector = [float(value) for value in query_vector]
     limit = max(1, min(50, int(top_k or 5)))
-    return _search_scan(base_id, vector, limit, dim)
+    return _search_scan(base_id, vector, limit, dim, query_text)
 
 
 def _search_scan(base_id: Any, vector: List[float], limit: int,
-                 dim: int) -> List[Dict[str, Any]]:
+                 dim: int, query_text: str = "") -> List[Dict[str, Any]]:
     """Перебор векторов базы: близость каждого чанка к запросу.
 
     Сложность линейная (O(n·dim)), и на этом масштабе она и есть правильная: у
@@ -595,6 +697,11 @@ def _search_scan(base_id: Any, vector: List[float], limit: int,
 
     Чанк с испорченным вектором (не та размерность, пусто) пропускается: выдать
     его за найденный значило бы показать пользователю случайный фрагмент.
+
+    Лексическая часть считается по ТЕКСТАМ тех же чанков (они уже прочитаны
+    вместе с векторами — отдельного чтения базы не нужно): замер на 1188 чанках —
+    11 мс, на 24 000 — 0,7 с, на 200 000 — около 6 с. Дорого только на предельных
+    базах, поэтому вес лексики можно выключить настройкой.
     """
     chunks = load_chunks(base_id, with_vectors=True)
     if not chunks:
@@ -609,15 +716,99 @@ def _search_scan(base_id: Any, vector: List[float], limit: int,
         rows.append(stored)
     if not rows:
         return []
-    scores = _score_all(rows, vector)
-    best = heapq.nlargest(min(limit, len(scores)), range(len(scores)),
-                          key=scores.__getitem__)
+    scores = _score_all(rows, vector)          # косинус — основа отбора
+    weight = lexical_weight()
+    lexical = [0.0] * len(rows)
+    final = scores
+    if weight > 0 and str(query_text or "").strip():
+        every = _lexical_scores([str(chunk.get("text") or "") for chunk in chunks],
+                                query_text)
+        # Лексика добавляется К косинусу, а не заменяет его: векторная близость
+        # отвечает за смысл («лечение раны» ≈ «медицинская помощь»), лексика — за
+        # точное слово (имя, заголовок, термин), на котором векторная модель
+        # ошибается из-за коротких чанков.
+        lexical = [every[position] for position in positions]
+        final = [score + weight * part for score, part in zip(scores, lexical)]
+    best = heapq.nlargest(min(limit, len(final)), range(len(final)),
+                          key=final.__getitem__)
     hits: List[Dict[str, Any]] = []
     for index in best:
         entry = dict(chunks[positions[index]])
-        entry["score"] = round(float(scores[index]), 6)
+        entry["score"] = round(float(final[index]), 6)
+        entry["vector_score"] = round(float(scores[index]), 6)
+        entry["lexical"] = round(float(lexical[index]), 6)
         hits.append(entry)
     return hits
+
+
+def _lexical_scores(texts: List[str], query: Any) -> List[float]:
+    """Доля слов запроса, найденных в каждом тексте, с весом по редкости (0…1).
+
+    Редкое слово значит больше служебного: «полыха» в запросе весит 6,4, а «про» —
+    0,3, поэтому совпадение по «про» почти ничего не даёт (IDF считается по САМОЙ
+    базе: сколько её чанков содержат это слово).
+
+    Сравнение — подстрокой по «основе» слова (первые LEXICAL_STEM_CHARS символов),
+    а не по слову целиком: так находятся другие формы («лазер» в «лазера»).
+    Дешёвая проверка подстрокой идёт ПЕРВОЙ и отсеивает чанки, где нет ни одного
+    слова запроса: разбор на слова (дорогой) делается только для оставшихся.
+    """
+    stems: List[str] = []
+    for word in _LEXICAL_TOKEN_RE.findall(str(query or "").lower()):
+        if len(word) >= LEXICAL_MIN_TOKEN:
+            stem = word[:LEXICAL_STEM_CHARS]
+            if stem not in stems:
+                stems.append(stem)
+    if not stems:
+        return [0.0] * len(texts)
+    # Что искать в тексте на первом проходе: НАЧАЛО основы (LEXICAL_MATCH_CHARS).
+    # Именно начало, а не основу целиком: «статьи» из запроса и «статья» в чанке
+    # расходятся последним символом, и поиск подстрокой «статьи» не нашёл бы
+    # кандидата вовсе — а совпадение начал считается совпадением.
+    probes = {stem: stem[:LEXICAL_MATCH_CHARS] for stem in stems}
+    found: List[Tuple[str, ...]] = []
+    frequency = dict.fromkeys(stems, 0)
+    for text in texts:
+        # ДЕШЁВАЯ ПРОВЕРКА ПОДСТРОКОЙ — только отбор кандидатов: она может
+        # сработать лишний раз (начало основы встретилось внутри другого слова), и
+        # тогда точная сверка ниже кандидата не пропустит. Разбор на слова
+        # (дорогой) делается не для всех чанков базы, а только для этих.
+        low = str(text or "").lower()
+        hit = tuple(stem for stem, probe in probes.items() if probe in low)
+        found.append(hit)
+        for stem in hit:
+            frequency[stem] += 1
+    total_count = len(texts)
+    weights = {stem: math.log((total_count + 1) / (frequency[stem] + 1)) for stem in stems}
+    total = sum(weights.values())
+    scores: List[float] = [0.0] * len(texts)
+    if total <= 0:
+        # Все слова запроса встречаются в КАЖДОМ чанке (например «и как») — по
+        # ним нельзя отличить один фрагмент от другого, и лексика молчит: решает
+        # векторная близость.
+        return scores
+    for index, hit in enumerate(found):
+        if not hit:
+            continue
+        words = {word[:LEXICAL_STEM_CHARS]
+                 for word in _LEXICAL_TOKEN_RE.findall(str(texts[index] or "").lower())}
+        # Совпадение считается ПО СЛОВАМ текста и их основам: «лазер» из запроса и
+        # «лазерная» в чанке — это одно и то же слово в разных формах, а не разные.
+        matched = [stem for stem in hit if any(_same_stem(stem, word) for word in words)]
+        scores[index] = sum(weights[stem] for stem in matched) / total
+    return scores
+
+
+def _same_stem(left: str, right: str) -> bool:
+    """Одна ли основа у двух слов: совпало начало длиной LEXICAL_MATCH_CHARS.
+
+    Точного равенства мало: «статья» и «статьи» расходятся последним символом,
+    «лазер» и «лазера» — тоже. Сравниваем начала основ, а слова короче
+    LEXICAL_MATCH_CHARS считаем совпавшими только целиком («сити» = «сити»).
+    """
+    if len(left) >= LEXICAL_MATCH_CHARS and len(right) >= LEXICAL_MATCH_CHARS:
+        return left[:LEXICAL_MATCH_CHARS] == right[:LEXICAL_MATCH_CHARS]
+    return left == right
 
 
 def _score_all(rows: List[List[float]], vector: List[float]) -> List[float]:

@@ -721,11 +721,15 @@ async def test_dialog():
           any("MCP" in t for t in texts(events, "debug")),
           str(texts(events, "debug"))[-200:])
     context = all_context()
+    # Ищем именно БЛОК данных: само словосочетание «ДАННЫЕ MCP» встречается ещё и
+    # в промпте планировщика (правило про готовые данные), и по нему нельзя понять,
+    # пришли ли данные на самом деле.
+    block_head = mcp_store.BLOCK_HEADER[:40]
     check("данные MCP уходят в модель (блоком системного промпта и в служебные вызовы)",
-          "ДАННЫЕ MCP" in system_texts() or "ДАННЫЕ MCP" in context,
+          block_head in system_texts() or block_head in context,
           context[-300:])
     check("планировщик видит данные MCP",
-          any("ДАННЫЕ MCP" in payload for payload in PLANNER_PAYLOADS),
+          any(block_head in payload for payload in PLANNER_PAYLOADS),
           str(PLANNER_PAYLOADS)[:200])
     dialog = chat._current_session()["dialog"]
     stored = workspace_store.dialog_mcp(dialog)
@@ -805,7 +809,8 @@ async def test_dialog():
           f"вызовов: {MCP_CHOICE_CALLS}")
     check("выключенный MCP не обращается к серверам", not TOOL_CALLS and DISCOVER_CALLS == 0,
           f"вызовы: {len(TOOL_CALLS)}, обнаружений: {DISCOVER_CALLS}")
-    check("блока данных MCP в контексте нет", "ДАННЫЕ MCP" not in system_texts(),
+    check("блока данных MCP в контексте нет",
+          mcp_store.BLOCK_HEADER[:40] not in system_texts(),
           system_texts()[-200:])
     check("ответ получен как обычно", bool(texts(events, "bot")),
           str(texts(events, "bot"))[:120])
@@ -831,7 +836,7 @@ async def test_dialog():
     check("сбой выбора не ломает ответ", bool(texts(events, "bot")),
           str(texts(events, "bot"))[:120])
     check("сбой выбора не оставляет блок данных",
-          "ДАННЫЕ MCP" not in system_texts(), system_texts()[-200:])
+          mcp_store.BLOCK_HEADER[:40] not in system_texts(), system_texts()[-200:])
 
     # 5.6 Реестр проекта: три локальных сервера без ключей и ДВА своих на VPS.
     restore_registry()

@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+from app import config
 from app.ai import attachments as attach_store
 from app.ai import client as llm_client
 from app.ai import service
@@ -49,6 +50,8 @@ from app.ai import profiles as profile_store
 from app.ai import rag
 from app.ai import rag_documents
 from app.ai import rag_jobs
+from app.ai import rag_search
+from app.ai import rag_suite
 from app.ai import rag_store
 from app.ai import task_state
 from app.ai import workspace as workspace_store
@@ -574,7 +577,8 @@ def _log_event(dialog: Optional[Dict[str, Any]], event: Dict[str, Any]) -> None:
         workspace_store.add_log(dialog, workspace_store.LOG_ERROR, event.get("text"))
     elif kind == "bot":
         workspace_store.add_log(dialog, workspace_store.LOG_ASSISTANT, event.get("text"),
-                                files=event.get("files"))
+                                files=event.get("files"),
+                                sources=event.get("sources"))
 
 
 def _defer_stop(session: Dict[str, Any], action: str) -> Optional[Dict[str, Any]]:
@@ -2073,6 +2077,12 @@ def _mcp_debug() -> str:
             "какие данные нужны для этого запроса.")
 
 
+def _rag_debug() -> str:
+    """Строка диагностики перед поиском по базам знаний (что именно происходит)."""
+    return ("RAG: ищу фрагменты в подключённых базах знаний проекта — векторным "
+            "поиском по этому запросу (локальные эмбеддинги, без обращения к LLM).")
+
+
 def _mcp_files_text(files: List[Dict[str, Any]]) -> str:
     """Подпись узла чата с файлами, полученными от MCP-инструментов.
 
@@ -2163,6 +2173,72 @@ def _verified_choice(dialog: Optional[Dict[str, Any]], text: str,
     if any(_flat(item.get("send")) == wanted for item in data["suggestions"]):
         return data
     return None
+
+
+async def _preflight_rag(task: Dict[str, Any], session: Dict[str, Any], text: str,
+                         state: "task_state.TaskState", reuse: bool = False,
+                         machine_step: bool = False, fresh: bool = False
+                         ) -> Tuple[Dict[str, Any], List[str], bool]:
+    """Фрагменты баз знаний (RAG) по запросу — ДО этапа планирования.
+
+    Возвращает (данные RAG, строки диагностики, «поиск выполнялся сейчас»).
+    Подключённых баз у проекта нет — ни поиска, ни данных: запрос идёт как
+    раньше, и в модель НЕ уходит блок с фрагментами (см. app/ai/rag_search.py).
+
+    Фрагменты кладутся в dialog["rag"] вместе с подписью «включённые базы + их
+    отпечаток + запрос задачи»: шаги плана выполняются отдельными HTTP-запросами,
+    и каждый из них должен видеть те же документы, а векторный поиск стоит
+    времени (вектор запроса + перебор индекса). `reuse` (служебная реплика шага,
+    подтверждение плана, «работай автономно», «перезапусти») означает «это НЕ
+    новый запрос»: искать по служебной фразе нельзя — по ней нашлось бы что
+    угодно. Новый содержательный текст пользователя — наоборот, новый запрос:
+    документы подбираются по НЕМУ, иначе ответ опирался бы на прежние фрагменты.
+
+    `fresh` — АВТОЗАПУСК периодической задачи: запрос тот же, но документы могли
+    обновиться (их переиндексировали), поэтому поиск идёт заново.
+
+    Отпечаток индексов (`corpus_stamp`) важен отдельно: без него сохранённые
+    фрагменты пережили бы переиндексацию базы, и агент отвечал бы по прежней
+    версии документа.
+
+    Поиск идёт В ПОТОКЕ: считается вектор запроса (модель эмбеддингов) и
+    перебираются векторы индекса — цикл событий на это время блокировать нельзя,
+    параллельные задачи ждали бы.
+    """
+    dialog = session["dialog"]
+    enabled = workspace_store.rag_enabled(task)
+    if not enabled:
+        return {}, [], False
+    # Служебные фразы описывают ПРЕЖНИЙ запрос задачи (state.request), новый текст
+    # пользователя — сам является запросом.
+    request_text = ((state.request or text or "").strip() if (reuse or machine_step)
+                    else (text or "").strip())
+    profile = _current_profile_id()
+    # Отпечаток индексов читается с диска (паспорта баз) — это дешёвая проверка
+    # «документы те же?», и только по ней решается, нужен ли поиск вообще.
+    stamp = await asyncio.to_thread(rag_search.corpus_stamp, enabled, profile)
+    signature = rag_search.signature(enabled, request_text, stamp)
+    stored = workspace_store.dialog_rag(dialog)
+    # Данные по ЭТОМУ запросу уже собраны (шаг плана, проверка результата или
+    # повтор того же запроса): искать заново нечего.
+    if stored.get("signature") == signature and not fresh:
+        return stored, [], False
+    if (reuse or machine_step) and not request_text:
+        # Служебная реплика шага, а запроса задачи в состоянии НЕТ (задача пришла
+        # из файла до первого шага): искать по служебной фразе нельзя — по ней
+        # нашлось бы что угодно. Обычно же искать ЕСТЬ по чему: подпись могла не
+        # совпасть из-за переиндексации базы или смены набора баз, а запрос задачи
+        # (`state.request`) от этого не меняется — по нему поиск и идёт.
+        return {}, [], False
+    # ПОИСК — В ПОТОКЕ: считается вектор запроса (модель эмбеддингов) и
+    # перебираются векторы индекса; цикл событий на это время блокировать нельзя,
+    # иначе параллельные задачи ждали бы чужой поиск.
+    result = await asyncio.to_thread(rag_search.search, enabled, request_text,
+                                     profile=profile)
+    workspace_store.set_dialog_rag(dialog, signature, request_text, result)
+    data = workspace_store.dialog_rag(dialog)
+    note = rag_search.results_note(data)
+    return data, ([note] if note else []), True
 
 
 async def _preflight_invariants(task: Dict[str, Any], session: Dict[str, Any],
@@ -2303,7 +2379,7 @@ def _gate_cache_key(steps: List[str], snapshot: Dict[str, Any]) -> tuple:
             invariants_store.rules_signature(snapshot))
 
 
-def _data_basis(results: Any) -> str:
+def _data_basis(results: Any, rag: Any = None) -> str:
     """ОСНОВА ДАННЫХ плана: какие внешние данные по запросу получены.
 
     План строится по фактическим данным (см. блок «ДАННЫЕ MCP»), поэтому смена
@@ -2313,10 +2389,19 @@ def _data_basis(results: Any) -> str:
     УСПЕШНЫЕ вызовы: план, построенный на отказе инструмента, — это план без данных,
     и его переиспользовать нельзя. Пустая строка — данных MCP нет (у проекта MCP
     выключен, запрос их не требует или все вызовы отказали).
+
+    `rag` — фрагменты баз знаний по тому же запросу: они такой же вход плана, как
+    и данные инструментов. База, из которой фрагменты НАШЛИСЬ, входит в основу по
+    идентификатору: переиндексация базы (или её включение у проекта) меняет
+    основу, и план не переиспользуется «по старой памяти».
     """
     pairs = sorted({f"{item.get('server')}·{item.get('tool')}"
                     for item in (results if isinstance(results, list) else [])
                     if isinstance(item, dict) and item.get("tool") and item.get("ok")})
+    bases = sorted({str(hit.get("base_id") or "")
+                    for hit in rag_search.hits_of(rag) if hit.get("base_id")})
+    if bases:
+        pairs.append("rag:" + ",".join(bases))
     return ", ".join(pairs)[:300]
 
 
@@ -2633,11 +2718,12 @@ async def mcp_apply(payload: McpApply) -> dict:
 # ---------------------------------------------------------------------------
 # RAG: базы знаний проекта (кнопка «RAG» рядом с «MCP»)
 #
-# Задача дня — ИНДЕКСАЦИЯ: пользователь загружает документы, они разбиваются на
-# чанки, считается эмбеддинг каждого чанка, и всё это ложится локальным индексом
-# (SQLite — рабочее, JSON — выгрузка) с метаданными. Сам RAG к агенту пока НЕ
-# подключён: включённая база ничего не добавляет в контекст модели — она просто
-# готова к этому (см. app/ai/rag.py, rag_store.search).
+# Пользователь загружает документы, они разбиваются на чанки, считается
+# эмбеддинг каждого чанка, и всё это ложится локальным индексом (SQLite —
+# рабочее, JSON — выгрузка) с метаданными. Перед каждым запросом агент ищет во
+# ВКЛЮЧЁННЫХ у проекта базах фрагменты по вопросу, отвечает по ним и показывает
+# источники под ответом (см. app/ai/rag_search.py и `_preflight_rag` ниже).
+# Поиск идёт ЛОКАЛЬНО и обращений к LLM не делает.
 # ---------------------------------------------------------------------------
 def _rag_view(task: Optional[Dict[str, Any]], force: bool = False) -> Dict[str, Any]:
     """Снимок баз знаний для интерфейса (диалог «База знаний»).
@@ -2687,6 +2773,15 @@ async def rag_apply(payload: RagApply) -> dict:
         workspace_store.set_rag_enabled(task, enabled)
         workspace_store.set_rag_chunking(task, payload.strategy,
                                          payload.chunk_size, payload.overlap)
+        # Фрагменты прежнего запроса сбрасываются (dialog["rag"]): набор баз
+        # изменился, и найденное ранее могло быть подобрано по базе, которую
+        # пользователь только что выключил. Подпись данных всё равно не совпала бы
+        # (в неё входят включённые базы), но чистить — надёжнее: иначе выключенная
+        # база оставалась бы видна в карточках источников до первого нового поиска.
+        for session in task.get("sessions") or []:
+            dialog = session.get("dialog")
+            if isinstance(dialog, dict):
+                workspace_store.set_dialog_rag(dialog, "", "", {})
         await _persist()
     return _rag_view(task)
 
@@ -2936,6 +3031,245 @@ async def rag_chunks(base_id: str, offset: int = 0, limit: int = 10,
                                offset=offset, limit=limit, source=source, query=q)
     except rag.RagError:
         raise HTTPException(status_code=404, detail="База знаний не найдена")
+
+
+# ---------------------------------------------------------------------------
+# ТЕСТОВЫЙ ПРОГОН RAG: команда /test_rag в чате (app/ai/rag_suite.py)
+#
+# ИСКЛЮЧЕНИЕ ИЗ ОБЫЧНОЙ РАБОТЫ, и это намеренно. Проверяется ПОИСК И ОТВЕТ ПО
+# ДОКУМЕНТАМ, а не умение агента планировать, поэтому прогон идёт МИМО пайплайна
+# задачи: без планировщика, подтверждения плана, шагов, автомата и приёмщика. В
+# память диалога (messages) и в автомат (state) он НЕ пишет ничего — иначе
+# контрольные вопросы перемешались бы с настоящей перепиской и ухудшили бы
+# следующие ответы задачи; в журнал чата (log) пишет: пользователь должен видеть
+# результат, в том числе после переключения задачи. Расход токенов прогона в
+# замер задачи (dialog["usage"]) не попадает — он показывается итоговой строкой.
+# ---------------------------------------------------------------------------
+def _rag_test_context() -> Tuple[List[str], str, str]:
+    """(включённые базы, готовый блок запроса, причина отказа) для прогона.
+
+    Базы берутся у ТЕКУЩЕГО проекта профиля — тот же набор, по которому отвечает
+    агент. Базы не включены — прогонять нечего: тест проверяет RAG, а не модель.
+    """
+    task = _current_task()
+    enabled = workspace_store.rag_enabled(task) if task else []
+    if not enabled:
+        return [], "", ("к проекту не подключено ни одной базы знаний — включите базу "
+                        "кнопкой «RAG», иначе проверять нечего")
+    return enabled, "", ""
+
+
+@router.post("/agent/rag/test")
+async def rag_test(request: Request) -> StreamingResponse:
+    """Прогон контрольных вопросов по базам знаний — команда `/test_rag` в чате.
+
+    Поток событий (NDJSON, как у чата агента):
+
+      * `{"type": "test_start", "total": N, "bases": [...]}` — начали, столько-то
+        вопросов по таким-то базам;
+      * `{"type": "test_question", "n": i, "total": N, "text": "…"}` — вопрос;
+      * `{"type": "bot", "text": "…"}` — ответ модели по фрагментам;
+      * `{"type": "test_error", "n": i, "text": "…"}` — вопрос остался без ответа
+        (прогон НЕ обрывается: остальные вопросы всё равно проверяются);
+      * `{"type": "test_verdict", "text": …, "items": [...]}` — вердикт судьи;
+      * `{"type": "done", "usage": {...}}` — итог прогона и его расход.
+
+    Вопросы, эталоны и промпты живут в `app/ai/rag_suite.py`; здесь только ход
+    прогона. Поиск по базе идёт тем же кодом, что у агента (`rag_search.search`),
+    и в потоке — цикл событий на нём не стоит.
+    """
+    enabled, _, reason = _rag_test_context()
+    if reason:
+        raise HTTPException(status_code=400, detail=reason)
+    task = _current_task()
+    if task is None:
+        raise HTTPException(status_code=400,
+                            detail="Сначала создайте проект — базы знаний привязаны к проекту")
+    # Место для вывода: активный диалог задачи. Его нет (задача без диалогов) —
+    # заводим, как это делает обычный запрос агента: результаты теста должны быть
+    # видны в чате, а не потеряться.
+    session = workspace_store.active_session(_workspace, task)
+    if session is None:
+        session = workspace_store.create_session(task)
+    dialog = session.get("dialog")
+    profile = _current_profile_id()
+    base_names = []
+    for base_id in enabled:
+        meta = rag_store.get_base(base_id, profile=profile) or {}
+        base_names.append(str(meta.get("name") or base_id))
+
+    def log(kind: str, text: str) -> None:
+        """Запись в журнал ЧАТА (не в память диалога): тест должен быть виден."""
+        if dialog is not None:
+            workspace_store.add_log(dialog, kind, text)
+
+    async def event_stream():
+        # Прогон НЕ берёт блокировку задачи: он ничего не меняет в её состоянии, а
+        # держать на нём замок значило бы блокировать настоящую работу.
+        rows: List[Dict[str, Any]] = []
+        usage: Dict[str, Any] = {}
+        start = {"type": "test_start", "total": rag_suite.total(),
+                 "bases": base_names}
+        log(workspace_store.LOG_DEBUG, (
+            "🧪 Тест RAG: %d контрольных вопросов по базам: %s. Прогон идёт мимо "
+            "плана задачи — состояние и память задачи не меняются."
+            % (rag_suite.total(), ", ".join(base_names))))
+        yield json.dumps(start, ensure_ascii=False) + "\n"
+        for number, case_data in enumerate(rag_suite.CASES, 1):
+            if await request.is_disconnected():
+                return
+            question = case_data["question"]
+            log(workspace_store.LOG_USER, "🧪 Вопрос %d/%d: %s"
+                % (number, rag_suite.total(), question))
+            event = {"type": "test_question", "n": number,
+                     "total": rag_suite.total(), "text": question}
+            yield json.dumps(event, ensure_ascii=False) + "\n"
+            started = time.monotonic()
+            try:
+                # 1. ПОИСК по базам проекта — тем же кодом, что у агента.
+                result = await asyncio.to_thread(rag_search.search, enabled, question,
+                                                 profile=profile)
+                hits = rag_search.hits_of(result)
+                block = rag_search.block(result)
+                # 2. ОТВЕТ модели по найденным фрагментам — ОДИН вызов, без плана.
+                content, metrics = await llm_client.call_llm_async(
+                    user_text=rag_suite.answer_payload(case_data, block),
+                    model=config.LLM_MODEL,
+                    disable_thinking=True,
+                    max_tokens=rag_suite.ANSWER_MAX_TOKENS,
+                    messages=[
+                        {"role": "system", "content": rag_suite.ANSWER_PROMPT},
+                        {"role": "user",
+                         "content": rag_suite.answer_payload(case_data, block)},
+                    ],
+                    timeout=_rag_test_timeout())
+                answer = str(content or "").strip()
+                usage = _merge_test_usage(usage, metrics)
+                source_line = ("%d. Найдено фрагментов: %d%s"
+                               % (number, len(hits),
+                                  ("; лучший — " + rag_search.address_of(hits[0]))
+                                  if hits else ""))
+                row = {"n": number, "question": question, "answer": answer,
+                       "hits": len(hits), "error": "", "metrics": metrics,
+                       "seconds": round(time.monotonic() - started, 1)}
+            except Exception as exc:                    # сбой одного вопроса
+                logger.warning("RAG-тест: вопрос %d не отработан — %s",
+                               number, str(exc)[:200])
+                row = {"n": number, "question": question, "answer": "",
+                       "hits": 0,
+                       "error": llm_client.redact_secrets(str(exc))[:300],
+                       "metrics": {}, "seconds": round(time.monotonic() - started, 1)}
+            rows.append(row)
+            yield json.dumps({"type": "debug", "text": source_line},
+                             ensure_ascii=False) + "\n"
+            log(workspace_store.LOG_DEBUG, source_line)
+            if row["answer"]:
+                log(workspace_store.LOG_ASSISTANT, row["answer"])
+                yield json.dumps({"type": "bot", "text": row["answer"],
+                                  "test": number}, ensure_ascii=False) + "\n"
+            else:
+                text = ("⚠ Вопрос %d остался без ответа: %s"
+                        % (number, row["error"] or "причина неизвестна"))
+                log(workspace_store.LOG_ERROR, text)
+                yield json.dumps({"type": "test_error", "n": number, "text": text},
+                                 ensure_ascii=False) + "\n"
+
+        # 3. ОЦЕНКА: вопросы, ЭТАЛОНЫ и ответы уходят судье — отдельным вызовом.
+        verdict = {"items": [], "summary": ""}
+        if any(row["answer"] for row in rows):
+            yield json.dumps({"type": "debug", "text": (
+                "🧪 Отдаю ответы на оценку модели: сравнит факты с эталонами, "
+                "выписанными из самой базы.")}, ensure_ascii=False) + "\n"
+            payload = rag_suite.judge_payload(rows)
+            try:
+                content, metrics = await llm_client.call_llm_async(
+                    user_text=payload,
+                    model=config.LLM_MODEL,
+                    disable_thinking=True,
+                    max_tokens=rag_suite.JUDGE_MAX_TOKENS,
+                    messages=[
+                        {"role": "system", "content": rag_suite.JUDGE_PROMPT},
+                        {"role": "user", "content": payload},
+                    ],
+                    timeout=_rag_test_timeout())
+                usage = _merge_test_usage(usage, metrics)
+                verdict = rag_suite.parse_verdict(content)
+            except Exception as exc:
+                logger.warning("RAG-тест: оценка не получена — %s", str(exc)[:200])
+                verdict["summary"] = ("Оценку получить не удалось: %s"
+                                      % llm_client.redact_secrets(str(exc))[:200])
+        else:
+            verdict["summary"] = "Ни один вопрос не получил ответа — оценивать нечего."
+
+        lines = rag_suite.verdict_lines(verdict)
+        text = "🧪 Оценка ответов\n" + rag_suite.summary_text(verdict)
+        if lines:
+            text += "\n" + "\n".join(lines)
+        if verdict.get("summary"):
+            text += "\n\n" + str(verdict["summary"])
+        text += "\n\n" + _rag_test_usage_line(usage, rows)
+        log(workspace_store.LOG_ASSISTANT, text)
+        yield json.dumps({"type": "test_verdict", "text": text,
+                          "items": verdict.get("items") or [],
+                          "summary": verdict.get("summary") or ""},
+                         ensure_ascii=False) + "\n"
+        yield json.dumps({"type": "done", "usage": usage}, ensure_ascii=False) + "\n"
+
+    async def stream():
+        """Поток прогона + запись журнала на диск (результаты видны и после
+        переключения задачи). Сбой записи прогон не отменяет."""
+        try:
+            async for chunk in event_stream():
+                yield chunk
+        finally:
+            if dialog is not None:
+                try:
+                    async with _workspace_lock:
+                        await _persist()
+                except Exception as exc:            # pragma: no cover - защита
+                    logger.warning("RAG-тест: журнал не сохранён — %s", str(exc)[:150])
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+def _rag_test_timeout() -> float:
+    """Таймаут одного вызова теста: ответы короткие, ждать дольше незачем."""
+    return float(llm_client.HTTP_TIMEOUT)
+
+
+def _merge_test_usage(total: Dict[str, Any], metrics: Any) -> Dict[str, Any]:
+    """Складывает расход прогона (вопросы + судья) в ОТДЕЛЬНЫЙ замер теста."""
+    if not isinstance(metrics, dict):
+        return total
+    result = dict(total or {})
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        try:
+            result[key] = int(result.get(key) or 0) + int(metrics.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+    result["calls"] = int(result.get("calls") or 0) + 1
+    result["model"] = str(metrics.get("model") or result.get("model") or "")
+    return result
+
+
+def _rag_test_usage_line(usage: Dict[str, Any], rows: List[Dict[str, Any]]) -> str:
+    """Строка расхода прогона: отдельным замером, в замер задачи не входит.
+
+    Токены теста считаются и показываются, но НЕ складываются с расходом задачи
+    (dialog["usage"]): иначе панель «Токены задачи» показывала бы работу, которой
+    по запросу задачи не было.
+    """
+    calls = int(usage.get("calls") or 0)
+    spent = 0.0
+    for row in rows:
+        metrics = row.get("metrics") or {}
+        spent += float(metrics.get("cost_rub") or 0.0)
+    line = ("Расход теста (в замер задачи не входит): вызовов %d, вход %s / выход %s "
+            "токенов" % (calls, int(usage.get("prompt_tokens") or 0),
+                         int(usage.get("completion_tokens") or 0)))
+    if spent:
+        line += ", стоимость %.4f руб." % spent
+    return line
 
 
 def _too_big_detail(name: str, size: int, limit: int) -> str:
@@ -3248,6 +3582,13 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         # Данные внешних инструментов MCP по текущему запросу задачи: заполняются
         # ДО планирования (см. _preflight_mcp) и уходят в план, ответ и проверку.
         mcp_data: List[Dict[str, Any]] = []
+        # Фрагменты баз знаний (RAG) по текущему запросу задачи: заполняются
+        # сразу после данных MCP (см. _preflight_rag) и уходят в план, ответ и
+        # проверку тем же системным блоком.
+        rag_data: Dict[str, Any] = {}
+        # Источники под финальным ответом: фрагменты, которые были у модели
+        # (карточки «файл · раздел · близость» в интерфейсе).
+        rag_sources: List[Dict[str, Any]] = []
         # Файлы, полученные инструментами в ЭТОМ запросе (карточки в чате), и
         # признак «готовый результат уже есть» (по нему не спрашиваем
         # подтверждение плана: работа сделана, ждать пользователя нечего).
@@ -3611,6 +3952,39 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             "files": mcp_files,
                         }
 
+                # 1г. БАЗЫ ЗНАНИЙ (RAG). Если у проекта включены базы знаний,
+                #     агент ищет в них фрагменты по этому запросу ДО планирования:
+                #     план и ответ должны строиться по документам пользователя, а
+                #     не по догадке (см. app/ai/rag_search.py). Найденные
+                #     фрагменты уходят в модель отдельным системным блоком,
+                #     сохраняются в диалоге под подписью запроса (шаги плана и
+                #     проверка берут их оттуда, а не ищут заново) и показываются
+                #     пользователю карточками источников под финальным ответом.
+                #     Обращений к LLM поиск НЕ делает: считаются только локальные
+                #     эмбеддинги, поэтому «служебных токенов» он не тратит.
+                if workspace_store.rag_enabled(task_now):
+                    if not machine_step:
+                        yield encode({"type": "debug", "text": (
+                            f"{_MACHINE}: " + _rag_debug()
+                        )})
+                    rag_data, rag_lines, rag_searched = await _preflight_rag(
+                        task_now, session_now, text, state,
+                        # Служебные фразы и подтверждение плана — не новый запрос:
+                        # фрагменты по запросу задачи уже найдены.
+                        reuse=(confirmed or autonomous or restart),
+                        machine_step=machine_step,
+                        # АВТОЗАПУСК периодической задачи: запрос тот же, но
+                        # документы могли переиндексировать — ищем заново.
+                        fresh=periodic_run)
+                    for line in rag_lines:
+                        yield encode({"type": "debug", "text": f"{_MACHINE}: {line}"})
+                    # ИСТОЧНИКИ под ответом: показываем фрагменты, которые были у
+                    # модели. Решаем это здесь, а подпись к карточкам — в интерфейсе:
+                    # «подобрано по запросу», а не «использовано в ответе» (что
+                    # именно попало в текст, решает модель).
+                    if rag_searched or rag_data:
+                        rag_sources = rag_search.sources(rag_data)
+
                 async def run_validation(answered_step: bool, step_errors: List[str],
                                          stored_exchange: bool, resumed: bool):
                     """Проверка результата: локальная самопроверка + содержательная
@@ -3678,6 +4052,9 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             # Проверка видит те же данные MCP, что и ответ: без них
                             # «сходил за погодой» выглядело бы выдуманным числом.
                             mcp=mcp_data,
+                            # И те же фрагменты баз знаний: иначе ссылка на документ
+                            # пользователя выглядела бы выдуманным источником.
+                            rag=rag_data,
                         )
                         if reviewer.last_usage:
                             usage = merge_usage(usage, reviewer.last_usage)
@@ -3794,7 +4171,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         if (machine_step or confirmed or restart) \
                         else (text or state.request)
                     plan_signature = _plan_signature(
-                        plan_request, _snapshot_for_plan, _data_basis(mcp_data))
+                        plan_request, _snapshot_for_plan, _data_basis(mcp_data, rag_data))
                     reuse_plan = bool(
                         (restarted_from_failure or periodic_task)
                         and state.autonomous and not confirmed
@@ -3837,6 +4214,11 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             # поставит в план шаг «узнать погоду» вместо работы по
                             # фактическим данным.
                             mcp=mcp_data,
+                            # Фрагменты баз знаний — по той же причине: шаг «найти
+                            # требования в регламенте» не нужен, если они уже
+                            # найдены, а шаг «сделать по регламенту» без них был бы
+                            # выдумкой.
+                            rag=rag_data,
                         )
                         # Замер вызова плана — ДЕЛЬТА (агент обнуляет счётчик в
                         # начале вызова), поэтому повторное перепланирование не
@@ -3857,6 +4239,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                 profile=profile,
                                 invariants=_invariants_snapshot(task_now, session_now),
                                 mcp=mcp_data,
+                                rag=rag_data,
                                 note=(
                                     "ПРОВЕРКА ПО ПРАВИЛАМ ОТКЛОНИЛА предыдущий план. "
                                     "Эти шаги нарушают правила, повторять их НЕЛЬЗЯ:\n"
@@ -3913,6 +4296,23 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                 "уже полученного результата, а не отдельная работа "
                                 "(каждый шаг стоил отдельного вызова модели)."
                             )})
+                        # ПОИСК ПО БАЗЕ ЗНАНИЙ УЖЕ СДЕЛАН (см. _preflight_rag): шаг
+                        # «найти что-то в базе знаний» ищет уже найденное. Правило в
+                        # промпте планировщика и в блоке фрагментов — просьба,
+                        # поэтому такой шаг убирает КОД (task_state.drop_kb_steps);
+                        # применяется только когда базы включены и поиск выполнен —
+                        # без поиска «посмотреть в базе» законная работа. Шаги с
+                        # последствиями и другой работой в том же шаге не трогаются.
+                        if rag_data:
+                            steps, dropped_kb = task_state.drop_kb_steps(steps,
+                                                                        plan_request)
+                            if dropped_kb:
+                                yield encode({"type": "debug", "text": (
+                                    f"{_MACHINE}: из плана убран {dropped_kb} "
+                                    f"{task_state.steps_word(dropped_kb)} поиска в базе "
+                                    "знаний — фрагменты по этому запросу уже найдены и "
+                                    "переданы модели (поиск идёт ДО планирования)."
+                                )})
                         state.steps = steps
                         # Запоминаем, для какого запроса и правил план построен:
                         # ровно за такой же план больше не платим (см. reuse_plan).
@@ -3923,7 +4323,7 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         dialog_now["plan_signature"] = dict(_plan_signature(
                             plan_request,
                             _invariants_snapshot(task_now, session_now),
-                            _data_basis(mcp_data)))
+                            _data_basis(mcp_data, rag_data)))
                         # Исходный запрос задачи — в состоянии: по нему проверка
                         # результата сверяет работу (последнее сообщение может
                         # быть подтверждением «ок» или служебной фразой шага).
@@ -4041,6 +4441,9 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # Данные внешних инструментов MCP по этому запросу: без них
                         # ответ шага не знал бы о том, что агент уже получил.
                         mcp=mcp_data,
+                        # Фрагменты баз знаний по этому запросу: ответ строится по
+                        # документам пользователя и ссылается на них.
+                        rag=rag_data,
                     ):
                         # Событие "done" несёт расход токенов текущего запроса.
                         kind = event.get("type")
@@ -4084,6 +4487,20 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                 "показываю: смотрите журнал работы выше)."
                             )})
                             continue
+                        if kind == "bot" and last_step and rag_sources \
+                                and not event.get("fallback"):
+                            # ИСТОЧНИКИ — К САМОМУ ОТВЕТУ, а не отдельным узлом:
+                            # карточки «файл · раздел · близость» рисуются под
+                            # финальным ответом, попадают в журнал вместе с ним и
+                            # восстанавливаются при переключении задачи. Только у
+                            # ПОКАЗЫВАЕМОГО ответа (последний шаг): у промежуточных
+                            # ответов карточки были бы мусором в чате, а сами
+                            # фрагменты и так видны в контексте каждого шага.
+                            # Запасной ответ (модель не ответила, `fallback`) карточек
+                            # не получает: фрагментами он не пользовался, и список
+                            # источников под отказом читался бы как «ответ по
+                            # документам».
+                            event = dict(event, sources=rag_sources)
                         yield encode(event)
                         # ФИНАЛЬНЫЙ ОТЧЁТ + ТАБЛИЦА: карточка файла идёт ПОСЛЕ
                         # ответа последнего шага, чтобы пользователь видел сначала

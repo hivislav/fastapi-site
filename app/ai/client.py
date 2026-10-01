@@ -104,6 +104,16 @@ def _redact_secrets(text: str, *secrets: str) -> str:
     return re.sub(r"(?i)(api[\s_-]*key[^:\n]{0,40}:\s*)\S+", r"\1***", out)
 
 
+def redact_secrets(text: str) -> str:
+    """Текст ошибки без ключей — для тех, кто показывает её пользователю.
+
+    Обёртка над `_redact_secrets`: чистить приходится и ВНЕ клиента (например,
+    тестовый прогон RAG показывает причину сбоя вызова прямо в чате). Правило
+    «что считать секретом» здесь не повторяется — оно одно на проект.
+    """
+    return _redact_secrets(text)
+
+
 def _supports_thinking(model: str) -> bool:
     """False, если модель отклоняет поле thinking (тогда его не отправляем)."""
     lowered = str(model or "").lower()
