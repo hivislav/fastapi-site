@@ -309,7 +309,7 @@ function ragBase(overrides) {
   return Object.assign({
     id: 'kb-00000001', name: 'Инструкции оператора', enabled: false,
     strategy: 'structure', strategy_name: 'По структуре (заголовки/разделы/файлы)',
-    chunk_size: 1000, overlap: 150,
+    chunk_size: 350, overlap: 70,
     chunks: 42, documents: 2, chars_total: 32768, chars_avg: 780,
     chars_min: 210, chars_max: 1180, sections: 11, est_tokens: 8192,
     vectors_bytes: 64512, dim: 384, backend: 'sentence-transformers',
@@ -341,11 +341,40 @@ let RAG = {
   enabled: [],
   uploads: [],
   streams: [],
-  settings: { strategy: 'structure', chunk_size: 1000, overlap: 150 },
+  settings: { strategy: 'structure', chunk_size: 350, overlap: 70 },
   // Настройки ПОИСКА для ответов (app/ai/rag_search.py): по ним строка состояния
-  // диалога говорит, что базы подключены к ответам, а не просто лежат списком.
-  search: { top_k: 5, max_hits: 12, min_score: 0.1, block_chars: 12000,
-            chunk_chars: 2200 },
+  // диалога говорит, что базы подключены к ответам, а не просто лежат списком, и
+  // ими же заполняется панель «Поиск и ответы» (два этапа, порог, топ-K до и
+  // после реранкинга, переформулировка запроса).
+  search: { top_k: 5, top_k_after: 5, top_k_before: 20, max_hits: 12,
+            ask_when_empty: true, min_ce: 0,
+            rerank_backend: 'auto', rerank_backend_name: 'авто (cross-encoder, если модель уже скачана)',
+            rewrite: true, rerank: true, filter: true,
+            block_chars: 12000, chunk_chars: 2200, neighbours: 1,
+            phrase_weight: 0.6, address_weight: 0.25, short_penalty: 0.35,
+            // Базовый отсев шума: действует ВСЕГДА, даже со снятой галочкой
+            // фильтрации (он был и в прежней реализации порогом RAG_MIN_SCORE).
+            noise_floor: 0.1 },
+  // Границы полей панели поиска — приходят С СЕРВЕРА (rag_search.limits), как и
+  // пределы размеров чанка: интерфейс не выдумывает их сам.
+  searchLimits: { top_k: { min: 1, max: 50 }, max_hits: { min: 1, max: 50 },
+                  min_ce: { min: 0, max: 1, step: 0.05 } },
+  // Состояние РЕРАНКЕРА (app/ai/rag_rerank.py, status): чем реранкить сейчас,
+  // какая модель, скачана ли она и почему работает не то, что выбрано.
+  rerank: {
+    requested: 'auto', requested_name: 'авто (cross-encoder, если модель уже скачана)',
+    backend: 'features', backend_name: 'признаки (без модели, работает всегда)',
+    model: 'cross-encoder/mmarco-mMiniLMv2-L12-H384-v1', cached: false,
+    installed: true, available: false, max_pairs: 64, ce_weight: 1,
+    reason: 'модель cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 не скачана: работает '
+            + 'признаковый реранкинг (выберите «cross-encoder», чтобы загрузить её один раз)',
+    cache_dir: 'data/rag/models',
+    backends: [
+      { id: 'auto', name: 'авто (cross-encoder, если модель уже скачана)' },
+      { id: 'features', name: 'признаки (без модели, работает всегда)' },
+      { id: 'cross-encoder', name: 'cross-encoder (модель, точнее и медленнее)' },
+    ],
+  },
 };
 
 // Источники под ответом агента (RAG): что сервер передаёт вместе с ответом
@@ -524,6 +553,8 @@ function ragPayload() {
     strategies: RAG_STRATEGIES,
     settings: Object.assign({}, RAG.settings),
     search: Object.assign({}, RAG.search),
+    search_limits: JSON.parse(JSON.stringify(RAG.searchLimits)),
+    rerank: JSON.parse(JSON.stringify(RAG.rerank)),
     defaults: { strategy: 'structure', chunk_size: 1000, overlap: 150 },
     limits: {
       chunk_size: { min: 100, max: 8000 }, overlap: { min: 0, max: 4000 },
@@ -538,6 +569,7 @@ function ragPayload() {
       requested: 'auto', backend: 'sentence-transformers',
       backend_name: 'sentence-transformers (семантические эмбеддинги)',
       model: 'paraphrase-multilingual-MiniLM-L12-v2', dim: 384,
+      max_seq_length: 128, window_chars: 365,
       sbert_installed: true, reason: '', cache_dir: 'data/rag/models',
       backends: [],
     },
@@ -920,6 +952,25 @@ function makeFetch() {
           chunk_size: Number(body.chunk_size) || RAG.settings.chunk_size,
           overlap: Number(body.overlap) || 0,
         };
+        // Панель ПОИСКА: сервер запоминает этапы, выборки и порог и возвращает
+        // их в снимке — проверка смотрит, что ушло именно то, что выбрано.
+        if (body.rewrite !== undefined) RAG.search.rewrite = Boolean(body.rewrite);
+        if (body.rerank_backend) {
+          RAG.search.rerank_backend = String(body.rerank_backend);
+        }
+        if (body.ask_when_empty !== undefined) {
+          RAG.search.ask_when_empty = Boolean(body.ask_when_empty);
+        }
+        if (body.rerank !== undefined) RAG.search.rerank = Boolean(body.rerank);
+        if (body.filter !== undefined) RAG.search.filter = Boolean(body.filter);
+        if (body.top_k_before) RAG.search.top_k_before = Number(body.top_k_before);
+        if (body.top_k_after) {
+          RAG.search.top_k_after = Number(body.top_k_after);
+          RAG.search.top_k = Number(body.top_k_after);
+        }
+        if (body.min_ce !== undefined && body.min_ce !== null) {
+          RAG.search.min_ce = Number(body.min_ce);
+        }
       }
       return jsonResponse(ragPayload());
     }
@@ -2535,6 +2586,19 @@ async function run() {
   check('пределы размеров взяты с сервера',
     $('rag-size').min === '100' && $('rag-size').max === '8000',
     $('rag-size').min + '…' + $('rag-size').max);
+  // ОКНО МОДЕЛИ ЭМБЕДДИНГОВ: чанк больше него поиск видит только до этого места
+  // (у MiniLM окно 128 токенов ≈ 365 символов, а прежний размер по умолчанию был
+  // 1000 — то есть большая часть каждого чанка была для поиска невидима).
+  $('rag-size').value = '1000';
+  $('rag-size').dispatchEvent(new dom.window.Event('input'));
+  check('размер чанка больше окна модели помечен предупреждением',
+    $('rag-strategy-hint').textContent.indexOf('больше окна модели эмбеддингов') >= 0
+    && $('rag-strategy-hint').classList.contains('off') === true,
+    $('rag-strategy-hint').textContent.slice(-160));
+  $('rag-size').value = '350';
+  $('rag-size').dispatchEvent(new dom.window.Event('input'));
+  check('рекомендуемый размер предупреждения не даёт',
+    $('rag-strategy-hint').textContent.indexOf('больше окна модели') < 0);
 
   // ВЫРАВНИВАНИЕ НАСТРОЕК: «размер чанка» и «перекрытие» обязаны стоять
   // симметрично. Раскладку задаёт СЕТКА (jsdom считает computed style), поэтому
@@ -2586,12 +2650,131 @@ async function run() {
     && $('rag-overlap').closest('.rag-field').querySelector('label')
       .textContent.indexOf('символов') >= 0);
 
+  // ПАНЕЛЬ «ПОИСК И ОТВЕТЫ»: два этапа поиска, порог и переформулировка. Её
+  // значения приходят С СЕРВЕРА (снимок search) вместе с границами полей
+  // (search_limits) — интерфейс ничего не выдумывает и не считает.
+  check('в диалоге есть галочки этапов поиска',
+    $('rag-rewrite') !== null && $('rag-rerank') !== null && $('rag-filter') !== null
+    && $('rag-rewrite').type === 'checkbox' && $('rag-rerank').type === 'checkbox'
+    && $('rag-filter').type === 'checkbox');
+  const flagText = q('.rag-flags .rag-flag').map(el => el.textContent).join(' | ');
+  check('подписи галочек называют этапы понятными словами',
+    flagText.indexOf('Query Rewrite') >= 0 && flagText.indexOf('Reranking') >= 0
+    && flagText.indexOf('Фильтрация по порогу') >= 0, flagText.slice(0, 140));
+  check('галочки стоят по настройкам проекта с сервера',
+    $('rag-rewrite').checked === RAG.search.rewrite
+    && $('rag-rerank').checked === RAG.search.rerank
+    && $('rag-filter').checked === RAG.search.filter);
+  check('есть галочка «спрашивать, если в документах ничего нет»',
+    $('rag-ask-empty') !== null && $('rag-ask-empty').checked === true);
+  check('в подписи «что произойдёт» учтена остановка на пустой базе',
+    $('rag-search-hint').textContent.indexOf('спрошу вас') >= 0,
+    $('rag-search-hint').textContent.slice(-140));
+  // ДВИЖОК РЕРАНКИНГА ВЫБИРАТЬ НЕЧЕГО: он один — модель cross-encoder (нужна
+  // фильтрации). В панели только СОСТОЯНИЕ: чем работаем и почему не моделью.
+  check('выбора «чем реранкить» в панели нет (движок один — модель)',
+    $('rag-rerank-backend') === null,
+    $('rag-rerank-backend') ? 'селект остался' : 'селекта нет');
+  check('состояние реранкера показано словами, с причиной',
+    $('rag-rerank-note').hidden === false
+    && $('rag-rerank-note').textContent.indexOf('признаки') >= 0
+    && $('rag-rerank-note').textContent.indexOf('не скачана') >= 0,
+    $('rag-rerank-note').textContent.slice(0, 160));
+  // ОДНА ШКАЛА: порог уверенности модели. Порога по «оценке поиска» в панели нет —
+  // это была служебная сумма до 3, которая только путала.
+  check('в панели ОДНА шкала порога — уверенность модели (0…1)',
+    $('rag-min-ce') !== null && $('rag-min-score') === null
+    && $('rag-min-ce').min === '0' && $('rag-min-ce').max === '1'
+    && Number($('rag-min-ce').value) === RAG.search.min_ce
+    && $('rag-min-ce-value').textContent === 'не применяется',
+    $('rag-min-ce').value + ' / ' + $('rag-min-ce-value').textContent);
+
+  // ФИЛЬТРАЦИЯ БЕЗ МОДЕЛИ — ОШИБКА, а не тихая подмена шкалы.
+  RAG.rerank.available = false;
+  RAG.rerank.reason = 'модель кросс-энкодера не скачана — работают признаки';
+  await dom.window.eval('loadRag(false)');
+  await wait(60);
+  check('фильтрация без модели помечена ошибкой прямо в панели',
+    $('rag-search-hint').textContent.indexOf('требует модель-реранкер') >= 0
+    && $('rag-search-hint').classList.contains('off') === true,
+    $('rag-search-hint').textContent.slice(-160));
+  RAG.rerank.available = true;
+  RAG.rerank.reason = '';
+  await dom.window.eval('loadRag(false)');
+  await wait(60);
+  check('с доступной моделью ошибки нет',
+    $('rag-search-hint').textContent.indexOf('требует модель-реранкер') < 0);
+
+  // ЗАВЫШЕННЫЙ ПОРОГ УВЕРЕННОСТИ: у нужных фрагментов 0,45–1,00, выше 0,7 уже
+  // начинает отсекаться верное.
+  $('rag-min-ce').value = '0.8';
+  $('rag-min-ce').dispatchEvent(new dom.window.Event('input'));
+  check('завышенный порог уверенности помечен предупреждением',
+    $('rag-search-hint').textContent.indexOf('отсечёт и часть верного') >= 0
+    && $('rag-search-hint').classList.contains('off') === true,
+    $('rag-search-hint').textContent.slice(-140));
+  $('rag-min-ce').value = '0.4';
+  $('rag-min-ce').dispatchEvent(new dom.window.Event('input'));
+  check('рабочий порог предупреждения не даёт',
+    $('rag-search-hint').textContent.indexOf('отсечёт и часть верного') < 0);
+  check('Top-K до и после реранкинга подставлены из настроек проекта',
+    $('rag-top-before').value === String(RAG.search.top_k_before)
+    && $('rag-top-after').value === String(RAG.search.top_k_after),
+    $('rag-top-before').value + ' / ' + $('rag-top-after').value);
+  const topOptions = Array.from($('rag-top-before').options).map(o => o.value);
+  check('в списках Top-K есть действующее значение и границы сервера',
+    topOptions.indexOf(String(RAG.search.top_k_before)) >= 0
+    && Number(topOptions[topOptions.length - 1]) <= RAG.searchLimits.top_k.max,
+    topOptions.join(','));
+  check('под панелью сказано, что произойдёт с фрагментами',
+    $('rag-search-hint').textContent.indexOf('реранкинг') >= 0
+    && $('rag-search-hint').textContent.indexOf('уверенностью модели ниже 0,40') >= 0
+    && $('rag-search-hint').textContent.indexOf('спрошу вас') >= 0,
+    $('rag-search-hint').textContent.slice(-200));
+
+  // ВЫКЛЮЧЕННЫЙ ЭТАП ГАСИТ СВОИ ПОЛЯ: иначе видно «настройку», которой поиск не
+  // пользуется (пул кандидатов без реранкинга ничего не значит, порог без
+  // фильтрации — тоже).
+  $('rag-rerank').checked = false;
+  $('rag-rerank').dispatchEvent(new dom.window.Event('change'));
+  $('rag-filter').checked = false;
+  $('rag-filter').dispatchEvent(new dom.window.Event('change'));
+  check('без реранкинга поле «Top-K до» выключено и объясняет почему',
+    $('rag-top-before').disabled === true && $('rag-top-before').title.length > 10,
+    $('rag-top-before').title);
+  check('без фильтрации ползунок уверенности выключен',
+    $('rag-min-ce').disabled === true && $('rag-min-ce').title.length > 10,
+    $('rag-min-ce').title);
+  check('снятая галочка фильтрации говорит, что остался базовый отсев шума',
+    $('rag-search-hint').textContent.indexOf('фильтрация выключена') >= 0
+    && $('rag-search-hint').textContent.indexOf('0,10') >= 0,
+    $('rag-search-hint').textContent);
+  check('выключенные этапы помечены в подписи',
+    q('.rag-flags .rag-flag.off').length === 2,
+    'помечено: ' + q('.rag-flags .rag-flag.off').length);
+  $('rag-rerank').checked = true;
+  $('rag-rerank').dispatchEvent(new dom.window.Event('change'));
+  $('rag-filter').checked = true;
+  $('rag-filter').dispatchEvent(new dom.window.Event('change'));
+  check('включённый этап возвращает свои поля в работу',
+    $('rag-top-before').disabled === false && $('rag-min-ce').disabled === false);
+
   // Включаем одну базу и меняем стратегию с размерами — «применить».
   const ragBoxes = q('#rag-list input[type=checkbox]');
   ragBoxes[0].checked = true;
   $('rag-strategy').value = 'fixed';
   $('rag-size').value = '600';
   $('rag-overlap').value = '90';
+  // Панель поиска: выключаем переформулировку запроса, ставим свою выборку и порог.
+  $('rag-rewrite').checked = false;
+  $('rag-ask-empty').checked = false;
+  $('rag-top-before').value = '12';
+  $('rag-top-after').value = '3';
+  $('rag-min-ce').value = '0.42';
+  $('rag-min-ce').dispatchEvent(new dom.window.Event('input'));
+  check('ползунок уверенности показывает значение рядом с подписью',
+    $('rag-min-ce-value').textContent === '0,42',
+    $('rag-min-ce-value').textContent);
   const ragPostsBefore = calls.filter(c => c === 'POST /api/agent/rag').length;
   await click($('rag-apply'), 80);
   check('«применить» отправил набор на сервер',
@@ -2603,6 +2786,16 @@ async function run() {
   check('стратегия и размеры чанка ушли вместе с набором',
     RAG.settings.strategy === 'fixed' && RAG.settings.chunk_size === 600
     && RAG.settings.overlap === 90, JSON.stringify(RAG.settings));
+  check('панель НЕ перезаписывает движок реранкинга (его задаёт окружение)',
+    RAG.search.rerank_backend === 'auto',
+    String(RAG.search.rerank_backend));
+  check('настройки панели поиска ушли вместе с набором',
+    RAG.search.rewrite === false && RAG.search.rerank === true
+    && RAG.search.filter === true && RAG.search.top_k_before === 12
+    && RAG.search.top_k_after === 3 && RAG.search.min_ce === 0.42,
+    JSON.stringify(RAG.search));
+  check('снятая галочка «спрашивать на пустой базе» ушла на сервер',
+    RAG.search.ask_when_empty === false, String(RAG.search.ask_when_empty));
   check('после «применить» диалог закрывается', $('rag-modal').hidden === true);
   check('включённая база помечает кнопку проекта',
     $('project-rag').classList.contains('on') === true
@@ -2617,6 +2810,12 @@ async function run() {
     JSON.stringify(q('#rag-list input[type=checkbox]').map(box => box.checked))
       === JSON.stringify(RAG.bases.map(base => RAG.enabled.indexOf(base.id) >= 0)),
     JSON.stringify(q('#rag-list input[type=checkbox]').map(box => box.checked)));
+  check('повторное открытие показывает сохранённые настройки поиска',
+    $('rag-rewrite').checked === false && $('rag-top-before').value === '12'
+    && $('rag-top-after').value === '3'
+    && $('rag-min-ce-value').textContent === '0,42',
+    [$('rag-rewrite').checked, $('rag-top-before').value,
+     $('rag-top-after').value, $('rag-min-ce-value').textContent].join(' / '));
 
   // ---------------------------------------------------------------------
   // ПРОСМОТР ЧАНКОВ: у каждой базы есть кнопка, диалог показывает текст
@@ -2912,7 +3111,8 @@ async function run() {
   RAG.enabled = [RAG.bases[0].id];
   RAG_SOURCES = [
     { base: 'Инструкции оператора', source: 'guide.md', number: 1081,
-      section: 'Глава 2 › Резервное копирование', score: 1.16,
+      section: 'Глава 2 › Резервное копирование', score: 1.16, base_score: 1.15,
+      by_model: true, ce: 0.98,
       vector_score: 0.33, lexical: 0.82, chars: 420,
       snippet: 'Резервное копирование выполняется командой backup.sh.' },
     { base: 'Регламенты', source: 'rules.docx', number: 42, section: '',
@@ -2956,20 +3156,25 @@ async function run() {
   check('соседний фрагмент подписан как продолжение, а не релевантностью',
     srcCards.length > 2
     && srcCards[2].querySelector('.rag-source-meta').textContent
-      .indexOf('продолжение фрагмента № 42') >= 0
+      .indexOf('соседний фрагмент № 42') >= 0
     && srcCards[2].querySelector('.rag-source-meta').textContent
       .indexOf('релевантность') < 0,
     srcCards[2] ? srcCards[2].querySelector('.rag-source-meta').textContent : '');
-  check('в подписи строки видна релевантность фрагмента запросу',
+  check('в подписи строки видны ДВА числа: релевантность и оценка модели',
     !!srcCards[0] && srcCards[0].querySelector('.rag-source-meta').textContent
-      .indexOf('релевантность 1.16') >= 0,
+      .indexOf('релевантность 1.15') >= 0
+    && srcCards[0].querySelector('.rag-source-meta').textContent
+      .indexOf('оценка модели 0.98') >= 0
+    && srcCards[0].querySelector('.rag-source-meta').textContent
+      .indexOf('оценка поиска') < 0,
     srcCards[0] ? srcCards[0].querySelector('.rag-source-meta').textContent : '');
   check('в подсказке строки — отрывок фрагмента',
     !!srcCards[0] && srcCards[0].title.indexOf('backup.sh') >= 0,
     srcCards[0] ? srcCards[0].title : '');
-  check('в подсказке видно, из чего сложилась оценка (вектор + текст)',
+  check('в подсказке видно, из чего сложилась релевантность (вектор + слова запроса)',
     !!srcCards[0] && srcCards[0].title.indexOf('вектор 0.33') >= 0
-      && srcCards[0].title.indexOf('текст 0.82') >= 0,
+      && srcCards[0].title.indexOf('слова запроса 0.82') >= 0
+      && srcCards[0].title.indexOf('релевантность первичного поиска: 1.15') >= 0,
     srcCards[0] ? srcCards[0].title : '');
   check('подпись блока честная: «подобраны по запросу», а не «использованы в ответе»',
     !!srcBox[0] && srcBox[0].querySelector('.rag-sources-head').textContent
@@ -3000,7 +3205,8 @@ async function run() {
   check('строка состояния говорит, что поиск подключён к ответам',
     $('rag-status').textContent.indexOf('Поиск включён') >= 0
       && $('rag-status').textContent.indexOf('12') >= 0
-      && $('rag-status').textContent.indexOf('0,10') >= 0,
+      && $('rag-status').textContent.indexOf('уверенность модели от 0,42') >= 0
+      && $('rag-status').textContent.indexOf('пул 12') >= 0,
     $('rag-status').textContent);
   RAG.enabled = [];
   await dom.window.eval('loadRag(false)');

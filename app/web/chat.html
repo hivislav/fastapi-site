@@ -1111,6 +1111,16 @@
             font-size: 0.82rem;
             color: var(--text-dim);
         }
+        /* Вариант-подсказка (без действия в чате, например «снизить порог»):
+           кнопка не нажимается — обещать кнопкой нечего. */
+        .inv-option:disabled, .inv-option.inv-option-hint {
+            opacity: 0.62;
+            cursor: default;
+        }
+        .inv-option.inv-option-hint:hover {
+            border-color: var(--line-strong);
+            background: var(--surface-2);
+        }
         .inv-option .inv-option-send {
             display: block;
             margin-top: 6px;
@@ -1524,6 +1534,45 @@
         }
         .rag-field input[type="file"] { padding: 5px 7px; font-size: 0.8rem; }
         .rag-strategy-hint { font-size: 0.78rem; color: var(--muted); margin: 0 0 10px; line-height: 1.5; }
+
+        /* Панель ПОИСКА: два этапа поиска, порог и переформулировка запроса.
+           Галочки идут СПИСКОМ (подпись — часть кликабельной строки), поля
+           выборки — двумя равными колонками, порог — ползунком с числом
+           рядом: значение видно и при перетаскивании, и когда поле не в фокусе. */
+        .rag-search { margin: 14px 0 0; }
+        .rag-flags { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+        .rag-flag {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            font-size: 0.82rem;
+            color: var(--text-dim);
+            line-height: 1.45;
+            cursor: pointer;
+        }
+        .rag-flag input[type="checkbox"] { margin-top: 2px; flex: none; }
+        .rag-flag b { color: var(--text); font-weight: 600; }
+        .rag-flag.off { opacity: 0.6; }
+        /* Две выборки (до и после реранкинга): ширины РАВНЫЕ, как у размеров
+           разбиения, — подписи переносятся одинаково и поля не «пляшут». */
+        .rag-row.search { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .rag-search select:disabled,
+        .rag-search input:disabled { opacity: 0.5; }
+        .rag-range-field { margin-bottom: 6px; }
+        .rag-range-field label { min-height: 0; }
+        .rag-range-field label span {
+            font-family: var(--mono);
+            color: var(--accent-2);
+            margin-left: 4px;
+        }
+        .rag-range-field input[type="range"] {
+            width: 100%;
+            accent-color: var(--accent);
+            margin: 2px 0 0;
+        }
+        .rag-search-hint { margin: 4px 0 0; }
+        .rag-search-hint.off { color: var(--warn); }
+        .rag-search-hint { color: var(--muted); }
         .rag-upload-status { margin: 8px 0 0; font-size: 0.82rem; color: var(--accent-2); line-height: 1.5; }
         .rag-upload-status.bad { color: var(--warn); }
         .rag-upload .modal-actions { margin-top: 6px; }
@@ -2329,6 +2378,76 @@
                     <div class="rag-list" id="rag-list"></div>
                     <p class="modal-hint rag-status" id="rag-status" hidden></p>
 
+                    <!-- ПАНЕЛЬ ПОИСКА (два этапа). Настройка ПРОЕКТА, как галочки
+                         баз: запоминается кнопкой «применить» внизу диалога.
+                         Первый этап ищет широкий пул кандидатов по всей базе,
+                         второй (реранкинг) переставляет и отсекает его по фразе,
+                         заголовку и порогу релевантности. Переформулировка
+                         запроса — единственное место, где поиск обращается к
+                         модели (служебный вызов), и её можно выключить. -->
+                    <div class="rag-search">
+                        <h4>Поиск и ответы</h4>
+                        <p class="rag-strategy-hint">Как документы попадают в ответ.
+                            Первый этап ищет кандидатов по смыслу и словам запроса,
+                            второй — реранкинг моделью-кросс-энкодером: она читает
+                            пару «вопрос + фрагмент» и решает, отвечает ли он
+                            (0…1). В ответ идут лучшие по этой оценке, а фрагменты,
+                            в которых модель уверена меньше порога, отбрасываются.
+                            Под ответом видно два числа: релевантность первичного
+                            поиска (косинус + слова, от 0 до 3) и оценка модели
+                            (0…1) — по ней и стоит настраивать строгость.</p>
+                        <div class="rag-flags">
+                            <label class="rag-flag" for="rag-rewrite">
+                                <input type="checkbox" id="rag-rewrite">
+                                <span><b>Query Rewrite</b> — переформулировать
+                                    запрос перед поиском</span>
+                            </label>
+                            <label class="rag-flag" for="rag-rerank">
+                                <input type="checkbox" id="rag-rerank">
+                                <span><b>Reranking</b> — второй этап: пересчёт и
+                                    перестановка пула кандидатов</span>
+                            </label>
+                            <label class="rag-flag" for="rag-filter">
+                                <input type="checkbox" id="rag-filter">
+                                <span><b>Фильтрация по порогу</b> — не отправлять
+                                    модели фрагменты ниже порога</span>
+                            </label>
+                            <label class="rag-flag" for="rag-ask-empty">
+                                <input type="checkbox" id="rag-ask-empty">
+                                <span><b>Спрашивать, если в документах ничего нет</b>
+                                    — не отвечать по общим знаниям без вашего
+                                    согласия, а предложить варианты</span>
+                            </label>
+                        </div>
+                        <div class="rag-row search">
+                            <div class="rag-field">
+                                <label for="rag-top-before">Пул кандидатов (нужен
+                                    реранкингу)</label>
+                                <select id="rag-top-before"></select>
+                            </div>
+                            <div class="rag-field">
+                                <label for="rag-top-after">Фрагментов в ответ
+                                    (с каждой базы)</label>
+                                <select id="rag-top-after"></select>
+                            </div>
+                        </div>
+                        <!-- ЧЕМ РЕРАНКИТЬ ВЫБИРАТЬ НЕЧЕГО: движок один — модель
+                             cross-encoder (она скачана в кэш проекта и нужна
+                             фильтрации). Здесь показывается СОСТОЯНИЕ: чем
+                             реранкинг работает сейчас и почему не моделью, если
+                             её нет. Ручной переключатель на признаки остался в
+                             окружении (RAG_RERANK_BACKEND) — на случай сбоя. -->
+                        <p class="rag-strategy-hint" id="rag-rerank-note" hidden></p>
+                        <div class="rag-field rag-range-field">
+                            <label for="rag-min-ce">Порог уверенности модели (основной):
+                                <span id="rag-min-ce-value">—</span></label>
+                            <input type="range" id="rag-min-ce" min="0" max="1" step="0.05">
+                        </div>
+
+
+                        <p class="rag-strategy-hint rag-search-hint" id="rag-search-hint"></p>
+                    </div>
+
                     <div class="rag-upload">
                         <h4>Загрузить свою базу знаний</h4>
                         <p class="rag-strategy-hint">Параметры разбиения ниже задают НОВУЮ базу.
@@ -3092,6 +3211,7 @@
             summary: 'сжатие памяти',
             facts: 'блок фактов',
             branching: 'план ветвления',
+            rewrite: 'переформулировка запроса (RAG)',
             service: 'прочие служебные'
         };
 
@@ -5210,6 +5330,7 @@
                 // Разбор инвариантов: под сообщением — кликабельные варианты
                 // решения (ни один не нарушает правила).
                 if (analysis && analysis.suggestions) drawInvariantOptions(wrap, analysis);
+                if (analysis && analysis.options) drawRagChoices(wrap, analysis);
                 // ФАЙЛЫ от внешних инструментов (MCP): карточки со ссылкой на
                 // скачивание. Файл лежит на сервере приложения, поэтому ссылка
                 // ведёт на /api/agent/files/<id> и работает после перезагрузки.
@@ -5260,15 +5381,51 @@
                     item.section || '',
                     item.base ? 'база «' + item.base + '»' : '',
                     item.neighbour
-                        ? 'продолжение фрагмента № ' + fmtNum(item.parent_chunk)
-                        : (score === null ? '' : 'релевантность ' + score.toFixed(2))
+                        ? 'соседний фрагмент № ' + fmtNum(item.parent_chunk)
+                        // ГЛАВНОЕ ЧИСЛО — УВЕРЕННОСТЬ МОДЕЛИ (0…1): понятна и
+                        // сравнима между запросами. Оценку поиска (сумму, которая
+                        // доходит до 3) показываем только когда модели НЕ было
+                        // (признаковый реранкинг) — её разбор всё равно есть в
+                        // подсказке строки.
+                        // ДВА ЧИСЛА: релевантность ПЕРВИЧНОГО поиска (косинус +
+                        // слова запроса) и, если работал реранкинг моделью, её
+                        // оценка. Первой одной мало: живой замер — у мусора 0,85,
+                        // у нужного 0,73, и разводит их именно оценка модели
+                        // (0,003 против 0,78).
+                        : (score === null ? ''
+                           : 'релевантность ' + Number(
+                               item.base_score === undefined ? item.score : item.base_score
+                             ).toFixed(2)
+                             + (Number(item.ce || 0) > 0
+                                 ? ' · оценка модели ' + Number(item.ce).toFixed(2)
+                                 : ''))
                 ].filter(Boolean).join(' · ');
                 line.appendChild(meta);
                 const parts = [];
                 if (typeof item.vector_score === 'number' || typeof item.lexical === 'number') {
-                    parts.push('оценка: вектор ' + Number(item.vector_score || 0).toFixed(2)
-                        + ' + текст ' + Number(item.lexical || 0).toFixed(2)
-                        + (score === null ? '' : ' = ' + score.toFixed(2)));
+                    // Разбор оценки: первый этап (вектор + текст) и добавки
+                    // второго (фраза и адрес), минус штраф короткому чанку без
+                    // слов запроса. Так видно, ПОЧЕМУ фрагмент оказался вверху.
+                    let line = 'релевантность первичного поиска: '
+                        + Number(item.base_score === undefined ? item.score : item.base_score).toFixed(2)
+                        + ' (вектор ' + Number(item.vector_score || 0).toFixed(2)
+                        + ' + слова запроса ' + Number(item.lexical || 0).toFixed(2) + ')';
+                    if (Number(item.phrase || 0) > 0) {
+                        line += ' + фраза ' + Number(item.phrase).toFixed(2);
+                    }
+                    if (Number(item.address || 0) > 0) {
+                        line += ' + адрес ' + Number(item.address).toFixed(2);
+                    }
+                    if (Number(item.ce || 0) > 0) {
+                        // Оценка CROSS-ENCODER: ею реранкил второй этап, если
+                        // выбран бэкенд с моделью (у признаков тут ноль).
+                        line += '; оценка модели ' + Number(item.ce).toFixed(2);
+                    }
+                    if (Number(item.penalty || 0) > 0) {
+                        line += ' − штраф ' + Number(item.penalty).toFixed(2);
+                    }
+                    parts.push(line
+                        + (score === null ? '' : '; итог отбора ' + score.toFixed(2)));
                 }
                 if (item.snippet) parts.push(item.snippet);
                 if (parts.length) line.title = parts.join('\n\n');
@@ -5321,6 +5478,47 @@
         // Кликабельные варианты решения под сообщением агента. Клик отправляет
         // вариант как запрос пользователя (или снимает противоречие правил, если
         // вариант — решение «главнее проект/задача»).
+        // ВАРИАНТЫ ПРОДОЛЖЕНИЯ, КОГДА В ДОКУМЕНТАХ НИЧЕГО НЕТ. Это не варианты
+        // инвариантов: там клик спрашивает сервер «что делать с номером», а здесь
+        // вариант — ГОТОВАЯ фраза, которую пользователь отправляет как запрос (по
+        // ней сервер и узнаёт его решение, см. rag_search.allows_general_answer).
+        // Поэтому кнопка просто отправляет текст, а не ходит в маршрут инвариантов.
+        function drawRagChoices(wrap, analysis) {
+            const list = (analysis.options || []).filter(item => item && item.title);
+            if (!list.length) return;
+            const box = document.createElement('div');
+            box.className = 'inv-options';
+            list.forEach(item => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'inv-option';
+                const title = document.createElement('span');
+                title.className = 'inv-option-title';
+                title.textContent = item.title;
+                btn.appendChild(title);
+                if (item.details) {
+                    const details = document.createElement('span');
+                    details.className = 'inv-option-details';
+                    details.textContent = item.details;
+                    btn.appendChild(details);
+                }
+                if (item.send) {
+                    const note = document.createElement('span');
+                    note.className = 'inv-option-send';
+                    note.textContent = 'отправить как запрос: «' + item.send + '»';
+                    btn.appendChild(note);
+                    btn.addEventListener('click', () => sendUserText(item.send));
+                } else {
+                    // Вариант-подсказка (например «снизить порог»): действия в чате
+                    // у него нет, и обещать кнопкой нечего.
+                    btn.disabled = true;
+                    btn.classList.add('inv-option-hint');
+                }
+                box.appendChild(btn);
+            });
+            wrap.appendChild(box);
+        }
+
         function drawInvariantOptions(wrap, analysis) {
             const list = (analysis.suggestions || []).filter(item => item && item.title);
             if (!list.length) return;
@@ -6100,6 +6298,18 @@
         const ragUploadBtn = document.getElementById('rag-upload');
         const ragUploadStatusEl = document.getElementById('rag-upload-status');
         const ragEmbedNoteEl = document.getElementById('rag-embed-note');
+        // Панель ПОИСКА: галочки этапов, выборки до и после реранкинга, порог.
+        const ragRewriteEl = document.getElementById('rag-rewrite');
+        const ragRerankEl = document.getElementById('rag-rerank');
+        const ragFilterEl = document.getElementById('rag-filter');
+        const ragAskEmptyEl = document.getElementById('rag-ask-empty');
+        const ragRerankNoteEl = document.getElementById('rag-rerank-note');
+        const ragTopBeforeEl = document.getElementById('rag-top-before');
+        const ragTopAfterEl = document.getElementById('rag-top-after');
+        const ragMinCeEl = document.getElementById('rag-min-ce');
+        const ragMinCeValueEl = document.getElementById('rag-min-ce-value');
+
+        const ragSearchHintEl = document.getElementById('rag-search-hint');
         const ragChunksModal = document.getElementById('rag-chunks-modal');
         const ragChunksListEl = document.getElementById('rag-chunks-list');
         const ragChunksSourceEl = document.getElementById('rag-chunks-source');
@@ -6134,6 +6344,8 @@
         // Идёт загрузка/индексация: кнопка занята, повторный запуск запрещён
         // (индексация одной базы — это разбор файла и работа модели).
         let ragBusy = false;
+        // Ошибка настройки: фильтрация включена, а модели-реранкера нет.
+        let modelWarning = '';
 
         function fmtNum(value) {
             const number = Number(value || 0);
@@ -6310,6 +6522,7 @@
             }
 
             renderRagSettings(data);
+            renderRagSearch(data);
 
             // Состояние эмбеддингов: каким бэкендом считаются векторы и почему
             // именно им — от этого зависит, найдёт ли поиск синонимы.
@@ -6353,16 +6566,13 @@
                   + `объём: ${counts.size_human || '0 Б'}`
                 : 'Баз знаний пока нет.';
             // Поиск подключён к ОТВЕТАМ: перед каждым запросом агент ищет во
-            // включённых базах фрагменты по вопросу и отвечает по ним (сколько
-            // фрагментов и с какой релевантностью — настройки сервера, см.
-            // app/ai/rag_search.py). Без этой строки «включено: 1» ничего не
-            // говорит о том, попадают ли документы в ответ.
+            // включённых базах фрагменты по вопросу и отвечает по ним. Подпись
+            // называет ДВА ЭТАПА и порог (настройки проекта, панель «Поиск и
+            // ответы» выше): без этого «включено: 1» ничего не говорит о том,
+            // попадают ли документы в ответ и что с ними делают по дороге.
             const search = data.search || {};
             if (counts.enabled && search.max_hits) {
-                ragStatusEl.textContent += ` Поиск включён: до ${search.max_hits} `
-                    + `фрагментов на запрос, релевантность от `
-                    + `${Number(search.min_score || 0).toFixed(2).replace('.', ',')}. `
-                    + 'Под ответом видны источники.';
+                ragStatusEl.textContent += ' Поиск включён: ' + ragSearchSummary();
             } else if (counts.bases) {
                 ragStatusEl.textContent += ' Включите базу галочкой — её документы '
                     + 'пойдут в ответы агента.';
@@ -6412,10 +6622,209 @@
             return found ? found.name : (id || '—');
         }
 
+        // ПАНЕЛЬ ПОИСКА. Значения приходят С СЕРВЕРА (снимок `search`) вместе с
+        // границами полей (`search_limits`): интерфейс ничего не выдумывает и не
+        // считает — он показывает то, чем поиск работает на самом деле.
+        // Незаданное у проекта значение сервер отдаёт из окружения, поэтому в
+        // полях всегда видно действующую настройку, а не пустоту.
+        function renderRagSearch(data) {
+            const search = data.search || {};
+            const limits = data.search_limits || {};
+            ragRewriteEl.checked = Boolean(search.rewrite);
+            ragRerankEl.checked = Boolean(search.rerank);
+            ragFilterEl.checked = Boolean(search.filter);
+            // По умолчанию галочка СТОИТ (сервер отдаёт значение проекта, а если
+            // он его не задавал — значение по умолчанию).
+            ragAskEmptyEl.checked = search.ask_when_empty !== false;
+            renderRagRerankBackend(data);
+            fillRagTopK(ragTopBeforeEl, search.top_k_before, limits.top_k);
+            fillRagTopK(ragTopAfterEl, search.top_k_after, limits.top_k);
+            const ceLimits = limits.min_ce || {};
+            ragMinCeEl.min = String(Number(ceLimits.min || 0));
+            ragMinCeEl.max = String(Number(ceLimits.max || 1));
+            ragMinCeEl.step = String(Number(ceLimits.step || 0.05));
+            ragMinCeEl.value = String(Number(search.min_ce || 0));
+            renderRagSearchHint();
+        }
+
+        // СОСТОЯНИЕ РЕРАНКЕРА (выбирать нечего — движок один, модель): какая
+        // модель, скачана ли она и что работает вместо неё, если её нет.
+        // Состояние приходит с сервера (`rerank` в снимке), интерфейс его не
+        // вычисляет: гадать, чем реранкит поиск, нельзя.
+        function renderRagRerankBackend(data) {
+            const rerank = data.rerank || {};
+            const note = ragRerankNoteEl;
+            note.hidden = false;
+            note.className = 'rag-strategy-hint' + (rerank.reason ? ' off' : '');
+            note.textContent = 'Реранкер: ' + (rerank.backend_name || rerank.backend || '—')
+                + (rerank.backend === 'cross-encoder' && rerank.model
+                    ? ' — модель ' + rerank.model
+                      + (rerank.cached ? ' (скачана)' : ' (будет скачана при первом поиске)')
+                    : '')
+                + '. ' + (rerank.reason || '');
+        }
+
+        // Значения Top-K — ЛЕСТНИЦА (1…12, дальше 15, 20, 25, 30, 40, 50), а не
+        // все числа подряд: полсотни одинаковых строк в списке выбирать не
+        // помогают. Действующее значение сервера добавляется ВСЕГДА, даже если
+        // его нет в лестнице: поле обязано показывать то, чем поиск работает.
+        const RAG_TOP_K_STEPS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                                 15, 20, 25, 30, 40, 50];
+
+        function fillRagTopK(node, value, limits) {
+            const current = Math.max(0, Number(value) || 0);
+            const max = Number((limits || {}).max || 50);
+            const options = RAG_TOP_K_STEPS.filter(item => item <= max);
+            if (current && options.indexOf(current) < 0) options.push(current);
+            options.sort((left, right) => left - right);
+            node.innerHTML = '';
+            options.forEach(item => {
+                const option = document.createElement('option');
+                option.value = String(item);
+                option.textContent = String(item);
+                node.appendChild(option);
+            });
+            node.value = String(current || options[0] || 1);
+        }
+
+        function ragScoreText(value) {
+            return Number(value || 0).toFixed(2).replace('.', ',');
+        }
+
+        // Подпись под ползунком: что именно сейчас произойдёт с фрагментами.
+        // Ползунок без пояснения читается как «чем больше, тем лучше», а на
+        // самом деле это ОТСЕЧЕНИЕ: слишком высокий порог оставит модель без
+        // документов, слишком низкий пустит шум.
+        function renderRagSearchHint() {
+            const search = (ragData && ragData.search) || {};
+            const rerank = ragRerankEl.checked;
+            const filter = ragFilterEl.checked;
+            const rewrite = ragRewriteEl.checked;
+            const before = Number(ragTopBeforeEl.value) || 0;
+            const after = Number(ragTopAfterEl.value) || 0;
+            // Поля, которые сейчас ни на что не влияют, гасим: иначе видно
+            // «настройку», которой поиск не пользуется.
+            // ПУЛ НУЖЕН ТОЛЬКО РЕРАНКИНГУ: переставлять и отсеивать можно лишь то,
+            // что нашлось. Без реранкинга поле выключено — и это не ограничение, а
+            // факт: взять 30 кандидатов и оставить 8 лучших по той же оценке даёт
+            // РОВНО те же 8, что взять сразу 8 (замер: выдача не меняется).
+            ragTopBeforeEl.disabled = !rerank;
+            ragTopBeforeEl.title = rerank
+                ? 'Сколько кандидатов первый этап берёт из каждой базы: их '
+                  + 'пересчитывает реранкинг, и из них выбираются лучшие.'
+                : 'Реранкинг выключен — переставлять нечего, поэтому пул не нужен: '
+                  + 'поиск сразу берёт лучшие по вектору и словам.';
+            // «В РЕШЕНИЕ» ВСЕГДА: это бюджет ответа, а не настройка реранкинга.
+            ragTopAfterEl.title = 'Сколько фрагментов из каждой базы уходит в ответ '
+                + '(с учётом реранкинга, если он включён). Общий предел на запрос — '
+                + fmtNum(Number((ragData && ragData.search || {}).max_hits || 0))
+                + ' фрагментов, плюс соседние к лучшим.';
+            // БАЗОВЫЙ ОТСЕВ ШУМА (search.noise_floor) действует ВСЕГДА: фрагмент с
+            // оценкой около нуля не уходит в модель ни при какой настройке.
+            const floor = Number(search.noise_floor || 0);
+            const minCe = Number(ragMinCeEl.value) || 0;
+            const modelReady = Boolean((ragData && ragData.rerank || {}).available);
+            ragMinCeEl.disabled = !filter;
+            ragMinCeValueEl.textContent = minCe > 0 ? ragScoreText(minCe) : 'не применяется';
+            ragMinCeEl.title = !filter
+                ? 'Фильтрация по порогу выключена — порог уверенности тоже не применяется.'
+                : 'Фрагменты, в которых модель уверена меньше этого значения, в ответ '
+                  + 'не идут. 0 — не отсекать. Рекомендуется 0,3–0,5: у мусора '
+                  + 'уверенность 0,00–0,02, у нужного 0,45–1,00.';
+            // ФИЛЬТРАЦИЯ БЕЗ МОДЕЛИ — ОШИБКА, а не тихая подмена шкалы: вероятностей
+            // у признакового реранкинга нет, и фильтровать было бы нечем. Панель
+            // говорит это сразу, а сервер отказывает (400) при «применить».
+            modelWarning = filter && !modelReady
+                ? 'Фильтрация по порогу требует модель-реранкер (cross-encoder), '
+                  + 'а она недоступна: ' + ((ragData && ragData.rerank || {}).reason
+                      || 'причина неизвестна')
+                : '';
+            [ragRewriteEl, ragRerankEl, ragFilterEl, ragAskEmptyEl].forEach(node => {
+                node.closest('.rag-flag').classList.toggle('off', !node.checked);
+            });
+            const parts = [];
+            parts.push(rewrite
+                ? 'запрос переформулируется служебным вызовом модели (без модели — локально)'
+                : 'запрос идёт в поиск как есть');
+            const engine = String((ragData && ragData.search || {}).rerank_backend || 'auto');
+            const engineName = engine === 'cross-encoder' ? 'cross-encoder'
+                : (engine === 'features' ? 'признаки' : 'авто');
+            const maxHits = Number((ragData && ragData.search || {}).max_hits || 0);
+            parts.push(rerank
+                ? `реранкинг (${engineName}): с каждой базы берётся пул ${before} кандидатов, `
+                  + `в ответ идут ${after}`
+                : `с каждой базы в ответ идут ${after} лучших по вектору и словам`);
+            parts.push(`всего на запрос — до ${fmtNum(maxHits)} фрагментов `
+                + '(по всем базам, плюс соседние к лучшим)');
+            parts.push(filter
+                ? (minCe > 0
+                    ? `фрагменты с уверенностью модели ниже ${ragScoreText(minCe)} отбрасываются`
+                    : 'отсечения по уверенности модели нет (порог 0)')
+                : 'фильтрация выключена: остаётся только базовый отсев шума '
+                  + ragScoreText(floor));
+            parts.push(ragAskEmptyEl.checked
+                ? 'если в документах ничего нет — спрошу вас и предложу варианты'
+                : 'если в документах ничего нет — отвечу по общим знаниям с пометкой');
+            let text = 'Сейчас: ' + parts.join('; ') + '.';
+            // ЗАВЫШЕННЫЙ ПОРОГ УВЕРЕННОСТИ — самая частая ошибка настройки: у
+            // нужных фрагментов уверенность 0,45–1,00, поэтому выше 0,7 начинает
+            // отсекаться и верное.
+            const tooHigh = filter && minCe >= 0.7;
+            if (tooHigh) {
+                text += ' ⚠ Порог ' + ragScoreText(minCe) + ' отсечёт и часть верного:'
+                    + ' у нужных фрагментов уверенность обычно 0,45–1,00.';
+            }
+            if (modelWarning) {
+                text += ' ⛔ ' + modelWarning;
+            }
+            ragSearchHintEl.textContent = text;
+            ragSearchHintEl.classList.toggle('off', tooHigh || Boolean(modelWarning));
+            ragSearchHintEl.classList.toggle('rag-search-hint', true);
+        }
+
+        // Короткая подпись настроек поиска для строки состояния диалога.
+        function ragSearchSummary() {
+            const search = (ragData && ragData.search) || {};
+            const parts = [];
+            if (search.rerank) {
+                parts.push(`пул ${fmtNum(search.top_k_before)} → ответ ${fmtNum(search.top_k_after)}`);
+            } else {
+                parts.push(`до ${fmtNum(search.top_k_after)} фрагментов на запрос`);
+            }
+            if (search.filter) {
+                parts.push(Number(search.min_ce || 0) > 0
+                    ? `уверенность модели от ${ragScoreText(search.min_ce)}`
+                    : 'без отсечения по уверенности модели');
+            } else {
+                parts.push(`порог проекта не применяется (отсев шума от `
+                    + `${ragScoreText(search.noise_floor)})`);
+            }
+            if (search.rewrite) parts.push('с переформулировкой запроса');
+            parts.push(`всего до ${fmtNum(search.max_hits)} фрагментов`);
+            return parts.join(', ') + '.';
+        }
+
         function renderRagStrategyHint() {
             const list = (ragData && ragData.strategies) || [];
             const found = list.find(item => item.id === ragStrategyEl.value);
-            ragStrategyHintEl.textContent = found ? (found.description || '') : '';
+            let text = found ? (found.description || '') : '';
+            // ОКНО МОДЕЛИ ЭМБЕДДИНГОВ: чанк больше него поиск «видит» только до
+            // этого места — хвост в вектор не попадает (живой замер: у MiniLM окно
+            // 128 токенов ≈ 365 символов русского текста, а чанк по умолчанию был
+            // 1000 — то есть ~60% каждого фрагмента были для поиска невидимы).
+            const windowChars = Number((ragData && ragData.embedding || {}).window_chars || 0);
+            const size = Number(ragSizeEl.value) || 0;
+            const tooBig = windowChars > 0 && size > windowChars;
+            if (tooBig) {
+                text += (text ? ' ' : '') + '⚠ Размер чанка ' + fmtNum(size)
+                    + ' больше окна модели эмбеддингов ('
+                    + fmtNum(windowChars) + ' символов ≈ '
+                    + fmtNum(Number((ragData.embedding || {}).max_seq_length || 0))
+                    + ' токенов): поиск будет видеть только начало чанка. '
+                    + 'Рекомендуемый размер — до ' + fmtNum(windowChars) + '.';
+            }
+            ragStrategyHintEl.textContent = text;
+            ragStrategyHintEl.classList.toggle('off', tooBig);
         }
 
         // Подпись кнопки «RAG»: сколько баз включено у текущего проекта.
@@ -6485,6 +6894,15 @@
                 strategy: ragStrategyEl.value,
                 chunk_size: Number(ragSizeEl.value) || null,
                 overlap: Number(ragOverlapEl.value) || null,
+                // Панель ПОИСКА: этапы, выборки и порог. Уходят все поля сразу —
+                // сервер сохраняет их на проекте и зажимает в границы.
+                rewrite: ragRewriteEl.checked,
+                rerank: ragRerankEl.checked,
+                filter: ragFilterEl.checked,
+                ask_when_empty: ragAskEmptyEl.checked,
+                top_k_before: Number(ragTopBeforeEl.value) || null,
+                top_k_after: Number(ragTopAfterEl.value) || null,
+                min_ce: Number(ragMinCeEl.value) || 0,
             }));
             if (!data) return;
             ragData = data;
@@ -6494,7 +6912,8 @@
             addMessage('bot', counts.enabled
                 ? `✅ Базы знаний включены у проекта: ${counts.enabled} из ${counts.bases} `
                   + `(чанков ${fmtNum(counts.chunks)}, документов ${fmtNum(counts.documents)}). `
-                  + 'Параметры разбиения запомнены.'
+                  + 'Параметры разбиения и поиска запомнены. Поиск: '
+                  + ragSearchSummary()
                 : '✅ Базы знаний выключены у проекта: агент отвечает без ваших документов.',
                 true);
         }
@@ -6910,6 +7329,14 @@
         document.getElementById('rag-progress-cancel')
             .addEventListener('click', cancelRagJob);
         ragStrategyEl.addEventListener('change', renderRagStrategyHint);
+        ragSizeEl.addEventListener('input', renderRagStrategyHint);
+        // Панель поиска: смена галочки или ползунка СРАЗУ перерисовывает подпись
+        // «что произойдёт с фрагментами» и гасит поля, которые сейчас ни на что
+        // не влияют. Применяется всё это кнопкой «применить» (как и галочки баз).
+        [ragRewriteEl, ragRerankEl, ragFilterEl, ragAskEmptyEl,
+         ragTopBeforeEl, ragTopAfterEl]
+            .forEach(node => node.addEventListener('change', renderRagSearchHint));
+        ragMinCeEl.addEventListener('input', renderRagSearchHint);
         document.getElementById('rag-refresh').addEventListener('click', async () => {
             ragStatusEl.hidden = false;
             ragStatusEl.textContent = 'Читаю список баз знаний…';
@@ -7520,6 +7947,10 @@
                             // План ветвления (стратегия «branching»): блок плана в
                             // корневом диалоге + список веток для переключения.
                             applyBranchesEvent(ev);
+                        } else if (ev.type === 'choices') {
+                            // В документах ничего нет: агент остановился и ждёт
+                            // решения пользователя (варианты — готовые фразы).
+                            pushAgentNode('assistant', ev.text, ev.analysis);
                         } else if (ev.type === 'suggestions') {
                             // Разбор инвариантов: отказ по запросу + варианты
                             // решения. План в этом случае не строится — задача

@@ -787,6 +787,23 @@ def set_dialog_rag(dialog: Dict[str, Any], signature: str, request: str,
         "bases": data.get("bases") or [],
         "hits": data.get("hits") or [],
         "notes": data.get("notes") or [],
+        # Настройки и счётчики ДВУХ ЭТАПОВ и сведения о переформулировке запроса.
+        # Без них подпись «каким порогом фильтровали» и «по какому запросу искали»
+        # жила бы только до первой записи файла, а после перечитывания диалога
+        # строка диагностики подставляла бы настройки окружения — то есть врала бы
+        # про конкретный поиск (эту потерю нашла проверка tools/check_rag.py [15]).
+        "stages": data.get("stages") or {},
+        "rewrite": data.get("rewrite") or {},
+        # Чем продолжить, если в документах ничего нет: список считает веб-слой,
+        # а блок для модели и проверка берут его отсюда (шаги плана — отдельные
+        # запросы, и список обязан быть тем же).
+        "alternatives": data.get("alternatives") or [],
+        # Можно ли отвечать по общим знаниям по ЭТОМУ запросу ("ask"/"allowed"/"").
+        # Поле обязано переживать запись файла: решение принимает веб-слой, а
+        # читает его блок для модели на КАЖДОМ шаге задачи — потерянное поле
+        # означало бы «решение пользователя забыто» после первой же записи
+        # (ровно эту потерю нашла проверка: агент вместо остановки отвечал сам).
+        "general": data.get("general") or "",
     })
     return dialog["rag"]
 
@@ -816,8 +833,19 @@ def _clean_sources(raw: Any) -> List[Dict[str, Any]]:
             "section": str(item.get("section") or "").strip()[:200],
             "number": _positive_int(item.get("number")),
             "score": _round3(item.get("score")),
+            # Коэффициент релевантности ПЕРВИЧНОГО поиска: без него после
+            # перечитывания журнала в карточке оставалась бы только оценка модели.
+            "base_score": _round3(item.get("base_score")),
             "vector_score": _round3(item.get("vector_score")),
             "lexical": _round3(item.get("lexical")),
+            # Слагаемые ВТОРОГО этапа (реранкинг): фраза, совпадение с адресом и
+            # снятый штраф. Новое поле источника добавляется СРАЗУ и здесь, и в
+            # rag_search.sources — иначе после перечитывания журнала разбор
+            # оценки терялся бы (эту потерю уже находила живая проверка).
+            "phrase": _round3(item.get("phrase")),
+            "address": _round3(item.get("address")),
+            "penalty": _round3(item.get("penalty")),
+            "ce": _round3(item.get("ce")),
             "chars": _positive_int(item.get("chars")),
             "snippet": str(item.get("snippet") or "").strip()[:400],
         })
@@ -1109,9 +1137,15 @@ def _normalize_rag(raw: Any) -> Dict[str, Any]:
     """Приводит настройку баз знаний проекта к рабочему виду.
 
     Формат: {"enabled": [<id базы>], "strategy": "structure", "chunk_size": 1000,
-    "overlap": 150}. Стратегия и размеры проверяются по общим правилам разбиения
-    (app/ai/rag_chunking.py), поэтому «настройка из файла» не может дать чанк
-    нулевой длины или перекрытие больше размера.
+    "overlap": 70, "rewrite": true, "rerank": true, "filter": true,
+    "top_k_before": 30, "top_k_after": 8, "min_ce": 0.0, "ask_when_empty": true}.
+    Выбор ДВИЖКА реранкинга сюда не входит: он один (модель cross-encoder), а
+    ручной переключатель на признаки остался в окружении (RAG_RERANK_BACKEND).
+    Стратегия и размеры
+    проверяются по общим правилам разбиения (app/ai/rag_chunking.py), настройки
+    ПОИСКА — по правилам поиска (app/ai/rag_search.py: search_settings), поэтому
+    «настройка из файла» не может дать чанк нулевой длины, перекрытие больше
+    размера, пул кандидатов меньше выборки или отрицательный порог.
 
     Существование базы здесь НЕ проверяется: список баз читается с диска, а
     нормализация вызывается на каждой записи workspace. Отсеивает чужие и
@@ -1127,11 +1161,32 @@ def _normalize_rag(raw: Any) -> Dict[str, Any]:
             enabled.append(key)
     settings = rag_chunking.chunk_settings(
         data.get("strategy"), data.get("chunk_size"), data.get("overlap"))
+    # МИГРАЦИЯ ПРЕЖНЕГО УМОЛЧАНИЯ (02.10): 1000/150 было значением по умолчанию до
+    # того, как выяснилось, что модель эмбеддингов видит только первые ~365
+    # символов. Пара, равная старому умолчанию, — это оно и есть, а не выбор
+    # человека: заменяем на новое (350/70). Осознанно выбранный другой размер
+    # (например 800) не трогаем — в панели о нём предупредит окно модели.
+    if (settings["chunk_size"], settings["overlap"]) == rag_chunking.LEGACY_DEFAULTS:
+        settings = rag_chunking.chunk_settings(settings["strategy"],
+                                              rag_chunking.DEFAULT_CHUNK_SIZE,
+                                              rag_chunking.DEFAULT_CHUNK_OVERLAP)
+    # Настройки поиска нормализуются ТЕМ ЖЕ кодом, что и сам поиск: иначе панель
+    # показывала бы одно, а поиск делал другое.
+    search = rag_search.search_settings(data)
     return {
         "enabled": enabled[-MAX_RAG_BASES:],
         "strategy": settings["strategy"],
         "chunk_size": settings["chunk_size"],
         "overlap": settings["overlap"],
+        "rewrite": search["rewrite"],
+        "rerank": search["rerank"],
+        "filter": search["filter"],
+        "top_k_before": search["top_k_before"],
+        "top_k_after": search["top_k_after"],
+        # Порог УВЕРЕННОСТИ МОДЕЛИ (0…1) — ЕДИНСТВЕННАЯ шкала фильтра: у мусора
+        # вероятность cross-encoder 0,00–0,02, у нужного 0,45–1,00.
+        "min_ce": round(float(search["min_ce"]), 4),
+        "ask_when_empty": search["ask_when_empty"],
     }
 
 
@@ -1160,12 +1215,7 @@ def set_rag_enabled(task: Dict[str, Any], enabled: Any) -> List[str]:
     профиля (rag.filter_enabled) — здесь остаётся нормализация и хранение.
     """
     settings = rag_settings(task)
-    task[RAG_FIELD] = _normalize_rag({
-        "enabled": enabled,
-        "strategy": settings.get("strategy"),
-        "chunk_size": settings.get("chunk_size"),
-        "overlap": settings.get("overlap"),
-    })
+    task[RAG_FIELD] = _normalize_rag(dict(settings, enabled=enabled))
     return list(task[RAG_FIELD]["enabled"])
 
 
@@ -1181,12 +1231,26 @@ def set_rag_chunking(task: Dict[str, Any], strategy: Any = None,
         settings.get("strategy") if strategy is None else strategy,
         settings.get("chunk_size") if chunk_size is None else chunk_size,
         settings.get("overlap") if overlap is None else overlap)
-    task[RAG_FIELD] = _normalize_rag({
-        "enabled": settings.get("enabled"),
-        "strategy": next_settings["strategy"],
-        "chunk_size": next_settings["chunk_size"],
-        "overlap": next_settings["overlap"],
-    })
+    task[RAG_FIELD] = _normalize_rag(dict(settings, **next_settings))
+    return dict(task[RAG_FIELD])
+
+
+def set_rag_search(task: Dict[str, Any], **fields: Any) -> Dict[str, Any]:
+    """Запоминает настройки ПОИСКА из панели «База знаний» (этапы и пороги).
+
+    Незаданные поля (None) остаются прежними — как у set_rag_chunking: панель
+    может прислать только часть настроек, и это не должно сбрасывать остальные.
+    Значения зажимаются в границы общими правилами поиска (rag_search.search_settings),
+    поэтому «настройка из интерфейса» не может дать пул меньше выборки или порог
+    вне допустимого.
+    """
+    settings = rag_settings(task)
+    merged = dict(settings)
+    for key in ("rewrite", "rerank", "rerank_backend", "filter", "top_k_before",
+                "top_k_after", "min_ce", "ask_when_empty"):
+        if key in fields and fields[key] is not None:
+            merged[key] = fields[key]
+    task[RAG_FIELD] = _normalize_rag(merged)
     return dict(task[RAG_FIELD])
 
 

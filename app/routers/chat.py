@@ -50,6 +50,8 @@ from app.ai import profiles as profile_store
 from app.ai import rag
 from app.ai import rag_documents
 from app.ai import rag_jobs
+from app.ai import rag_query
+from app.ai import rag_rerank
 from app.ai import rag_search
 from app.ai import rag_suite
 from app.ai import rag_store
@@ -2077,10 +2079,160 @@ def _mcp_debug() -> str:
             "какие данные нужны для этого запроса.")
 
 
-def _rag_debug() -> str:
-    """Строка диагностики перед поиском по базам знаний (что именно происходит)."""
-    return ("RAG: ищу фрагменты в подключённых базах знаний проекта — векторным "
-            "поиском по этому запросу (локальные эмбеддинги, без обращения к LLM).")
+def _rag_alternatives(task: Dict[str, Any]) -> List[str]:
+    """Чем агент может продолжить, если в базах знаний ответа нет.
+
+    Список уходит в блок «в документах этого нет» (`rag_search.NO_HITS_NOTE`), и
+    модель обязана ПРЕДЛОЖИТЬ эти варианты пользователю — иначе на вопрос, ответа
+    на который в документах нет, агент просто молчит или уходит в общие знания.
+
+    Варианты берутся только из того, что у ПРОЕКТА действительно есть: внешние
+    инструменты (MCP) — из КЭША обнаружения, без подключения к серверам (тянуть
+    живое соединение ради подсказки нельзя: это замедлило бы каждый запрос).
+    Плюс два варианта, которые есть всегда: ответ по общим знаниям с честной
+    пометкой и уточнение запроса/пополнение базы.
+    """
+    out: List[str] = []
+    for server_id in workspace_store.mcp_enabled(task):
+        entry = mcp_store.find_server(server_id) or {}
+        tools = mcp_store.cached_tools(server_id)[:6]
+        names = [str(item.get("name") or "").strip() for item in tools]
+        names = [name for name in names if name]
+        if not names:
+            continue
+        out.append("поискать во внешних инструментах проекта (MCP, сервер «%s»): %s "
+                   "— для этого напишите, что искать, и я вызову их следующим запросом"
+                   % (entry.get("title") or entry.get("name") or server_id,
+                      ", ".join(names)))
+    # Варианты, которые есть всегда, живут в модуле поиска: они не зависят от
+    # настроек проекта, и без них блок «в документах этого нет» снова был бы
+    # тупиком (в том числе при прямых вызовах поиска, мимо веб-слоя).
+    out.extend(rag_search.DEFAULT_ALTERNATIVES)
+    return out
+
+
+def _rag_general_state(task: Dict[str, Any], text: str, *, reuse: bool,
+                       machine_step: bool) -> str:
+    """Можно ли по ЭТОМУ запросу отвечать по общим знаниям. Три состояния:
+
+      * "allowed" — пользователь разрешил сам (список формулировок —
+        `rag_search.allows_general_answer`): он выбрал вариант, который агент
+        предложил, и вопрос задавать больше не о чем;
+      * "ask" — базы включены, настройка проекта «спрашивать, если в документах
+        ничего нет» включена, и это НОВЫЙ запрос пользователя: ответ по общим
+        знаниям без его согласия давать нельзя (см. `_rag_choice_view`);
+      * "" — спрашивать некого или нечего: служебный шаг плана, подтверждение
+        плана, автономный прогон периодической задачи, выключенная настройка.
+        Тогда агент отвечает, но ОБЯЗАН пометить, что это не из документов.
+
+    Служебные реплики (`reuse`, `machine_step`) не спрашивают намеренно: шаг плана
+    и проверка выполняются отдельными запросами, и вопрос «как продолжить» на
+    каждом из них превратился бы в цикл.
+    """
+    if reuse or machine_step:
+        return ""
+    if rag_search.allows_general_answer(text):
+        return "allowed"
+    return "ask" if workspace_store.rag_settings(task).get("ask_when_empty", True) else ""
+
+
+def _rag_choice_view(data: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, Any]:
+    """Сообщение о том, что в документах ничего нет, и варианты продолжения.
+
+    Отправляется ВМЕСТО ответа: агент не уходит сам в общие знания, а
+    останавливается и ждёт решения пользователя — ровно то, что просили («конечное
+    решение же должен предоставлять юзер, если в базе ничего не найдено»).
+
+    Варианты — готовые ФРАЗЫ, которые можно отправить как запрос: по ним же
+    распознаётся выбор (`rag_search.allows_general_answer`), поэтому порядок и
+    формулировки вариантов задаёт код, а не модель.
+    """
+    bases = "; ".join(
+        "%s — %s" % (item.get("name") or "база", rag_search._base_outcome(item))
+        for item in (data.get("bases") or [])) or "нет"
+    cut = rag_search._cut_by_threshold(data)
+    if cut:
+        head = ("⚠ В документах проекта есть близкие фрагменты, но все они ниже "
+                "порога УВЕРЕННОСТИ модели (порог %s) — поэтому в ответ они не пошли."
+                % _fmt_score((data.get("stages") or {}).get("min_ce")))
+    else:
+        head = "⚠ В документах проекта по этому запросу ничего не нашлось."
+    text = (head + "\n\nПоиск уже выполнен по всем включённым базам: " + bases
+            + ".\n\nОтвечать по общим знаниям без вашего решения я не буду — "
+              "выберите, как продолжить (или напишите свой вариант):")
+    options = [{
+        "title": "Ответить по общим знаниям",
+        "details": "ответ будет помечен как «не из ваших документов»",
+        "send": rag_search.GENERAL_CHOICE,
+    }]
+    if cut:
+        options.insert(0, {
+            "title": "Снизить порог и поискать снова",
+            "details": "в документах есть близкое, но порог уверенности %s его отсёк — "
+                       "снизьте ползунок в панели «Поиск и ответы» и повторите запрос"
+                       % _fmt_score((data.get("stages") or {}).get("min_ce")),
+            "send": "",
+        })
+    for item in (data.get("alternatives") or []):
+        low = str(item).lower()
+        if "общим знаниям" in low or "уточнить вопрос" in low:
+            continue
+        options.append({"title": str(item)[:120], "details": "", "send": ""})
+    options.append({
+        "title": "Уточнить вопрос",
+        "details": "формулировку, термин или контекст — или добавьте документ в базу",
+        "send": "",
+    })
+    return {"message": text, "options": options, "kind": "rag_empty",
+            "bases": data.get("bases") or []}
+
+
+def _fmt_score(value: Any) -> str:
+    """Оценка для человека: два знака и запятая (как в интерфейсе)."""
+    try:
+        return ("%.2f" % float(value or 0.0)).replace(".", ",")
+    except (TypeError, ValueError):
+        return "0,00"
+
+
+def _rag_debug(settings: Any = None) -> str:
+    """Строка диагностики перед поиском: что произойдёт С ЭТИМИ настройками.
+
+    Раньше строка описывала архитектуру вообще («ДВА ЭТАПА… реранкинг… порог»),
+    и при снятых галочках она обещала то, чего в поиске не будет — живое
+    замечание 02.10. Поэтому текст собирается по ДЕЙСТВУЮЩИМ настройкам проекта:
+    два этапа упоминаются только когда реранкинг включён, порог — только когда
+    он задан и есть чем фильтровать, а переформулировка — только когда включена.
+
+    Переформулировка запроса — единственное место, где RAG обращается к модели
+    (служебный вызов, вид "rewrite"): без неё поиск идёт локально — вектор
+    запроса считается локальными эмбеддингами, дальше перебор индекса.
+    """
+    data = settings if isinstance(settings, dict) else {}
+    rerank = bool(data.get("rerank"))
+    filter_on = bool(data.get("filter"))
+    min_ce = float(data.get("min_ce") or 0.0)
+    parts = ["RAG: ищу фрагменты в подключённых базах знаний проекта"]
+    if rerank:
+        engine = "cross-encoder" if str(data.get("rerank_backend") or "") == "cross-encoder" \
+            else ("признаки" if str(data.get("rerank_backend") or "") == "features"
+                  else rag_rerank.backend_name(rag_rerank.backend()))
+        parts.append("ДВА ЭТАПА: сначала широкий пул кандидатов (до %d с базы) "
+                     "векторным поиском, затем реранкинг пула (%s)"
+                     % (rag_search.top_k_before(), engine))
+        if filter_on and min_ce > 0:
+            parts.append("и отсечение фрагментов, в которых уверенность модели "
+                         "ниже %.2f" % min_ce)
+    else:
+        parts.append("реранкинг выключен, поэтому пула нет: беру %d лучших "
+                     "фрагментов по вектору и словам" % rag_search.top_k())
+    if bool(data.get("rewrite")):
+        parts.append("запрос перед поиском переформулирую служебным вызовом модели "
+                     "(Query Rewrite: в базу идут ключевые слова, а не разговорный "
+                     "вопрос; отключается галочкой в «Поиск и ответы»)")
+    return ("; ".join(parts) + ". Всё локально — эмбеддинги, перебор индекса"
+            + (" и реранкер" if rerank else "") + ", обращений к LLM за "
+            "фрагментами нет.")
 
 
 def _mcp_files_text(files: List[Dict[str, Any]]) -> str:
@@ -2177,13 +2329,23 @@ def _verified_choice(dialog: Optional[Dict[str, Any]], text: str,
 
 async def _preflight_rag(task: Dict[str, Any], session: Dict[str, Any], text: str,
                          state: "task_state.TaskState", reuse: bool = False,
-                         machine_step: bool = False, fresh: bool = False
-                         ) -> Tuple[Dict[str, Any], List[str], bool]:
+                         machine_step: bool = False, fresh: bool = False,
+                         agent: Optional[Agent] = None
+                         ) -> Tuple[Dict[str, Any], List[str], bool, Dict[str, Any]]:
     """Фрагменты баз знаний (RAG) по запросу — ДО этапа планирования.
 
-    Возвращает (данные RAG, строки диагностики, «поиск выполнялся сейчас»).
+    Возвращает (данные RAG, строки диагностики, «поиск выполнялся сейчас»,
+    расход служебного вызова переформулировки).
+
     Подключённых баз у проекта нет — ни поиска, ни данных: запрос идёт как
     раньше, и в модель НЕ уходит блок с фрагментами (см. app/ai/rag_search.py).
+
+    Поиск — ДВА ЭТАПА и, если включено, ПЕРЕФОРМУЛИРОВКА ЗАПРОСА. Настройки
+    берутся у ПРОЕКТА (task["rag"], панель «Поиск и ответы»): реранкинг, порог,
+    топ-K до и после. Переформулировка — служебный вызов модели (app/ai/rag_query.py);
+    без модели работает тот же модуль локально, поэтому поиск не остаётся без
+    запроса. Строка дебага «запрос после rewriting: «…»» говорит, по какому
+    запросу искали и чем он получен.
 
     Фрагменты кладутся в dialog["rag"] вместе с подписью «включённые базы + их
     отпечаток + запрос задачи»: шаги плана выполняются отдельными HTTP-запросами,
@@ -2208,7 +2370,7 @@ async def _preflight_rag(task: Dict[str, Any], session: Dict[str, Any], text: st
     dialog = session["dialog"]
     enabled = workspace_store.rag_enabled(task)
     if not enabled:
-        return {}, [], False
+        return {}, [], False, {}
     # Служебные фразы описывают ПРЕЖНИЙ запрос задачи (state.request), новый текст
     # пользователя — сам является запросом.
     request_text = ((state.request or text or "").strip() if (reuse or machine_step)
@@ -2222,23 +2384,59 @@ async def _preflight_rag(task: Dict[str, Any], session: Dict[str, Any], text: st
     # Данные по ЭТОМУ запросу уже собраны (шаг плана, проверка результата или
     # повтор того же запроса): искать заново нечего.
     if stored.get("signature") == signature and not fresh:
-        return stored, [], False
+        return stored, [], False, {}
     if (reuse or machine_step) and not request_text:
         # Служебная реплика шага, а запроса задачи в состоянии НЕТ (задача пришла
         # из файла до первого шага): искать по служебной фразе нельзя — по ней
         # нашлось бы что угодно. Обычно же искать ЕСТЬ по чему: подпись могла не
         # совпасть из-за переиндексации базы или смены набора баз, а запрос задачи
         # (`state.request`) от этого не меняется — по нему поиск и идёт.
-        return {}, [], False
+        return {}, [], False, {}
+    settings = workspace_store.rag_settings(task)
+    lines: List[str] = []
+    usage: Dict[str, Any] = {}
+    # ПЕРЕФОРМУЛИРОВКА ЗАПРОСА (Query Rewrite) — ДО поиска: в базу идёт строка
+    # ключевых слов, а не разговорный вопрос. Выключена у проекта — ищем по
+    # исходному тексту, и вызова модели нет вовсе.
+    query_text = request_text
+    rewrite_info: Dict[str, Any] = {}
+    if settings.get("rewrite") and agent is not None:
+        rewrite_info = await agent.rewrite_query(request_text)
+        usage = merge_usage(usage, dict(agent.last_usage or {}))
+        if rewrite_info.get("query"):
+            query_text = str(rewrite_info["query"])
+        line = rag_query.debug_line(rewrite_info)
+        if line:
+            lines.append(line)
+            if str(rewrite_info.get("by") or "") and query_text != request_text:
+                lines.append("ищу по обоим запросам: переформулированному «%s» "
+                             "и исходному «%s» — так неточная переформулировка "
+                             "ничего не теряет" % (query_text, request_text))
     # ПОИСК — В ПОТОКЕ: считается вектор запроса (модель эмбеддингов) и
     # перебираются векторы индекса; цикл событий на это время блокировать нельзя,
     # иначе параллельные задачи ждали бы чужой поиск.
-    result = await asyncio.to_thread(rag_search.search, enabled, request_text,
-                                     profile=profile)
+    # Ищем по ОБОИМ запросам: переформулированному (если он был) и исходному тексту
+    # пользователя. Переформулировка тогда может только добавить кандидатов, но не
+    # отнять найденное по исходному запросу — живой случай: модель переписала
+    # опечатку «ьестия» как есть, и поиск по одной такой строке нужного чанка не
+    # находил.
+    result = await asyncio.to_thread(rag_search.search, enabled, query_text,
+                                     profile=profile, settings=settings,
+                                     rewrite=rewrite_info,
+                                     also=(request_text if rewrite_info else ""))
+    # ЧЕМ ПРОДОЛЖИТЬ, если ответа в документах нет: список собирается ДО
+    # сохранения, потому что его читает и блок для модели, и проверка результата.
+    result["alternatives"] = _rag_alternatives(task)
+    # Можно ли отвечать по общим знаниям по этому запросу — решает ПОЛЬЗОВАТЕЛЬ
+    # (см. `_rag_general_state`): без его решения агент остановится и спросит.
+    result["general"] = _rag_general_state(task, request_text, reuse=reuse,
+                                           machine_step=machine_step)
     workspace_store.set_dialog_rag(dialog, signature, request_text, result)
     data = workspace_store.dialog_rag(dialog)
     note = rag_search.results_note(data)
-    return data, ([note] if note else []), True
+    if note:
+        lines.append(note)
+    return data, lines, True, usage
 
 
 async def _preflight_invariants(task: Dict[str, Any], session: Dict[str, Any],
@@ -2757,11 +2955,14 @@ async def rag_get(force: int = 0) -> dict:
 
 @router.post("/agent/rag")
 async def rag_apply(payload: RagApply) -> dict:
-    """Применяет набор включённых баз знаний проекта и параметры разбиения.
+    """Применяет набор включённых баз знаний проекта, параметры разбиения и настройки поиска.
 
     Приходит ПОЛНЫЙ список галочек: база, которой в нём нет, выключается.
     Несуществующие и ЧУЖИЕ (другого профиля) базы отбрасываются — включить то,
-    чего у профиля нет, нельзя. Обращений к модели нет: настройка — это данные.
+    чего у профиля нет, нельзя. Здесь же запоминаются настройки ПОИСКА (панель
+    «Поиск и ответы»): переформулировка запроса, реранкинг, фильтрация по порогу,
+    топ-K до и после второго этапа, порог релевантности. Обращений к модели нет:
+    настройка — это данные.
     """
     task = _current_task()
     if task is None:
@@ -2773,6 +2974,28 @@ async def rag_apply(payload: RagApply) -> dict:
         workspace_store.set_rag_enabled(task, enabled)
         workspace_store.set_rag_chunking(task, payload.strategy,
                                          payload.chunk_size, payload.overlap)
+        settings_now = workspace_store.rag_settings(task)
+        # Движок реранкинга выбирает ОКРУЖЕНИЕ (RAG_RERANK_BACKEND), а не проект:
+        # движок один — модель, нужная фильтрации. Здесь только проверяем, что она
+        # есть, прежде чем включать фильтр.
+        backend_now = settings_now.get("rerank_backend") or rag_rerank.backend()
+        # ФИЛЬТРАЦИЯ ТРЕБУЕТ МОДЕЛИ: вероятностей у признакового реранкинга нет, и
+        # «фильтровать по порогу» было бы нечем. Включение галочки без модели —
+        # ОШИБКА с причиной, а не тихая подмена шкалы (просьба от 02.10).
+        if payload.filter and not rag_rerank.filter_available(backend_now):
+            raise HTTPException(
+                status_code=400,
+                detail="Фильтрация по порогу требует модель-реранкер: "
+                       + rag_rerank.filter_reason(backend_now))
+        workspace_store.set_rag_search(
+            task,
+            rewrite=payload.rewrite,
+            rerank=payload.rerank,
+            filter=payload.filter,
+            ask_when_empty=payload.ask_when_empty,
+            top_k_before=payload.top_k_before,
+            top_k_after=payload.top_k_after,
+            min_ce=payload.min_ce)
         # Фрагменты прежнего запроса сбрасываются (dialog["rag"]): набор баз
         # изменился, и найденное ранее могло быть подобрано по базе, которую
         # пользователь только что выключил. Подпись данных всё равно не совпала бы
@@ -2851,6 +3074,18 @@ async def rag_delete(base_id: str) -> dict:
     profile = _current_profile_id()
     if not rag.delete_base(base_id, profile=profile):
         raise HTTPException(status_code=404, detail="База знаний не найдена")
+    # БРОШЕННЫЕ ВРЕМЕННЫЕ ФАЙЛЫ ЗАГРУЗОК убираем ВМЕСТЕ с базой: потоковая
+    # загрузка пишет копию документа в `.incoming`, работник задачи удаляет её в
+    # `finally`, но переживший перезапуск файл остаётся — и это копия ТОГО ЖЕ
+    # документа, то есть «удалённая база» продолжала бы лежать на диске (живой
+    # случай: 241 МБ копии PDF после удаления базы). Штатная уборка
+    # (`prune_incoming`) вызывается на следующей загрузке, которой может не быть
+    # вовсе, поэтому зовём её здесь. Файлы свежее часа не трогаются: их может
+    # писать идущая индексация.
+    removed_files = rag_jobs.prune_incoming()
+    if removed_files:
+        logger.info("RAG: вместе с базой %s убрано брошенных файлов загрузки: %d",
+                    base_id, removed_files)
     async with _workspace_lock:
         for task in workspace_store.profile_tasks(_workspace, profile):
             settings = workspace_store.rag_settings(task)
@@ -3076,7 +3311,11 @@ async def rag_test(request: Request) -> StreamingResponse:
 
     Вопросы, эталоны и промпты живут в `app/ai/rag_suite.py`; здесь только ход
     прогона. Поиск по базе идёт тем же кодом, что у агента (`rag_search.search`),
-    и в потоке — цикл событий на нём не стоит.
+    и в потоке — цикл событий на нём не стоит. Настройки поиска тоже берутся у
+    ПРОЕКТА (панель «Поиск и ответы»): реранкинг, порог, топ-K до и после, а если
+    включена переформулировка запроса — вопрос перед поиском превращается в
+    поисковый запрос (тем же модулем, см. app/ai/rag_query.py). Иначе прогон
+    проверял бы не то, что делает агент.
     """
     enabled, _, reason = _rag_test_context()
     if reason:
@@ -3093,6 +3332,7 @@ async def rag_test(request: Request) -> StreamingResponse:
         session = workspace_store.create_session(task)
     dialog = session.get("dialog")
     profile = _current_profile_id()
+    test_settings = workspace_store.rag_settings(task)
     base_names = []
     for base_id in enabled:
         meta = rag_store.get_base(base_id, profile=profile) or {}
@@ -3112,8 +3352,15 @@ async def rag_test(request: Request) -> StreamingResponse:
                  "bases": base_names}
         log(workspace_store.LOG_DEBUG, (
             "🧪 Тест RAG: %d контрольных вопросов по базам: %s. Прогон идёт мимо "
-            "плана задачи — состояние и память задачи не меняются."
-            % (rag_suite.total(), ", ".join(base_names))))
+            "плана задачи — состояние и память задачи не меняются. Настройки "
+            "поиска — как у проекта: реранкинг %s, порог %s, топ-K %s→%s, "
+            "переформулировка запроса %s."
+            % (rag_suite.total(), ", ".join(base_names),
+               "вкл" if test_settings.get("rerank") else "выкл",
+               ("%.2f" % float(test_settings.get("min_score") or 0.0))
+               if test_settings.get("filter") else "выкл",
+               test_settings.get("top_k_before"), test_settings.get("top_k_after"),
+               "вкл" if test_settings.get("rewrite") else "выкл")))
         yield json.dumps(start, ensure_ascii=False) + "\n"
         for number, case_data in enumerate(rag_suite.CASES, 1):
             if await request.is_disconnected():
@@ -3126,9 +3373,35 @@ async def rag_test(request: Request) -> StreamingResponse:
             yield json.dumps(event, ensure_ascii=False) + "\n"
             started = time.monotonic()
             try:
-                # 1. ПОИСК по базам проекта — тем же кодом, что у агента.
-                result = await asyncio.to_thread(rag_search.search, enabled, question,
-                                                 profile=profile)
+                # 0. ПЕРЕФОРМУЛИРОВКА ЗАПРОСА — если она включена у проекта: тот
+                #    же модуль, что у агента. Расход этого вызова входит в итог
+                #    прогона (метрики забирает обёртка): он настоящий.
+                query_text = question
+                rewrite_line = ""
+                info: Dict[str, Any] = {}
+                if test_settings.get("rewrite"):
+                    spent: Dict[str, Any] = {}
+
+                    async def call(**kwargs: Any) -> Any:
+                        content, metrics = await llm_client.call_llm_async(**kwargs)
+                        spent["metrics"] = metrics
+                        return content, metrics
+
+                    info = await rag_query.rewrite(question, call)
+                    # Расход считаем только по ФАКТИЧЕСКОМУ ответу модели: сбой
+                    # вызова (сеть, ключ) не должен добавлять прогону «вызов без
+                    # токенов» — в замере это выглядело бы как лишняя оплата.
+                    if spent.get("metrics"):
+                        usage = _merge_test_usage(usage, spent["metrics"])
+                    if info.get("query"):
+                        query_text = str(info["query"])
+                    rewrite_line = rag_query.debug_line(info)
+                # 1. ПОИСК по базам проекта — тем же кодом, что у агента, и с теми
+                #    же настройками проекта (два этапа: пул → реранкинг → порог).
+                result = await asyncio.to_thread(rag_search.search, enabled, query_text,
+                                                 profile=profile,
+                                                 settings=test_settings,
+                                                 rewrite=info if rewrite_line else None)
                 hits = rag_search.hits_of(result)
                 block = rag_search.block(result)
                 # 2. ОТВЕТ модели по найденным фрагментам — ОДИН вызов, без плана.
@@ -3160,6 +3433,12 @@ async def rag_test(request: Request) -> StreamingResponse:
                        "error": llm_client.redact_secrets(str(exc))[:300],
                        "metrics": {}, "seconds": round(time.monotonic() - started, 1)}
             rows.append(row)
+            if rewrite_line:
+                # Строка о переформулировке идёт ПЕРЕД строкой о находках: видно,
+                # по какому запросу искали, а уже потом — что нашлось.
+                yield json.dumps({"type": "debug", "text": rewrite_line},
+                                 ensure_ascii=False) + "\n"
+                log(workspace_store.LOG_DEBUG, rewrite_line)
             yield json.dumps({"type": "debug", "text": source_line},
                              ensure_ascii=False) + "\n"
             log(workspace_store.LOG_DEBUG, source_line)
@@ -3960,14 +4239,18 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 #     сохраняются в диалоге под подписью запроса (шаги плана и
                 #     проверка берут их оттуда, а не ищут заново) и показываются
                 #     пользователю карточками источников под финальным ответом.
-                #     Обращений к LLM поиск НЕ делает: считаются только локальные
-                #     эмбеддинги, поэтому «служебных токенов» он не тратит.
+                #     Поиск идёт ЛОКАЛЬНО (эмбеддинги + перебор индекса) и в ДВА
+                #     ЭТАПА: широкий пул кандидатов, затем реранкинг и порог —
+                #     настройки у проекта (панель «Поиск и ответы»). Токены тратит
+                #     только переформулировка запроса, и лишь когда она включена
+                #     (служебный вызов, вид "rewrite").
                 if workspace_store.rag_enabled(task_now):
                     if not machine_step:
                         yield encode({"type": "debug", "text": (
-                            f"{_MACHINE}: " + _rag_debug()
+                            f"{_MACHINE}: "
+                            + _rag_debug(workspace_store.rag_settings(task_now))
                         )})
-                    rag_data, rag_lines, rag_searched = await _preflight_rag(
+                    rag_data, rag_lines, rag_searched, rag_usage = await _preflight_rag(
                         task_now, session_now, text, state,
                         # Служебные фразы и подтверждение плана — не новый запрос:
                         # фрагменты по запросу задачи уже найдены.
@@ -3975,9 +4258,47 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         machine_step=machine_step,
                         # АВТОЗАПУСК периодической задачи: запрос тот же, но
                         # документы могли переиндексировать — ищем заново.
-                        fresh=periodic_run)
+                        fresh=periodic_run,
+                        # Переформулировка запроса — служебный вызов модели
+                        # (см. app/ai/rag_query.py): он делается через агента,
+                        # чтобы токены попали в замер запроса с видом "rewrite".
+                        agent=analyzer)
+                    if rag_usage:
+                        usage = merge_usage(usage, rag_usage)
                     for line in rag_lines:
                         yield encode({"type": "debug", "text": f"{_MACHINE}: {line}"})
+                    # 1г-2. В ДОКУМЕНТАХ НИЧЕГО НЕТ — РЕШАЕТ ПОЛЬЗОВАТЕЛЬ.
+                    #       Базы включены, поиск по НОВОМУ запросу прошёл, а
+                    #       фрагментов нет (или порог отсёк всё): агент НЕ уходит
+                    #       сам в общие знания, а останавливается и предлагает
+                    #       варианты. Ответ строится только после его решения —
+                    #       тогда в тексте запроса будет разрешение, и поиск
+                    #       вернётся с состоянием "allowed" (см. _rag_general_state).
+                    if (rag_searched and not rag_search.has_hits(rag_data)
+                            and str(rag_data.get("general") or "") == "ask"):
+                        view = _rag_choice_view(rag_data, task_now)
+                        # Узел журнала: без него сообщение исчезло бы при
+                        # переключении задачи (журнал — единственное место, где
+                        # живёт переписка чата).
+                        workspace_store.add_log_event(
+                            dialog_now, workspace_store.LOG_SUGGESTIONS,
+                            view["message"], view)
+                        yield encode({"type": "choices", "text": view["message"],
+                                      "options": view["options"], "analysis": view})
+                        if state.stage == "planning" and not state.steps:
+                            task_state.await_confirmation(
+                                state, [],
+                                "в документах проекта ответа нет — жду решения пользователя")
+                        # Расход этого запроса (сверка инвариантов, MCP, поиск)
+                        # сохраняем служебной записью: ответа не было, но токены
+                        # потрачены — иначе замер исчез бы после перезагрузки.
+                        if usage:
+                            dialog_now.setdefault("usage", []).append(
+                                dict(usage, kind="service"))
+                        yield encode(_state_event(session_now, state))
+                        yield encode({"type": "done", "usage": dict(usage),
+                                      "state": _state_snapshot(session_now, state)})
+                        return
                     # ИСТОЧНИКИ под ответом: показываем фрагменты, которые были у
                     # модели. Решаем это здесь, а подпись к карточкам — в интерфейсе:
                     # «подобрано по запросу», а не «использовано в ответе» (что

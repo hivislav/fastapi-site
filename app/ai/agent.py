@@ -44,6 +44,7 @@ from typing import (
 
 from app import config
 from app.ai import client, demo, invariants as invariants_store, json_utils, mcp as mcp_store
+from app.ai import rag_query
 from app.ai import rag_search
 from app.ai import task_state
 
@@ -1252,6 +1253,21 @@ class Agent:
             user_message, self.invariants,
             self._tracked_call(self.SERVICE_INVARIANTS))
 
+    async def rewrite_query(self, user_message: str) -> Dict[str, Any]:
+        """Переформулировка запроса для ПОИСКА ПО БАЗАМ ЗНАНИЙ — служебный вызов.
+
+        Перед поиском вопрос пользователя превращается в поисковый запрос: уходят
+        вежливость и разговорная рамка, добавляются синонимы и расшифровки
+        (см. app/ai/rag_query.py). Служебный вызов может не удаться — тогда
+        работает тот же модуль без модели, поэтому поиск не остаётся без запроса.
+
+        Возвращает {"query", "by", "reason"}: `by` — чем получен запрос ("model",
+        "local", "" — переформулировки не было). Замер — ДЕЛЬТА одного вызова:
+        веб-слой складывает его с расходом ответа и плана.
+        """
+        self.last_usage = self._new_usage()
+        return await rag_query.rewrite(user_message, self._tracked_call(self.SERVICE_REWRITE))
+
     async def review_result(
         self,
         user_request: str,
@@ -2291,6 +2307,7 @@ class Agent:
     SERVICE_FACTS = "facts"          # обновление блока фактов (sticky facts)
     SERVICE_BRANCHING = "branching"  # план ветвления (стратегия «branching»)
     SERVICE_MCP = "mcp"              # выбор внешних инструментов MCP (app/ai/mcp.py)
+    SERVICE_REWRITE = "rewrite"      # переформулировка запроса для поиска (RAG)
 
     @staticmethod
     def _new_usage() -> Dict[str, Any]:

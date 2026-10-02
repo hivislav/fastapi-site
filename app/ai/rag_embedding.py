@@ -297,6 +297,30 @@ def _hash_embed_one(text: str, dim: int) -> List[float]:
 # ---------------------------------------------------------------------------
 # Публичный интерфейс
 # ---------------------------------------------------------------------------
+# Токенов на символ русского текста у мультиязычного MiniLM — ИЗМЕРЕНО на
+# настоящей базе (чанк 815 символов = 286 токенов ≈ 0,35). Нужно, чтобы перевести
+# окно модели в СИМВОЛЫ: пользователь задаёт размер чанка символами, а окно у
+# модели в токенах, и «сколько это в символах» он посчитать не может.
+TOKENS_PER_CHAR = 0.35
+
+
+def window_chars() -> int:
+    """Сколько СИМВОЛОВ текста реально видит модель эмбеддингов (0 — без предела).
+
+    Замер 02.10: `max_seq_length` 128 токенов, русский текст ≈ 0,35 токена на
+    символ → около 365 символов. Всё, что дальше, в вектор чанка не попадает
+    (embedding(815 симв.) совпал с embedding(450 симв.) до последнего знака).
+    У встроенного офлайн-бэкенда предела нет — он считает все слова и n-граммы.
+    """
+    model = _MODEL_STATE.get("model")
+    if model is None:
+        return 0
+    try:
+        return int(float(getattr(model, "max_seq_length", 0)) / TOKENS_PER_CHAR)
+    except Exception:                       # pragma: no cover - защита
+        return 0
+
+
 def backend_status(force: bool = False) -> Dict[str, Any]:
     """Что за бэкенд доступен и чем он посчитает векторы (снимок для интерфейса).
 
@@ -327,6 +351,10 @@ def backend_status(force: bool = False) -> Dict[str, Any]:
         "backend_name": BACKEND_NAMES.get(active, active),
         "model": model_name() if active == BACKEND_SBERT else "",
         "dim": embedded_dim() if active == BACKEND_SBERT else hash_dim(),
+        # ОКНО МОДЕЛИ В СИМВОЛАХ: чанк больше этого размера поиск видит только до
+        # этого места (интерфейс предупреждает об этом рядом с полем размера).
+        "max_seq_length": int(getattr(_MODEL_STATE.get("model"), "max_seq_length", 0) or 0),
+        "window_chars": window_chars(),
         "sbert_installed": installed,
         "reason": reason,
         "cache_dir": model_cache_dir(),

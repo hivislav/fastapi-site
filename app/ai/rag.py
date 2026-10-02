@@ -29,6 +29,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.ai import rag_chunking, rag_documents, rag_embedding, rag_ocr
+from app.ai import rag_rerank
 from app.ai import rag_search
 from app.ai import rag_store
 
@@ -518,10 +519,19 @@ def snapshot(profile: Optional[str] = None, enabled_ids: Optional[List[str]] = N
         },
         "formats": list(rag_documents.SUPPORTED_EXTENSIONS),
         "embedding": rag_embedding.backend_status(force=force),
-        # Настройки ПОИСКА (сколько фрагментов уходит в ответ и с какой близостью,
-        # см. app/ai/rag_search.py): интерфейс подписывает ими строку «поиск
-        # подключён к ответам», чтобы связь баз со ответами агента была видна.
-        "search": rag_search.settings(),
+        # Настройки ПОИСКА (сколько фрагментов уходит в ответ и с какой
+        # релевантностью, см. app/ai/rag_search.py): интерфейс подписывает ими
+        # строку «поиск подключён к ответам» и заполняет панель «Поиск и ответы»
+        # (переформулировка запроса, реранкинг, порог, топ-K до и после второго
+        # этапа). Не заданные у проекта значения берутся из окружения — снимок
+        # показывает то, чем поиск работает НА САМОМ ДЕЛЕ.
+        "search": rag_search.settings(settings),
+        # Границы полей этой панели: интерфейс не выдумывает их сам.
+        "search_limits": rag_search.limits(),
+        # СОСТОЯНИЕ РЕРАНКЕРА: чем реранкить сейчас и почему именно так (модель
+        # cross-encoder скачана или нет). Модель при снимке НЕ загружается —
+        # диалог открывается мгновенно, как и с эмбеддингами.
+        "rerank": rag_rerank.status(force=force),
         "storage": rag_store.storage_report(),
         # Распознавание сканов: доступно ли и чем (см. app/ai/rag_ocr.py).
         "ocr": rag_ocr.status(),

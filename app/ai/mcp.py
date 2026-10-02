@@ -1010,6 +1010,22 @@ def forget(server_id: str = "") -> None:
             _TOOLS_CACHE.clear()
 
 
+def cached_tools(server_id: Any) -> List[Dict[str, Any]]:
+    """Инструменты сервера ИЗ КЭША обнаружения — БЕЗ подключения к серверу.
+
+    Нужны там, где список инструментов идёт в текст для модели (например, в блок
+    «в документах этого нет — вот чем можно продолжить»). Тянуть живое соединение
+    ради подсказки нельзя: это замедлило бы каждый запрос, а недоступный сервер
+    заставил бы ждать таймаут. Пусто — инструменты в этом запросе ещё не
+    обнаружены (или сервер не подключён к проекту).
+    """
+    entry = find_server(server_id)
+    if entry is None:
+        return []
+    payload = _cached(entry["id"])
+    return [dict(item) for item in ((payload or {}).get("tools") or [])]
+
+
 def discover(server_id: str, force: bool = False) -> Dict[str, Any]:
     """Список инструментов сервера (с кэшем): {"ok", "tools", "error", ...}.\n"
 

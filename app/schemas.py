@@ -280,12 +280,30 @@ class RagApply(BaseModel):
     Здесь же уходят выбранные параметры разбиения (стратегия, размер чанка,
     перекрытие) — они запоминаются на проекте для следующей загрузки. Значения
     зажимаются в допустимые границы на сервере (app/ai/rag_chunking.py).
+
+    И настройки ПОИСКА — панель «Поиск и ответы»: переформулировка запроса,
+    реранкинг и фильтрация по порогу (галочки), сколько кандидатов берёт первый
+    этап и сколько фрагментов идёт в ответ после второго, каков порог
+    релевантности. Они тоже запоминаются на проекте и зажимаются на сервере
+    (app/ai/rag_search.py: search_settings). None — «не менять»: интерфейс может
+    прислать часть настроек.
     """
 
     enabled: List[str] = Field(default_factory=list, max_length=64)
     strategy: Optional[str] = None
     chunk_size: Optional[int] = None
     overlap: Optional[int] = None
+    rewrite: Optional[bool] = None
+    rerank: Optional[bool] = None
+    filter: Optional[bool] = None
+    # Спрашивать ли пользователя, если в документах ничего не нашлось (вместо
+    # ответа по общим знаниям без его согласия).
+    ask_when_empty: Optional[bool] = None
+    top_k_before: Optional[int] = None
+    top_k_after: Optional[int] = None
+    # ЕДИНСТВЕННЫЙ порог — УВЕРЕННОСТЬ МОДЕЛИ (0…1). Порога по «оценке поиска»
+    # (сумме до 3) в настройках проекта нет: он путал человека и не имел смысла.
+    min_ce: Optional[float] = None
 
 
 class RagFile(BaseModel):

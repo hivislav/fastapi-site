@@ -794,21 +794,37 @@ def _lexical_scores(texts: List[str], query: Any) -> List[float]:
                  for word in _LEXICAL_TOKEN_RE.findall(str(texts[index] or "").lower())}
         # Совпадение считается ПО СЛОВАМ текста и их основам: «лазер» из запроса и
         # «лазерная» в чанке — это одно и то же слово в разных формах, а не разные.
-        matched = [stem for stem in hit if any(_same_stem(stem, word) for word in words)]
+        matched = [stem for stem in hit if any(same_stem(stem, word) for word in words)]
         scores[index] = sum(weights[stem] for stem in matched) / total
     return scores
 
 
-def _same_stem(left: str, right: str) -> bool:
+def same_stem(left: str, right: str) -> bool:
     """Одна ли основа у двух слов: совпало начало длиной LEXICAL_MATCH_CHARS.
 
     Точного равенства мало: «статья» и «статьи» расходятся последним символом,
     «лазер» и «лазера» — тоже. Сравниваем начала основ, а слова короче
     LEXICAL_MATCH_CHARS считаем совпавшими только целиком («сити» = «сити»).
+
+    Функция публичная: тем же правилом сравнения пользуется ВТОРОЙ этап поиска —
+    фразы и совпадение с адресом фрагмента (см. `rag_search._rerank`). Разные
+    правила сравнения в двух этапах дали бы оценки, которые нельзя сравнивать.
     """
     if len(left) >= LEXICAL_MATCH_CHARS and len(right) >= LEXICAL_MATCH_CHARS:
         return left[:LEXICAL_MATCH_CHARS] == right[:LEXICAL_MATCH_CHARS]
     return left == right
+
+
+def content_stems(text: Any) -> List[str]:
+    """Основы значимых слов текста В ПОРЯДКЕ появления (слова короче — прочь).
+
+    Нужны там, где важен ПОРЯДОК слов: фраза «резервное копирование» весит больше,
+    чем те же два слова в разных абзацах (см. `rag_search._rerank`). Служебные
+    слова короче LEXICAL_MIN_TOKEN отбрасываются: в фразе «и в на» смысла нет.
+    """
+    return [word[:LEXICAL_STEM_CHARS]
+            for word in _LEXICAL_TOKEN_RE.findall(str(text or "").lower())
+            if len(word) >= LEXICAL_MIN_TOKEN]
 
 
 def _score_all(rows: List[List[float]], vector: List[float]) -> List[float]:
