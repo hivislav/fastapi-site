@@ -46,6 +46,7 @@ from app import config
 from app.ai import client, demo, invariants as invariants_store, json_utils, mcp as mcp_store
 from app.ai import rag_query
 from app.ai import rag_search
+from app.ai import task_memory as memory_store
 from app.ai import task_state
 
 logger = logging.getLogger(__name__)
@@ -554,6 +555,13 @@ class Agent:
         # реплики диалога, а справочный материал по запросу, и в истории он
         # занимал бы место навсегда.
         self.rag: Dict[str, Any] = {}
+        # ПАМЯТЬ ЗАДАЧИ — выжимка разговора, которую ведёт САМ агент (цель
+        # задачи, уточнения пользователя, зафиксированные ограничения и
+        # термины; см. app/ai/task_memory.py). В отличие от слоёв памяти,
+        # наполняемых пользователем кнопками, её обновляет код по ходу диалога.
+        # Уходит в модель СВОИМ системным блоком (см. _memory_blocks) и
+        # обрезке контекста не подчиняется: пустая память блока не даёт вовсе.
+        self.task_memory: Dict[str, Any] = {}
         # Компактный вид данных MCP: True — в системный блок идёт КОРОТКАЯ сводка
         # (имена вызовов, исход, файлы) вместо полного блока со значениями.
         # Включает приёмщик результата (review_result): значения он сверяет с
@@ -623,6 +631,7 @@ class Agent:
         invariants: Optional[Dict[str, Any]] = None,
         mcp: Optional[List[Dict[str, Any]]] = None,
         rag: Optional[Dict[str, Any]] = None,
+        task_memory: Optional[Dict[str, Any]] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
@@ -662,6 +671,7 @@ class Agent:
         await self._process(
             user_message, history, sink, summary, facts, branches, branch, covered,
             working_memory, long_term_memory, profile, state, invariants, mcp, rag,
+            task_memory,
         )
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
@@ -690,6 +700,7 @@ class Agent:
         invariants: Optional[Dict[str, Any]] = None,
         mcp: Optional[List[Dict[str, Any]]] = None,
         rag: Optional[Dict[str, Any]] = None,
+        task_memory: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -721,6 +732,7 @@ class Agent:
             self._process(
                 user_message, history, sink, summary, facts, branches, branch, covered,
                 working_memory, long_term_memory, profile, state, invariants, mcp, rag,
+                task_memory,
             )
         )
         try:
@@ -757,6 +769,7 @@ class Agent:
         invariants: Optional[Dict[str, Any]] = None,
         mcp: Optional[List[Dict[str, Any]]] = None,
         rag: Optional[Dict[str, Any]] = None,
+        task_memory: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -809,6 +822,13 @@ class Agent:
             # «по памяти», а не по документам пользователя.
             if rag is not None:
                 self.rag = rag_search.normalize(rag)
+            # ПАМЯТЬ ЗАДАЧИ (см. app/ai/task_memory.py): выжимка разговора —
+            # цель, уточнения, ограничения, термины. Уходит в модель отдельным
+            # системным блоком и стратегиям контекста НЕ подчиняется: именно
+            # поэтому к концу длинного разговора агент не теряет ни цель, ни
+            # договорённости (в отличие от истории, которую режет окно).
+            if task_memory is not None:
+                self.task_memory = memory_store.normalize(task_memory)
             text = (user_message or "").strip()
 
             await emit(self._step("debug", f"{self.name}: принял сообщение ({len(text)} симв.) — запускаю обработку."))
@@ -1686,6 +1706,13 @@ class Agent:
         if self.working_memory:
             body = _cap_lines(self.working_memory, MEMORY_LAYER_CHARS)
             blocks.append({"role": "system", "content": WORKING_MEMORY_HEADER + "\n" + body})
+        # ПАМЯТЬ ЗАДАЧИ — ПОСЛЕДНЕЙ, ближе к запросу: это договорённости
+        # ТЕКУЩЕГО разговора (цель, уточнения, ограничения), и они важнее общих
+        # слоёв памяти. Пустая память блока не даёт: приглашение «помни то,
+        # чего нет» только сбивало бы модель на догадки.
+        memory_block = memory_store.block(self.task_memory)
+        if memory_block:
+            blocks.append({"role": "system", "content": memory_block})
         return blocks
 
     def _memory_text(self) -> str:
@@ -2308,6 +2335,7 @@ class Agent:
     SERVICE_BRANCHING = "branching"  # план ветвления (стратегия «branching»)
     SERVICE_MCP = "mcp"              # выбор внешних инструментов MCP (app/ai/mcp.py)
     SERVICE_REWRITE = "rewrite"      # переформулировка запроса для поиска (RAG)
+    SERVICE_MEMORY = "memory"        # обновление памяти задачи (выжимка диалога)
 
     @staticmethod
     def _new_usage() -> Dict[str, Any]:
@@ -2397,6 +2425,23 @@ class Agent:
         service = self.last_usage.setdefault("service", {})
         return service.setdefault(
             str(kind)[:20], {"requests": 0, "input": 0, "output": 0, "failed": 0})
+
+    def note_usage(self, metrics: Optional[Dict[str, Any]],
+                   service: Any = None) -> None:
+        """ПУБЛИЧНАЯ запись расхода вызова в замер этого агента.
+
+        Нужна мини-чату по базам знаний (app/ai/rag_dialog.py): он делает свои
+        вызовы (ответ, переформулировка запроса, обновление памяти) и обязан
+        показывать расход ТЕМ ЖЕ счётом, что режим «AI-агент» — теми же полями,
+        той же разбивкой по видам служебных вызовов и той же стоимостью. Ведёт
+        замер обычный Agent, поэтому формат панели токенов не разъезжается с
+        основным путём (см. chat.py, `_rag_dialog_turn`).
+        """
+        self._track_usage(metrics, service)
+
+    def usage_snapshot(self) -> Dict[str, Any]:
+        """Копия накопленного замера (расход одного хода мини-чата)."""
+        return dict(self.last_usage)
 
     @staticmethod
     def _is_limit_exceeded(

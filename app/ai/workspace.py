@@ -76,6 +76,7 @@ from app.ai import periodic as periodic_store
 from app.ai import rag_chunking
 from app.ai import rag_search
 from app.ai import rag_store
+from app.ai import task_memory as memory_store
 from app.ai import task_state
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,50 @@ _SUGGESTION_TEXT = 600
 
 # Сколько символов первого запроса пользователя попадает в заголовок сессии.
 _TITLE_CHARS = 120
+
+# --- ТИП ЗАДАЧИ-ДИАЛОГА (сессии) -------------------------------------------
+# ОДИН режим «AI-агент» умеет и отвечать по источникам, и работать по плану:
+# разница не в источниках (базы знаний и внешние инструменты доступны обоим
+# путям), а в том, нужна ли ПРОЦЕДУРА — несколько действий с последствиями.
+# Поэтому тип задачи — это не «два разных режима», а ПЕРЕОПРЕДЕЛЕНИЕ ВЫБОРА:
+#   MODE_AUTO (по умолчанию) — решает КОД по признакам запроса
+#     (task_state.needs_plan: явная просьба о плане, действия с последствиями,
+#     поручение с результатом) — и человек может переопределить одним нажатием
+#     («⚙ разобрать на шаги» в ответе или сам переключатель);
+#   MODE_PLAN — в этой задаче всегда план (кому нужен предсказуемый автомат);
+#   MODE_ANSWER — в этой задаче всегда прямой ответ по источникам.
+# Тип живёт У ЗАДАЧИ (диалог, память задачи и замер у каждой свои), приходит в
+# снимке workspace и переключается маршрутом POST /api/agent/sessions/{id}/mode.
+# У ПЕРИОДИЧЕСКОЙ задачи тип не действует: её повтор — это процедура, и он идёт
+# по сохранённому плану всегда.
+MODE_AUTO = "auto"
+MODE_PLAN = "plan"
+MODE_ANSWER = "answer"
+MODE_LABELS = {MODE_AUTO: "по обстоятельствам", MODE_PLAN: "всегда по плану",
+               MODE_ANSWER: "всегда сразу ответ"}
+# Прежние значения поля (тип задачи вводился 03.10 как «чат или задача»):
+# "task" было ЗНАЧЕНИЕМ ПО УМОЛЧАНИЮ (не осознанным выбором), поэтому оно
+# переходит в "auto" — такова новая работа по умолчанию; "chat" — в "answer".
+_LEGACY_MODES = {"task": MODE_AUTO, "chat": MODE_ANSWER}
+
+
+def normalize_mode(value: Any) -> str:
+    """Тип задачи из чего угодно: неизвестное значение — «по обстоятельствам»."""
+    text = str(value or "").strip().lower()
+    if text in _LEGACY_MODES:
+        return _LEGACY_MODES[text]
+    return text if text in MODE_LABELS else MODE_AUTO
+
+
+def session_mode(session: Optional[Dict[str, Any]]) -> str:
+    """Тип задачи-диалога (MODE_AUTO/MODE_PLAN/MODE_ANSWER)."""
+    return normalize_mode((session or {}).get("mode"))
+
+
+def set_session_mode(session: Dict[str, Any], value: Any) -> str:
+    """Ставит тип задачи и возвращает его (значение нормализуется)."""
+    session["mode"] = normalize_mode(value)
+    return session["mode"]
 
 # --- Слои памяти, которые наполняет пользователь ---------------------------
 # Рабочая память (данные текущей ЗАДАЧИ) живёт в задаче — ключ "working";
@@ -245,6 +290,15 @@ def empty_dialog(task_id: str = "") -> Dict[str, Any]:
         # Новый запрос (или переиндексация базы) меняет подпись, и поиск идёт
         # заново.
         "rag": {},
+        # ПАМЯТЬ ЗАДАЧИ (см. app/ai/task_memory.py): выжимка разговора, которую
+        # ведёт САМ агент — цель задачи, уточнения пользователя, зафиксированные
+        # ограничения и термины. Хранится в диалоге (как история и фрагменты) и
+        # уходит в модель отдельным системным блоком в КАЖДОМ запросе: стратегия
+        # контекста её не режет, поэтому к концу длинного разговора агент не
+        # теряет ни цель, ни договорённости. Ключ обязан быть и здесь, и в
+        # normalize_dialog — иначе память молча теряется при первой же записи
+        # файла workspace.
+        "task_memory": memory_store.empty(),
     }
 
 
@@ -565,6 +619,10 @@ def normalize_dialog(raw: Any, task_id: str = "") -> Dict[str, Any]:
     # фрагменты (см. app/ai/rag_search.py). Без подписи запись не хранится —
     # значит, неизвестно, к какому запросу эти фрагменты.
     dialog["rag"] = _normalize_dialog_rag(raw.get("rag"))
+    # ПАМЯТЬ ЗАДАЧИ: выжимка разговора (цель, уточнения, ограничения, термины).
+    # Без нормализации она терялась бы при первой же записи файла — та же
+    # ловушка, что у ключей mcp/rag (см. §5.13 в SESSION_PROMPT).
+    dialog["task_memory"] = memory_store.normalize(raw.get("task_memory"))
     # Внешние сборы, запущенные задачей: их отменяет отмена/удаление задачи.
     dialog["mcp_started"] = _normalize_started(raw.get("mcp_started"))
     return dialog
@@ -808,6 +866,39 @@ def set_dialog_rag(dialog: Dict[str, Any], signature: str, request: str,
     return dialog["rag"]
 
 
+def task_memory(dialog: Dict[str, Any]) -> Dict[str, Any]:
+    """Память задачи диалога (пустая запись, если её ещё нет).
+
+    Читается на КАЖДОМ запросе мини-чата и агента: она уходит в модель отдельным
+    системным блоком (см. app/ai/task_memory.py). Битое поле нормализуется на
+    месте — диалог мог прийти из памяти процесса, а не с диска.
+    """
+    current = dialog.get("task_memory")
+    if not isinstance(current, dict):
+        dialog["task_memory"] = memory_store.normalize(current)
+    return dialog["task_memory"]
+
+
+def set_task_memory(dialog: Dict[str, Any],
+                    update: Any) -> Dict[str, Any]:
+    """СЛИВАЕТ память задачи диалога с обновлением и запоминает результат.
+
+    Именно слияние, а не запись: обновление приходит ответом модели (или
+    локальным разбором), и его сбой не имеет права стереть договорённости
+    разговора. Подробности — app/ai/task_memory.py, `merge`.
+    """
+    merged = memory_store.merge(task_memory(dialog), update)
+    dialog["task_memory"] = merged
+    return merged
+
+
+def set_task_memory_value(dialog: Dict[str, Any],
+                          memory: Any) -> Dict[str, Any]:
+    """Записывает память задачи ЦЕЛИКОМ (нормализовав) — для правки и проверок."""
+    dialog["task_memory"] = memory_store.normalize(memory)
+    return dialog["task_memory"]
+
+
 def _clean_sources(raw: Any) -> List[Dict[str, Any]]:
     """Источники под ответом агента (список «что подобрано из баз знаний»).
 
@@ -913,6 +1004,10 @@ def _normalize_session(raw: Any) -> Optional[Dict[str, Any]]:
         # task_id состояния — это id САМОЙ сессии: задача пользователя в режиме
         # «AI-агент» ведётся в диалоге (сессии) и своей сессии не имеет.
         "dialog": normalize_dialog(raw.get("dialog"), session_id),
+        # Тип задачи-диалога (см. MODE_AUTO/MODE_PLAN/MODE_ANSWER): переопределение
+        # выбора «прямой ответ или план». Ключ обязан быть здесь и в
+        # create_session — иначе он молча теряется при первой же записи файла.
+        "mode": normalize_mode(raw.get("mode")),
         # Расписание ПЕРИОДИЧЕСКОЙ задачи (см. app/ai/periodic.py): период,
         # следующий срок, счётчик повторов. Пусто — задача обычная, одноразовая.
         "periodic": periodic_store.normalize(raw.get("periodic")),
@@ -1939,6 +2034,9 @@ def create_session(task: Dict[str, Any], title: str = "",
         "id": session_id,
         "title": str(title).strip()[:_MAX_TITLE],
         "created": _now(),
+        # Тип задачи-диалога: по умолчанию «по обстоятельствам» — код сам решает,
+        # ответить прямо или строить план (см. task_state.needs_plan).
+        "mode": MODE_AUTO,
         # Новый диалог — новая задача для автомата: состояние создаётся сразу
         # (этап planning), а его task_id — id этой сессии.
         "dialog": empty_dialog(session_id),
@@ -2114,7 +2212,10 @@ def snapshot(workspace: Dict[str, Any], profile_id: Optional[str] = None,
     task = active_task(workspace, profile_id)
     sessions = []
     for session in (task.get("sessions", []) if task else []):
-        brief = {"id": session["id"], "title": session_title(session)}
+        brief = {"id": session["id"], "title": session_title(session),
+                 # Тип задачи виден в списке (интерфейс помечает нестандартный
+                 # выбор отдельно): это свойство задачи, а не режима окна.
+                 "mode": session_mode(session)}
         periodic = session_periodic_brief(
             session, running=str(session["id"]) in running_ids, moment=moment)
         if periodic:
@@ -2141,11 +2242,21 @@ def memory_snapshot(workspace: Dict[str, Any],
     база знаний ЭТОГО профиля (профили изолированы). Краткосрочная память
     (диалоги сессий) в этот снимок не входит: она живёт в dialog каждой сессии и
     в панель токенов.
+
+    `task_memory` — выжимка ТЕКУЩЕГО диалога (цель, уточнения, ограничения,
+    термины; см. app/ai/task_memory.py). Она в этом снимке потому, что панель
+    показывает её рядом со слоями памяти: человеку важно видеть, что агент
+    запомнил о задаче САМ, а не только то, что он добавил кнопками.
     """
     task = active_task(workspace, profile_id)
+    session = active_session(workspace, task, profile_id)
+    dialog = (session or {}).get("dialog") or {}
     return {
         "task": ({"id": task["id"], "name": task["name"]} if task else None),
         "working": [dict(entry) for entry in (memory(task, MEMORY_WORKING) if task else [])],
         "long_term": [dict(entry) for entry in memory(
             long_term_container(workspace, profile_id), MEMORY_LONG_TERM)],
+        "task_memory": memory_store.snapshot(
+            dialog.get("task_memory") if dialog else None,
+            session_id=str((session or {}).get("id") or "")),
     }

@@ -607,6 +607,25 @@ const PERIODIC_LABELS = {
   '43200': 'каждые 12 часов', '86400': 'раз в сутки', '604800': 'раз в неделю',
 };
 const ragTests = [];          // тела POST /api/agent/rag/test
+const sessionModes = [];      // тела POST /api/agent/sessions/{id}/mode
+// МИНИ-ЧАТ ПО БАЗАМ ЗНАНИЙ и КОНТРОЛЬНЫЕ ДИАЛОГИ (app/ai/rag_dialog.py):
+// тела запросов к своим маршрутам — по ним видно, что команда ушла ИМЕННО туда
+// и с каким сценарием, а не в чат агента.
+const dialogTurns = [];       // тела POST /api/agent/rag/dialog
+const dialogTests = [];       // тела POST /api/agent/rag/dialog/test
+// Снимок ПАМЯТИ ЗАДАЧИ, как его отдаёт сервер (workspace.memory_snapshot):
+// цель, уточнения, ограничения, термины — панель рисует его третьим видом.
+const DIALOG_MEMORY = {
+  goal: 'Собрать короткую памятку для команды по медицине',
+  turns: 10,
+  counts: { goal: 1, clarified: 1, constraints: 2, terms: 1 },
+  clarified: [{ id: 'tm-1', text: 'играем по правилам Cyberpunk 2020', turn: 1 }],
+  constraints: [
+    { id: 'tm-1', text: 'только факты из базы знаний проекта', turn: 1 },
+    { id: 'tm-2', text: 'ответ не длиннее пяти пунктов', turn: 2 },
+  ],
+  terms: [{ id: 'tm-1', text: 'под «Спидхилом» понимаем препарат из базы', turn: 3 }],
+};
 const periodicBodies = [];    // тела POST /api/agent/sessions
 const periodicUpdates = [];   // тела POST /api/agent/periodic/{id}
 
@@ -625,9 +644,14 @@ function periodicPayload() {
   return { tasks: tasks, now: '2026-01-01T00:00:00' };
 }
 // Снимок workspace: у периодических задач в списке — свежее расписание.
+// Тип задачи-диалога («chat» — разговор по документам, «task» — задача с планом):
+// как на сервере, хранится у ЗАДАЧИ и приходит в снимке списка задач.
+const SESSION_MODES = { 's-1': 'auto', 's-2': 'auto' };
+
 function workspacePayload() {
   return Object.assign({}, workspace, {
     sessions: (workspace.sessions || []).map(session => Object.assign({}, session,
+      { mode: SESSION_MODES[session.id] || 'auto' },
       PERIODIC.tasks[session.id] ? { periodic: periodicBrief(session.id) } : {})),
   });
 }
@@ -652,6 +676,27 @@ function jsonResponse(data, ok) {
   return { ok: ok !== false, status: ok === false ? 400 : 200,
     json: async () => data, text: async () => JSON.stringify(data) };
 }
+// Поток с ЗАДЕРЖКОЙ между событиями: нужен, чтобы проверить, что интерфейс
+// показывает прогон ПО МЕРЕ ПОЯВЛЕНИЯ, а не всё в конце (живой дефект 03.10:
+// gzip копил куски у Starlette, и прогон «молчал» до конца — см. main.py).
+function streamResponseSlow(events, delay) {
+  const lines = events.map(e => JSON.stringify(e) + '\n');
+  let index = 0;
+  const encoder = new TextEncoder();
+  return { ok: true, status: 200, body: { getReader: () => ({
+    read: async () => {
+      if (index > 0) await sleep(delay);
+      return index < lines.length
+        ? { done: false, value: encoder.encode(lines[index++]) }
+        : { done: true };
+    } }) } };
+}
+let dialogTestDelay = 0;   // задержка потока контрольного диалога (для [W])
+// Прямой ответ на вопрос (объединённый режим). По умолчанию ВЫКЛЮЧЕН: разделы
+// [S2]/[V] проверяют путь с планом и пустой поиск, и включают его только те
+// проверки, которые проверяют сам гейт («вопрос — прямой ответ»).
+let DIRECT_ANSWER = false;
+
 function streamResponse(events) {
   const lines = events.map(e => JSON.stringify(e) + '\n');
   let index = 0;
@@ -768,6 +813,15 @@ function makeFetch() {
     const body = typeof rawBody === 'string' ? JSON.parse(rawBody) : {};
 
     if (url === '/api/agent/workspace') return jsonResponse(workspacePayload());
+    if (url.indexOf('/api/agent/sessions/') === 0 && url.indexOf('/mode') > 0
+        && method === 'POST') {
+      // Смена ТИПА задачи: как сервер — тип хранится у ЗАДАЧИ и приходит в снимке.
+      const id = decodeURIComponent(url.split('/')[4]);
+      sessionModes.push({ session: id, body: body });
+      const known = ['auto', 'plan', 'answer'];
+      SESSION_MODES[id] = known.indexOf(body && body.mode) >= 0 ? body.mode : 'auto';
+      return jsonResponse(workspacePayload());
+    }
     if (url === '/api/agent/periodic') return jsonResponse(periodicPayload());
     if (url.indexOf('/api/agent/periodic/') === 0 && method === 'POST') {
       // Правка расписания: как сервер — период (числом секунд) и включение-
@@ -844,7 +898,8 @@ function makeFetch() {
       return jsonResponse(invPayload(explicit || undefined));
     }
     if (url === '/api/agent/memory') {
-      return jsonResponse({ task: { id: 't-1', name: 'Задача' }, working: [], long_term: [] });
+      return jsonResponse({ task: { id: 't-1', name: 'Задача' }, working: [],
+        long_term: [], task_memory: DIALOG_MEMORY });
     }
     if (url.indexOf('/api/agent/mcp') === 0) {
       if (method === 'POST') {
@@ -876,6 +931,55 @@ function makeFetch() {
           items: [{ n: 1, ok: true, comment: 'сходится' }], summary: 'почти всё верно' },
         { type: 'done', usage: { calls: 3, prompt_tokens: 100, completion_tokens: 20 } },
       ]);
+    }
+    if (url === '/api/agent/rag/dialog') {
+      // Мини-чат: сервер отвечает потоком тех же событий, что и в жизни
+      // (см. app/routers/chat.py, rag_dialog_chat).
+      dialogTurns.push(body || {});
+      return streamResponse([
+        { type: 'debug', text: '🔎 Ищу в базах знаний по запросу: «как быстро приезжает Trauma Team»' },
+        { type: 'debug', text: 'Найдено фрагментов: 2; лучший — med.md · ТЕМП ИСЦЕЛЕНИЯ' },
+        { type: 'bot', turn: 1, hits: 2, cited: true,
+          text: 'Trauma Team прибывает в течение 1+1D6 минут [1].\n\n📄 Источники: '
+            + '[1] med.md · ТЕМП ИСЦЕЛЕНИЯ · релевантность 0.73 · фрагмент № 3.',
+          sources: RAG_SOURCES || [] },
+        { type: 'task_memory', memory: DIALOG_MEMORY,
+          text: '🧠 Память задачи — ' + DIALOG_MEMORY.goal },
+        { type: 'done', usage: usage({ requests: 2, input: 120, output: 40 }),
+          memory: DIALOG_MEMORY },
+      ]);
+    }
+    if (url === '/api/agent/rag/dialog/test') {
+      // Контрольный диалог: 10 реплик и 10 ответов с источниками, память задачи
+      // после каждой реплики и вердикт судьи в конце. `dialogTestDelay` > 0 —
+      // события приходят с паузами (проверка «показывается по мере появления»).
+      dialogTests.push(body || {});
+      const scenario = Number((body || {}).scenario) || 1;
+      const title = scenario === 2 ? 'Памятка медика' : 'Нетраннер к игре';
+      const events = [{ type: 'dialog_start', scenario: scenario, title: title,
+        turns: 10, bases: ['Инструкции оператора'], goal: DIALOG_MEMORY.goal,
+        plan: [] }];
+      for (let n = 1; n <= 10; n += 1) {
+        events.push({ type: 'dialog_turn', n: n, total: 10,
+          text: 'Реплика ' + n + ' контрольного диалога',
+          source: n <= 2 ? 'fixed' : 'model' });
+        events.push({ type: 'debug', text: 'Найдено фрагментов: 2 по реплике ' + n });
+        events.push({ type: 'bot', turn: n, hits: 2, cited: true,
+          text: 'Ответ ' + n + ' по фрагментам [1].\n\n📄 Источники: [1] med.md · '
+            + 'ТЕМП ИСЦЕЛЕНИЯ · релевантность 0.73 · фрагмент № 3.',
+          sources: RAG_SOURCES || [] });
+        events.push({ type: 'task_memory', turn: n, memory: DIALOG_MEMORY,
+          text: '🧠 Память задачи — ' + DIALOG_MEMORY.goal });
+      }
+      events.push({ type: 'dialog_verdict',
+        text: '🧪 Оценка диалога «' + title + '»\nОтветов с источниками: 10 из 10\n'
+          + 'Цель задачи: удержана ✅\nШагов без замечаний: 10 из 10.',
+        items: [{ n: 1, goal: true, sources: true, grounded: true, comment: 'сверено' }],
+        summary: 'цель удержана', stats: { turns: 10, with_sources: 10 },
+        memory: DIALOG_MEMORY });
+      events.push({ type: 'done', usage: usage({ requests: 30, input: 900, output: 300 }) });
+      return dialogTestDelay ? streamResponseSlow(events, dialogTestDelay)
+                             : streamResponse(events);
     }
     if (url.indexOf('/api/agent/rag') === 0) {
       if (url === '/api/agent/rag/upload' && method === 'POST') {
@@ -1128,6 +1232,44 @@ function makeFetch() {
       const requestText = String((body && body.content) || '');
       if (requestText && !body.continue_step) {
         logs[logSession].push({ kind: 'user', text: requestText });
+      }
+      // ПРЯМОЙ ОТВЕТ ИЛИ ПЛАН — ГЕЙТ (как на сервере, chat._plan_needed): вопрос
+      // отвечается сразу по источникам, без плана, шагов и проверки; поручение с
+      // действиями разбирается планом. Заглушка повторяет решение по признакам
+      // запроса — иначе проверка мерила бы не то, что делает приложение.
+      const questionLike = requestText.indexOf('?') >= 0
+        || /^\s*(что|кто|как|где|когда|почему|зачем|сколько|какие|какой|какая|чем)\b/i
+          .test(requestText);
+      if (!body.continue_step && requestText && questionLike && DIRECT_ANSWER) {
+        const directText = 'Trauma Team всегда прибывает в течение 1+1D6 минут '
+          + 'после вызова [1].\n\n📄 Источники: [1] med.md · ТЕМП ИСЦЕЛЕНИЯ · '
+          + 'релевантность 0.73 · фрагмент № 3.';
+        logs[logSession].push({ kind: 'debug',
+          text: 'Автомат задачи: плана не будет — работа в один шаг.' });
+        logs[logSession].push({ kind: 'assistant', text: directText,
+          sources: RAG_SOURCES || [] });
+        logs[logSession].push({ kind: 'suggestions',
+          text: 'Если это была работа, а не вопрос, её можно разложить на шаги.',
+          analysis: { kind: 'plan_offer', message: 'Если это была работа, а не вопрос, '
+            + 'её можно разложить на шаги.',
+            options: [{ title: '⚙ Разложить работу на шаги', details: 'план',
+              send: requestText + ', разложи на шаги' }] } });
+        return streamResponse([
+          { type: 'state', state: snapshot() },
+          { type: 'debug', text: 'Автомат задачи: плана не будет — работа в один шаг.' },
+          { type: 'bot', text: directText, sources: RAG_SOURCES || [] },
+          { type: 'choices',
+            text: 'Если это была работа, а не вопрос, её можно разложить на шаги.',
+            options: [{ title: '⚙ Разложить работу на шаги', details: 'план',
+              send: requestText + ', разложи на шаги' }],
+            analysis: { kind: 'plan_offer',
+              message: 'Если это была работа, а не вопрос, её можно разложить на шаги.',
+              options: [{ title: '⚙ Разложить работу на шаги', details: 'план',
+                send: requestText + ', разложи на шаги' }] } },
+          { type: 'usage', usage: usage({ requests: 2, input: 30, output: 12 }) },
+          { type: 'done', usage: usage({ requests: 2, input: 30, output: 12 }),
+            state: snapshot() },
+        ]);
       }
       if (!body.continue_step && /веб/i.test(requestText)) {
         LAST_ANALYSIS = {
@@ -3955,6 +4097,213 @@ async function run() {
     q('#messages .msg.user').some(el => el.textContent.indexOf('🧪 Вопрос 1/2') >= 0)
     && q('#messages .msg.bot').some(el => el.querySelectorAll('strong').length === 1),
     JSON.stringify(q('#messages .msg.bot').map(el => el.textContent.slice(0, 24))));
+
+  // ---------------------------------------------------------------------
+  // [W] МИНИ-ЧАТ ПО БАЗАМ ЗНАНИЙ («RAG-диалог») И КОНТРОЛЬНЫЕ ДИАЛОГИ.
+  //     Кнопка режима, свой маршрут (без плана задачи), память задачи в панели
+  //     и команды /test_rag_dialog_1|2 — 10 реплик с имитацией пользователя.
+  // ---------------------------------------------------------------------
+  console.log('\n[W] Мини-чат RAG: режим, источники и контрольные диалоги');
+  check('в шапке есть переключатель ТИПА ЗАДАЧИ (вместо кнопки режима окна)',
+    !!$('session-mode') && !!$('session-mode-auto') && !!$('session-mode-plan')
+    && !!$('session-mode-answer')
+    && $('session-mode-auto').textContent.indexOf('По обстоятельствам') >= 0
+    && $('session-mode-plan').textContent.indexOf('Всегда по плану') >= 0
+    && $('session-mode-answer').textContent.indexOf('Всегда сразу ответ') >= 0);
+  check('кнопка режима «RAG-диалог» из шапки убрана',
+    $('rag-dialog-toggle') === null);
+  check('по умолчанию у задачи тип «по обстоятельствам» (решает код)',
+    $('session-mode-auto').classList.contains('on')
+    && $('session-mode-plan').classList.contains('on') === false
+    && dom.window.document.body.classList.contains('session-answer') === false);
+  // «ВСЕГДА ОТВЕТ»: полоса состояния скрыта, ответы идут по источникам.
+  const modesBefore = sessionModes.length;
+  await click($('session-mode-answer'), 80);
+  check('переключение типа уходит на сервер с типом ЭТОЙ задачи',
+    sessionModes.length === modesBefore + 1
+    && sessionModes[modesBefore].body.mode === 'answer'
+    && sessionModes[modesBefore].session === workspace.active_session,
+    JSON.stringify(sessionModes[modesBefore] || {}));
+  check('тип «всегда сразу ответ» подсвечен и скрывает полосу состояния',
+    $('session-mode-answer').classList.contains('on')
+    && dom.window.document.body.classList.contains('session-answer')
+    && declaredStyle($('task-machine'), 'display') === 'none',
+    declaredStyle($('task-machine'), 'display'));
+  // ТИП ЧИТАЕТСЯ ИЗ СНИМКА СЕРВЕРА, а не хранится в состоянии вкладки: меняем
+  // тип «на сервере» и перечитываем снимок — интерфейс обязан перестроиться.
+  SESSION_MODES[workspace.active_session] = 'plan';
+  await dom.window.eval('refreshWorkspace()');
+  await wait(40);
+  check('тип задачи берётся из снимка сервера (а не из памяти вкладки)',
+    $('session-mode-plan').classList.contains('on')
+    && dom.window.document.body.classList.contains('session-answer') === false
+    && declaredStyle($('task-machine'), 'display') !== 'none',
+    'класс body session-answer='
+      + dom.window.document.body.classList.contains('session-answer'));
+  SESSION_MODES[workspace.active_session] = 'auto';
+  await dom.window.eval('refreshWorkspace()');
+  await wait(40);
+  check('тип «по обстоятельствам» восстанавливается по снимку (после перезагрузки)',
+    $('session-mode-auto').classList.contains('on')
+    && dom.window.document.body.classList.contains('session-answer') === false);
+  SESSION_MODES[workspace.active_session] = 'plan';
+  await dom.window.eval('refreshWorkspace()');
+  await wait(40);
+  check('нестандартный тип задачи виден в списке задач',
+    !!q('.session-item .session-mode-mark').length
+    && q('.session-item .session-mode-mark')[0].textContent.indexOf('план') >= 0,
+    q('.session-item .session-mode-mark').length
+      ? q('.session-item .session-mode-mark')[0].textContent : '(нет метки)');
+  SESSION_MODES[workspace.active_session] = 'auto';
+  await dom.window.eval('refreshWorkspace()');
+  await wait(40);
+  check('у типа «по обстоятельствам» метки в списке нет (это норма)',
+    q('.session-item .session-mode-mark').length === 0);
+  // Вопрос отвечается ПРЯМЫМ путём того же режима агента: маршрут ОДИН
+  // (/api/agent/chat), плана и шагов нет, ответ приходит с источниками.
+  const dialogChatCalls = chatCalls();
+  const dialogStepCalls = stepCalls();
+  const dialogTurnsBefore = dialogTurns.length;
+  DIRECT_ANSWER = true;      // заглушка отвечает так же, как сервер: прямо
+  await sendRequest('Как быстро приезжает Trauma Team после вызова?', 120);
+  await wait(160);
+  DIRECT_ANSWER = false;
+  check('вопрос уходит в ОБЩИЙ маршрут агента (отдельного мини-чата больше нет)',
+    chatCalls() === dialogChatCalls + 1 && dialogTurns.length === dialogTurnsBefore,
+    'вызовов чата: ' + (chatCalls() - dialogChatCalls)
+      + ', вызовов мини-чата: ' + (dialogTurns.length - dialogTurnsBefore));
+  check('прямой ответ не запускает шаги плана задачи',
+    stepCalls() === dialogStepCalls, 'шагов: ' + (stepCalls() - dialogStepCalls));
+  const answerNodes = q('#messages .msg.bot').filter(
+    el => el.textContent.indexOf('Trauma Team') >= 0);
+  const withSources = answerNodes.filter(
+    el => el.querySelectorAll('.rag-source').length > 0);
+  check('прямой ответ нарисован в чате с источниками и строкой источников',
+    withSources.length >= 1
+    && withSources[withSources.length - 1].textContent.indexOf('📄 Источники:') >= 0,
+    'ответов: ' + answerNodes.length + ', с источниками: ' + withSources.length);
+  check('в чате сказано, что плана не будет (решение кода видно)',
+    q('#messages .msg.debug').some(el => el.textContent.indexOf('плана не будет') >= 0));
+  check('под ответом есть вариант «разложить на шаги» (кликабельный)',
+    q('#messages .inv-option').some(el => el.textContent.indexOf('на шаги') >= 0)
+    && q('#messages .inv-option').filter(el => el.disabled === false).length > 0,
+    'вариантов: ' + q('#messages .inv-option').length);
+  // ПОЛЕ ВВОДА и подсказки: обычная подсказка режима агента (отдельного режима
+  // мини-чата нет — путь выбирает сервер).
+  check('в поле ввода обычная подсказка режима агента',
+    $('input').placeholder.length > 0
+    && $('input').placeholder.indexOf('Мини-чат по базам знаний') < 0,
+    $('input').placeholder);
+
+  // ПАНЕЛЬ: третий вид — «Память задачи» (цель, уточнения, ограничения, термины).
+  dom.window.eval('setAgentPanelView("taskmem")');
+  await wait(80);
+  check('панель показывает память задачи отдельным видом',
+    $('agent-taskmem-view').hidden === false
+    && $('agent-tokens-view').hidden === true
+    && $('agent-panel-title').textContent === 'Память задачи',
+    $('agent-panel-title').textContent);
+  check('в панели видна ЦЕЛЬ задачи и зафиксированные ограничения',
+    $('taskmem-goal').textContent.indexOf('памятку для команды') >= 0
+    && q('#taskmem-constraints-list .memory-item').length === 2
+    && $('taskmem-clarified-list').textContent.indexOf('2020') >= 0
+    && $('taskmem-terms-list').textContent.indexOf('Спидхил') >= 0,
+    $('taskmem-goal').textContent.slice(0, 60));
+  check('кнопка вида говорит, что будет показано следующим',
+    $('agent-view-toggle').textContent === 'Показать статистику по токенам',
+    $('agent-view-toggle').textContent);
+  dom.window.eval('setAgentPanelView("tokens")');
+  await wait(40);
+
+  // КОМАНДЫ /test_rag_dialog_1|2: контрольный разговор из 10 реплик.
+  const dialogTestsBefore = dialogTests.length;
+  const turnsBefore = q('#messages .msg.test').length;
+  await sendRequest('/test_rag_dialog_2', 120);
+  await wait(300);
+  check('команда диалога ушла в свой маршрут со своим сценарием',
+    dialogTests.length === dialogTestsBefore + 1
+    && Number(dialogTests[dialogTests.length - 1].scenario) === 2,
+    JSON.stringify(dialogTests[dialogTests.length - 1] || {}));
+  const testTurns = q('#messages .msg.test').length - turnsBefore;
+  check('в чате 10 реплик контрольного диалога', testTurns === 10,
+    'реплик: ' + testTurns);
+  check('каждая реплика диалога — со своим номером',
+    q('#messages .msg.test').slice(-1)[0].textContent.indexOf('10/10') >= 0,
+    q('#messages .msg.test').slice(-1)[0].textContent.slice(0, 60));
+  const dialogAnswers = q('#messages .msg.bot').filter(
+    el => el.textContent.indexOf('по фрагментам [1]') >= 0);
+  check('на каждую реплику есть ответ с источниками',
+    dialogAnswers.length === 10
+    && dialogAnswers.every(el => el.querySelectorAll('.rag-source').length > 0),
+    'ответов: ' + dialogAnswers.length);
+  check('у ответов диалога видна строка источников',
+    dialogAnswers.every(el => el.textContent.indexOf('📄 Источники:') >= 0));
+  check('память задачи обновлялась на каждой реплике (10 служебных строк)',
+    q('#messages .msg.debug').filter(
+      el => el.textContent.indexOf('Память задачи') >= 0).length >= 10);
+  check('в конце пришла оценка диалога с целью и источниками',
+    q('#messages .msg.bot').some(
+      el => el.textContent.indexOf('Оценка диалога') >= 0
+        && el.textContent.indexOf('Ответов с источниками: 10 из 10') >= 0
+        && el.textContent.indexOf('Цель задачи: удержана') >= 0));
+  check('после прогона диалога поле ввода свободно', $('input').disabled === false);
+  check('в панели токенов учтён расход диалога',
+    q('#messages .msg.debug').length > 0 && panelRequests() > 0,
+    'запросов в панели: ' + panelRequests());
+
+  // ПРОГРОН ВИДЕН ПО МЕРЕ ПОЯВЛЕНИЯ: события приходят с паузами — в окне уже
+  // есть первые реплики и ответы, а прогон ещё идёт (поле ввода занято). Именно
+  // этого не было при живом дефекте с gzip: чат молчал весь прогон и выдавал всё
+  // разом в конце.
+  dialogTestDelay = 40;
+  const slowBefore = q('#messages .msg.test').length;
+  sendRequest('/test_rag_dialog_1');
+  await wait(220);
+  const slowTurns = q('#messages .msg.test').length - slowBefore;
+  const slowAnswers = q('#messages .msg.bot').filter(
+    el => el.textContent.indexOf('по фрагментам [1]') >= 0).length;
+  const stillRunning = $('input').disabled === true;
+  check('реплики прогона появляются в чате ПО МЕРЕ ПОЯВЛЕНИЯ (не всё в конце)',
+    slowTurns >= 1 && slowTurns < 10 && stillRunning,
+    'реплик уже: ' + slowTurns + ', ответов: ' + slowAnswers
+      + ', поле ввода занято: ' + stillRunning);
+  check('ответ на уже прозвучавшую реплику тоже виден сразу',
+    slowAnswers >= 1, 'ответов: ' + slowAnswers);
+  await wait(2400);          // даём медленному прогону закончиться
+  dialogTestDelay = 0;
+  check('после медленного прогона поле ввода снова свободно',
+    $('input').disabled === false);
+
+  // НЕПОЛНАЯ КОМАНДА: «/test_rag_dialog» без номера не уходит в модель вопросом
+  // по документам, а показывает доступные команды.
+  const turnsBeforeHint = dialogTurns.length;
+  await sendRequest('/test_rag_dialog', 80);
+  await wait(80);
+  check('неполная команда диалога показывает подсказку, а не идёт в модель',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('/test_rag_dialog_1') >= 0
+      && el.textContent.indexOf('/test_rag_dialog_2') >= 0)
+    && dialogTurns.length === turnsBeforeHint,
+    'запросов в мини-чат: ' + (dialogTurns.length - turnsBeforeHint));
+
+  // КОМАНДА РАБОТАЕТ И ВНЕ РЕЖИМА АГЕНТА: это тестовый прогон, а не запрос к
+  // модели (проект нужен — базы знаний привязаны к проекту).
+  // Тип задачи возвращаем на «по обстоятельствам» и выключаем режим агента.
+  await click($('session-mode-auto'), 80);
+  dom.window.eval('setAgentMode(false)');
+  await wait(60);
+  const testsPlainW = dialogTests.length;
+  const chatPlainW = chatCalls();
+  await sendRequest('/test_rag_dialog_1', 120);
+  await wait(200);
+  check('команда диалога работает и вне режима агента (свой маршрут)',
+    dialogTests.length === testsPlainW + 1 && chatCalls() === chatPlainW
+    && Number(dialogTests[dialogTests.length - 1].scenario) === 1,
+    'прогонов: ' + (dialogTests.length - testsPlainW));
+  check('вне режима агента тип задачи не показывается (задач-диалогов нет)',
+    $('session-mode').hidden === true
+    && dom.window.document.body.classList.contains('session-answer') === false);
+  dom.window.eval('setAgentMode(true)');
+  await wait(60);
 
   console.log('\n[T] Тарифы и стоимость в интерфейсе');
   // Стоимость вызова у официального DeepSeek — тысячные доли рубля, поэтому

@@ -987,6 +987,69 @@
             border-color: var(--accent-2);
             box-shadow: 0 0 16px rgba(0, 255, 157, 0.22);
         }
+        /* ТИП ЗАДАЧИ «всегда сразу ответ»: полоса состояния задачи скрыта — план
+           в такой задаче не участвует вовсе (см. app/ai/rag_dialog.py). Сам
+           автомат не сбрасывается: переключили задачу на «по обстоятельствам» или
+           «всегда план» — она продолжает свой этап, как его оставили. Класс
+           ставится по типу ТЕКУЩЕЙ задачи. */
+        body.session-answer #task-machine { display: none !important; }
+        body.session-answer #tm-idle { display: none !important; }
+        /* Переключатель типа задачи: две кнопки, активная подсвечена. */
+        .session-mode {
+            display: inline-flex;
+            gap: 4px;
+            padding: 3px;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: rgba(0, 255, 157, 0.04);
+        }
+        .session-mode button {
+            padding: 6px 10px;
+            border: 1px solid transparent;
+            border-radius: 8px;
+            background: none;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.78rem;
+            cursor: pointer;
+            transition: background 0.2s, color 0.2s, border-color 0.2s;
+        }
+        .session-mode button:hover { color: var(--accent-2); }
+        .session-mode button.on {
+            background: rgba(0, 255, 157, 0.16);
+            border-color: var(--accent-2);
+            color: var(--accent-2);
+        }
+        /* Маркер типа задачи в списке задач: «разговор по документам». */
+        .session-mode-mark {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--accent-2);
+            margin-left: 6px;
+        }
+        /* Память задачи: цель — отдельной строкой, разделы — теми же
+           карточками, что слои памяти (единый вид панели). */
+        .taskmem-goal {
+            border: 1px solid var(--line-soft);
+            border-left: 3px solid var(--accent-2);
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin-bottom: 12px;
+            color: var(--text);
+            font-size: 0.86rem;
+            line-height: 1.45;
+            background: rgba(0, 255, 157, 0.05);
+            white-space: pre-wrap;
+        }
+        .taskmem-goal.empty { color: var(--muted); border-left-color: var(--line-strong); background: none; }
+        .taskmem-head {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: var(--muted);
+            margin: 10px 0 6px;
+        }
         .expert-panel {
             display: flex;
             align-items: center;
@@ -2182,6 +2245,22 @@
                     </div>
                     <button id="expert-toggle" type="button" title="Экспертный режим">Экспертный режим</button>
                     <button id="agent-toggle" type="button" title="AI-агент: агент сам выбирает параметры генерации и ведёт историю диалога">AI-агент</button>
+                    <!-- ПЕРЕОПРЕДЕЛЕНИЕ ВЫБОРА «ответ или план» у ЭТОЙ задачи.
+                         По умолчанию («по обстоятельствам») решает КОД по признакам
+                         запроса (task_state.needs_plan): вопрос — прямой ответ по
+                         источникам, поручение с действиями — план, подтверждение и
+                         проверка. Источники у обоих путей ОДНИ (правила проекта,
+                         внешние инструменты, фрагменты баз знаний), поэтому выбор
+                         нужен лишь тем, кто хочет предсказуемости. Тип хранится
+                         У ЗАДАЧИ и переживает перезагрузку. -->
+                    <div class="session-mode" id="session-mode" hidden>
+                        <button type="button" id="session-mode-auto"
+                                title="По обстоятельствам: вопрос — быстрый ответ по источникам, поручение с действиями — план и шаги. Ничего нажимать не нужно (по умолчанию).">🔄 По обстоятельствам</button>
+                        <button type="button" id="session-mode-plan"
+                                title="Всегда по плану: каждый запрос разбивается на шаги с подтверждением и проверкой результата.">📋 Всегда по плану</button>
+                        <button type="button" id="session-mode-answer"
+                                title="Всегда сразу ответ: отвечаю по источникам без плана и шагов. Полосу состояния задачи скрываю — она в этой задаче не участвует.">💬 Всегда сразу ответ</button>
+                    </div>
                 </div>
                 <div class="chat-settings">
                     <div class="basic-settings" id="basic-settings">
@@ -2429,7 +2508,13 @@
                         прогон контрольных вопросов по включённым базам; ответы
                         сверяются эталонами, выписанными из самой базы. Под каждым
                         ответом видны те же источники, что и в обычном ответе —
-                        с цитатой фрагмента и переходом к чанку.</p>
+                        с цитатой фрагмента и переходом к чанку.
+                        <b>Разговор по документам:</b> команды
+                        <b>/test_rag_dialog_1</b> и <b>/test_rag_dialog_2</b> —
+                        два контрольных ДИАЛОГА по 10 реплик: пользователя
+                        имитирует модель, а отвечает мини-чат (кнопка
+                        «💬 RAG-диалог») — проверяется, что агент не теряет цель
+                        задачи и у каждого ответа есть источники.</p>
                     <div class="rag-list" id="rag-list"></div>
                     <p class="modal-hint rag-status" id="rag-status" hidden></p>
 
@@ -2733,6 +2818,24 @@
                 </div>
                 <div class="agent-hint">Эти слои памяти не подчиняются стратегиям управления контекстом: их записи уходят в модель в каждом запросе целиком (окно и резюме их не сокращают). Пополняются кнопками «добавить в рабочую память» и «добавить в долговременную память» под сообщениями — и своими, и агента. Краткосрочная память — текущая задача; её расход виден на вкладке «Токены задачи».</div>
             </div>
+            <!-- Вид «Память задачи»: выжимка разговора, которую агент ведёт САМ
+                 (цель задачи, уточнения пользователя, зафиксированные
+                 ограничения и термины; см. app/ai/task_memory.py). В отличие от
+                 слоёв памяти ниже, её не наполняет пользователь кнопками — её
+                 собирает мини-чат по базам знаний, и она уходит в модель в
+                 КАЖДОМ запросе, поэтому к концу длинного разговора агент не
+                 теряет ни цель, ни договорённости. -->
+            <div class="agent-view" id="agent-taskmem-view" hidden>
+                <div class="memory-section">
+                    <h3>Память задачи <span class="memory-scope">цель и договорённости разговора</span></h3>
+                    <div class="taskmem-goal" id="taskmem-goal"></div>
+                    <div class="memory-list" id="taskmem-clarified-list"></div>
+                    <div class="memory-list" id="taskmem-constraints-list"></div>
+                    <div class="memory-list" id="taskmem-terms-list"></div>
+                    <div class="memory-empty" id="taskmem-empty" hidden>Память задачи пока пуста: она наполняется в мини-чате по базам знаний («RAG-диалог») — цель задачи, уточнения и зафиксированные ограничения.</div>
+                </div>
+                <div class="agent-hint">Память задачи ведёт агент САМ по ходу разговора в мини-чате: цель задачи, что пользователь уже уточнил, какие ограничения и термины зафиксированы. Она уходит в модель в каждом запросе отдельным блоком и не режется стратегией контекста — поэтому к концу длинного разговора агент не теряет цель. Ограничения и термины меняются только по прямой просьбе пользователя; при сбое обновления память остаётся прежней (ничего не стирается).</div>
+            </div>
             <!-- Стратегия работы агента с контекстом диалога: выпадающий список
                  и поля выбранной стратегии. Поля показываются только у той
                  стратегии, которой они нужны. -->
@@ -2846,6 +2949,15 @@
         const formatSelect = document.getElementById('format');
         const stopInput = document.getElementById('stop-condition');
         const agentToggle = document.getElementById('agent-toggle');
+        // Мини-чат по базам знаний («RAG-диалог»): подрежим режима агента —
+        // история + поиск по документам на каждый вопрос + источники + память
+        // задачи, без плана и шагов (app/ai/rag_dialog.py).
+        const sessionModeBox = document.getElementById('session-mode');
+        const sessionModeButtons = {
+            auto: document.getElementById('session-mode-auto'),
+            plan: document.getElementById('session-mode-plan'),
+            answer: document.getElementById('session-mode-answer')
+        };
 
         // Поле «Длина» принимает только целые числа (не пропускаем не-цифры).
         maxLengthInput.addEventListener('input', () => {
@@ -3027,9 +3139,24 @@
         const agentViewToggle = document.getElementById('agent-view-toggle');
         const agentTokensView = document.getElementById('agent-tokens-view');
         const agentMemoryView = document.getElementById('agent-memory-view');
+        const agentTaskmemView = document.getElementById('agent-taskmem-view');
         const memoryWorkList = document.getElementById('memory-work-list');
         const memoryLongList = document.getElementById('memory-long-list');
         const memoryTaskName = document.getElementById('memory-task-name');
+        // ПАМЯТЬ ЗАДАЧИ (третий вид панели): цель, уточнения, ограничения,
+        // термины — выжимка разговора, которую агент ведёт сам.
+        const taskmemGoal = document.getElementById('taskmem-goal');
+        const taskmemEmpty = document.getElementById('taskmem-empty');
+        const taskmemLists = {
+            clarified: document.getElementById('taskmem-clarified-list'),
+            constraints: document.getElementById('taskmem-constraints-list'),
+            terms: document.getElementById('taskmem-terms-list')
+        };
+        const TASKMEM_HEADERS = {
+            clarified: 'Уточнено пользователем',
+            constraints: 'Ограничения — нарушать нельзя',
+            terms: 'Термины и договорённости'
+        };
         // agentUsage — по одному замеру на запрос пользователя:
         // {requests, input, output, limit, overflow}. Замер приходит с событием
         // "done" агентского потока и восстанавливается с сервера вместе с
@@ -3067,19 +3194,34 @@
         // Снимок слоёв памяти с сервера (GET /api/agent/memory).
         let agentMemory = { task: null, working: [], long_term: [] };
 
+        // Видов ТРИ, и переключаются они по кругу одной кнопкой: токены →
+        // состояние памяти → память задачи → токены. Подпись кнопки всегда
+        // говорит, что будет показано СЛЕДУЮЩИМ.
+        const AGENT_PANEL_VIEWS = ['tokens', 'memory', 'taskmem'];
+        const AGENT_PANEL_TITLES = {
+            tokens: 'Токены задачи',
+            memory: 'Состояние памяти',
+            taskmem: 'Память задачи'
+        };
+        const AGENT_PANEL_NEXT = {
+            tokens: 'Показать состояние памяти',
+            memory: 'Показать память задачи',
+            taskmem: 'Показать статистику по токенам'
+        };
+
         function setAgentPanelView(view) {
-            agentPanelView = (view === 'memory') ? 'memory' : 'tokens';
-            const memory = agentPanelView === 'memory';
-            agentPanelTitle.textContent = memory ? 'Состояние памяти' : 'Токены задачи';
-            agentViewToggle.textContent = memory ? 'Показать статистику по токенам'
-                : 'Показать состояние памяти';
-            agentTokensView.hidden = memory;
-            agentMemoryView.hidden = !memory;
-            if (memory) loadMemory();
+            agentPanelView = AGENT_PANEL_VIEWS.indexOf(view) >= 0 ? view : 'tokens';
+            agentPanelTitle.textContent = AGENT_PANEL_TITLES[agentPanelView];
+            agentViewToggle.textContent = AGENT_PANEL_NEXT[agentPanelView];
+            agentTokensView.hidden = agentPanelView !== 'tokens';
+            agentMemoryView.hidden = agentPanelView !== 'memory';
+            agentTaskmemView.hidden = agentPanelView !== 'taskmem';
+            if (agentPanelView !== 'tokens') loadMemory();
         }
 
         agentViewToggle.addEventListener('click', () => {
-            setAgentPanelView(agentPanelView === 'memory' ? 'tokens' : 'memory');
+            const index = AGENT_PANEL_VIEWS.indexOf(agentPanelView);
+            setAgentPanelView(AGENT_PANEL_VIEWS[(index + 1) % AGENT_PANEL_VIEWS.length]);
         });
 
         // Загружает срезы рабочей и долговременной памяти и рисует их.
@@ -3092,6 +3234,47 @@
                 return;   // память недоступна — панель просто останется как была
             }
             renderMemory();
+            renderTaskMemory();
+        }
+
+        // ПАМЯТЬ ЗАДАЧИ в панели: цель отдельной строкой, разделы — карточками.
+        // Пустая память честно говорит, что её ещё не наполняли (её ведёт
+        // мини-чат по базам знаний, а не пользователь кнопками).
+        function renderTaskMemory() {
+            const snapshot = (agentMemory && agentMemory.task_memory) || null;
+            const goal = String((snapshot && snapshot.goal) || '');
+            taskmemGoal.textContent = goal
+                ? ('Цель задачи: ' + goal)
+                : 'Цель задачи пока не сформулирована.';
+            taskmemGoal.classList.toggle('empty', !goal);
+            let total = goal ? 1 : 0;
+            Object.keys(taskmemLists).forEach(key => {
+                const list = taskmemLists[key];
+                const entries = (snapshot && snapshot[key]) || [];
+                list.innerHTML = '';
+                total += entries.length;
+                if (!entries.length) return;
+                const head = document.createElement('div');
+                head.className = 'taskmem-head';
+                head.textContent = TASKMEM_HEADERS[key] || key;
+                list.appendChild(head);
+                entries.forEach(entry => {
+                    const item = document.createElement('div');
+                    item.className = 'memory-item';
+                    const text = document.createElement('div');
+                    text.className = 'memory-text';
+                    text.textContent = String(entry.text || '');
+                    item.appendChild(text);
+                    if (entry.turn) {
+                        const meta = document.createElement('div');
+                        meta.className = 'memory-meta';
+                        meta.textContent = 'из реплики ' + entry.turn;
+                        item.appendChild(meta);
+                    }
+                    list.appendChild(item);
+                });
+            });
+            taskmemEmpty.hidden = total > 0;
         }
 
         // Метка времени записи памяти: «01.01.2026, 12:00» (или пусто).
@@ -3634,6 +3817,60 @@
         function agentModeOn() {            return agentToggle.classList.contains('active');
         }
 
+        // ПЕРЕОПРЕДЕЛЕНИЕ ВЫБОРА у ТЕКУЩЕЙ задачи: auto (по обстоятельствам —
+        // решает код), plan (всегда план), answer (всегда прямой ответ). Приходит
+        // С СЕРВЕРА в снимке задачи и НИЧЕГО не сбрасывает: диалог общий,
+        // состояние автомата живёт своей жизнью.
+        function currentSessionMode() {
+            const session = (workspace.sessions || [])
+                .find(item => item.id === workspace.active_session);
+            const mode = session && session.mode;
+            return (mode === 'plan' || mode === 'answer') ? mode : 'auto';
+        }
+
+        // Вид «всегда сразу ответ»: план в этой задаче не участвует, полоса
+        // состояния скрыта (в остальных видах она на месте).
+        function sessionAnswerMode() {
+            return agentModeOn() && currentSessionMode() === 'answer';
+        }
+
+        function renderSessionMode() {
+            const mode = currentSessionMode();
+            sessionModeBox.hidden = !agentModeOn() || !workspace.active_session;
+            Object.keys(sessionModeButtons).forEach(key => {
+                sessionModeButtons[key].classList.toggle('on', key === mode);
+            });
+            document.body.classList.toggle('session-answer', sessionAnswerMode());
+            updateComposerState();
+        }
+
+        // Переключение типа задачи: сервер запоминает его у ЗАДАЧИ.
+        const SESSION_MODE_NOTES = {
+            auto: '🔄 Тип задачи: «по обстоятельствам» — вопрос отвечаю сразу по '
+                + 'источникам, поручение с действиями разбираю планом.',
+            plan: '📋 Тип задачи: «всегда план» — каждый запрос разбивается на шаги '
+                + 'с подтверждением и проверкой результата.',
+            answer: '💬 Тип задачи: «всегда сразу ответ» — отвечаю по источникам без '
+                + 'плана и шагов; разложить работу на шаги можно вариантом в ответе.'
+        };
+
+        async function setSessionMode(mode) {
+            if (!workspace.active_session || switching) return;
+            if (currentSessionMode() === mode) return;
+            const snapshot = await workspaceRequest(
+                '/api/agent/sessions/' + encodeURIComponent(workspace.active_session) + '/mode',
+                jsonOptions('POST', { mode: mode }));
+            if (!snapshot) return;
+            workspace = snapshot;
+            renderWorkspace();
+            renderSessionMode();
+            addMessage('debug', SESSION_MODE_NOTES[mode] || SESSION_MODE_NOTES.auto, true);
+        }
+
+        Object.keys(sessionModeButtons).forEach(key => {
+            sessionModeButtons[key].addEventListener('click', () => setSessionMode(key));
+        });
+
         // Периодическая ли задача (по расписанию из снимка workspace). Нужна и
         // прогону шагов, и подсказкам: у периодической задачи ход работы другой —
         // план строится один раз, итоговой проверки нет, «готово» не ставится, а
@@ -3746,6 +3983,9 @@
                 profiles = workspace.profile;
                 renderProfiles();
             }
+            // Тип текущей задачи (переключатель и класс body) — вместе с панелью:
+            // он меняется при переключении задачи.
+            renderSessionMode();
             // Полоса состояния зависит от наличия задачи (без неё диалог не
             // начать) — перерисовываем её вместе с панелью.
             renderTaskMachine();
@@ -3768,10 +4008,15 @@
 
         function updateComposerState() {
             const agentOn = agentModeOn();
+            // Задача типа «всегда сразу ответ»: план не участвует, поэтому ни
+            // пауза, ни завершение задачи её не блокируют — ответ идёт по
+            // источникам проекта (см. app/ai/rag_dialog.py).
+            const ragChat = sessionAnswerMode();
             const needTask = agentOn && !workspace.active_task;
             // Задача на паузе («Пауза» в полосе состояния): шаг не выполняется,
             // пока не нажата «Продолжить» — поле ввода тоже блокируем.
-            const paused = agentOn && !!(taskMachineState && taskMachineState.paused);
+            const paused = !ragChat && agentOn
+                && !!(taskMachineState && taskMachineState.paused);
             // Авто-прогон шагов плана: автомат работает сам, поле ввода занято —
             // сообщение пользователю понадобится, только когда автомат
             // остановится (пауза, ожидание плана, ошибка).
@@ -3792,7 +4037,9 @@
                 ? 'Переключаю диалог…'
                 : needTask
                 ? 'Сначала создайте проект — кнопка «Новый проект»'
-                : (paused
+                : (ragChat
+                    ? 'Мини-чат по базам знаний: спросите по документам проекта'
+                    : (paused
                     ? 'Задача на паузе — нажмите «Продолжить»'
                     : (chainHere
                         ? 'Автомат выполняет шаги плана… «Пауза» остановит его'
@@ -3816,7 +4063,7 @@
                                         : `Задача в работе: шаг ${taskMachineState.step_number} из `
                                           + `${taskMachineState.steps_total} — отправьте сообщение, `
                                           + 'чтобы выполнить его')
-                                    : 'Введите сообщение...')))));
+                                    : 'Введите сообщение...'))))));
             // «Отправить» зависит от занятости ОТКРЫТОЙ задачи (openBusy), а не
             // от того, что где-то в фоне считаются другие задачи.
             sendBtn.disabled = needTask || paused || openBusy;
@@ -3900,6 +4147,25 @@
                 ? title + (period && period.running ? ' — идёт автозапуск' : ' — выполняются шаги')
                 : title;
             item.appendChild(label);
+            // ТИП ЗАДАЧИ («разговор по документам») виден в списке: в такой
+            // задаче план и шаги не участвуют, и это надо знать ДО открытия
+            // задачи — иначе её поведение выглядит как «агент не планирует».
+            const sessionMode = session.mode === 'plan' || session.mode === 'answer'
+                ? session.mode : 'auto';
+            if (!period && sessionMode !== 'auto') {
+                // ПЕРЕОПРЕДЕЛЕНИЕ выбора «ответ или план» у этой задачи: по
+                // умолчанию («по обстоятельствам») метки нет — это норма.
+                const modeMark = document.createElement('span');
+                modeMark.className = 'session-mode-mark';
+                modeMark.textContent = sessionMode === 'plan' ? '📋 всегда план'
+                    : '💬 всегда сразу ответ';
+                modeMark.title = sessionMode === 'plan'
+                    ? 'Тип задачи: всегда план — каждый запрос разбивается на шаги '
+                      + 'с подтверждением и проверкой результата'
+                    : 'Тип задачи: всегда сразу ответ — отвечаю по источникам без '
+                      + 'плана и шагов';
+                item.appendChild(modeMark);
+            }
             if (period) {
                 const badge = document.createElement('span');
                 badge.className = 'session-period';
@@ -5055,6 +5321,11 @@
         function setAgentMode(on) {
             agentToggle.classList.toggle('active', !!on);
             document.body.classList.toggle('agent-mode', !!on);
+            // Тип задачи показываем только в режиме агента (вне его задачи-диалога
+            // нет вовсе), а класс «разговор по документам» снимаем: полоса плана
+            // возвращается вместе с режимом.
+            if (!on) document.body.classList.remove('session-answer');
+            renderSessionMode();
             // Панель «Токены диалога» — только в режиме агента (то же место и
             // размер, что у панели статистики в экспертном режиме).
             agentPanel.hidden = !on;
@@ -8193,6 +8464,125 @@
             }
         }
 
+        // ---------------------------------------------------------------------
+        // МИНИ-ЧАТ ПО БАЗАМ ЗНАНИЙ («RAG-диалог», app/ai/rag_dialog.py).
+        // Вопрос уходит на сервер, оттуда идёт поток: диагностика поиска, ответ
+        // ВМЕСТЕ С ИСТОЧНИКАМИ (те же карточки, что у агента: файл, раздел,
+        // номер чанка, цитата, переход к чанку), память задачи после реплики и
+        // расход хода. План, шаги и автомат задачи НЕ участвуют: мини-чат — это
+        // разговор по документам, а не выполнение плана.
+        // ---------------------------------------------------------------------
+        // Чтение NDJSON-потока сервера построчно: одно событие — одна строка.
+        async function readNdjsonStream(res, onEvent) {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buf = '';
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += decoder.decode(value, { stream: true });
+                let nl;
+                while ((nl = buf.indexOf('\n')) !== -1) {
+                    const line = buf.slice(0, nl).trim();
+                    buf = buf.slice(nl + 1);
+                    if (!line) continue;
+                    let ev;
+                    try { ev = JSON.parse(line); } catch (e) { continue; }
+                    onEvent(ev);
+                }
+            }
+        }
+
+        // События текущего потока рисуем ТОЛЬКО в своём диалоге: переключились —
+        // поток дочитываем (сервер всё сохранит в журнал), но в чужое окно
+        // ничего не пишем (то же правило, что у теста /test_rag).
+        function dialogStreamHere(streamEpoch, streamSession) {
+            return agentModeOn() && streamEpoch === viewEpoch
+                && streamSession === workspace.active_session;
+        }
+
+        // Снимок ПАМЯТИ ЗАДАЧИ с сервера: обновляем панель (вид «Память задачи»)
+        // сразу после реплики — иначе она показывала бы прежнюю память, пока её
+        // не переоткроют.
+        function applyTaskMemory(snapshot) {
+            if (!snapshot || typeof snapshot !== 'object') return;
+            agentMemory = Object.assign({}, agentMemory, { task_memory: snapshot });
+            if (agentPanelView === 'taskmem') renderTaskMemory();
+        }
+
+        // Узел диалога в окне чата (как pushAgentNode у агентского потока).
+        function pushDialogNode(role, text, sources) {
+            const at = new Date().toISOString();
+            agentViewMessages().push({ role: role, text: text, at: at,
+                                       sources: sources || null });
+            drawAgentNode(role, text, null, at, null, sources || null);
+        }
+
+
+        // ---------------------------------------------------------------------
+        // КОНТРОЛЬНЫЙ ДИАЛОГ (команды /test_rag_dialog_1 и /test_rag_dialog_2) —
+        // ТЕСТОВЫЙ КЕЙС. Десять реплик: старт задан сценарием, дальше реплики
+        // пишет имитация пользователя (служебный вызов LLM), а отвечает тот же
+        // мини-чат. Пайплайн задачи не участвует, как и у /test_rag.
+        // ---------------------------------------------------------------------
+        async function runRagDialogTest(scenario) {
+            if (requestBusyHere()) return;
+            const sessionId = workspace.active_session || null;
+            const streamEpoch = viewEpoch;
+            const streamSession = sessionId;
+            pushDialogNode('debug', '🧪 Запускаю контрольный диалог №' + scenario
+                + ' по базам знаний: 10 реплик, пользователя имитирует модель. '
+                + 'План, шаги, автомат и проверка результата не участвуют.');
+            foregroundRequests.add(streamSession);
+            updateComposerState();
+            updateTyping();
+            try {
+                const res = await fetch('/api/agent/rag/dialog/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ scenario: scenario, session_id: sessionId })
+                });
+                if (!res.ok) {
+                    pushDialogNode('error', await res.text() || 'Диалог не запустился.');
+                    return;
+                }
+                await readNdjsonStream(res, (ev) => {
+                    if (!dialogStreamHere(streamEpoch, streamSession)) return;
+                    if (ev.type === 'dialog_start') {
+                        pushDialogNode('debug', '🧪 Диалог «' + ev.title + '»: '
+                            + ev.turns + ' реплик по базам: '
+                            + (ev.bases || []).join(', ') + '. Цель сценария: ' + ev.goal);
+                    } else if (ev.type === 'dialog_turn') {
+                        // Реплика пользователя — отдельным узлом (как вопрос
+                        // теста): это не сообщение человека, а имитация.
+                        pushDialogNode('test', '🧪 Реплика ' + ev.n + '/' + ev.total
+                            + ': ' + ev.text);
+                    } else if (ev.type === 'bot') {
+                        pushDialogNode('assistant', ev.text, ev.sources);
+                    } else if (ev.type === 'task_memory') {
+                        applyTaskMemory(ev.memory);
+                        pushDialogNode('debug', ev.text);
+                    } else if (ev.type === 'dialog_error') {
+                        pushDialogNode('error', ev.text);
+                    } else if (ev.type === 'debug') {
+                        pushDialogNode('debug', ev.text);
+                    } else if (ev.type === 'dialog_verdict') {
+                        applyTaskMemory(ev.memory);
+                        pushDialogNode('assistant', ev.text);
+                    } else if (ev.type === 'done') {
+                        if (ev.memory) applyTaskMemory(ev.memory);
+                    }
+                });
+            } catch (err) {
+                pushDialogNode('error', 'Диалог прерван: '
+                    + (err && err.message ? err.message : err));
+            } finally {
+                foregroundRequests.delete(streamSession);
+                updateComposerState();
+                updateTyping();
+            }
+        }
+
         async function sendAgentRequest(body, background) {
             // Поколение вида фиксируем ДО запроса: ответ относится к диалогу,
             // который открыт сейчас. Если пользователь успеет переключиться, пока
@@ -8412,6 +8802,41 @@
                 return;
             }
 
+            // НЕПОЛНАЯ КОМАНДА КОНТРОЛЬНОГО ДИАЛОГА («/test_rag_dialog» без
+            // номера, «/test_rag_dialog_3»): подсказываем доступные команды. Иначе
+            // такой текст уходил бы в модель обычным вопросом по документам —
+            // живой случай 03.10: команду набрали без номера, и мини-чат честно
+            // искал в базе слово «/test_rag_dialog».
+            const rawCommand = content.trim().toLowerCase();
+            if (/^\/test_rag_dialog(_\d+)?$/.test(rawCommand)
+                    && !/^\/test_rag_dialog_[12]$/.test(rawCommand)) {
+                input.value = '';
+                addMessage('bot', '⚠️ У контрольного диалога нужен номер: '
+                    + '**/test_rag_dialog_1** — «Нетраннер к игре», '
+                    + '**/test_rag_dialog_2** — «Памятка медика». '
+                    + 'Есть ещё **/test_rag** — прогон контрольных вопросов по базам.', true);
+                return;
+            }
+
+            // КОМАНДЫ /test_rag_dialog_1 и /test_rag_dialog_2 — КОНТРОЛЬНЫЕ
+            // ДИАЛОГИ по базам знаний (см. app/ai/rag_dialog.py). Это не запрос
+            // к модели, а тестовый кейс: разговор из 10 реплик, где пользователя
+            // имитирует отдельный вызов LLM. Перехватывается в любом режиме и
+            // уходит в свой маршрут — пайплайн задачи (план, подтверждение,
+            // шаги, автомат) не участвует, как и у /test_rag.
+            const dialogCommand = content.trim().toLowerCase()
+                .match(/^\/test_rag_dialog_([12])$/);
+            if (dialogCommand) {
+                if (!workspace.active_task) {
+                    addMessage('bot', '⚠️ Контрольный диалог идёт по базам знаний '
+                        + 'проекта — сначала создайте проект (кнопка «Новый проект»).', true);
+                    return;
+                }
+                input.value = '';
+                await runRagDialogTest(Number(dialogCommand[1]));
+                return;
+            }
+
             // Режим «AI-агент»: длина проверяется как обычно; эксперт/параметры
             // не участвуют, ответ приходит потоком debug-сообщений агента.
             if (agentModeOn()) {
@@ -8455,6 +8880,10 @@
                 input.value = '';
                 // Подсветка «агент ждёт уточнения» снимается вместе с отправкой.
                 input.classList.remove('need-clarify');
+                // ПУТЬ ОДИН: ответ по источникам или план решает СЕРВЕР
+                // (`_plan_needed`: признаки запроса, тип задачи, кнопки-варианты).
+                // Отдельного режима окна для «разговора по документам» нет —
+                // мини-чат стал вторым путём того же режима «AI-агент».
                 // Запрос относится к ЭТОЙ задаче (шаг её прогона или сообщение
                 // пользователя): другие задачи на своих блокировках.
                 foregroundRequests.add(workspace.active_session);

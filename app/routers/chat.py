@@ -34,7 +34,7 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -48,6 +48,7 @@ from app.ai import mcp as mcp_store
 from app.ai import periodic as periodic_store
 from app.ai import profiles as profile_store
 from app.ai import rag
+from app.ai import rag_dialog
 from app.ai import rag_documents
 from app.ai import rag_jobs
 from app.ai import rag_query
@@ -55,6 +56,7 @@ from app.ai import rag_rerank
 from app.ai import rag_search
 from app.ai import rag_suite
 from app.ai import rag_store
+from app.ai import task_memory as memory_store
 from app.ai import task_state
 from app.ai import workspace as workspace_store
 from app.ai.agent import (
@@ -63,8 +65,8 @@ from app.ai.agent import (
 from app.schemas import (
     ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
     McpApply, MemoryEntryCreate, NameUpdate, PeriodicUpdate, PlanUpdate, ProfileCreate,
-    ProfileFields, RagApply, RagJobDone, RagRelax, RagUpload, SessionCreate,
-    TaskCreate,
+    ProfileFields, RagApply, RagDialogTest, RagJobDone, RagRelax, RagUpload,
+    SessionCreate, SessionMode, TaskCreate,
 )
 
 logger = logging.getLogger(__name__)
@@ -558,6 +560,39 @@ def _task_request(messages: List[Dict[str, Any]], fallback: str = "") -> str:
             if content:
                 return content
     return str(fallback or "").strip()
+
+
+def _plan_needed(text: str, session: Dict[str, Any],
+                 force_plan: bool = False,
+                 periodic: bool = False) -> Tuple[bool, str]:
+    """НУЖЕН ЛИ ПЛАН для этого запроса: (нужен, причина).
+
+    ОДИН РЕЖИМ, ДВА ПУТИ. Источники у обоих путей ОДНИ (правила проекта, внешние
+    инструменты, фрагменты баз знаний) — разница только в том, нужна ли
+    ПРОЦЕДУРА. Поэтому выбор делает КОД по признакам запроса
+    (`task_state.needs_plan`), а человек переопределяет его:
+
+      * `force_plan` (поле запроса) — кнопка «⚙ Разложить работу на шаги»
+        под прямым ответом: то же самое, но как задача;
+      * тип задачи (`session["mode"]`): `plan` — всегда план, `answer` — всегда
+        прямой ответ, `auto` — по обстоятельствам (по умолчанию);
+      * ПЕРИОДИЧЕСКАЯ задача всегда идёт планом: её повтор — это процедура, и
+        выбор тут не при чём.
+
+    Причина возвращается человеческой фразой — чат говорит, ПОЧЕМУ выбран путь:
+    «промпт — просьба, гарантия — код» требует, чтобы решение было видно, а не
+    выглядело случайным.
+    """
+    if periodic:
+        return True, "периодическая задача идёт по плану"
+    if force_plan:
+        return True, "просили выполнить как задачу"
+    mode = workspace_store.session_mode(session)
+    if mode == workspace_store.MODE_PLAN:
+        return True, "у задачи тип «всегда по плану»"
+    if mode == workspace_store.MODE_ANSWER:
+        return False, "у задачи тип «всегда сразу ответ»"
+    return task_state.needs_plan(text)
 
 
 def _log_event(dialog: Optional[Dict[str, Any]], event: Dict[str, Any]) -> None:
@@ -1065,9 +1100,42 @@ async def session_create(payload: Optional[SessionCreate] = None) -> dict:
     periodic = None
     if payload is not None and payload.periodic:
         periodic = payload.interval if payload.interval else periodic_store.DEFAULT_INTERVAL
-    workspace_store.create_session(task, periodic=periodic)
+    session = workspace_store.create_session(task, periodic=periodic)
+    # ТИП задачи можно задать сразу при создании («разговор по документам» —
+    # мини-чат по базам вместо плана). У периодической задачи тип не меняется:
+    # её повтор ведёт автомат по сохранённому плану (см. app/periodic_runner.py).
+    if payload is not None and payload.mode and periodic is None:
+        workspace_store.set_session_mode(session, payload.mode)
     await _persist()
     return _snapshot()
+
+
+@router.post("/agent/sessions/{session_id}/mode")
+async def session_mode_set(session_id: str, payload: SessionMode) -> dict:
+    """Переключает ТИП задачи-диалога: «разговор по документам» / «задача с планом».
+
+    Тип принадлежит ЗАДАЧЕ, а не режиму окна: у каждой задачи свой диалог, своя
+    память задачи и свой замер, поэтому и способ ответа — её свойство. «Разговор
+    по документам» — мини-чат по базам знаний (история, поиск на каждый вопрос,
+    ответ по фрагментам, источники, память задачи) БЕЗ плана и шагов;
+    «задача с планом» — обычный режим «AI-агент» с конечным автоматом.
+
+    Переключение НИЧЕГО не сбрасывает: диалог (messages, журнал, память задачи)
+    общий для обоих типов, а состояние автомата живёт своей жизнью — вернувшись к
+    «задаче с планом», пользователь продолжит её с того же места. У периодической
+    задачи тип не переключается: её повтор ведёт автомат по сохранённому плану.
+    """
+    task, session = _find_session_anywhere(session_id)
+    if task is None or session is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if workspace_store.periodic_meta(session):
+        raise HTTPException(status_code=409, detail=(
+            "У периодической задачи тип не переключается: её повтор ведёт автомат "
+            "по сохранённому плану"))
+    async with _workspace_lock:
+        workspace_store.set_session_mode(session, payload.mode)
+        await _persist()
+        return _snapshot()
 
 
 @router.get("/agent/periodic")
@@ -3546,6 +3614,13 @@ async def rag_test(request: Request) -> StreamingResponse:
             event = {"type": "test_question", "n": number,
                      "total": rag_suite.total(), "text": question}
             yield json.dumps(event, ensure_ascii=False) + "\n"
+            # ЧТО ПРОИСХОДИТ СЕЙЧАС: строка уходит СРАЗУ после вопроса, а не
+            # только вместе с ответом. Иначе в чате между вопросом и ответом
+            # висела тишина (поиск + вызов модели), и прогон читался как
+            # «всё появилось в конце» (жалоба 03.10 — см. §7, «потоки без gzip»).
+            yield json.dumps({"type": "debug", "text": (
+                "🔎 Ищу фрагменты по вопросу в базах проекта: «%s»"
+                % question[:200])}, ensure_ascii=False) + "\n"
             started = time.monotonic()
             try:
                 # 0. ПЕРЕФОРМУЛИРОВКА ЗАПРОСА — если она включена у проекта: тот
@@ -3665,6 +3740,15 @@ async def rag_test(request: Request) -> StreamingResponse:
 
         lines = rag_suite.verdict_lines(verdict)
         text = "🧪 Оценка ответов\n" + rag_suite.summary_text(verdict)
+        # Вопросы без найденных фрагментов — та же подсказка про порог: прогон
+        # проверяет поиск, и «в документах нет» может быть следствием настройки.
+        rag_stats = {"turns": len(rows),
+                     "with_sources": sum(1 for row in rows if row.get("hits"))}
+        rag_hint = rag_dialog.yield_hint(rag_stats, test_settings.get("min_score"),
+                                         test_settings.get("min_ce"),
+                                         bool(test_settings.get("filter")))
+        if rag_hint:
+            text += "\n" + rag_hint
         if lines:
             text += "\n" + "\n".join(lines)
         if verdict.get("summary"):
@@ -3697,6 +3781,613 @@ async def rag_test(request: Request) -> StreamingResponse:
 def _rag_test_timeout() -> float:
     """Таймаут одного вызова теста: ответы короткие, ждать дольше незачем."""
     return float(llm_client.HTTP_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# МИНИ-ЧАТ ПО БАЗАМ ЗНАНИЙ (app/ai/rag_dialog.py)
+#
+# ЧТО ЭТО. Диалог с опорой на документы проекта: история разговора + поиск по
+# включённым базам на КАЖДЫЙ новый вопрос + ответ по найденным фрагментам +
+# источники под ответом + память задачи (цель, уточнения, ограничения, термины).
+#
+# МИМО ПАЙПЛАЙНА ЗАДАЧИ — так же, как контрольный прогон `/test_rag`: ни
+# планировщика, ни подтверждения плана, ни шагов, ни приёмщика, ни переходов
+# автомата. Причина та же: короткий разговор «вопрос — ответ по документам» не
+# нуждается в шагах, а каждый шаг стоил бы отдельного вызова модели. Состояние
+# автомата мини-чат НЕ трогает: вернувшись в режим «AI-агент», задача продолжает
+# свой этап ровно так, как его оставили.
+#
+# ЧТО МИНИ-ЧАТ ЗАПИСЫВАЕТ. Реплики — в память диалога (messages: следующий ход
+# мини-чата и обычный запрос агента видят разговор), ответ и служебные строки — в
+# журнал чата (log: окно восстанавливается при переключении задачи), расход — в
+# dialog["usage"] (панель «Токены задачи»), память задачи — в dialog["task_memory"].
+# НЕ записывает: состояние автомата, подпись плана. Фрагменты поиска тоже НЕ
+# кладутся в dialog["rag"]: это запись «к какому запросу ЗАДАЧИ относятся
+# данные» — мини-чат ищет по каждому своему вопросу заново, и его поиск не должен
+# подменять собой данные шага плана (см. §5.13 в SESSION_PROMPT).
+# ---------------------------------------------------------------------------
+def _rag_dialog_target(session_id: str = "") -> Tuple[Optional[Dict[str, Any]],
+                                                     Optional[Dict[str, Any]]]:
+    """(проект, диалог) для мини-чата: своя задача — по id, иначе текущая.
+
+    Диалога ещё нет (задача без диалогов) — он заводится: мини-чат хранит
+    ИСТОРИЮ, а хранить её негде без сессии.
+    """
+    explicit = str(session_id or "").strip()
+    if explicit:
+        task, session = _find_session_anywhere(explicit)
+        return task, session
+    task = _current_task()
+    if task is None:
+        return None, None
+    session = workspace_store.active_session(_workspace, task)
+    if session is None:
+        session = workspace_store.create_session(task)
+    return task, session
+
+
+def _rag_dialog_bases(task: Dict[str, Any]) -> List[str]:
+    """Включённые базы проекта — по ним отвечает мини-чат (как агент)."""
+    return workspace_store.rag_enabled(task)
+
+
+def _rag_hits_line(hits: List[Dict[str, Any]], number: int = 0) -> str:
+    """Строка диагностики «сколько нашлось и что лучший» (как у `/test_rag`)."""
+    prefix = ("%d. " % number) if number else ""
+    if not hits:
+        return prefix + "Найдено фрагментов: 0"
+    return ("%sНайдено фрагментов: %d; лучший — %s"
+            % (prefix, len(hits), rag_search.address_of(hits[0])))
+
+
+def _rag_cut_note(result: Dict[str, Any]) -> str:
+    """Чем отсеклись фрагменты («score»/«ce») — для честной строки источников.
+
+    Это тот же разбор, что у диагностики RAG: «порог отсёк всё» и «в документах
+    нет» — РАЗНЫЕ вещи, и путать их в ответе мини-чата нельзя.
+    """
+    kind = rag_search.cut_kind(result)
+    if kind == "score":
+        stages = (result or {}).get("stages") or {}
+        return "порог первичной релевантности %.2f" % float(
+            stages.get("min_score") or 0.0)
+    if kind == "ce":
+        stages = (result or {}).get("stages") or {}
+        return "порог уверенности модели %.2f" % float(stages.get("min_ce") or 0.0)
+    return ""
+
+
+async def _rag_dialog_turn(question: str, *, memory: Dict[str, Any],
+                           history: str, profile: str,
+                           profile_id: Optional[str],
+                           settings: Dict[str, Any], enabled: List[str],
+                           tracker: Agent,
+                           number: int = 0) -> AsyncIterator[Dict[str, Any]]:
+    """ОДИН ход мини-чата: поиск по базам → ответ по фрагментам → память задачи.
+
+    Отдаёт события по мере хода (асинхронный генератор): диагностику поиска,
+    ответ (`bot` вместе с ИСТОЧНИКАМИ), снимок памяти задачи и расход хода.
+    Запись в диалог — дело вызывающего кода: этим же ходом пользуются и обычный
+    мини-чат (пишет в диалог), и контрольный прогон (ничего не пишет).
+
+    ПОИСК ИДЁТ НА КАЖДЫЙ ВОПРОС, без исключений: в этом и смысл мини-чата.
+    Запрос переформулируется тем же модулем, что у агента (если включено у
+    проекта), ищется тем же `rag_search.search` с настройками ПРОЕКТА — иначе
+    мини-чат мерил бы не то, что видит человек в панели «Поиск и ответы».
+    """
+    # 1. ПЕРЕФОРМУЛИРОВКА ЗАПРОСА (Query Rewrite) — если включена у проекта:
+    #    тот же модуль и тот же вид служебного вызова, что у агента.
+    query_text = question
+    rewrite_info: Dict[str, Any] = {}
+    if settings.get("rewrite"):
+        async def call(**kwargs: Any) -> Any:
+            content, metrics = await llm_client.call_llm_async(**kwargs)
+            tracker.note_usage(metrics, Agent.SERVICE_REWRITE)
+            return content, metrics
+
+        rewrite_info = await rag_query.rewrite(question, call)
+        if rewrite_info.get("query"):
+            query_text = str(rewrite_info["query"])
+        line = rag_query.debug_line(rewrite_info)
+        if line:
+            yield {"type": "debug", "text": line}
+    # 2. ПОИСК ПО БАЗАМ — в потоке: считается вектор запроса и перебирается
+    #    индекс, цикл событий на это время блокировать нельзя.
+    #    ВТОРОЙ ЗАПРОС: переформулировка (если была) и — у «сводной» просьбы
+    #    («собери памятку», «сведи чек-лист») — ЦЕЛЬ задачи. У такой просьбы нет
+    #    своих слов о теме, и поиск по ней приносил случайные разделы: живой
+    #    прогон 03.10 показал, как на «собери памятку из того, что нашли» модель
+    #    получила чужие фрагменты и честно ответила «в этих фрагментах этого
+    #    нет» — свод разваливался, хотя все факты были найдены раньше.
+    goal_query = rag_dialog.search_query(question, memory)[1]
+    yield {"type": "debug", "text": "🔎 Ищу в базах знаний по запросу: «%s»"
+           % query_text[:200]}
+    # Собираем второй запрос из частей: исходный текст (если была
+    # переформулировка — она ничего не должна терять) и цель задачи.
+    also_parts: List[str] = []
+    if rewrite_info:
+        also_parts.append(question)
+    if goal_query:
+        also_parts.append(goal_query)
+        yield {"type": "debug", "text": (
+            "🔎 Это просьба свести уже найденное — ищу ещё и по ЦЕЛИ задачи: «%s»"
+            % goal_query[:200])}
+    result = await asyncio.to_thread(
+        rag_search.search, enabled, query_text, profile=profile_id,
+        settings=settings, rewrite=rewrite_info or None,
+        also=" ".join(also_parts))
+    hits = rag_search.hits_of(result)
+    note = rag_search.results_note(result)
+    if note:
+        yield {"type": "debug", "text": note}
+    yield {"type": "debug", "text": _rag_hits_line(hits, number)}
+    # 3. ОТВЕТ ПО ФРАГМЕНТАМ: один вызов модели, без плана и шагов.
+    messages = rag_dialog.answer_messages(
+        memory_store.block(memory), rag_search.block(result), history, question,
+        profile)
+    content, metrics = await llm_client.call_llm_async(
+        user_text=question, model=config.LLM_MODEL, disable_thinking=True,
+        max_tokens=rag_dialog.ANSWER_MAX_TOKENS, messages=messages,
+        timeout=_rag_test_timeout())
+    tracker.note_usage(metrics, None)
+    if not str(content or "").strip():
+        # Модель не ответила (сбой вызова, пустой ответ): ВЫДАВАТЬ строку
+        # источников за ответ нельзя — это выглядело бы как ответ по документам.
+        # Сбой помечается ошибкой, ход считается несостоявшимся, а расход вызова
+        # (если он был) остаётся в замере как сбойный.
+        yield {"type": "error", "text": (
+            "⚠ Мини-чат не получил ответа от модели — повторите вопрос.")}
+        return
+    # ИСТОЧНИКИ — ГАРАНТИЕЙ КОДА: строка под ответом есть ВСЕГДА (либо номера
+    # фрагментов, либо честное «фрагментов не найдено»).
+    answer = rag_dialog.ensure_sources(content, hits, searched=len(enabled),
+                                       cut=_rag_cut_note(result))
+    yield {"type": "bot", "text": answer,
+           "sources": rag_search.sources(result), "hits": len(hits),
+           "cited": rag_dialog.has_citation(answer),
+           # ССЫЛКИ НА НЕСУЩЕСТВУЮЩИЕ ФРАГМЕНТЫ: номера обновляются на каждом
+           # вопросе, и перенесённый из прошлого ответа номер указывает на чужой
+           # документ. Это проверяет КОД (ссылка — это число), а судья прогона
+           # проверяет то, что кодом не проверить: подтверждает ли цитата слова.
+           "bad_cites": rag_dialog.bad_citations(answer, len(hits)),
+           "honest": rag_dialog.looks_like_no_data(answer)}
+    # 4. ПАМЯТЬ ЗАДАЧИ: что пользователь уточнил, что зафиксировано. Сбой этого
+    #    служебного вызова ответ не отменяет — память дополнит локальный разбор.
+    async for event in _rag_memory_update(question, answer, memory, tracker):
+        yield event
+
+
+async def _rag_memory_update(question: str, answer: str, memory: Dict[str, Any],
+                             tracker: Agent,
+                             turn: int = 0) -> AsyncIterator[Dict[str, Any]]:
+    """Обновление ПАМЯТИ ЗАДАЧИ после реплики (служебный вызов + страховка).
+
+    Модель получает прежнюю память и новую пару реплик и возвращает память
+    целиком; результат СЛИВАЕТСЯ с прежней (см. app/ai/task_memory.py): ни одна
+    договорённость не теряется даже при сбое или мусорном ответе. Цель и явные
+    ограничения дополнительно достаются КОДОМ из самой реплики — если модель не
+    ответила, разговор всё равно помнит, чего от него хотят.
+    """
+    payload = memory_store.extract_payload(memory, question, answer, turn)
+    content = ""
+    try:
+        content, metrics = await llm_client.call_llm_async(
+            user_text=payload, model=config.LLM_MODEL, disable_thinking=True,
+            max_tokens=rag_dialog.MEMORY_MAX_TOKENS,
+            messages=[{"role": "system", "content": memory_store.EXTRACT_PROMPT},
+                      {"role": "user", "content": payload}],
+            timeout=_rag_test_timeout())
+        tracker.note_usage(metrics, Agent.SERVICE_MEMORY)
+    except Exception as exc:                    # память не роняем никогда
+        logger.warning("Мини-чат: память задачи обновлена локально — %s",
+                       str(exc)[:200])
+    update = memory_store.parse(content, turn=turn)
+    local = memory_store.local_update(question, memory, turn=turn)
+    if not update.get("goal"):
+        update["goal"] = local.get("goal") or ""
+    for key, _, _ in memory_store.LISTS:
+        if not update.get(key):
+            update[key] = local.get(key) or []
+    merged = memory_store.merge(memory, update)
+    yield {"type": "task_memory", "memory": memory_store.snapshot(merged),
+           "text": "🧠 Память задачи — " + memory_store.summary_line(merged)}
+
+
+@router.post("/agent/rag/dialog")
+async def rag_dialog_chat(msg: ChatMessage) -> StreamingResponse:
+    """РАЗГОВОР ПО ДОКУМЕНТАМ — движок прямого ответа, без правил проекта и MCP.
+
+    ПОСЛЕ ОБЪЕДИНЕНИЯ ПУТЕЙ (03.10) интерфейс этим маршрутом НЕ пользуется: в
+    режиме «AI-агент» путь выбирает гейт (`_plan_needed`), и прямой ответ идёт
+    через `agent_chat` — в нём те же правила ответа плюс гейт инвариантов, данные
+    внешних инструментов и останов «в документах ничего нет — решает
+    пользователь». Маршрут остался как ЧИСТЫЙ разговор по документам: его
+    используют проверки, из него же растёт движок (`_rag_dialog_turn`), и он
+    годится для внешних вызовов, которым правила проекта и MCP не нужны.
+
+    Поток событий (NDJSON, как у чата агента):
+
+      * `{"type": "debug", "text": …}` — что делает мини-чат: переформулировка
+        запроса, что нашлось в базах, порог;
+      * `{"type": "bot", "text": …, "sources": [...]}` — ответ ВМЕСТЕ С
+        ИСТОЧНИКАМИ (в тексте всегда есть строка «📄 Источники: …», в `sources` —
+        те же фрагменты, что у агента: интерфейс рисует по ним карточки с
+        цитатой и переходом к чанку);
+      * `{"type": "task_memory", "memory": {...}, "text": …}` — память задачи
+        после этой реплики (цель, уточнения, ограничения, термины);
+      * `{"type": "usage", "usage": {...}}` — расход хода (ответ +
+        переформулировка + обновление памяти) одной записью, как у агента;
+      * `{"type": "done", "usage": {...}}` — конец потока.
+
+    Базы не включены — отказ СРАЗУ (400) без обращений к модели: мини-чат
+    отвечает ПО ДОКУМЕНТАМ, и без документов он не имеет смысла.
+    """
+    task, session = _rag_dialog_target(str(getattr(msg, "session_id", "") or ""))
+    if task is None or session is None:
+        return JSONResponse(
+            {"detail": "Сначала создайте проект — мини-чат отвечает по базам знаний проекта"},
+            status_code=400)
+    question = (msg.content or "").strip()
+    if not question:
+        raise HTTPException(status_code=400,
+                            detail="Введите вопрос — мини-чат отвечает по документам")
+    enabled = _rag_dialog_bases(task)
+    if not enabled:
+        raise HTTPException(status_code=400, detail=(
+            "к проекту не подключено ни одной базы знаний — мини-чат отвечает по "
+            "документам, включите базу кнопкой «RAG»"))
+    settings = workspace_store.rag_settings(task)
+    profile_id = _current_profile_id()
+    profile = _profile_block()
+    log_target: Dict[str, Any] = {}
+
+    def encode(event: dict) -> str:
+        _log_event(log_target.get("dialog"), event)
+        return json.dumps(event, ensure_ascii=False) + "\n"
+
+    async def event_stream():
+        async with _session_lock(str(session["id"])):
+            # Диалог берём ПОД блокировкой СВОЕЙ задачи: за время подготовки
+            # ответа задачу могли переключить.
+            task_now, session_now = _rag_dialog_target(
+                str(getattr(msg, "session_id", "") or ""))
+            if task_now is None or session_now is None:
+                yield encode({"type": "error", "text": "Диалог не найден."})
+                yield encode({"type": "done", "usage": {}})
+                return
+            dialog_now: Dict[str, Any] = session_now["dialog"]
+            log_target["dialog"] = dialog_now
+            _running_sessions.add(str(session_now["id"]))
+            workspace_store.add_log(dialog_now, workspace_store.LOG_USER, question)
+            yield encode({"type": "debug", "text": (
+                "💬 Мини-чат: отвечаю по документам проекта (план задачи не "
+                "участвует). Базы: %d, настройки поиска — как у проекта."
+                % len(enabled))})
+            usage: Dict[str, Any] = {}
+            answer = ""
+            sources: List[Dict[str, Any]] = []
+            memory = workspace_store.task_memory(dialog_now)
+            turn = int(len([m for m in dialog_now["messages"]
+                            if m.get("role") == "user"]) or 0) + 1
+            tracker = Agent(AgentConfig(max_tokens=rag_dialog.ANSWER_MAX_TOKENS))
+            try:
+                async for event in _rag_dialog_turn(
+                        question, memory=memory,
+                        history=rag_dialog.history_text(dialog_now["messages"]),
+                        profile=profile, profile_id=profile_id, settings=settings,
+                        enabled=enabled, tracker=tracker):
+                    kind = event.get("type")
+                    if kind == "bot":
+                        answer = str(event.get("text") or "")
+                        sources = list(event.get("sources") or [])
+                    elif kind == "task_memory":
+                        # Память задачи — в диалог: следующий ход (и обычный
+                        # запрос агента) обязан её видеть.
+                        memory = workspace_store.set_task_memory_value(
+                            dialog_now, event.get("memory") or {})
+                        yield encode({"type": "debug", "text": event.get("text")})
+                        continue
+                    yield encode(event)
+            except Exception as exc:            # сбой хода — ответа нет, поток жив
+                logger.warning("Мини-чат: ход не выполнен — %s", str(exc)[:200])
+                yield encode({"type": "error", "text": (
+                    "⚠ Мини-чат не смог ответить: %s"
+                    % llm_client.redact_secrets(str(exc))[:300])})
+            # ЗАПИСЬ ХОДА: реплики — в память диалога, расход — одной записью,
+            # память задачи — в диалог. Состояние автомата НЕ трогаем.
+            delta = tracker.usage_snapshot()
+            if answer:
+                dialog_now["messages"].append({"role": "user", "content": question})
+                dialog_now["messages"].append({"role": "assistant", "content": answer})
+                usage = merge_usage(usage, delta)
+                if usage:
+                    dialog_now["usage"].append(dict(usage))
+                    _usage_matches_history(dialog_now)
+            elif delta.get("requests") or delta.get("failed_requests"):
+                # Ответа нет (сбой модели), но вызовы были — расход не теряем.
+                dialog_now.setdefault("usage", []).append(
+                    dict(delta, kind="service"))
+            await _persist()
+            yield encode({"type": "done", "usage": dict(usage),
+                          "memory": memory_store.snapshot(memory)})
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# КОНТРОЛЬНЫЕ ДИАЛОГИ RAG: команды /test_rag_dialog_1 и /test_rag_dialog_2
+#
+# ЧТО ПРОВЕРЯЕТСЯ. Два РАЗНЫХ разговора по 10 реплик (app/ai/rag_dialog.py,
+# SCENARIOS): старт задан хардкодом, дальше реплики пишет имитация пользователя
+# (служебный вызов LLM), а отвечает тот же мини-чат, что и в жизни. Проверяется
+# главное свойство разговора: агент НЕ ТЕРЯЕТ ЦЕЛЬ задачи (память задачи) и
+# КАЖДЫЙ ответ приходит с источниками.
+#
+# МИМО ПАЙПЛАЙНА — как `/test_rag`: ни планировщика, ни подтверждения, ни шагов,
+# ни автомата, ни приёмщика. В память диалога (messages), замер (usage) и автомат
+# (state) прогон НЕ пишет: синтетический разговор не должен становиться историей
+# рабочей задачи. В журнал чата (`log`) пишет — результат виден пользователю.
+# Память задачи прогон ведёт ЛОКАЛЬНО: она показана в событиях и в вердикте, но
+# в диалог не попадает (по той же причине).
+#
+# ЧАСТЬ ИТОГА СЧИТАЕТ КОД, А НЕ СУДЬЯ: сколько ответов пришло с источниками и
+# сказал ли агент «в документах этого нет» на вопрос-ловушку — это факты потока
+# (см. rag_dialog.turn_stats). Судья отвечает только за то, чего код знать не
+# может: служит ли ответ цели разговора и нет ли в нём выдуманных фактов.
+# ---------------------------------------------------------------------------
+@router.post("/agent/rag/dialog/test")
+async def rag_dialog_test(payload: RagDialogTest) -> StreamingResponse:
+    """Контрольный ДИАЛОГ по базам знаний — команды `/test_rag_dialog_1|2`.
+
+    Поток событий (NDJSON):
+
+      * `{"type": "dialog_start", "scenario", "title", "turns", "bases", "goal",
+        "plan": [...]}` — что за разговор начинается и из каких реплик он состоит;
+      * `{"type": "dialog_turn", "n", "total", "text", "source"}` — реплика
+        пользователя (`source`: "fixed" — из сценария, "model" — имитация);
+      * `{"type": "debug", …}` — ход поиска и работа с памятью задачи;
+      * `{"type": "bot", "text", "sources", "turn", "hits"}` — ответ агента
+        ВМЕСТЕ С ИСТОЧНИКАМИ (как в чате: карточки фрагментов и цитаты);
+      * `{"type": "task_memory", "turn", "memory", "text"}` — память задачи после
+        реплики: её и проверяет тест на «не потерял ли агент цель»;
+      * `{"type": "dialog_error", "n", "text"}` — шаг остался без ответа (прогон
+        НЕ обрывается: остальные реплики всё равно проверяются);
+      * `{"type": "dialog_verdict", "text", "items", "summary", "stats",
+        "memory"}` — вердикт судьи и ФАКТЫ прогона (сколько ответов с источниками);
+      * `{"type": "done", "usage": {...}}` — итог прогона и его расход.
+    """
+    sc = rag_dialog.scenario(payload.scenario)
+    if sc is None:
+        raise HTTPException(status_code=400, detail=(
+            "неизвестный сценарий диалога: есть 1 и 2 (команды "
+            "/test_rag_dialog_1 и /test_rag_dialog_2)"))
+    task, session = _rag_dialog_target(payload.session_id)
+    if task is None or session is None:
+        raise HTTPException(status_code=400, detail=(
+            "Сначала создайте проект — базы знаний привязаны к проекту"))
+    enabled = _rag_dialog_bases(task)
+    if not enabled:
+        raise HTTPException(status_code=400, detail=(
+            "к проекту не подключено ни одной базы знаний — включите базу "
+            "кнопкой «RAG», иначе проверять нечего"))
+    settings = workspace_store.rag_settings(task)
+    profile_id = _current_profile_id()
+    profile = _profile_block()
+    dialog = session.get("dialog")
+    base_names = []
+    for base_id in enabled:
+        meta = rag_store.get_base(base_id, profile=profile_id) or {}
+        base_names.append(str(meta.get("name") or base_id))
+
+    def log(kind: str, text: str, sources: Any = None) -> None:
+        """Запись в журнал ЧАТА (не в память диалога): прогон должен быть виден."""
+        if dialog is not None:
+            workspace_store.add_log(dialog, kind, text, sources=sources)
+
+    async def event_stream():
+        rows: List[Dict[str, Any]] = []
+        # ПАМЯТЬ ЗАДАЧИ прогона — ЛОКАЛЬНАЯ: синтетический разговор не должен
+        # подменять память рабочей задачи. Начинается с пустой: тест проверяет,
+        # что агент САМ её построит по первой реплике и не потеряет к концу.
+        memory: Dict[str, Any] = memory_store.empty()
+        history: List[Dict[str, str]] = []
+        tracker = Agent(AgentConfig())
+        plan = rag_dialog.turn_plan(sc)
+        first_goal = ""
+        log(workspace_store.LOG_DEBUG, (
+            "🧪 Диалог «%s»: %d реплик, базы: %s. Прогон идёт мимо плана задачи — "
+            "состояние и память задачи не меняются. Цель сценария: %s"
+            % (sc.get("title"), rag_dialog.TURNS, ", ".join(base_names),
+               sc.get("goal"))))
+        yield json.dumps({"type": "dialog_start", "scenario": sc["id"],
+                          "title": sc.get("title") or "",
+                          "turns": rag_dialog.TURNS, "bases": base_names,
+                          "goal": sc.get("goal") or "", "plan": plan},
+                         ensure_ascii=False) + "\n"
+        for step in plan:
+            number = int(step["n"])
+            source = step["source"]
+            question = ""
+            if source == "fixed":
+                question = str(step["text"])
+            else:
+                # Имитация пользователя — тоже вызов модели (несколько секунд):
+                # строку про неё показываем ДО вызова, иначе между репликами
+                # висела тишина и прогон выглядел «молчащим» до конца.
+                yield json.dumps({"type": "debug", "text": (
+                    "✍️ Готовлю реплику %d/%d (имитация пользователя)…"
+                    % (number, rag_dialog.TURNS))}, ensure_ascii=False) + "\n"
+                # ИМИТАЦИЯ ПОЛЬЗОВАТЕЛЯ: одна реплика на служебный вызов. Сбой
+                # вызова НЕ пропускает шаг — реплика берётся из плана сценария
+                # (пункты сформулированы как вопросы), и разговор продолжается.
+                topic = str(step.get("topic") or "")
+                payload_text = rag_dialog.simulator_payload(
+                    sc, number, rag_dialog.history_text(history), memory)
+                try:
+                    content, metrics = await llm_client.call_llm_async(
+                        user_text=payload_text, model=config.LLM_MODEL,
+                        disable_thinking=True,
+                        max_tokens=rag_dialog.ANSWER_MAX_TOKENS,
+                        messages=[{"role": "system",
+                                   "content": rag_dialog.USER_SIM_PROMPT},
+                                  {"role": "user", "content": payload_text}],
+                        timeout=_rag_test_timeout())
+                    tracker.note_usage(metrics, None)
+                    question = rag_dialog.parse_user(content)
+                except Exception as exc:
+                    logger.warning("Диалог RAG: имитация пользователя не ответила — %s",
+                                   str(exc)[:200])
+                if not question:
+                    question = rag_dialog.fallback_question(topic)
+                    source = "script"
+            log(workspace_store.LOG_USER, "🧪 Реплика %d/%d: %s"
+                % (number, rag_dialog.TURNS, question))
+            yield json.dumps({"type": "dialog_turn", "n": number,
+                              "total": rag_dialog.TURNS, "text": question,
+                              "source": source},
+                             ensure_ascii=False) + "\n"
+            row: Dict[str, Any] = {
+                "n": number, "question": question, "answer": "", "hits": 0,
+                "sources": [], "cited": False, "error": "", "metrics": {},
+                "bad_cites": [], "trap": rag_dialog.is_trap(sc, number),
+                "honest": False,
+            }
+            try:
+                async for event in _rag_dialog_turn(
+                        question, memory=memory,
+                        history=rag_dialog.history_text(history), profile=profile,
+                        profile_id=profile_id, settings=settings,
+                        enabled=enabled, tracker=tracker, number=number):
+                    kind = event.get("type")
+                    if kind == "bot":
+                        row["answer"] = str(event.get("text") or "")
+                        row["sources"] = list(event.get("sources") or [])
+                        row["hits"] = int(event.get("hits") or 0)
+                        row["cited"] = bool(event.get("cited"))
+                        row["honest"] = bool(event.get("honest"))
+                        row["bad_cites"] = list(event.get("bad_cites") or [])
+                        event = dict(event, turn=number)
+                    elif kind == "task_memory":
+                        memory = memory_store.normalize(event.get("memory") or {})
+                        event = dict(event, turn=number)
+                    if kind == "debug":
+                        log(workspace_store.LOG_DEBUG, str(event.get("text") or ""))
+                    elif kind == "bot" and row["answer"]:
+                        log(workspace_store.LOG_ASSISTANT, row["answer"],
+                            sources=row["sources"])
+                    elif kind == "task_memory":
+                        log(workspace_store.LOG_DEBUG, str(event.get("text") or ""))
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+            except Exception as exc:                # сбой шага прогон не обрывает
+                logger.warning("Диалог RAG: реплика %d не отработана — %s",
+                               number, str(exc)[:200])
+                row["error"] = llm_client.redact_secrets(str(exc))[:300]
+                text = ("⚠ Реплика %d осталась без ответа: %s"
+                        % (number, row["error"]))
+                log(workspace_store.LOG_ERROR, text)
+                yield json.dumps({"type": "dialog_error", "n": number,
+                                  "text": text}, ensure_ascii=False) + "\n"
+            rows.append(row)
+            # История разговора для следующих шагов: реплика и ответ. Хвост
+            # истории обрезает сам модуль (rag_dialog.history_text).
+            history.append({"role": "user", "content": question})
+            if row["answer"]:
+                history.append({"role": "assistant", "content": row["answer"]})
+            if number == 1 and memory_store.goal_of(memory):
+                first_goal = memory_store.goal_of(memory)
+
+        # ОЦЕНКА РАЗГОВОРА: судья видит цель сценария, каждый ответ и фрагменты,
+        # из которых ответ взят. Сбоя оценки прогон не отменяет.
+        verdict: Dict[str, Any] = {"items": [], "summary": "", "goal_kept": None}
+        stats = rag_dialog.turn_stats(rows)
+        if any(row["answer"] for row in rows):
+            # Судье уходит и ПАМЯТЬ ЗАДАЧИ разговора: без неё он принимал
+            # названное пользователем за выдумку агента (см. JUDGE_PROMPT).
+            judge_payload = rag_dialog.judge_payload(sc, rows, memory)
+            try:
+                content, metrics = await llm_client.call_llm_async(
+                    user_text=judge_payload, model=config.LLM_MODEL,
+                    disable_thinking=True, max_tokens=rag_suite.JUDGE_MAX_TOKENS,
+                    messages=[{"role": "system",
+                               "content": rag_dialog.JUDGE_PROMPT},
+                              {"role": "user", "content": judge_payload}],
+                    timeout=_rag_test_timeout())
+                tracker.note_usage(metrics, None)
+                verdict = rag_dialog.parse_verdict(content)
+            except Exception as exc:
+                logger.warning("Диалог RAG: оценка не получена — %s",
+                               str(exc)[:200])
+                verdict["summary"] = ("Оценку получить не удалось: %s"
+                                      % llm_client.redact_secrets(str(exc))[:200])
+        else:
+            verdict["summary"] = "Ни одна реплика не получила ответа — оценивать нечего."
+        # ЦЕЛЬ НЕ ПОТЕРЯНА — проверка КОДОМ по памяти задачи: в начале разговора
+        # она построена по первой реплике, в конце обязана быть на месте. Смена
+        # формулировки — не потеря (модель уточняет её по ходу), поэтому
+        # сравниваем не текст, а наличие цели; потеря ловится судьёй по шагам.
+        goal_now = memory_store.goal_of(memory)
+        goal_line = ("Память задачи: цель %s; уточнений %d, ограничений %d, "
+                     "терминов %d."
+                     % ("удержана ✅" if goal_now else "⚠ ПУСТА",
+                        len(memory_store.texts(memory, "clarified")),
+                        len(memory_store.texts(memory, "constraints")),
+                        len(memory_store.texts(memory, "terms"))))
+        if first_goal and goal_now and first_goal != goal_now:
+            goal_line += " Цель уточнялась по ходу: «%s» → «%s»." % (
+                first_goal[:80], goal_now[:80])
+        lines = rag_dialog.verdict_lines(verdict)
+        text = ("🧪 Оценка диалога «%s»\n%s"
+                % (sc.get("title"), rag_dialog.summary_text(verdict, stats)))
+        if stats.get("bad_cites"):
+            text += ("\n⚠ Ссылки на несуществующие фрагменты (номер вне выдачи, "
+                     "то есть ссылка врёт) — шагов: %d, номера: %s"
+                     % (stats["bad_cites"],
+                        ", ".join(str(number) for number
+                                  in (stats.get("bad_cite_numbers") or []))))
+        # ФРАГМЕНТОВ ПОЧТИ НЕТ — это про НАСТРОЙКУ ПОИСКА, а не про агента:
+        # говорим об этом прямо, называя порог проекта (живой случай 03.10:
+        # порог 0,96 давал 0 ответов с источниками, и прогон выглядел провалом).
+        hint = rag_dialog.yield_hint(stats, settings.get("min_score"),
+                                     settings.get("min_ce"),
+                                     bool(settings.get("filter")))
+        if hint:
+            text += "\n" + hint
+        trap = next((row for row in rows if row["trap"]), None)
+        if trap is not None:
+            text += ("\nЛовушка (реплика %d, ответа в базе нет): %s"
+                     % (trap["n"], "честно сказано «в документах этого нет» ✅"
+                     if trap["honest"] else "⚠ агент не признал отсутствие данных"))
+        if lines:
+            text += "\n" + "\n".join(lines)
+        text += "\n" + goal_line
+        if verdict.get("summary"):
+            text += "\n\n" + str(verdict["summary"])
+        text += "\n\n" + rag_dialog.usage_line(tracker.usage_snapshot(), stats)
+        log(workspace_store.LOG_ASSISTANT, text)
+        yield json.dumps({"type": "dialog_verdict", "text": text,
+                          "items": verdict.get("items") or [],
+                          "summary": verdict.get("summary") or "",
+                          "stats": stats,
+                          "memory": memory_store.snapshot(memory)},
+                         ensure_ascii=False) + "\n"
+        yield json.dumps({"type": "done", "usage": tracker.usage_snapshot()},
+                         ensure_ascii=False) + "\n"
+
+    async def stream():
+        """Поток прогона + запись журнала на диск (сбой записи прогон не отменяет)."""
+        try:
+            async for chunk in event_stream():
+                yield chunk
+        finally:
+            if dialog is not None:
+                try:
+                    async with _workspace_lock:
+                        await _persist()
+                except Exception as exc:            # pragma: no cover - защита
+                    logger.warning("Диалог RAG: журнал не сохранён — %s",
+                                   str(exc)[:150])
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 def _merge_test_usage(total: Dict[str, Any], metrics: Any) -> Dict[str, Any]:
@@ -4036,6 +4727,123 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         _log_event(log_target.get("dialog"), event)
         return json.dumps(event, ensure_ascii=False) + "\n"
 
+    async def run_direct_answer(*, task_now: Dict[str, Any],
+                                session_now: Dict[str, Any],
+                                dialog_now: Dict[str, Any],
+                                state: "task_state.TaskState", text: str,
+                                reason: str, analyzer: Agent,
+                                invariants_now: Dict[str, Any], profile: str,
+                                memory_now: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+        """ПРЯМОЙ ОТВЕТ ПО ИСТОЧНИКАМ — второй путь ОДНОГО режима «AI-агент».
+
+        ЧЕМ ОТЛИЧАЕТСЯ ОТ ПЛАНА: только отсутствием шагов. Источники те же:
+        правила проекта (гейт инвариантов), внешние инструменты (MCP — до
+        подтверждения плана только ЧТЕНИЯ) и фрагменты баз знаний тем же поиском
+        и с теми же настройками. Ответ строится ОДНИМ вызовом модели, под ним
+        ВСЕГДА строка источников (`rag_dialog.ensure_sources` — гарантия кода),
+        память задачи обновляется как в мини-чате.
+
+        АВТОМАТ ЗАДАЧИ НЕ ТРОГАЕТСЯ: план, если он был или будет построен,
+        продолжается с того же места. Именно поэтому «разговор по документам» и
+        «работа по плану» могут жить в одной задаче и в одном диалоге.
+
+        Отдаёт события чата; последним — служебное `{"type": "usage"}` с расходом
+        хода. Запись в память диалога и замер делает вызывающий код: он же решает,
+        считать ли ход состоявшимся (был ли ответ).
+        """
+        # Замер — свой агент: он копит дельту ЭТОГО хода, не смешиваясь с
+        # замерами автомата (у того свои служебные вызовы).
+        tracker = Agent(AgentConfig())
+        total: Dict[str, Any] = {}
+        yield {"type": "debug", "text": (
+            f"{_MACHINE}: отвечаю по источникам — {reason}. План и шаги не строю; "
+            "если это была работа, под ответом будет вариант «⚙ Разложить работу "
+            "на шаги».")}
+        # 1. ПРАВИЛА ПРОЕКТА: тот же гейт, что и перед планом. Запрос, нарушающий
+        #    правило, не выполняется НИ ОДНИМ путём — иначе объединение путей
+        #    стало бы лазейкой в правилах.
+        analysis, pre_usage, preverified = await _preflight_invariants(
+            task_now, session_now, text, analyzer, invariants_now)
+        total = merge_usage(total, pre_usage)
+        if invariants_store.blocks(analysis):
+            view = _analysis_view(analysis)
+            workspace_store.add_log_event(
+                dialog_now, workspace_store.LOG_SUGGESTIONS,
+                view["message"], view)
+            yield {"type": "suggestions", "analysis": view,
+                   "text": view["message"]}
+            yield {"type": "usage", "usage": total}
+            return
+        # 2. ВНЕШНИЕ ИНСТРУМЕНТЫ: данные доступны и прямому ответу — в этом и
+        #    смысл объединения (прежде «разговор по документам» их не спрашивал).
+        #    `approved=False` — до подтверждения плана инструменты только читают:
+        #    побочные действия откладываются, как и в пути с планом.
+        mcp_data: List[Dict[str, Any]] = []
+        if workspace_store.mcp_enabled(task_now):
+            mcp_data, mcp_usage, mcp_lines, _ = await _preflight_mcp(
+                task_now, session_now, text, analyzer, state, approved=False)
+            total = merge_usage(total, mcp_usage)
+            for line in mcp_lines:
+                yield {"type": "debug", "text": f"{_MACHINE}: {line}"}
+        # 3. ФРАГМЕНТЫ БАЗ ЗНАНИЙ — тот же поиск, те же настройки проекта.
+        rag_data, rag_lines, rag_searched, rag_usage = await _preflight_rag(
+            task_now, session_now, text, state, agent=analyzer)
+        total = merge_usage(total, rag_usage)
+        for line in rag_lines:
+            yield {"type": "debug", "text": f"{_MACHINE}: {line}"}
+        # 3а. НИЧЕГО НЕ НАШЛОСЬ — РЕШАЕТ ПОЛЬЗОВАТЕЛЬ, как и перед планом:
+        #     молчаливого перехода в общие знания нет ни на одном пути.
+        if (rag_searched and not rag_search.has_hits(rag_data)
+                and str(rag_data.get("general") or "") == "ask"):
+            view = _rag_choice_view(rag_data, task_now)
+            workspace_store.add_log_event(
+                dialog_now, workspace_store.LOG_SUGGESTIONS,
+                view["message"], view)
+            yield {"type": "choices", "text": view["message"],
+                   "options": view["options"], "analysis": view}
+            yield {"type": "usage", "usage": total}
+            return
+        # 4. ОДИН ВЫЗОВ МОДЕЛИ: ответ по собранным источникам.
+        enabled = workspace_store.rag_enabled(task_now)
+        hits = rag_search.hits_of(rag_data)
+        messages = rag_dialog.answer_messages(
+            memory_store.block(memory_now), rag_search.block(rag_data),
+            rag_dialog.history_text(dialog_now["messages"]), text, profile,
+            extra_blocks=[invariants_store.block(invariants_now),
+                          mcp_store.block(mcp_data)])
+        content, metrics = await llm_client.call_llm_async(
+            user_text=text, model=config.LLM_MODEL, disable_thinking=True,
+            max_tokens=rag_dialog.ANSWER_MAX_TOKENS, messages=messages,
+            timeout=_rag_test_timeout())
+        tracker.note_usage(metrics)
+        if not str(content or "").strip():
+            yield {"type": "error", "text": (
+                "⚠ Ответа от модели нет: вызов не удался. Повторите запрос или "
+                "отправьте его как задачу (вариант «⚙ Разложить работу на шаги»).")}
+            yield {"type": "usage",
+                   "usage": merge_usage(total, tracker.usage_snapshot())}
+            return
+        answer = rag_dialog.ensure_sources(content, hits, searched=len(enabled),
+                                           cut=_rag_cut_note(rag_data))
+        yield {"type": "bot", "text": answer,
+               "sources": rag_search.sources(rag_data), "hits": len(hits),
+               "cited": rag_dialog.has_citation(answer),
+               "bad_cites": rag_dialog.bad_citations(answer, len(hits))}
+        # 5. ПАМЯТЬ ЗАДАЧИ — как в мини-чате: цель, уточнения, ограничения.
+        async for event in _rag_memory_update(text, answer, memory_now, tracker):
+            yield event
+        # 6. ВОССТАНОВЛЕНИЕ ПОСЛЕ ОШИБКИ ГЕЙТА: та же работа, но планом. Вариант
+        #    отправляет ГОТОВУЮ ФРАЗУ (см. rag_dialog.plan_choice) — сервер узнаёт
+        #    по ней решение, и кнопка работает даже после перезагрузки страницы.
+        option = rag_dialog.plan_choice(text)
+        offer = ("Если это была работа, а не вопрос, её можно разложить на шаги: "
+                 "план с подтверждением, шаги и проверка результата.")
+        yield {"type": "choices", "text": offer, "options": [option],
+               "analysis": {"message": offer, "options": [option],
+                            "kind": "plan_offer"}}
+        yield {"type": "usage",
+               "usage": merge_usage(total, tracker.usage_snapshot())}
+
     async def event_stream():
         # Переменные объявлены заранее: в аварийной ветке (except) нужно
         # сохранить состояние и закрыть поток событием "done".
@@ -4080,6 +4888,17 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 # окно чата восстанавливается при переключении диалога.
                 log_target["dialog"] = dialog_now
                 _running_sessions.add(str(session_now["id"]))
+                # ПАМЯТЬ ЗАДАЧИ (см. app/ai/task_memory.py): выжимку разговора
+                # ведёт мини-чат по базам знаний, а читают ВСЕ вызовы задачи —
+                # план, ответ шага и проверка результата. Ставим её каждому
+                # агенту один раз на запрос: иначе, вернувшись из мини-чата в
+                # режим «AI-агент», пользователь потерял бы зафиксированные в
+                # разговоре цель, уточнения и ограничения — они бы просто не
+                # попали в контекст. Пустая память блока не даёт вовсе, поэтому
+                # там, где мини-чат не работал, поведение прежнее.
+                task_memory_now = workspace_store.task_memory(dialog_now)
+                for worker in (agent, planner, reviewer, analyzer):
+                    worker.task_memory = task_memory_now
                 # «Пауза»/«Отменить», нажатые в предыдущем шаге, могли не успеть
                 # примениться (блокировку держал поток) — применяем до работы.
                 _apply_pending_stop(session_now, state)
@@ -4239,6 +5058,12 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                 "автозапуск останется выключенным."
                             )})
 
+                # ЖДЁТ ЛИ РЕШЕНИЯ УЖЕ ПОКАЗАННЫЙ ПЛАН. Считаем ЭТО до переходов
+                # этапов: этап awaiting_user ниже превратится в planning, а
+                # разница между «плана нет» и «план ждёт «ок»» для гейта важна —
+                # в ожидании плана текст пользователя обычно ЕГО ПРАВКА, а не
+                # новый разговор (см. условие гейта ниже).
+                plan_pending = bool(state.steps) or state.stage == "awaiting_user"
                 if state.stage in ("done", "cancelled"):
                     # Предыдущая задача завершена — это НОВАЯ задача: автомат
                     # рождается заново (planning) с записью о сбросе в истории.
@@ -4277,6 +5102,100 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 if autonomous:
                     state.autonomous = True
                 yield encode(_state_event(session_now, state))
+
+                # 1б-0. ОТВЕТ ИЛИ ПЛАН — ГЕЙТ (см. `_plan_needed`). ОДИН РЕЖИМ
+                #       умеет и отвечать по источникам, и работать по плану:
+                #       источники у обоих путей ОДНИ (правила проекта, внешние
+                #       инструменты, фрагменты баз знаний), разница — нужна ли
+                #       ПРОЦЕДУРА. Решает КОД по признакам запроса, человек
+                #       переопределяет типом задачи или вариантом в ответе.
+                #       Служебные реплики («ок», «работай автономно», шаг плана,
+                #       автозапуск) гейт не проходят вовсе: это не новый запрос.
+                #       ГЕЙТ РАБОТАЕТ ТОЛЬКО НА ЭТАПЕ ПЛАНИРОВАНИЯ — и это не
+                #       мелочь: в execution текст пользователя означает «выполни
+                #       текущий шаг», в validation — отложенную проверку. Прямой
+                #       ответ там подменил бы работу шага (так и вышло в первой
+                #       редакции: шаг «выполняй» превращался в ответ по базе).
+                #       Завершённая/отменённая/ошибочная задача к этому месту уже
+                #       сброшена в planning (см. переходы этапов выше), поэтому
+                #       новый вопрос после «готово» отвечается прямо, а не планом.
+                #       ЕСЛИ ПЛАН УЖЕ ПОКАЗАН и ждёт «ок», прямым ответом уходит
+                #       только ВОПРОС (человек спрашивает, а не правит план), и
+                #       показанный план при этом остаётся ждать подтверждения.
+                #       Остальной текст — правка плана, ей занимается автомат.
+                direct_allowed = (not plan_pending) or task_state.is_question(text)
+                if text and not machine_step and not confirmed and not autonomous \
+                        and not restart and state.stage == "planning" \
+                        and direct_allowed:
+                    plan_needed, plan_reason = _plan_needed(
+                        text, session_now,
+                        force_plan=bool(getattr(msg, "force_plan", False)),
+                        periodic=bool(periodic_task))
+                    if plan_needed:
+                        yield encode({"type": "debug", "text": (
+                            f"{_MACHINE}: строю план — {plan_reason}."
+                        )})
+                    else:
+                        yield encode({"type": "debug", "text": (
+                            f"{_MACHINE}: плана не будет — {plan_reason or 'работа в один шаг'}."
+                        )})
+                        direct_answer = ""
+                        direct_answered = False
+                        async for event in run_direct_answer(
+                                task_now=task_now, session_now=session_now,
+                                dialog_now=dialog_now, state=state, text=text,
+                                reason=plan_reason or "работа в один шаг",
+                                analyzer=analyzer, invariants_now=invariants_now,
+                                profile=profile, memory_now=task_memory_now):
+                            kind = event.get("type")
+                            if kind == "usage":
+                                # Расход хода (ответ + поиск + память) — одной
+                                # записью в замер задачи, как у шага плана.
+                                usage = merge_usage(usage, event.get("usage") or {})
+                                continue
+                            if kind == "bot" and str(event.get("text") or "").strip():
+                                direct_answered = True
+                                direct_answer = str(event["text"])
+                            elif kind == "task_memory":
+                                # Память задачи — в диалог: следующий ход (и план,
+                                # если пользователь его попросит) её видит.
+                                workspace_store.set_task_memory_value(
+                                    dialog_now, event.get("memory") or {})
+                                yield encode({"type": "debug",
+                                              "text": event.get("text")})
+                                continue
+                            elif kind == "choices":
+                                # Варианты («разложить на шаги») — в журнал: по нему
+                                # окно восстанавливается вместе с кнопками.
+                                workspace_store.add_log_event(
+                                    dialog_now, workspace_store.LOG_SUGGESTIONS,
+                                    event.get("text"), event.get("analysis"))
+                            yield encode(event)
+                        # ЗАПИСЬ ХОДА: реплики — в память диалога, расход — одной
+                        # записью (служебной, если ответа не было: токены всё
+                        # равно потрачены). Состояние автомата НЕ трогаем: план,
+                        # если он был, продолжается с того же места.
+                        if direct_answered:
+                            dialog_now["messages"].append(
+                                {"role": "user", "content": text})
+                            dialog_now["messages"].append(
+                                {"role": "assistant", "content": direct_answer})
+                        if usage:
+                            dialog_now["usage"].append(
+                                dict(usage) if direct_answered
+                                else dict(usage, kind="service"))
+                            _usage_matches_history(dialog_now)
+                        # «Пауза»/«Отменить», нажатые во время ответа: шагов тут
+                        # нет, но команда должна примениться — полоса состояния
+                        # обязана отреагировать.
+                        stopped_now = _pending_stops.pop(str(session_now["id"]), None)
+                        if stopped_now is not None:
+                            _apply_pending_stop(session_now, state, force=stopped_now)
+                        await _persist()
+                        yield encode(_state_event(session_now, state))
+                        yield encode({"type": "done", "usage": dict(usage),
+                                      "state": _state_snapshot(session_now, state)})
+                        return
 
                 # 1б. ИНВАРИАНТЫ И ЗАПРОС. Самое первое, что делает агент, —
                 #     сверяет ЗАПРОС пользователя с правилами, которые нарушать

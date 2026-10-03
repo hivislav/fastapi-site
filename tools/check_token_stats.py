@@ -269,7 +269,11 @@ async def main():
         await chat.agent_history_clear()
         CALLS.clear()
         CFG["plan"] = ["Шаг 1", "Шаг 2", "Шаг 3", "Шаг 4"]
-        events = await run_chat("Длинная работа", agent_strategy="summary", summary=2)
+        # force_plan: строка «Длинная работа» — искусственная (в ней нет ни
+        # объекта-результата, ни действий), а проверка измеряет расход ПУТИ С
+        # ПЛАНОМ (сжатие памяти между шагами), поэтому запрос идёт как задача.
+        events = await run_chat("Длинная работа", agent_strategy="summary",
+                                summary=2, force_plan=True)
         for _ in range(5):
             events += await run_chat("", continue_step=True, agent_strategy="summary",
                                      summary=2)

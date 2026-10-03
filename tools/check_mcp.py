@@ -705,7 +705,11 @@ async def test_dialog():
     reset_calls()
     MCP_CALLS[:] = [{"server": FAKE_ID, "tool": "get_weather",
                      "arguments": {"city": "Москва"}}]
-    events = await run_chat("Какая сейчас погода в Москве?")
+    # force_plan: раздел 5 проверяет MCP В ПУТИ С ПЛАНОМ (планировщик видит данные,
+    # шаги берут их из диалога без нового выбора). Вопрос «какая погода» гейт
+    # `_plan_needed` отправил бы ПРЯМЫМ ответом — это тоже верно (см. 5.6), но
+    # проверяет другое.
+    events = await run_chat("Какая сейчас погода в Москве?", force_plan=True)
     check("служебный выбор инструментов вызван один раз", MCP_CHOICE_CALLS == 1,
           f"вызовов: {MCP_CHOICE_CALLS}")
     check("модели показан список инструментов сервера",
@@ -762,7 +766,7 @@ async def test_dialog():
     # 5.3 Новый запрос — новая подпись: инструменты выбираются заново.
     reset_calls()
     MCP_CALLS[:] = []
-    events = await run_chat("А теперь просто поздоровайся")
+    events = await run_chat("А теперь просто поздоровайся", force_plan=True)
     check("новый запрос снова спрашивает модель о вызовах", MCP_CHOICE_CALLS == 1,
           f"вызовов: {MCP_CHOICE_CALLS}")
     check("«данные не нужны» — вызовов инструментов нет", not TOOL_CALLS,
@@ -777,7 +781,7 @@ async def test_dialog():
     reset_calls()
     MCP_CALLS[:] = [{"server": FAKE_ID, "tool": "get_weather",
                      "arguments": {"city": "Москва"}}]
-    await run_chat("Какая сейчас погода в Москве?")
+    await run_chat("Какая сейчас погода в Москве?", force_plan=True)
     check("первый запрос собрал данные", MCP_CHOICE_CALLS == 1 and len(TOOL_CALLS) == 1,
           f"выбор: {MCP_CHOICE_CALLS}, вызовы: {len(TOOL_CALLS)}")
     reset_calls()
@@ -793,13 +797,39 @@ async def test_dialog():
     reset_calls()
     MCP_CALLS[:] = [{"server": FAKE_ID, "tool": "get_weather",
                      "arguments": {"city": "Москва"}}]
-    await run_chat("Какая сейчас погода в Москве?")
+    await run_chat("Какая сейчас погода в Москве?", force_plan=True)
     reset_calls()
     await run_chat("работай автономно")
     check("фраза управления не оплачивает выбор инструментов заново",
           MCP_CHOICE_CALLS == 0, f"выборов: {MCP_CHOICE_CALLS}")
     check("фраза управления сохраняет данные прежнего запроса",
           "Погода в Москва" in all_context(), all_context()[-200:])
+
+    # 5.6 ОДИН РЕЖИМ, ДВА ПУТИ: вопрос отвечается ПРЯМО (без плана и шагов), но
+    #     ДАННЫЕ ВНЕШНИХ ИНСТРУМЕНТОВ ему доступны — в этом и смысл объединения
+    #     «разговора» и «задачи». Прежде мини-чат не спрашивал MCP вовсе.
+    await fresh_project()
+    reset_calls()
+    MCP_CALLS[:] = [{"server": FAKE_ID, "tool": "get_weather",
+                     "arguments": {"city": "Москва"}}]
+    await chat.mcp_apply(McpApply(enabled=[FAKE_ID]))
+    reset_calls()
+    PLANNER_PAYLOADS.clear()
+    events = await run_chat("Какая сейчас погода в Москве?")
+    check("вопрос отвечается ПРЯМО: планировщик не вызывается",
+          not PLANNER_PAYLOADS, str(PLANNER_PAYLOADS)[:120])
+    check("прямой ответ видит данные внешних инструментов",
+          "Погода в Москва" in system_texts(), system_texts()[-200:])
+    check("прямой ответ строится по блоку данных MCP и даёт ответ",
+          mcp_store.BLOCK_HEADER[:40] in system_texts()
+          and bool(texts(events, "bot")), str(texts(events, "bot"))[:120])
+    check("прямой ответ сохраняет данные в диалоге (шаги возьмут их же)",
+          workspace_store.dialog_mcp(chat._current_session()["dialog"]).get("signature")
+          is not None,
+          str(workspace_store.dialog_mcp(chat._current_session()["dialog"]))[:160])
+    check("в чате сказано, почему плана не будет",
+          any("плана не будет" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[-200:])
 
     # 5.4 MCP выключен у проекта: ни вызовов, ни расхода, ни блока.
     reset_calls()
@@ -1898,7 +1928,10 @@ async def test_chain_data_on_step():
         # ШАГ 2 (последний): данных уже хватает, к серверам не ходим.
         {"done": True, "reason": "данные получены", "calls": []},
     ]
-    await run_chat("прогноз для городов Славы и Ивана")
+    # force_plan: раздел проверяет, что ЦЕПОЧКА ВЫЗОВОВ доигрывается НА ШАГЕ
+    # выполнения (план, подтверждение, шаги). Гейт «ответ или план» отправил бы
+    # такую просьбу прямым ответом — тоже рабочий путь (см. 5.6), но другой.
+    await run_chat("прогноз для городов Славы и Ивана", force_plan=True)
     reset_calls()
     CHAIN_CALLS.clear()
 

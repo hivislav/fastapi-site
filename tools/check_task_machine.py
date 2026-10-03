@@ -879,7 +879,10 @@ async def test_routes():
     REVIEW = {"verdict": "ok", "step": 0, "comment": "ок"}
     PLAN_STEPS = ["Первый шаг плана", "Второй шаг плана", "Третий шаг плана"]
     await chat.agent_history_clear()
-    await run_chat("Дай рецепт борща")
+    # force_plan: раздел проверяет ЖУРНАЛ И ШАГИ пути с планом (показанный план,
+    # пометка source=machine, заголовок по запросу). Сам запрос — просьба ответа
+    # («дай рецепт»), и гейт отправил бы его прямым ответом: см. `_plan_needed`.
+    await run_chat("Дай рецепт борща", force_plan=True)
     history = await chat.agent_history()
     log = history.get("log") or []
     kinds = [item["kind"] for item in log]
@@ -923,7 +926,10 @@ async def test_routes():
 
     # 3.16 Мгновенные «Пауза»/«Отменить» во время шага + переключение сессии.
     await chat.agent_history_clear()
-    await run_chat("Задача для проверки остановки")       # план из 3 шагов
+    # force_plan: строки вида «Задача …» — искусственные (в них нет ни объекта
+    # результата, ни действий), а раздел проверяет ШАГИ И ПАУЗЫ пути с планом;
+    # гейт «ответ или план» (chat._plan_needed) отправил бы их прямым ответом.
+    await run_chat("Задача для проверки остановки", force_plan=True)   # план из 3 шагов
     await run_chat("ок")                                  # шаг 1 → execution step_2
     first_session = chat._current_session()["id"]
     created = await chat.session_create()                 # вторая сессия
@@ -973,7 +979,7 @@ async def test_routes():
     # Именно три шага: у ПОСЛЕДНЕГО шага своя семантика паузы (перед проверкой).
     PLAN_STEPS = ["Первый шаг", "Второй шаг", "Третий шаг"]
     await chat.agent_history_clear()
-    await run_chat("Задача для адресной паузы")
+    await run_chat("Задача для адресной паузы", force_plan=True)
     await run_chat("ок")                                   # шаг 1 → execution step_2
     running_session = chat._current_session()["id"]
     created = await chat.session_create()                  # открываем ВТОРУЮ задачу
@@ -1041,7 +1047,7 @@ async def test_routes():
     await chat.agent_history_clear()
     PLAN_STEPS = ["Первый шаг", "Последний шаг"]
     REVIEW = {"verdict": "ok", "step": 0, "comment": "ок"}
-    await run_chat("Задача из двух шагов")
+    await run_chat("Задача из двух шагов", force_plan=True)
     await run_chat("ок")                                  # шаг 1 → execution, шаг 2 из 2
     reviews_before = sum(1 for c in CALLS if c["system"].startswith("Ты — приёмщик"))
     SLOW_ANSWER = asyncio.Event()
@@ -1080,7 +1086,7 @@ async def test_routes():
     # Отмена во время шага — на свежей задаче (шаг не последний).
     PLAN_STEPS = ["Первый шаг", "Второй шаг", "Третий шаг"]
     await chat.agent_history_clear()
-    await run_chat("Задача для отмены на ходу")
+    await run_chat("Задача для отмены на ходу", force_plan=True)
     await run_chat("ок")                                  # шаг 1 → execution step_2
     SLOW_ANSWER = asyncio.Event()
     slow = asyncio.ensure_future(run_chat("", continue_step=True))
@@ -1101,7 +1107,7 @@ async def test_routes():
     PLAN_STEPS = ["Первый шаг", "Второй шаг", "Третий шаг"]
     REVIEW = {"verdict": "ok", "step": 0, "comment": "ок"}
     await chat.agent_history_clear()
-    await run_chat("Фоновая задача")
+    await run_chat("Фоновая задача", force_plan=True)
     await run_chat("ок")                                  # шаг 1 → execution, шаг 2 из 3
     background = chat._current_session()["id"]
     created = await chat.session_create()                 # открываем ДРУГУЮ задачу
@@ -1152,11 +1158,11 @@ async def test_routes():
     # 3.19 Задачи работают ПАРАЛЛЕЛЬНО (раньше их сериализовала одна блокировка).
     PLAN_STEPS = ["Первый шаг", "Второй шаг", "Третий шаг"]
     await chat.agent_history_clear()
-    await run_chat("Задача A")
+    await run_chat("Задача A", force_plan=True)
     await run_chat("ок")                                   # A: шаг 1 → execution step_2
     session_a = chat._current_session()["id"]
     await chat.session_create()
-    await run_chat("Задача B")
+    await run_chat("Задача B", force_plan=True)
     await run_chat("ок")                                   # B: шаг 1 → execution step_2
     session_b = chat._current_session()["id"]
     check("две разные задачи подготовлены", session_a != session_b)
@@ -1443,7 +1449,8 @@ async def test_request_compliance():
         ],
     }
     plan_calls_before = len(CALLS)
-    events = await run_chat("нужно веб-приложение погоды, открывается в браузере")
+    events = await run_chat("нужно веб-приложение погоды, открывается в браузере",
+                           force_plan=True)
     analyses = _suggestions_events(events)
     check("разбор запроса вызван ДО планирования", ANALYSIS_CALLS == 1,
           f"вызовов разбора: {ANALYSIS_CALLS}")
@@ -1487,7 +1494,8 @@ async def test_request_compliance():
 
     # 5.3 Повторный разбор того же запроса не тратит вызов LLM (кэш по подписи).
     ANALYSIS_CALLS = 0
-    events = await run_chat("нужно веб-приложение погоды, открывается в браузере")
+    events = await run_chat("нужно веб-приложение погоды, открывается в браузере",
+                           force_plan=True)
     check("тот же запрос при тех же правилах не разбирается повторно",
           ANALYSIS_CALLS == 0, f"вызовов разбора: {ANALYSIS_CALLS}")
     check("отказ повторяется из кэша", bool(_suggestions_events(events)))

@@ -40,7 +40,43 @@ app = FastAPI(title="Чат-бот на FastAPI", lifespan=lifespan)
 # Сжатие ответов: страница чата и сохранённый диалог — крупные JSON/HTML
 # (страница ~290 КБ, диалог с журналом до ~35 КБ), и они отдаются заново при
 # каждом переключении задачи. С gzip это в 5–6 раз меньше трафика.
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+#
+# НО ПОТОКИ СОБЫТИЙ СЖИМАТЬ НЕЛЬЗЯ — и это не оптимизация, а исправление
+# живого дефекта (найден 03.10 замерами). `GZipMiddleware` из Starlette сжимает
+# КАЖДЫЙ кусок потока через zlib, а zlib копит мелкие куски во внутреннем буфере
+# и отдаёт их только когда наберётся блок: в браузере (он всегда присылает
+# `Accept-Encoding: gzip`) ответ выглядел так, будто сервер молчит весь прогон, а
+# в конце разом вываливает всё — жалоба была ровно на это («долгое ожидание и
+# потом куча информации»). Замер одного и того же запроса: без gzip события
+# приходили на 0,00 / 0,63 / 1,80 / 2,94 с, с gzip — ВСЕ на 2,40 с.
+# Поэтому потоки (NDJSON чата агента, `/test_rag`, контрольных диалогов) идут
+# МИМО сжатия: они и так отдаются по мере появления, а сжатие им ничего не даёт
+# (объём небольшой, а задержка видна человеку).
+_STREAM_PATHS = (
+    "/api/agent/chat",
+    "/api/agent/rag/test",
+    "/api/agent/rag/dialog",
+    "/api/agent/rag/dialog/test",
+)
+
+
+class GZipExceptStreams(GZipMiddleware):
+    """GZip, но НЕ для потоковых маршрутов (`_STREAM_PATHS`).
+
+    Список путей, а не признак ответа, намеренно: middleware видит запрос ДО
+    маршрута и не знает, будет ли ответ потоком; зато пути потоков — часть
+    контракта API (см. §5.7 в SESSION_PROMPT), и их немного. Новый потоковый
+    маршрут обязан попасть в список: иначе он «замолчит» до конца ответа.
+    """
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") in _STREAM_PATHS:
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
+app.add_middleware(GZipExceptStreams, minimum_size=1024)
 
 app.include_router(pages.router)
 app.include_router(chat.router)

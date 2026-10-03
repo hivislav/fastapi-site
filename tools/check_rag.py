@@ -33,7 +33,13 @@
       строка дебага в чате и расход служебного вызова;
   [16] ДВА ПОРОГА: первичная релевантность (фильтрация) и уверенность модели
       (реранкинг) — границы, «порог отсёк всё» вместо «документов нет»,
-      вариант «снизить порог», маршрут `relax`, переход к чанку.
+      вариант «снизить порог», маршрут `relax`, переход к чанку;
+  [17] ПАМЯТЬ ЗАДАЧИ и МИНИ-ЧАТ RAG: выжимка разговора (цель, уточнения,
+      ограничения, термины) не теряется ни при сбое модели, ни при записи файла;
+      мини-чат хранит историю, ищет по базам на каждый вопрос, всегда отвечает
+      с источниками и ведёт память задачи; контрольные ДИАЛОГИ
+      `/test_rag_dialog_1|2` — 10 реплик с имитацией пользователя, судья,
+      источники у каждого ответа, прогон мимо пайплайна задачи.
 
 Рабочие данные не трогаются: workspace, профили и каталог баз знаний пишутся во
 временный каталог (переменные выставляются ДО импорта маршрутов).
@@ -82,16 +88,20 @@ from app.ai import rag_chunking                      # noqa: E402
 from app.ai import rag_documents                     # noqa: E402
 from app.ai import rag_embedding                     # noqa: E402
 from app.ai import mcp as mcp_store                  # noqa: E402
+from app.ai import rag_dialog                        # noqa: E402
 from app.ai import rag_query                         # noqa: E402
 from app.ai import rag_rerank                        # noqa: E402
 from app.ai import rag_search                        # noqa: E402
 from app.ai import rag_suite                         # noqa: E402
+from app.ai import task_memory as memory_store       # noqa: E402
+from app.ai import task_state as task_state_store    # noqa: E402
 from app.ai import rag_store                         # noqa: E402
 from app.ai import client as llm_client              # noqa: E402
 from app.ai import workspace as workspace_store      # noqa: E402
+from app.ai.agent import Agent, AgentConfig          # noqa: E402
 from app.routers import chat                         # noqa: E402
-from app.schemas import (ChatMessage, RagApply, RagFile, RagJobDone,  # noqa: E402
-                         RagUpload)
+from app.schemas import (ChatMessage, RagApply, RagDialogTest, RagFile,  # noqa: E402
+                         RagJobDone, RagUpload, SessionCreate, SessionMode)
 
 FAILURES = []
 
@@ -2511,6 +2521,12 @@ async def run_agent_chat(text, **kwargs):
 
 async def section_answer():
     print("\n[13] RAG в ответе агента: фрагменты в контексте, источники в чате")
+    # ВАЖНО: этот раздел проверяет путь С ПЛАНОМ (гейт плана `drop_kb_steps`,
+    # подпись плана, приёмщик результата). Гейт «ответ или план» (см.
+    # `_plan_gate`) отправил бы вопросы вроде «Как делается резервное
+    # копирование?» на ПРЯМОЙ ответ — и проверки плана не сработали бы. Поэтому
+    # здесь каждый запрос идёт с force_plan=True: это и есть «выполнить как
+    # задачу» (та же кнопка, что в интерфейсе).
     llm_client.call_llm_async = fake_call_llm_async
     await chat.task_create(chat.TaskCreate(name="RAG-ответы"))
     payload = base64.b64encode(DOC_MD.encode("utf-8")).decode("ascii")
@@ -2534,14 +2550,14 @@ async def section_answer():
     question = "Как делается резервное копирование базы данных?"
     rag_search.search = counting_search
     try:
-        await run_agent_chat(question)          # план: поиск идёт ДО планирования
+        await run_agent_chat(question, force_plan=True)   # план: поиск идёт ДО планирования
         after_plan = dict(searched)
         # Контекст вызовов ЭТАПА ПЛАНА: планировщик обязан видеть те же
         # фрагменты, иначе он поставит в план шаг «найти документ».
         plan_context = list(LLM_CONTEXT)
         LLM_CONTEXT.clear()
         LLM_USERS.clear()
-        events = await run_agent_chat("ок")     # подтверждение → единственный шаг
+        events = await run_agent_chat("ок", force_plan=True)   # подтверждение → шаг
     finally:
         rag_search.search = original_search
 
@@ -2619,7 +2635,8 @@ async def section_answer():
     LLM_CONTEXT.clear()
     rag_search.search = counting_search
     try:
-        off_events = await run_agent_chat("И снова про резервное копирование")
+        off_events = await run_agent_chat("И снова про резервное копирование",
+                                          force_plan=True)
     finally:
         rag_search.search = original_search
     check("с выключенными базами поиск не выполняется",
@@ -2645,7 +2662,8 @@ async def section_answer():
     # Вопрос ОТВЕЧАЕМ базой-фикстурой: шаг про поиск в базе убирается именно
     # тогда, когда фрагменты уже найдены. (На вопрос, которого в документах нет,
     # теперь срабатывает останов «решение за пользователем», и плана не будет.)
-    plan_events = await run_agent_chat("Как делается резервное копирование базы данных?")
+    plan_events = await run_agent_chat("Как делается резервное копирование базы данных?",
+                                       force_plan=True)
     planned = step_texts((await chat.state_get())["state"])
     check("шаг «найти в базе знаний» убран из плана — поиск уже сделан",
           planned == ["Сообщить Славе автора статьи"], str(planned))
@@ -2659,7 +2677,7 @@ async def section_answer():
     # (искать нечего, поиска не было).
     await chat.rag_apply(RagApply(enabled=[]))
     await chat.task_create(chat.TaskCreate(name="RAG выключен"))
-    await run_agent_chat("Кто автор статьи про насилие в Найт-Сити?")
+    await run_agent_chat("Кто автор статьи про насилие в Найт-Сити?", force_plan=True)
     planned_off = step_texts((await chat.state_get())["state"])
     check("с выключенными базами шаг поиска в плане остаётся",
           planned_off == LLM_PLAN, str(planned_off))
@@ -2676,7 +2694,7 @@ async def section_answer():
     await chat.rag_apply(RagApply(enabled=[base_id]))
     empty_question = "в каком жанре играют samurai"
     LLM_CONTEXT.clear()          # контексты прошлых запросов тут не считаем
-    events = await run_agent_chat(empty_question)
+    events = await run_agent_chat(empty_question, force_plan=True)
     kinds = [event.get("type") for event in events]
     choice = next((event for event in events if event.get("type") == "choices"), None)
     check("без фрагментов агент останавливается и предлагает выбор",
@@ -2709,7 +2727,7 @@ async def section_answer():
     # ВЫБОР ПОЛЬЗОВАТЕЛЯ: та же фраза варианта — новый запрос, и теперь модели
     # разрешено отвечать по общим знаниям, но ТОЛЬКО с пометкой.
     LLM_CONTEXT.clear()
-    events = await run_agent_chat(rag_search.GENERAL_CHOICE)
+    events = await run_agent_chat(rag_search.GENERAL_CHOICE, force_plan=True)
     kinds = [event.get("type") for event in events]
     check("выбор варианта снимает остановку: план и ответ строятся",
           "bot" in kinds, str(kinds))
@@ -2722,7 +2740,7 @@ async def section_answer():
     # сам, но с пометкой (для автономных прогонов, где спрашивать некого).
     await chat.rag_apply(RagApply(enabled=[base_id], ask_when_empty=False))
     LLM_CONTEXT.clear()
-    events = await run_agent_chat(empty_question)
+    events = await run_agent_chat(empty_question, force_plan=True)
     kinds = [event.get("type") for event in events]
     check("со снятой галочкой агент отвечает и больше не спрашивает",
           not any(event.get("type") == "choices" for event in events)
@@ -2918,6 +2936,11 @@ async def section_suite():
               for event in single if event.get("type") == "debug"),
           str([str(event.get("text"))[:60] for event in single
                if event.get("type") == "debug"][:3]))
+    check("перед поиском в чат уходит строка «ищу» (видно, что прогон идёт)",
+          any(str(event.get("text") or "").startswith("🔎 Ищу фрагменты по вопросу")
+              for event in events if event.get("type") == "debug"),
+          str([str(event.get("text"))[:50] for event in events
+               if event.get("type") == "debug"][:4]))
     check("диагностика говорит, сколько фрагментов нашлось и какой лучший",
           any("Найдено фрагментов" in event.get("text", "")
               for event in events if event.get("type") == "debug"),
@@ -4020,6 +4043,853 @@ def _test_request() -> Request:
                     "headers": []}, receive)
 
 
+# ---------------------------------------------------------------------------
+# 17. Память задачи и мини-чат RAG (app/ai/task_memory.py, app/ai/rag_dialog.py)
+#
+# ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ. Память задачи — выжимка разговора (цель, уточнения,
+# ограничения, термины): она НЕ ТЕРЯЕТСЯ ни при сбое модели, ни при мусорном
+# ответе, ни при записи файла workspace, и уходит в контекст отдельным блоком.
+# Мини-чат — история разговора + поиск по базам на КАЖДЫЙ вопрос + ответ по
+# фрагментам + ИСТОЧНИКИ (гарантия кода, а не просьба в промпте) + обновление
+# памяти задачи. Контрольные диалоги `/test_rag_dialog_1|2` — 10 реплик, где
+# пользователя имитирует служебный вызов LLM, а в конце разговор оценивает судья.
+# ---------------------------------------------------------------------------
+DIALOG_DOC = (
+    "ПАМЯТКА МЕДИКА\n\n"
+    "Trauma Team всегда прибывает в течение 1+1D6 минут после вызова: заявка "
+    "уходит по корпоративному контракту.\n\n"
+    "ТЕМП ИСЦЕЛЕНИЯ\n\n"
+    "Темп исцеления в день: первая помощь +0,5; медицинский техник +1; "
+    "медицинский техник со Спидхилом +2; с Нанотехнологией +2; все три вместе +3.\n\n"
+    "АНТИБИОТИК\n\n"
+    "10 Антибиотик: + Сила наркотика к спас-броску против заражения.\n\n"
+    "СОТОВЫЕ ДЕКИ\n\n"
+    "Портативная дека для подключения к сотовой телефонной сети: эффективна в "
+    "любом месте в пределах города, но бесполезна в сельской местности, имеет "
+    "25% шанс потерять соединение.\n\n"
+    "ПОТЕРЯ ЧЕЛОВЕЧНОСТИ\n\n"
+    "За каждые десять очков стоимости киберимплантов персонаж теряет одно очко "
+    "Эмпатии; киберпсихоз — потеря контроля и насильственные поступки.\n\n"
+    "НЕТРАННЕР\n\n"
+    "Особая способность роли Нетраннер — Интерфейс; нетраннер работает через "
+    "деки и подключается к сетям.\n\n"
+    "ТАБЛИЦА ПРОФЕССИИ\n\n"
+    "Городской полицейский — 1200 EB в месяц, репортёр на зарплате — 1200 EB, "
+    "ассистент корпората — 1500 EB.\n"
+)
+
+# Ответ «модели» на обновление памяти: цель и зафиксированные ограничения.
+DIALOG_MEMORY_JSON = {
+    "цель": "собрать памятку для команды по медицине",
+    "уточнено": ["играем по правилам Cyberpunk 2020"],
+    "ограничения": ["только факты из базы, ответ не длиннее пяти пунктов"],
+    "термины": ["под «Спидхилом» понимаем препарат из базы"],
+}
+
+
+def section_memory():
+    """[17a] Память задачи: слияние без потерь, блок для модели, хранение."""
+    print("\n[17a] Память задачи: цель, уточнения, ограничения, термины")
+    empty = memory_store.empty()
+    check("пустая память не даёт блока для модели",
+          memory_store.block(empty) == "" and not memory_store.has_content(empty))
+    first = memory_store.from_request("Собери памятку для команды по медицине")
+    check("цель задачи известна коду даже без вызова модели",
+          memory_store.goal_of(first) == "Собери памятку для команды по медицине",
+          memory_store.summary_line(first))
+    model_update = memory_store.parse(json.dumps(DIALOG_MEMORY_JSON,
+                                                 ensure_ascii=False), turn=1)
+    memory = memory_store.merge(first, model_update)
+    check("память задачи собирается по ответу модели: цель, уточнения, ограничения",
+          memory_store.goal_of(memory) == DIALOG_MEMORY_JSON["цель"]
+          and memory_store.texts(memory, "clarified")
+          and memory_store.texts(memory, "constraints")
+          and memory_store.texts(memory, "terms"),
+          memory_store.summary_line(memory))
+    check("память уходит в модель отдельным блоком с правилами",
+          memory_store.BLOCK_HEADER[:30] in memory_store.block(memory)
+          and "ЦЕЛЬ ЗАДАЧИ" in memory_store.block(memory)
+          and "ОГРАНИЧЕНИЯ" in memory_store.block(memory)
+          and "НЕЛЬЗЯ" in memory_store.block(memory),
+          memory_store.block(memory)[:160])
+    # ГЛАВНОЕ СВОЙСТВО: память НИЧЕГО НЕ ТЕРЯЕТ. Мусорный ответ модели, пустое
+    # обновление и обрезанный JSON — ни один из них не стирает договорённости.
+    for name, broken in (("мусор", "извините, не могу помочь"),
+                         ("пустой JSON", "{}"),
+                         ("обрезанный JSON", '{"цель": "собрать"')):
+        after = memory_store.merge(memory, memory_store.parse(broken, turn=2))
+        check("память не теряется при ответе модели «%s»" % name,
+              memory_store.goal_of(after) == memory_store.goal_of(memory)
+              and memory_store.texts(after, "constraints")
+              == memory_store.texts(memory, "constraints"),
+              memory_store.summary_line(after))
+    after = memory_store.merge(memory, memory_store.parse(
+        json.dumps({"цель": "", "ограничения": ["ответ не длиннее пяти пунктов"]},
+                   ensure_ascii=False), turn=3))
+    check("повторная запись не плодит дубли (та же договорённость дважды)",
+          len(memory_store.texts(after, "constraints"))
+          == len(memory_store.texts(memory, "constraints")),
+          str(memory_store.texts(after, "constraints")))
+    # ЛОКАЛЬНЫЙ ПУТЬ: модель не ответила, а названное ограничение обязано
+    # остаться в памяти — это договорённость, а не «мнение модели».
+    local = memory_store.local_update(
+        "Отвечай только коротким списком, не более пяти пунктов", memory, turn=4)
+    without_model = memory_store.merge(memory, local)
+    check("явное ограничение пользователя попадает в память БЕЗ вызова модели",
+          bool(memory_store.find(without_model, "не более пяти пунктов")),
+          memory_store.summary_line(without_model))
+    check("битая память из файла читается пустой, а не роняет загрузку",
+          memory_store.normalize("чепуха") == memory_store.empty()
+          and memory_store.normalize({"goal": 42, "clarified": "строка"})["goal"] == "42"
+          and memory_store.normalize({"goal": 42})["clarified"] == [],
+          str(memory_store.normalize({"goal": 42})))
+    # «СВОДНАЯ» ПРОСЬБА («собери памятку», «сведи чек-лист») ищет ЕЩЁ И ПО ЦЕЛИ:
+    # у такого вопроса нет своих слов о теме, и поиск по нему приносил случайные
+    # разделы (живой прогон 03.10: свод разваливался, хотя факты были найдены).
+    check("обычный вопрос ищется сам по себе, без цели задачи",
+          rag_dialog.search_query("Как быстро приезжает Trauma Team?", memory)
+          == ("Как быстро приезжает Trauma Team?", ""),
+          str(rag_dialog.search_query("Как быстро приезжает Trauma Team?", memory)))
+    meta_query, meta_also = rag_dialog.search_query(
+        "Собери, пожалуйста, памятку из того, что мы уже нашли", memory)
+    check("просьба свести уже найденное ищет и по ЦЕЛИ задачи",
+          meta_also == memory_store.goal_of(memory) and meta_query,
+          "%s | %s" % (meta_query, meta_also))
+    check("«фрагментов почти нет» называется настройкой поиска, а не провалом агента",
+          "проверяет настройку поиска" in rag_dialog.yield_hint(
+              {"turns": 10, "with_sources": 0}, 0.96, 0.85, True)
+          and "0,3–0,5" in rag_dialog.yield_hint(
+              {"turns": 10, "with_sources": 0}, 0.96, 0.85, True)
+          and rag_dialog.yield_hint({"turns": 10, "with_sources": 10},
+                                    0.96, 0.85, True) == "",
+          rag_dialog.yield_hint({"turns": 10, "with_sources": 0}, 0.96, 0.85, True)[:160])
+    check("ссылка на несуществующий фрагмент распознаётся как выдуманный источник",
+          rag_dialog.bad_citations("смотри [1] и [12]", 8) == [12]
+          and rag_dialog.bad_citations("смотри [1] и [8]", 8) == []
+          and rag_dialog.citations("нет ссылок") == [],
+          str(rag_dialog.bad_citations("смотри [1] и [12]", 8)))
+    check("цель задачи не подставляется, когда её нет",
+          rag_dialog.search_query("Собери памятку", None) == ("Собери памятку", ""),
+          str(rag_dialog.search_query("Собери памятку", None)))
+    # Служебный промпт обновления видит и прежнюю память, и новую реплику.
+    payload = memory_store.extract_payload(memory, "А что с Эмпатией?",
+                                           "За десять очков имплантов минус одно очко.")
+    check("промпт обновления памяти несёт прежнюю память и новую пару реплик",
+          memory_store.goal_of(memory) in payload and "А что с Эмпатией?" in payload
+          and "минус одно очко" in payload, payload[:160])
+    # ХРАНЕНИЕ: ключ обязан пережить запись файла workspace (та же ловушка, что
+    # у ключей mcp/rag: без нормализации память теряется при первой же записи).
+    task = {"id": "t-mem", "name": "Проект", "profile": "p1", "sessions": [],
+            "working": [], "invariants": [], "mcp": {}, "rag": {}}
+    session = workspace_store.create_session(task)
+    workspace_store.set_task_memory(session["dialog"], memory)
+    workspace = {"version": 1, "tasks": [task], "active_tasks": {"p1": "t-mem"}}
+    again = workspace_store.normalize_workspace(
+        json.loads(workspace_store.workspace_payload(workspace)))
+    dialog_again = again["tasks"][0]["sessions"][0]["dialog"]
+    check("память задачи переживает запись файла workspace",
+          memory_store.goal_of(dialog_again["task_memory"])
+          == memory_store.goal_of(memory)
+          and memory_store.texts(dialog_again["task_memory"], "constraints")
+          == memory_store.texts(memory, "constraints"),
+          memory_store.summary_line(dialog_again["task_memory"]))
+    snapshot = workspace_store.memory_snapshot(workspace, "p1")
+    check("панель «Память задачи» получает её снимком памяти",
+          snapshot["task_memory"]["goal"] == memory_store.goal_of(memory)
+          and snapshot["task_memory"]["counts"]["constraints"] >= 1,
+          str(snapshot["task_memory"].get("summary")))
+    # АГЕНТ: память уходит системным блоком и НЕ режется стратегией контекста.
+    agent = Agent(AgentConfig())
+    check("пустая память не добавляет агенту лишнего блока",
+          not any("ПАМЯТЬ ЗАДАЧИ" in item["content"]
+                  for item in agent._memory_blocks()))
+    agent.task_memory = memory
+    blocks = [item["content"] for item in agent._memory_blocks()]
+    check("память задачи уходит агенту отдельным системным блоком",
+          any(memory_store.BLOCK_HEADER[:30] in item for item in blocks),
+          str([item[:40] for item in blocks]))
+    check("служебные вызовы видят память задачи (она в _memory_text)",
+          memory_store.goal_of(memory) in agent._memory_text())
+    check("стратегия контекста память задачи не режет (она не в истории)",
+          memory_store.goal_of(memory) in "\n".join(
+              item["content"] for item in agent._build_context("вопрос")))
+
+
+def section_plan_gate():
+    """[17г] ГЕЙТ «ОТВЕТ ИЛИ ПЛАН»: один режим, два пути (чистые правила)."""
+    print("\n[17г] Гейт «ответ или план»: вопрос отвечаем, поручение планируем")
+    cases = [
+        # (запрос, ожидается план?, чем объясняется)
+        ("Кто такая Бестия?", False, "вопрос"),
+        ("Сколько зарабатывает нетраннер?", False, "вопрос без «?»"),
+        ("Как делается резервное копирование базы данных?", False, "вопрос"),
+        ("Что говорит таблица профессий?", False, "вопрос со словом-объектом"),
+        ("Собери памятку из того, что мы уже нашли", False, "ответ, а не поручение"),
+        ("Составь список вопросов для встречи", False, "ответ-перечень"),
+        ("Сделай отчёт по продажам", True, "поручение с результатом"),
+        ("Сделай что-то большое", True, "поручение без объекта"),
+        ("Начни работу", True, "поручение"),
+        ("выгрузи таблицу в файл", True, "действие с последствиями"),
+        ("запиши данные о пользователе Иван, живёт в Москве", True,
+         "действие с последствиями («запиши»)"),
+        ("Сделай что-нибудь по шагам", True, "просьба разложить на шаги"),
+        ("Ещё отчёт", True, "просят результат"),
+        ("ответь прямо: что такое Эмпатия?", False, "просьба ответить без плана"),
+        ("проверь, есть ли в базе про Смэшера", False, "«посмотри и скажи»"),
+        ("проверь чек-лист на противоречия", True, "поручение «проверь»"),
+    ]
+    wrong = []
+    for text, expected, why in cases:
+        need, reason = task_state_store.needs_plan(text)
+        if need != expected:
+            wrong.append("%s → %s (%s)" % (text, "план" if need else "ответ", reason))
+    check("гейт верно выбирает путь на 16 характерных запросах",
+          not wrong, "; ".join(wrong)[:300])
+    check("решение гейта объясняется человеку словами",
+          all(task_state_store.needs_plan(text)[1]
+              for text in ("Сделай отчёт по продажам", "выгрузи таблицу в файл",
+                           "Сделай что-нибудь по шагам"))
+          and task_state_store.needs_plan("Кто такая Бестия?")[1] == "",
+          task_state_store.needs_plan("Сделай отчёт по продажам")[1])
+    # ПЕРЕОПРЕДЕЛЕНИЯ: тип задачи и явный флаг сильнее признаков запроса.
+    session = {"mode": "answer"}
+    check("тип «всегда сразу ответ» отменяет план даже у поручения",
+          chat._plan_needed("Сделай отчёт по продажам", session) == (False, "у задачи тип «всегда сразу ответ»"),
+          str(chat._plan_needed("Сделай отчёт по продажам", session)))
+    session = {"mode": "plan"}
+    check("тип «всегда план» планирует даже вопрос",
+          chat._plan_needed("Кто такая Бестия?", session)[0] is True,
+          str(chat._plan_needed("Кто такая Бестия?", session)))
+    check("флаг «выполнить как задачу» планирует вопрос",
+          chat._plan_needed("Кто такая Бестия?", {"mode": "auto"}, force_plan=True)[0] is True
+          and "как задачу" in chat._plan_needed("Кто такая Бестия?", {"mode": "auto"},
+                                                 force_plan=True)[1],
+          str(chat._plan_needed("Кто такая Бестия?", {"mode": "auto"}, force_plan=True)))
+    check("периодическая задача всегда идёт планом",
+          chat._plan_needed("Кто такая Бестия?", {"mode": "answer"},
+                            periodic=True)[0] is True,
+          str(chat._plan_needed("Кто такая Бестия?", {"mode": "answer"}, periodic=True)))
+    # ВАРИАНТ-ВОССТАНОВЛЕНИЕ: «⚙ Разложить работу на шаги» отправляет ГОТОВУЮ
+    # фразу, по которой гейт узнаёт решение (кнопка работает и после перезагрузки).
+    option = rag_dialog.plan_choice("Кто такая Бестия?")
+    check("вариант «разложить на шаги» отправляет фразу, которую понимает гейт",
+          option.get("send") and task_state_store.needs_plan(option["send"])[0] is True,
+          str(option))
+
+
+async def run_stream(target):
+    """Собирает события NDJSON-потока маршрута (как клиент чата).
+
+    Принимает и готовый ответ, и корутину маршрута: `rag_dialog_chat` — обычная
+    асинхронная функция, её ответ надо дождаться.
+    """
+    response = await target if asyncio.iscoroutine(target) else target
+    events = []
+    async for chunk in response.body_iterator:
+        for line in str(chunk).splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+    return events
+
+
+async def section_dialog():
+    """[17b] Мини-чат RAG: история, поиск на каждый вопрос, источники, память."""
+    print("\n[17b] Мини-чат RAG: история, поиск на каждый вопрос, источники")
+    # Базы у проекта нет — мини-чат отвечает ПО ДОКУМЕНТАМ, и без них это отказ
+    # СРАЗУ, без единого вызова модели.
+    await chat.task_create(chat.TaskCreate(name="Мини-чат без баз"))
+    check("без включённых баз мини-чат запускать нечего (400 и причина)",
+          await _status(lambda: chat.rag_dialog_chat(
+              ChatMessage(content="Что там по базе?"))) == 400
+          and "ни одной базы" in await _detail(lambda: chat.rag_dialog_chat(
+              ChatMessage(content="Что там по базе?"))))
+
+    await chat.task_create(chat.TaskCreate(name="Мини-чат"))
+    payload = base64.b64encode(DIALOG_DOC.encode("utf-8")).decode("ascii")
+    uploaded = await chat.rag_upload(RagUpload(
+        name="Памятка медика", files=[RagFile(filename="med.md",
+                                              content_base64=payload)],
+        strategy="structure", chunk_size=400, overlap=60))
+    base_id = uploaded["base"]["id"]
+    await chat.rag_apply(RagApply(enabled=[base_id], rewrite=False, rerank=False,
+                                  filter=True, min_score=0.2, top_k_after=5))
+    settings = workspace_store.rag_settings(chat._current_task())
+    check("настройки поиска проекта действуют на мини-чат (переформулировка выкл)",
+          settings["rewrite"] is False and settings["top_k_after"] == 5,
+          str({key: settings[key] for key in ("rewrite", "min_score", "top_k_after")}))
+
+    # ТИП ЗАДАЧИ (правка 03.10): «разговор по документам» — свойство САМОЙ
+    # ЗАДАЧИ, а не режим окна. Кнопка режима в шапке была глобальной, хотя диалог,
+    # память задачи и замер у каждой задачи свои; теперь тип живёт у задачи,
+    # приходит в снимке списка задач и переключается своим маршрутом.
+    task = chat._current_task()
+    if chat._current_session() is None:
+        await chat.session_create(SessionCreate())
+    session = chat._current_session()
+    check("у новой задачи тип «по обстоятельствам» (решает код, не человек)",
+          workspace_store.session_mode(session) == workspace_store.MODE_AUTO,
+          workspace_store.session_mode(session))
+    switched = await chat.session_mode_set(session["id"], SessionMode(mode="answer"))
+    mine = next(item for item in switched["sessions"] if item["id"] == session["id"])
+    check("тип задачи переключается маршрутом и виден в снимке задач",
+          mine["mode"] == "answer"
+          and workspace_store.session_mode(session) == workspace_store.MODE_ANSWER,
+          str(mine))
+    check("прежние значения типа читаются как новые (task→auto, chat→answer)",
+          workspace_store.normalize_mode("task") == workspace_store.MODE_AUTO
+          and workspace_store.normalize_mode("chat") == workspace_store.MODE_ANSWER,
+          "%s / %s" % (workspace_store.normalize_mode("task"),
+                       workspace_store.normalize_mode("chat")))
+    again = workspace_store.normalize_workspace(
+        json.loads(workspace_store.workspace_payload(chat._workspace)))
+    stored = next((item for task_item in again["tasks"]
+                   for item in task_item["sessions"]
+                   if item["id"] == session["id"]), None)
+    check("тип задачи переживает запись файла workspace",
+          stored is not None
+          and workspace_store.session_mode(stored) == workspace_store.MODE_ANSWER,
+          str(workspace_store.session_mode(stored)) if stored else "задача не найдена")
+    check("неизвестный тип задачи не ломает снимок (становится «по обстоятельствам»)",
+          workspace_store.normalize_mode("разговор") == workspace_store.MODE_AUTO
+          and workspace_store.normalize_mode("") == workspace_store.MODE_AUTO)
+    # У ПЕРИОДИЧЕСКОЙ задачи тип не переключается: её повтор ведёт автомат по
+    # сохранённому плану, и «разговор по документам» там был бы обманом.
+    periodic_snapshot = await chat.session_create(SessionCreate(periodic=True))
+    periodic_id = periodic_snapshot["active_session"]
+    check("периодической задаче тип не назначается (409)",
+          await _status(lambda: chat.session_mode_set(
+              periodic_id, SessionMode(mode="answer"))) == 409
+          and "периодической" in await _detail(lambda: chat.session_mode_set(
+              periodic_id, SessionMode(mode="answer"))))
+    chat._current_task()["sessions"] = [
+        item for item in chat._current_task()["sessions"]
+        if item["id"] != periodic_id]
+    chat._current_task()["active_session"] = session["id"]
+    check("чужой/неизвестной задачи тип не назначается (404)",
+          await _status(lambda: chat.session_mode_set(
+              "s-нет-такой", SessionMode(mode="answer"))) == 404)
+    # И задачу можно СОЗДАТЬ сразу с нужным типом («всегда сразу ответ»).
+    created = await chat.session_create(SessionCreate(mode="answer"))
+    chat_mode_id = created["active_session"]
+    chat_now = chat._current_session()
+    check("задачу можно создать сразу с типом «всегда сразу ответ»",
+          workspace_store.session_mode(chat_now) == workspace_store.MODE_ANSWER
+          and str(chat_now["id"]) == str(chat_mode_id),
+          workspace_store.session_mode(chat_now))
+
+    LLM_CONTEXT.clear()
+    turns = {"n": 0}
+
+    async def dialog_fake(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        system = str(messages[0].get("content") or "") if messages else ""
+        user = str(messages[-1].get("content") or "") if messages else ""
+        LLM_CONTEXT.append("\n".join(str(item.get("content") or "")
+                                    for item in messages))
+        if system.startswith("Ты ведёшь ПАМЯТЬ ЗАДАЧИ"):
+            return json.dumps(DIALOG_MEMORY_JSON, ensure_ascii=False), _metrics(20, 30)
+        turns["n"] += 1
+        if turns["n"] == 2:
+            # Второй ответ — БЕЗ ссылки на фрагмент: строку источников обязан
+            # дописать код (иначе «всегда выводит источники» остаётся просьбой).
+            return "Trauma Team приезжает быстро.", _metrics()
+        return ("Trauma Team всегда прибывает в течение 1+1D6 минут [1].",
+                _metrics())
+
+    saved = llm_client.call_llm_async
+    llm_client.call_llm_async = dialog_fake
+    searches = {"count": 0}
+    original_search = rag_search.search
+
+    def counting_search(*args, **kwargs):
+        searches["count"] += 1
+        return original_search(*args, **kwargs)
+
+    rag_search.search = counting_search
+    try:
+        first = await run_stream(chat.rag_dialog_chat(
+            ChatMessage(content="Как быстро приезжает Trauma Team после вызова?")))
+        after_first = dict(searches)
+        LLM_CONTEXT.clear()
+        second = await run_stream(chat.rag_dialog_chat(
+            ChatMessage(content="А сколько пунктов в день даёт Спидхил?")))
+    finally:
+        rag_search.search = original_search
+        llm_client.call_llm_async = saved
+
+    first_bot = [event for event in first if event.get("type") == "bot"]
+    check("мини-чат отвечает событием bot с источниками",
+          bool(first_bot) and "sources" in first_bot[0]
+          and first_bot[0]["sources"],
+          str(first_bot[0].get("sources"))[:160] if first_bot else "ответа нет")
+    check("в источнике есть база, номер чанка и ЦИТАТА (карточки как у агента)",
+          bool(first_bot) and all(
+              item.get("base_id") and item.get("number") and item.get("snippet")
+              for item in first_bot[0]["sources"]),
+          str(first_bot[0]["sources"][:1])[:220] if first_bot else "")
+    check("поиск по базам идёт на КАЖДЫЙ вопрос мини-чата",
+          after_first["count"] == 1 and searches["count"] == 2, str(searches))
+    check("история разговора уходит в контекст следующего вопроса",
+          any("Trauma Team после вызова" in text for text in LLM_CONTEXT),
+          "вызовов: %d" % len(LLM_CONTEXT))
+    # ИСТОЧНИКИ — ГАРАНТИЯ КОДА: у ответа без ссылки модели строка источников
+    # дописывается (промпт — просьба, гарантия — код).
+    second_bot = [event for event in second if event.get("type") == "bot"]
+    check("ответ без ссылки модели всё равно получает строку источников",
+          bool(second_bot) and rag_dialog.SOURCES_MARK in second_bot[0]["text"]
+          and rag_dialog.has_citation(second_bot[0]["text"]),
+          second_bot[0]["text"][:160] if second_bot else "ответа нет")
+    check("в диагностике видно, что именно нашлось",
+          any("Найдено фрагментов" in str(event.get("text") or "")
+              for event in first if event.get("type") == "debug"),
+          str([event.get("text", "")[:60] for event in first
+               if event.get("type") == "debug"][:3]))
+
+    session = chat._current_session()
+    dialog = session["dialog"]
+    check("мини-чат ХРАНИТ историю диалога (реплики и ответы в памяти диалога)",
+          len(dialog["messages"]) == 4
+          and dialog["messages"][0]["role"] == "user"
+          and dialog["messages"][1]["role"] == "assistant",
+          str([item["role"] for item in dialog["messages"]]))
+    check("память задачи записана в диалог (цель и ограничения)",
+          memory_store.goal_of(dialog["task_memory"]) == DIALOG_MEMORY_JSON["цель"]
+          and memory_store.texts(dialog["task_memory"], "constraints"),
+          memory_store.summary_line(dialog["task_memory"]))
+    check("расход хода мини-чата записан одной записью на реплику",
+          len(dialog["usage"]) == 2 and dialog["usage"][-1].get("requests"),
+          str([item.get("requests") for item in dialog["usage"]]))
+    check("мини-чат НЕ трогает автомат задачи (план не участвует)",
+          dialog["state"]["stage"] == "planning"
+          and not (dialog["state"].get("steps") or []),
+          str(dialog["state"]["stage"]))
+    log = (await chat.agent_history()).get("log") or []
+    asked = [str(item.get("text") or "") for item in log
+             if item.get("kind") == "user"]
+    check("журнал чата хранит реплики мини-чата и ответы с источниками",
+          any("Trauma Team после вызова" in text for text in asked)
+          and any("Спидхил" in text for text in asked)
+          and any(item.get("kind") == "assistant" and item.get("sources")
+                  for item in log),
+          str([(item.get("kind"), len(item.get("sources") or []))
+               for item in log][-4:]))
+
+    # СВОДНАЯ ПРОСЬБА: в поиск уходит и ЦЕЛЬ задачи (вторым запросом) — иначе
+    # «собери памятку» ищется по пустым для темы словам и приносит что угодно.
+    seen_queries: List[Dict[str, Any]] = []
+    rag_search.search = original_search
+    original_search_real = original_search
+
+    def spy_search(base_ids, query, **kwargs):
+        seen_queries.append({"query": query, "also": kwargs.get("also") or ""})
+        return original_search_real(base_ids, query, **kwargs)
+
+    llm_client.call_llm_async = dialog_fake
+    rag_search.search = spy_search
+    try:
+        await run_stream(chat.rag_dialog_chat(ChatMessage(
+            content="Собери, пожалуйста, памятку из того, что мы уже нашли")))
+        await run_stream(chat.rag_dialog_chat(ChatMessage(
+            content="А что там по антибиотику?")))
+    finally:
+        rag_search.search = original_search
+        llm_client.call_llm_async = saved
+    stored_goal = memory_store.goal_of(
+        chat._current_session()["dialog"]["task_memory"])
+    check("у сводной просьбы поиск идёт ещё и по цели задачи",
+          bool(seen_queries) and bool(seen_queries[0]["also"])
+          and bool(stored_goal) and stored_goal in seen_queries[0]["also"],
+          "%s | цель: %s" % (str(seen_queries[:1])[:160], stored_goal))
+    check("у обычного вопроса второго запроса нет (ничего не подменяется)",
+          len(seen_queries) > 1 and not seen_queries[1]["also"],
+          str(seen_queries[1:2])[:220])
+
+    # СБОЙ МОДЕЛИ: ответа нет — но и «строки источников за ответ» быть не должно.
+    async def broken(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        system = str(messages[0].get("content") or "") if messages else ""
+        if system.startswith("Ты ведёшь ПАМЯТЬ ЗАДАЧИ"):
+            return json.dumps(DIALOG_MEMORY_JSON, ensure_ascii=False), _metrics()
+        return "", _metrics()
+
+    before_dead = len(chat._current_session()["dialog"]["messages"])
+    llm_client.call_llm_async = broken
+    try:
+        dead = await run_stream(chat.rag_dialog_chat(
+            ChatMessage(content="И ещё раз про Trauma Team")))
+    finally:
+        llm_client.call_llm_async = saved
+    kinds = [event.get("type") for event in dead]
+    check("сбой модели в мини-чате — ошибка, а не «ответ без источников»",
+          "error" in kinds and "bot" not in kinds and kinds[-1] == "done", str(kinds))
+    check("сбойная реплика не попала в память диалога",
+          len(chat._current_session()["dialog"]["messages"]) == before_dead,
+          "%d против %d" % (len(chat._current_session()["dialog"]["messages"]),
+                            before_dead))
+
+    # МИНИ-ЧАТ → АГЕНТ: память задачи, собранная разговором, обязана быть видна и
+    # основному пайплайну — иначе, вернувшись в режим «AI-агент», пользователь
+    # потерял бы зафиксированные в разговоре цель и ограничения.
+    llm_client.call_llm_async = fake_call_llm_async
+    LLM_CONTEXT.clear()
+    try:
+        # Вопрос — по документам базы-фикстуры: на пустом поиске агент
+        # останавливается и спрашивает решение пользователя (и тогда до модели
+        # дело не доходит вовсе, что проверяет [13]).
+        await run_agent_chat("Как быстро приезжает Trauma Team после вызова?")
+    finally:
+        llm_client.call_llm_async = saved
+    check("память задачи из мини-чата видна основному агенту (блоком в контексте)",
+          any(memory_store.BLOCK_HEADER[:30] in text for text in LLM_CONTEXT)
+          and any(DIALOG_MEMORY_JSON["цель"] in text for text in LLM_CONTEXT),
+          "вызовов модели: %d" % len(LLM_CONTEXT))
+    check("цель и ограничения мини-чата видны и планировщику задачи",
+          any("ПАМЯТЬ ЗАДАЧИ" in text and DIALOG_MEMORY_JSON["цель"] in text
+              for text in LLM_CONTEXT))
+
+
+async def section_direct_answer():
+    """[17д] ПРЯМОЙ ОТВЕТ в объединённом режиме: один путь, два выхода."""
+    print("\n[17д] Прямой ответ внутри режима «AI-агент»: источники, память, состояние")
+    await chat.task_create(chat.TaskCreate(name="Объединённый режим"))
+    payload = base64.b64encode(DIALOG_DOC.encode("utf-8")).decode("ascii")
+    uploaded = await chat.rag_upload(RagUpload(
+        name="Памятка врачам", files=[RagFile(filename="med.md",
+                                              content_base64=payload)],
+        strategy="structure", chunk_size=400, overlap=60))
+    await chat.rag_apply(RagApply(enabled=[uploaded["base"]["id"]], rewrite=False,
+                                  rerank=False, filter=True, min_score=0.2,
+                                  top_k_after=5))
+    saved = llm_client.call_llm_async
+    calls = {"plan": 0, "answer": 0}
+
+    async def direct_fake(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        system = str(messages[0].get("content") or "") if messages else ""
+        if system.startswith("Ты — планировщик"):
+            calls["plan"] += 1
+        elif system.startswith("Ты ведёшь РАЗГОВОР"):
+            calls["answer"] += 1
+        return await fake_call_llm_async(*args, **kwargs)
+
+    llm_client.call_llm_async = direct_fake
+    LLM_CONTEXT.clear()
+    try:
+        # ВОПРОС: ни плана, ни шагов — ответ по фрагментам с источниками.
+        events = await run_agent_chat("Как быстро приезжает Trauma Team после вызова?")
+    finally:
+        llm_client.call_llm_async = saved
+    kinds = [event.get("type") for event in events]
+    bots = [event for event in events if event.get("type") == "bot"]
+    state = (await chat.state_get())["state"]
+    check("вопрос отвечается ПРЯМО: планировщик не вызывается",
+          calls["plan"] == 0 and calls["answer"] == 1 and "bot" in kinds,
+          "план: %d, ответ: %d, события: %s" % (calls["plan"], calls["answer"], kinds))
+    check("ответ приходит с источниками и строкой источников",
+          bool(bots) and bots[-1].get("sources")
+          and rag_dialog.SOURCES_MARK in bots[-1]["text"],
+          str(bots[-1].get("sources"))[:160] if bots else "ответа нет")
+    check("решение гейта объяснено в чате («плана не будет»)",
+          any("плана не будет" in str(event.get("text") or "")
+              for event in events if event.get("type") == "debug"),
+          str([event.get("text", "")[:60] for event in events
+               if event.get("type") == "debug"][:3]))
+    check("задача осталась на планировании, шагов нет (автомат не тронут)",
+          state["stage"] == "planning" and not state.get("steps"),
+          str(state["stage"]))
+    check("под ответом предложен вариант «разложить на шаги»",
+          any(event.get("type") == "choices"
+              and any("на шаги" in str(item.get("title") or "")
+                      for item in (event.get("options") or []))
+              for event in events), str(kinds))
+    dialog = chat._current_session()["dialog"]
+    check("реплики прямого ответа записаны в память диалога",
+          len(dialog["messages"]) == 2
+          and dialog["messages"][0]["role"] == "user"
+          and dialog["messages"][1]["role"] == "assistant",
+          str([item["role"] for item in dialog["messages"]]))
+    check("память задачи обновлена и записана в диалог",
+          bool(memory_store.has_content(dialog.get("task_memory"))),
+          memory_store.summary_line(dialog.get("task_memory")))
+    check("расход хода записан одной записью",
+          len(dialog["usage"]) == 1 and dialog["usage"][0].get("requests"),
+          str([item.get("requests") for item in dialog["usage"]]))
+    # ВАРИАНТ «РАЗЛОЖИТЬ НА ШАГИ»: та же фраза с признаком работы — и это уже план.
+    calls.update({"plan": 0, "answer": 0})
+    llm_client.call_llm_async = fake_call_llm_async
+    try:
+        plan_events = await run_agent_chat("Как быстро приезжает Trauma Team "
+                                          "после вызова?, разложи на шаги")
+    finally:
+        llm_client.call_llm_async = saved
+    plan_state = (await chat.state_get())["state"]
+    check("вариант «разложить на шаги» строит план (второй путь того же режима)",
+          plan_state["stage"] == "awaiting_user" and bool(plan_state.get("steps")),
+          "%s, шагов: %d" % (plan_state["stage"], len(plan_state.get("steps") or [])))
+    check("план показан в чате, а не ответ",
+          any("План задачи" in str(event.get("text") or "")
+              for event in plan_events if event.get("type") == "bot"),
+          str([event.get("text", "")[:60] for event in plan_events
+               if event.get("type") == "bot"])[:120])
+    rag_store.delete_base(uploaded["base"]["id"],
+                          profile=chat._current_profile_id())
+
+
+async def section_dialog_test():
+    """[17c] Контрольные диалоги /test_rag_dialog_1|2: 10 реплик и оценка."""
+    print("\n[17c] Контрольные диалоги /test_rag_dialog_1|2 (10 реплик, судья)")
+    await chat.task_create(chat.TaskCreate(name="Диалоги RAG без баз"))
+    check("без включённых баз диалог запускать нечего (400 и причина)",
+          await _status(lambda: chat.rag_dialog_test(
+              RagDialogTest(scenario=1))) == 400
+          and "ни одной базы" in await _detail(lambda: chat.rag_dialog_test(
+              RagDialogTest(scenario=1))))
+
+    await chat.task_create(chat.TaskCreate(name="Диалоги RAG"))
+    payload = base64.b64encode(DIALOG_DOC.encode("utf-8")).decode("ascii")
+    uploaded = await chat.rag_upload(RagUpload(
+        name="Памятка для диалогов",
+        files=[RagFile(filename="med.md", content_base64=payload)],
+        strategy="structure", chunk_size=400, overlap=60))
+    base_id = uploaded["base"]["id"]
+    await chat.rag_apply(RagApply(enabled=[base_id], rewrite=False, rerank=False,
+                                  filter=True, min_score=0.2, top_k_after=5))
+    check("неизвестный сценарий диалога — понятный отказ, а не молчание",
+          await _status(lambda: chat.rag_dialog_test(
+              RagDialogTest(scenario=9))) == 400
+          and "/test_rag_dialog_1" in await _detail(lambda: chat.rag_dialog_test(
+              RagDialogTest(scenario=9))))
+    check("сценарии РАЗНЫЕ: свои название, цель и план реплик",
+          len(rag_dialog.scenarios()) == 2
+          and len({item["title"] for item in rag_dialog.scenarios()}) == 2
+          and len({item["goal"] for item in rag_dialog.scenarios()}) == 2
+          and all(len(rag_dialog.turn_plan(item)) == rag_dialog.TURNS
+                  for item in rag_dialog.scenarios()),
+          str([item["title"] for item in rag_dialog.scenarios()]))
+
+    LLM_CONTEXT.clear()
+    state = {"sim": 0, "answers": 0, "judge": None, "fail_sim": False,
+             "fail_answer": 0}
+
+    async def test_fake(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        system = str(messages[0].get("content") or "") if messages else ""
+        user = str(messages[-1].get("content") or "") if messages else ""
+        LLM_CONTEXT.append("\n".join(str(item.get("content") or "")
+                                    for item in messages))
+        if system.startswith("Ты ведёшь ПАМЯТЬ ЗАДАЧИ"):
+            return json.dumps(DIALOG_MEMORY_JSON, ensure_ascii=False), _metrics(20, 30)
+        if system.startswith("Ты играешь роль ПОЛЬЗОВАТЕЛЯ"):
+            state["sim"] += 1
+            if state["fail_sim"]:
+                raise RuntimeError("сеть недоступна")
+            if "Смэшера" in user:
+                return "А что база знает про Адама Смэшера?", _metrics(25, 10)
+            return "Как быстро приезжает Trauma Team после вызова?", _metrics(25, 10)
+        if system.startswith("Ты — приёмщик контрольного РАЗГОВОРА"):
+            state["judge"] = user
+            items = []
+            turns_total = rag_dialog.TURNS
+            for number in range(1, turns_total + 1):
+                items.append({"n": number, "цель": True, "источники": True,
+                              "по_документам": number != 4, "ссылки": True,
+                              "оценка": "сверено с шагом" if number != 4 else "выдумал факт"})
+            return json.dumps({"итоги": items, "цель_удержана": True,
+                               "общий_вывод": "цель удержана, один шаг с замечанием"},
+                              ensure_ascii=False), _metrics(60, 40)
+        state["answers"] += 1
+        if state["fail_answer"] == state["answers"]:
+            raise RuntimeError("сеть недоступна")
+        if "Смэшера" in user:
+            return "В документах этого нет.", _metrics()
+        if state["answers"] % 2 == 0:
+            return "Trauma Team всегда прибывает в течение 1+1D6 минут [1].", _metrics()
+        return "Trauma Team приезжает в течение 1+1D6 минут.", _metrics()
+
+    saved = llm_client.call_llm_async
+    llm_client.call_llm_async = test_fake
+    try:
+        events = await run_stream(chat.rag_dialog_test(RagDialogTest(scenario=2)))
+    finally:
+        llm_client.call_llm_async = saved
+
+    kinds = [event.get("type") for event in events]
+    start = events[0]
+    turns = [event for event in events if event.get("type") == "dialog_turn"]
+    bots = [event for event in events if event.get("type") == "bot"]
+    memories = [event for event in events if event.get("type") == "task_memory"]
+    check("диалог начинается объявлением сценария, баз и плана реплик",
+          start["type"] == "dialog_start" and start["turns"] == rag_dialog.TURNS
+          and len(start["plan"]) == rag_dialog.TURNS
+          and start["title"] == rag_dialog.scenario(2)["title"]
+          and start["bases"] == ["Памятка для диалогов"],
+          str({key: start.get(key) for key in ("turns", "title", "bases")})[:180])
+    check("в диалоге РОВНО 10 реплик и 10 ответов",
+          len(turns) == rag_dialog.TURNS == 10 and len(bots) == rag_dialog.TURNS,
+          "реплик: %d, ответов: %d" % (len(turns), len(bots)))
+    check("старт разговора задан сценарием, дальше реплики пишет имитация",
+          [event["source"] for event in turns][:2] == ["fixed", "fixed"]
+          and state["sim"] == rag_dialog.TURNS - 2,
+          "имитаций: %d, источники реплик: %s"
+          % (state["sim"], [event["source"] for event in turns]))
+    check("перед имитацией пользователя в чат уходит строка прогресса",
+          any("имитация пользователя" in str(event.get("text") or "")
+              for event in events if event.get("type") == "debug")
+          and kinds.index("debug") < kinds.index("bot"),
+          str([str(event.get("text"))[:60] for event in events
+               if event.get("type") == "debug"][:3]))
+    check("имитации пользователя уходит цель сценария и о чём спросить",
+          any(rag_dialog.scenario(2)["goal"] in text for text in LLM_CONTEXT)
+          and any("О ЧЁМ СПРОСИТЬ ЭТОЙ РЕПЛИКОЙ" in text for text in LLM_CONTEXT))
+    check("КАЖДЫЙ ответ диалога несёт источники (поле sources в событии)",
+          all("sources" in event for event in bots)
+          and all(rag_dialog.SOURCES_MARK in event["text"] for event in bots),
+          str([len(event.get("sources") or []) for event in bots]))
+    check("у ответов есть карточки фрагментов с цитатой (как в чате)",
+          any(event.get("sources") for event in bots)
+          and all(item.get("snippet")
+                  for event in bots for item in (event.get("sources") or [])),
+          str(bots[0].get("sources"))[:200] if bots else "")
+    check("память задачи обновляется на КАЖДОЙ реплике",
+          len(memories) == rag_dialog.TURNS
+          and all("Память задачи" in event["text"] for event in memories),
+          "событий памяти: %d" % len(memories))
+    check("память задачи диалога не пустеет к концу (цель не потеряна)",
+          bool(memory_store.goal_of(memories[-1]["memory"]))
+          and memories[-1]["memory"]["counts"]["constraints"] >= 1,
+          str(memories[-1]["memory"].get("summary")))
+    verdict_event = [event for event in events
+                     if event.get("type") == "dialog_verdict"][-1]
+    check("в конце — вердикт судьи и ФАКТЫ прогона",
+          kinds[-2:] == ["dialog_verdict", "done"]
+          and verdict_event["items"] and verdict_event["stats"]["turns"] == 10,
+          str(kinds[-3:]))
+    check("итог называет источники по КОДУ, а не по оценке модели",
+          "Ответов с источниками: %d из 10" % verdict_event["stats"]["with_sources"]
+          in verdict_event["text"]
+          and verdict_event["stats"]["with_sources"]
+          == len([event for event in bots if event.get("sources")]),
+          verdict_event["text"][:200])
+    # ПОДСКАЗКА ПРО ПОРОГ: она появляется РОВНО тогда, когда её требует код по
+    # данным прогона (фрагменты почти не находились) — иначе прогон выглядел бы
+    # провалом агента, хотя проверялась настройка поиска (живой случай 03.10).
+    check("подсказка про порог согласована с данными прогона",
+          (("проверяет настройку поиска" in verdict_event["text"])
+           == bool(rag_dialog.yield_hint(
+               verdict_event["stats"],
+               workspace_store.rag_settings(chat._current_task()).get("min_score"),
+               workspace_store.rag_settings(chat._current_task()).get("min_ce"),
+               bool(workspace_store.rag_settings(
+                   chat._current_task()).get("filter"))))),
+          "источников %s из %s" % (verdict_event["stats"].get("with_sources"),
+                                   verdict_event["stats"].get("turns")))
+    check("выдуманные ссылки (номер вне выдачи) посчитаны кодом, а не судьёй",
+          "bad_cites" in verdict_event["stats"]
+          and verdict_event["stats"]["bad_cites"] == 0
+          and "несуществующие фрагменты" not in verdict_event["text"],
+          str({key: verdict_event["stats"].get(key)
+               for key in ("bad_cites", "bad_cite_numbers")}))
+    check("ловушка (вопрос, ответа на который в базе нет) проверяется по факту",
+          verdict_event["stats"]["trap"] == 7
+          and verdict_event["stats"]["trap_honest"] is True
+          and "честно сказано" in verdict_event["text"],
+          verdict_event["text"][:300])
+    check("в итоге видно, что цель задачи удержана, а один шаг с замечанием",
+          "Цель задачи: удержана" in verdict_event["text"]
+          and "Шагов без замечаний: 9 из 10" in verdict_event["text"],
+          verdict_event["text"][:300])
+    check("судья получил сценарий, все 10 шагов и фрагменты каждого шага",
+          state["judge"] and rag_dialog.scenario(2)["goal"] in state["judge"]
+          and all(("ШАГ %d" % number) in state["judge"]
+                  for number in range(1, rag_dialog.TURNS + 1))
+          and "ФРАГМЕНТЫ У АГЕНТА" in state["judge"],
+          str(state["judge"])[:160])
+    # БЕЗ ПЛАНА И ПАМЯТИ СУДЬЯ НАКАЗЫВАЛ АГЕНТА ЗА ЧУЖИЕ ВОПРОСЫ И ЗА ПЕРЕНОС
+    # ФАКТОВ ИЗ ПРОШЛЫХ ШАГОВ (живой прогон 03.10). Поэтому в задании судье есть
+    # план разговора, память задачи и правила чтения данных.
+    check("судья видит план разговора (вопрос «в сторону» — он задан заранее)",
+          state["judge"] and "ПЛАН РАЗГОВОРА" in state["judge"]
+          and "не является уходом от цели" in state["judge"],
+          str(state["judge"])[:120])
+    check("судья видит память задачи разговора (цель и ограничения)",
+          state["judge"] and "ПАМЯТЬ ЗАДАЧИ В КОНЦЕ РАЗГОВОРА" in state["judge"]
+          and "ограничения" in state["judge"],
+          str(state["judge"])[:160])
+    judge_prompt_text = rag_dialog.JUDGE_PROMPT.lower()
+    check("правила чтения данных записаны в промпте судьи",
+          "не выдумка агента" in judge_prompt_text
+          and "не потеря цели" in judge_prompt_text
+          and "любых приведённых фрагментах" in judge_prompt_text, "")
+    lines_now = rag_dialog.verdict_lines({"items": verdict_event["items"]})
+    check("в вердикте есть разбор ссылок и выдумок по шагам",
+          "links" in verdict_event["items"][0]
+          and bool(lines_now) and "ВЫДУМКИ" in lines_now[3],
+          str(lines_now[3] if len(lines_now) > 3 else lines_now[:2]))
+    # ПРОГОН МИМО ПАЙПЛАЙНА: ни памяти диалога, ни замера задачи, ни автомата —
+    # как у /test_rag. Пишет только в журнал чата.
+    session = chat._current_session()
+    dialog_now = session["dialog"]
+    check("прогон НЕ пишет в память диалога (реплики не стали историей задачи)",
+          dialog_now["messages"] == [], str(dialog_now["messages"])[:120])
+    check("прогон НЕ трогает автомат задачи",
+          (await chat.state_get())["state"]["stage"] == "planning"
+          and not (await chat.state_get())["state"]["steps"],
+          str((await chat.state_get())["state"]["stage"]))
+    check("расход прогона в замер задачи не попадает",
+          dialog_now.get("usage") == [], str(dialog_now.get("usage")))
+    check("память задачи прогона остаётся ЛОКАЛЬНОЙ (в диалог не пишется)",
+          not memory_store.has_content(dialog_now.get("task_memory")))
+    log = (await chat.agent_history()).get("log") or []
+    check("в журнале видны все реплики диалога и ответы с источниками",
+          sum(1 for item in log if str(item.get("text") or "").startswith("🧪 Реплика"))
+          == rag_dialog.TURNS
+          and any(item.get("kind") == "assistant" and item.get("sources")
+                  for item in log),
+          str([item.get("text", "")[:30] for item in log[:3]]))
+    check("прогон НЕ зовёт планировщика, приёмщика задачи и разбор инвариантов",
+          not any(text.startswith("Ты — планировщик") for text in LLM_CONTEXT)
+          and not any(text.startswith("Ты — приёмщик работы") for text in LLM_CONTEXT)
+          and not any(text.startswith("Ты — арбитр инвариантов")
+                      for text in LLM_CONTEXT))
+    check("расход диалога показан итоговой строкой (в замер задачи не входит)",
+          "Расход диалога" in verdict_event["text"]
+          and "не входит" in verdict_event["text"]
+          and verdict_event["stats"]["fragments"] > 0,
+          str(verdict_event["stats"]))
+
+    # СБОЙ ИМИТАЦИИ И СБОЙ ОТВЕТА: шаг не пропускается, прогон не обрывается.
+    LLM_CONTEXT.clear()
+    state.update({"sim": 0, "answers": 0, "fail_sim": True, "fail_answer": 3})
+    llm_client.call_llm_async = test_fake
+    try:
+        broken = await run_stream(chat.rag_dialog_test(RagDialogTest(scenario=1)))
+    finally:
+        llm_client.call_llm_async = saved
+        state["fail_sim"] = False
+    state["fail_answer"] = 0
+    broken_turns = [event for event in broken if event.get("type") == "dialog_turn"]
+    broken_bots = [event for event in broken if event.get("type") == "bot"]
+    check("сбой имитации пользователя не пропускает шаг (реплика из сценария)",
+          len(broken_turns) == rag_dialog.TURNS
+          and any(event["source"] == "script" for event in broken_turns),
+          str([event["source"] for event in broken_turns]))
+    check("сбой одного ответа не обрывает диалог",
+          any(event.get("type") == "dialog_error" for event in broken)
+          and len(broken_bots) == rag_dialog.TURNS - 1
+          and broken[-1].get("type") == "done",
+          "ответов: %d, событий: %d" % (len(broken_bots), len(broken)))
+    broken_verdict = [event for event in broken
+                      if event.get("type") == "dialog_verdict"][-1]
+    check("в вердикте сбойный шаг назван, а не выдаётся за ответ",
+          any("осталась без ответа" in str(event.get("text") or "")
+              for event in broken if event.get("type") == "dialog_error")
+          and ("Ответов с источниками: %d из 10"
+               % broken_verdict["stats"]["with_sources"]) in broken_verdict["text"]
+          and broken_verdict["stats"]["without_sources"] >= 1,
+          str(broken_verdict["stats"]))
+    rag_store.delete_base(base_id, profile=chat._current_profile_id())
+
+
 def main():
     print("Проверка пайплайна индексации RAG (без сети)")
     print("Каталог данных проверки: %s" % _TMP)
@@ -4039,6 +4909,11 @@ def main():
     asyncio.run(section_suite())
     section_two_stage()
     section_threshold()
+    section_memory()
+    section_plan_gate()
+    asyncio.run(section_dialog())
+    asyncio.run(section_direct_answer())
+    asyncio.run(section_dialog_test())
 
     print()
     if FAILURES:
