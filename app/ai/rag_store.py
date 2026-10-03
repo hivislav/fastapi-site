@@ -518,14 +518,24 @@ def neighbours(base_id: Any, indexes: Any, profile: Optional[str] = None
 
 
 def chunks_page(base_id: Any, offset: int = 0, limit: int = 10,
-                source: str = "", query: str = "") -> Tuple[List[Dict[str, Any]], int]:
-    """Страница чанков базы для просмотра: (чанки, всего подходящих).
+                source: str = "", query: str = "", chunk: int = 0
+                ) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Страница чанков базы для просмотра: (чанки, всего подходящих, смещение).
 
     Просмотр чанков — это то, чем пользователь проверяет, годится ли выбранная
     стратегия и размер: глазами видно, что раздел не разорван и что чанк не
     состоит из одного заголовка. Поэтому нужны и срез по документу, и поиск по
     тексту, и постраничная выдача — база на 20 000 чанков целиком в диалог не
     поместится.
+
+    `chunk` — НОМЕР ЧАНКА (1-based, как в интерфейсе и в карточках источников):
+    по нему страница сдвигается так, чтобы этот чанк в неё попал. Это нужно для
+    перехода «клик по источнику под ответом → открыть ИМЕННО этот фрагмент»:
+    иначе пользователь попадал бы на первую страницу списка и искал глазами.
+    Смещение считается тем же фильтром, что и выдача, — иначе номер «поехал» бы
+    относительно отфильтрованного списка. ВОЗВРАЩАЕТСЯ ТРЕТЬИМ ЗНАЧЕНИЕМ: без
+    него вызывающий не знает, куда встала страница, и «показать ещё» показывало бы
+    её заново.
 
     Поиск по тексту идёт В SQLite, а не перебором в Python: сравнение регистра
     делает ЗАРЕГИСТРИРОВАННАЯ питоновская функция `py_lower`, потому что
@@ -535,7 +545,7 @@ def chunks_page(base_id: Any, offset: int = 0, limit: int = 10,
     folder = base_path(base_id)
     path = os.path.join(folder, SQLITE_FILE) if folder else ""
     if not path or not os.path.isfile(path):
-        return [], 0
+        return [], 0, 0
     where: List[str] = []
     params: List[Any] = []
     source = str(source or "").strip()
@@ -557,6 +567,16 @@ def chunks_page(base_id: Any, offset: int = 0, limit: int = 10,
                                        deterministic=True)
             total = int(connection.execute(
                 "SELECT COUNT(*) FROM chunks" + clause, params).fetchone()[0])
+            wanted = int(chunk or 0)
+            if wanted > 0:
+                # Смещение = сколько чанков идёт ДО нужного под ТЕМ ЖЕ фильтром.
+                # Так нужный фрагмент оказывается ПЕРВЫМ на странице, и его видно
+                # без прокрутки.
+                before = (" WHERE "
+                          + " AND ".join(where + ["chunk_index < ?"]))
+                start = max(0, int(connection.execute(
+                    "SELECT COUNT(*) FROM chunks" + before,
+                    params + [max(0, wanted - 1)]).fetchone()[0]))
             rows = connection.execute(
                 "SELECT chunk_id, chunk_index, doc_index, position, source, title,"
                 " section, kind, start, end, chars, text FROM chunks" + clause
@@ -566,13 +586,13 @@ def chunks_page(base_id: Any, offset: int = 0, limit: int = 10,
             connection.close()
     except sqlite3.Error as exc:
         logger.warning("RAG: страница чанков %s не прочитана — %s", base_id, str(exc)[:150])
-        return [], 0
+        return [], 0, 0
     chunks = [{
         "chunk_id": row[0], "index": row[1], "doc_index": row[2], "position": row[3],
         "source": row[4], "title": row[5], "section": row[6], "kind": row[7],
         "start": row[8], "end": row[9], "chars": row[10], "text": row[11],
     } for row in rows]
-    return chunks, total
+    return chunks, total, start
 
 
 def load_meta_from_sqlite(base_id: Any) -> Dict[str, str]:

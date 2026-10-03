@@ -347,7 +347,10 @@ let RAG = {
   // ими же заполняется панель «Поиск и ответы» (два этапа, порог, топ-K до и
   // после реранкинга, переформулировка запроса).
   search: { top_k: 5, top_k_after: 5, top_k_before: 20, max_hits: 12,
-            ask_when_empty: true, min_ce: 0,
+            ask_when_empty: true,
+            // Два порога: первичная релевантность (фильтрация) и уверенность
+            // модели (реранкинг) — разные шкалы, разные ползунки.
+            min_score: 0.3, min_ce: 0,
             rerank_backend: 'auto', rerank_backend_name: 'авто (cross-encoder, если модель уже скачана)',
             rewrite: true, rerank: true, filter: true,
             block_chars: 12000, chunk_chars: 2200, neighbours: 1,
@@ -358,6 +361,7 @@ let RAG = {
   // Границы полей панели поиска — приходят С СЕРВЕРА (rag_search.limits), как и
   // пределы размеров чанка: интерфейс не выдумывает их сам.
   searchLimits: { top_k: { min: 1, max: 50 }, max_hits: { min: 1, max: 50 },
+                  min_score: { min: 0, max: 2, step: 0.05 },
                   min_ce: { min: 0, max: 1, step: 0.05 } },
   // Состояние РЕРАНКЕРА (app/ai/rag_rerank.py, status): чем реранкить сейчас,
   // какая модель, скачана ли она и почему работает не то, что выбрано.
@@ -381,6 +385,10 @@ let RAG = {
 // последнего шага (событие bot с полем sources). Проверка подставляет их в
 // заглушку потока и смотрит, что интерфейс рисует карточки.
 let RAG_SOURCES = null;
+
+// «В документах ничего нет» (RAG): сервер отвечает событием `choices` с текстом и
+// ВАРИАНТАМИ ПРОДОЛЖЕНИЯ, у каждого — своё действие (см. _rag_choice_view).
+let RAG_CHOICES = null;
 
 // Чанки базы для проверки просмотра: 25 штук с разными документами и текстом,
 // чтобы работали и страницы, и фильтр по документу, и поиск по тексту.
@@ -406,16 +414,21 @@ function ragChunkSet(base) {
 function ragChunksPayload(baseId, url) {
   const base = RAG.bases.filter(item => item.id === baseId)[0] || RAG.bases[0];
   const query = new URLSearchParams(url.split('?')[1] || '');
-  const offset = Number(query.get('offset') || 0);
+  let offset = Number(query.get('offset') || 0);
   const limit = Number(query.get('limit') || 10);
   const source = query.get('source') || '';
   const text = query.get('q') || '';
+  // ПЕРЕХОД К ЧАНКУ: сервер сдвигает страницу так, чтобы нужный номер был первым
+  // (app/ai/rag_store.chunks_page). Заглушка обязана вести себя так же, иначе
+  // проверка перехода проверяла бы не сервер, а саму себя.
+  const wanted = Number(query.get('chunk') || 0);
   let all = ragChunkSet(base);
   if (source) all = all.filter(chunk => chunk.source === source);
   if (text) {
     const needle = text.toLowerCase();
     all = all.filter(chunk => chunk.text.toLowerCase().indexOf(needle) >= 0);
   }
+  if (wanted > 0) offset = Math.max(0, all.findIndex(chunk => chunk.index + 1 === wanted));
   const page = all.slice(offset, offset + limit);
   return {
     base: { id: base.id, name: base.name, strategy: base.strategy,
@@ -718,9 +731,15 @@ async function runStep() {
   // Источники (RAG) приходят с ответом ПОСЛЕДНЕГО шага — как на сервере, где
   // они висят на событии bot и попадают в журнал вместе с ним.
   const stepSources = finalStep && RAG_SOURCES ? RAG_SOURCES : null;
+  // ССЫЛКИ НА ФРАГМЕНТЫ в тексте ответа («[1]»): модель ставит их по номерам из
+  // блока баз знаний, и интерфейс обязан сделать их кликабельными. Текст с
+  // ссылками даём только там, где есть источники: без них ссылаться не на что.
+  const stepText = finalStep
+    ? (stepSources ? 'Шаг выполнен: итог задачи (см. [1] и [3]).'
+                   : 'Шаг выполнен: итог задачи.')
+    : 'Шаг выполнен.';
   logs[sessionId] = (logs[sessionId] || []).concat([
-    { kind: 'assistant', text: finalStep ? 'Шаг выполнен: итог задачи.' : 'Шаг выполнен.',
-      sources: stepSources },
+    { kind: 'assistant', text: stepText, sources: stepSources },
   ]);  const blockedEvent = CHECK_BLOCKED && last ? {
     type: 'error',
     text: '⚠️ Проверку результата выполнить не удалось: модель не ответила. Задачу '
@@ -729,8 +748,7 @@ async function runStep() {
   } : null;
   return streamResponse([
     { type: 'state', state: snapshot() },
-    { type: 'bot', text: finalStep ? 'Задача выполнена.' : 'Шаг выполнен.',
-      sources: stepSources },
+    { type: 'bot', text: stepText, sources: stepSources },
     { type: 'state', state: snapshot() },
     // Уточнённый замер: автомат сделал служебный вызов (проверка результата) —
     // фронт обязан ЗАМЕНИТЬ замер запроса, а не добавить второй.
@@ -840,13 +858,19 @@ function makeFetch() {
       // Заглушка контрольного прогона RAG: сервер отвечает потоком тех же
       // событий, что и в жизни (см. app/routers/chat.py, rag_test).
       ragTests.push(body || {});
+      // Ответы теста приходят ВМЕСТЕ С ИСТОЧНИКАМИ (как у агента): под ними
+      // рисуются карточки фрагментов с цитатой и переходом к чанку, а ссылки
+      // «[N]» в тексте становятся кликабельными. Второй ответ — без источников
+      // (поиск ничего не нашёл): блока под ним быть не должно.
       return streamResponse([
         { type: 'test_start', total: 2, bases: ['Инструкции оператора'] },
         { type: 'test_question', n: 1, total: 2, text: 'Кто автор статьи про Найт-Сити?' },
         { type: 'debug', text: '1. Найдено фрагментов: 2; лучший — guide.md · чанк № 1081' },
-        { type: 'bot', text: 'Автор — **Исида Бес** (guide.md, чанк № 1081).', test: 1 },
+        { type: 'bot', text: 'Автор — **Исида Бес**: «Автор Исида Бес» [1].',
+          test: 1, sources: RAG_SOURCES || [] },
         { type: 'test_question', n: 2, total: 2, text: 'Что даёт антибиотик?' },
-        { type: 'bot', text: 'Бонус к спас-броску против заражения.', test: 2 },
+        { type: 'bot', text: 'Бонус к спас-броску против заражения.', test: 2,
+          sources: [] },
         { type: 'test_error', n: 0, text: '⚠ Вопрос 3 остался без ответа: таймаут' },
         { type: 'test_verdict', text: '🧪 Оценка ответов\nВерных ответов: 1 из 2.\n1. ✅ верно',
           items: [{ n: 1, ok: true, comment: 'сходится' }], summary: 'почти всё верно' },
@@ -892,6 +916,17 @@ function makeFetch() {
                          overlap: Number(body.overlap) || 0 };
         return jsonResponse({ base: Object.assign({}, base, { enabled: true }),
                               view: ragPayload() });
+      }
+      if (url.indexOf('/api/agent/rag/relax') === 0 && method === 'POST') {
+        // Снижение порога уверенности по выбору пользователя в чате: заглушка
+        // повторяет сервер — меняется ТОЛЬКО порог, остальные настройки на месте.
+        if (body && body.min_ce !== undefined && body.min_ce !== null) {
+          RAG.search.min_ce = Number(body.min_ce);
+        }
+        if (body && body.min_score !== undefined && body.min_score !== null) {
+          RAG.search.min_score = Number(body.min_score);
+        }
+        return jsonResponse(ragPayload());
       }
       if (url.indexOf('/api/agent/rag/') === 0 && url.indexOf('/chunks') > 0) {
         const id = decodeURIComponent(url.split('/')[4]);
@@ -1121,6 +1156,22 @@ function makeFetch() {
         ]);
       }
       LAST_ANALYSIS = { verdict: '', kind: '', explanation: '', suggestions: [] };
+      // В ДОКУМЕНТАХ НИЧЕГО НЕТ: агент останавливается и предлагает варианты
+      // (сервер шлёт событие `choices`, см. _rag_choice_view). Так проверяется
+      // главное в этих вариантах — что клик по ним ЧТО-ТО ДЕЛАЕТ, а не гасится.
+      if (RAG_CHOICES) {
+        const view = RAG_CHOICES;
+        logs[requestSession || workspace.active_session] =
+          (logs[requestSession || workspace.active_session] || []).concat([
+            { kind: 'suggestions', text: view.message, analysis: view },
+          ]);
+        return streamResponse([
+          { type: 'state', state: snapshot() },
+          { type: 'choices', text: view.message, options: view.options, analysis: view },
+          { type: 'state', state: snapshot() },
+          { type: 'done', usage: usage(), state: snapshot() },
+        ]);
+      }
       // Как на сервере: задача запроса — из session_id (шаг фоновой задачи),
       // иначе открытая.
       requestSession = (body && body.session_id) || workspace.active_session;
@@ -2680,30 +2731,70 @@ async function run() {
     && $('rag-rerank-note').textContent.indexOf('признаки') >= 0
     && $('rag-rerank-note').textContent.indexOf('не скачана') >= 0,
     $('rag-rerank-note').textContent.slice(0, 160));
-  // ОДНА ШКАЛА: порог уверенности модели. Порога по «оценке поиска» в панели нет —
-  // это была служебная сумма до 3, которая только путала.
-  check('в панели ОДНА шкала порога — уверенность модели (0…1)',
-    $('rag-min-ce') !== null && $('rag-min-score') === null
+  // ДВА ПОЛЗУНКА, ДВЕ ШКАЛЫ: первичная релевантность (фильтрация) и уверенность
+  // модели (реранкинг). Путать их нельзя — именно на этом строился живой случай
+  // «порог 0,85, а в ответе числа 0,73».
+  check('в панели ДВА порога со своими шкалами',
+    $('rag-min-score') !== null && $('rag-min-ce') !== null
+    && $('rag-min-score').min === '0' && $('rag-min-score').max === '2'
     && $('rag-min-ce').min === '0' && $('rag-min-ce').max === '1'
-    && Number($('rag-min-ce').value) === RAG.search.min_ce
-    && $('rag-min-ce-value').textContent === 'не применяется',
-    $('rag-min-ce').value + ' / ' + $('rag-min-ce-value').textContent);
+    && Number($('rag-min-score').value) === RAG.search.min_score
+    && Number($('rag-min-ce').value) === RAG.search.min_ce,
+    $('rag-min-score').value + ' / ' + $('rag-min-ce').value);
+  const panelText = dom.window.document.body.textContent;
+  check('подписи ползунков называют этап каждого порога',
+    panelText.indexOf('Порог первичной релевантности') >= 0
+    && panelText.indexOf('Порог уверенности модели') >= 0
+    && panelText.indexOf('фильтрация, 0…2') >= 0
+    && panelText.indexOf('реранкинг, 0…1') >= 0);
 
-  // ФИЛЬТРАЦИЯ БЕЗ МОДЕЛИ — ОШИБКА, а не тихая подмена шкалы.
+  // ПОРОГ ВТОРОГО ЭТАПА БЕЗ РЕРАНКИНГА НЕ ПРИМЕНЯЕТСЯ — и панель говорит это
+  // словами и ГАСИТ ползунок: скрытой связи «выставил порог — включился
+  // реранкинг» быть не должно (живое замечание 03.10: «причём здесь реранкинг?»).
+  $('rag-min-ce').value = '0.4';
+  $('rag-min-ce').dispatchEvent(new dom.window.Event('input'));
+  $('rag-rerank').checked = false;
+  $('rag-rerank').dispatchEvent(new dom.window.Event('change'));
+  check('без реранкинга ползунок уверенности погашен, а первичной — работает',
+    $('rag-min-ce').disabled === true && $('rag-min-score').disabled === false
+    && $('rag-top-before').disabled === true
+    && $('rag-search-hint').textContent.indexOf('не применяется') >= 0,
+    $('rag-search-hint').textContent.slice(-220));
+  $('rag-rerank').checked = true;
+  $('rag-rerank').dispatchEvent(new dom.window.Event('change'));
+  check('с реранкингом оба ползунка и пул снова рабочие',
+    $('rag-min-ce').disabled === false && $('rag-top-before').disabled === false);
+
+  // ОШИБКА НАСТРОЙКИ — только когда отсекать НЕЧЕМ ВООБЩЕ (оба порога нули).
   RAG.rerank.available = false;
   RAG.rerank.reason = 'модель кросс-энкодера не скачана — работают признаки';
   await dom.window.eval('loadRag(false)');
   await wait(60);
-  check('фильтрация без модели помечена ошибкой прямо в панели',
-    $('rag-search-hint').textContent.indexOf('требует модель-реранкер') >= 0
+  $('rag-min-score').value = '0';
+  $('rag-min-score').dispatchEvent(new dom.window.Event('input'));
+  $('rag-min-ce').value = '0';
+  $('rag-min-ce').dispatchEvent(new dom.window.Event('input'));
+  check('оба порога нули — панель помечает, что отсекать нечем',
+    $('rag-search-hint').textContent.indexOf('отсекать нечем') >= 0
     && $('rag-search-hint').classList.contains('off') === true,
-    $('rag-search-hint').textContent.slice(-160));
+    $('rag-search-hint').textContent.slice(-200));
+  // Порог ПЕРВИЧНОЙ релевантности работает без модели: он снимает ошибку.
+  $('rag-min-score').value = '0.5';
+  $('rag-min-score').dispatchEvent(new dom.window.Event('input'));
+  check('порог первичной релевантности снимает ошибку — он модели не требует',
+    $('rag-search-hint').textContent.indexOf('отсекать нечем') < 0
+    && $('rag-search-hint').classList.contains('off') === false,
+    $('rag-search-hint').textContent.slice(-200));
+  // А порог уверенности без модели — это ⓘ (не ошибка), и сказано, что будет.
+  $('rag-min-ce').value = '0.4';
+  $('rag-min-ce').dispatchEvent(new dom.window.Event('input'));
+  check('порог уверенности без модели-реранкера объяснён, а не спрятан',
+    $('rag-search-hint').textContent.indexOf('вероятностей не будет') >= 0,
+    $('rag-search-hint').textContent.slice(-220));
   RAG.rerank.available = true;
   RAG.rerank.reason = '';
   await dom.window.eval('loadRag(false)');
   await wait(60);
-  check('с доступной моделью ошибки нет',
-    $('rag-search-hint').textContent.indexOf('требует модель-реранкер') < 0);
 
   // ЗАВЫШЕННЫЙ ПОРОГ УВЕРЕННОСТИ: у нужных фрагментов 0,45–1,00, выше 0,7 уже
   // начинает отсекаться верное.
@@ -2726,9 +2817,10 @@ async function run() {
     topOptions.indexOf(String(RAG.search.top_k_before)) >= 0
     && Number(topOptions[topOptions.length - 1]) <= RAG.searchLimits.top_k.max,
     topOptions.join(','));
-  check('под панелью сказано, что произойдёт с фрагментами',
+  check('под панелью сказано, что произойдёт с фрагментами (оба порога названы)',
     $('rag-search-hint').textContent.indexOf('реранкинг') >= 0
-    && $('rag-search-hint').textContent.indexOf('уверенностью модели ниже 0,40') >= 0
+    && $('rag-search-hint').textContent.indexOf('уверенность модели ниже 0,40') >= 0
+    && $('rag-search-hint').textContent.indexOf('первичная релевантность') >= 0
     && $('rag-search-hint').textContent.indexOf('спрошу вас') >= 0,
     $('rag-search-hint').textContent.slice(-200));
 
@@ -3108,19 +3200,32 @@ async function run() {
   //      (и после перечитывания диалога — они лежат в журнале задачи).
   // ---------------------------------------------------------------------
   console.log('\n[S2] RAG в ответе: источники под ответом и строка «поиск включён»');
+  // База возвращается к исходному набору: раздел [S] удалял базу, и источник под
+  // ответом ссылается на фрагмент ТОЙ базы, чей документ указан в карточке.
+  RAG.bases = [ragBase({})];
+  await dom.window.eval('loadRag(false)');
+  await wait(40);
   RAG.enabled = [RAG.bases[0].id];
   RAG_SOURCES = [
-    { base: 'Инструкции оператора', source: 'guide.md', number: 1081,
+    // base_id и chunk_id — из rag_search.sources: по ним интерфейс открывает
+    // ИМЕННО этот фрагмент в просмотре чанков (номер чанка уникален внутри базы).
+    // Номер выбран так, чтобы он СУЩЕСТВОВАЛ в наборе чанков проверки (25 штук) и
+    // принадлежал тому же документу — иначе проверка перехода проверяла бы не
+    // переход, а пустую страницу.
+    { base_id: RAG.bases[0].id, chunk_id: 'kb-1-0-0006',
+      base: 'Инструкции оператора', source: 'guide.md', number: 7,
       section: 'Глава 2 › Резервное копирование', score: 1.16, base_score: 1.15,
       by_model: true, ce: 0.98,
       vector_score: 0.33, lexical: 0.82, chars: 420,
       snippet: 'Резервное копирование выполняется командой backup.sh.' },
-    { base: 'Регламенты', source: 'rules.docx', number: 42, section: '',
+    { base_id: RAG.bases[0].id, chunk_id: 'kb-1-0-42', base: 'Регламенты',
+      source: 'rules.docx', number: 42, section: '',
       score: 0.31, vector_score: 0.31, lexical: 0, chars: 500,
       snippet: 'Копии хранятся тридцать дней.' },
     // СОСЕДНИЙ фрагмент (продолжение таблицы, разрезанной границей чанка):
     // приходит без оценки — подписывается как продолжение, а не релевантностью.
-    { base: 'Регламенты', source: 'rules.docx', number: 43, section: '',
+    { base_id: RAG.bases[0].id, chunk_id: 'kb-1-0-43', base: 'Регламенты',
+      source: 'rules.docx', number: 43, section: '',
       score: 0, vector_score: 0, lexical: 0, chars: 500, neighbour: true,
       parent_chunk: 42, snippet: 'Остальные строки той же таблицы.' },
   ];
@@ -3147,8 +3252,8 @@ async function run() {
     srcCards[0] ? srcCards[0].textContent : '(нет строки)');
   check('в строке виден НОМЕР чанка (как в окне «чанки» базы)',
     !!srcCards[0] && srcCards[0].querySelector('.rag-source-name').textContent
-      .indexOf('№ 1') >= 0
-      && srcCards[0].querySelector('.rag-source-name').textContent.indexOf('081') >= 0,
+      .indexOf('№ 7') >= 0
+      && srcCards[0].querySelector('.rag-source-name').textContent.indexOf('guide.md') >= 0,
     srcCards[0] ? srcCards[0].querySelector('.rag-source-name').textContent : '');
   check('строки пронумерованы по порядку',
     srcCards.length > 1 && srcCards[1].querySelector('.rag-source-num').textContent === '2.',
@@ -3188,7 +3293,69 @@ async function run() {
   check('после перечитывания диалога источники восстанавливаются из журнала',
     q('#messages .rag-source').length === RAG_SOURCES.length,
     'строк: ' + q('#messages .rag-source').length);
-  // Ответ БЕЗ источников (базы выключены) рисуется как обычно — блока нет.
+  check('после перечитывания диалога кликабельность источников сохраняется',
+    q('#messages .rag-source.openable').length === RAG_SOURCES.length,
+    'кликабельных: ' + q('#messages .rag-source.openable').length);
+
+  // ---------------------------------------------------------------------
+  // ЦИТАТЫ И ПЕРЕХОД К ФРАГМЕНТУ: «источники кликабельны — можно перейти к
+  // просмотру конкретного чанка». Строка источника знает свою базу и номер
+  // чанка, показывает ЦИТАТУ (начало самого фрагмента) и открывает ИМЕННО его.
+  // ---------------------------------------------------------------------
+  const firstCard = q('#messages .rag-source')[0];
+  check('под источником видна ЦИТАТА фрагмента, а не только адрес',
+    !!firstCard && !!firstCard.querySelector('.rag-source-quote')
+    && firstCard.querySelector('.rag-source-quote').textContent.indexOf('backup.sh') >= 0,
+    firstCard ? firstCard.querySelector('.rag-source-quote').textContent : '(нет строки)');
+  const quoteEl = firstCard.querySelector('.rag-source-quote');
+  await click(quoteEl, 20);
+  check('клик по цитате разворачивает её целиком',
+    quoteEl.classList.contains('open'), quoteEl.className);
+  check('клик по цитате НЕ открывает окно чанков (иначе её нельзя прочитать)',
+    $('rag-chunks-modal').hidden === true);
+  await click(quoteEl, 20);
+  check('повторный клик сворачивает цитату',
+    quoteEl.classList.contains('open') === false, quoteEl.className);
+
+  // ССЫЛКА «[1]» В ТЕКСТЕ ОТВЕТА: клик раскрывает цитату источника с этим
+  // номером. Без этого номера в ответе были бы просто цифрами в скобках.
+  const cites = q('#messages .msg.bot .msg-cite');
+  check('номера фрагментов в ответе стали ссылками',
+    cites.length === 2 && cites[0].textContent === '[1]' && cites[1].textContent === '[3]',
+    cites.map(node => node.textContent).join(' '));
+  await click(cites[0], 20);
+  check('клик по «[1]» раскрывает цитату первого источника',
+    q('#messages .rag-source')[0].querySelector('.rag-source-quote')
+      .classList.contains('open'),
+    q('#messages .rag-source')[0].querySelector('.rag-source-quote').className);
+  check('клик по «[3]» (соседний фрагмент) ничего не ломает',
+    q('#messages .rag-source')[2].querySelector('.rag-source-quote')
+      .classList.contains('open') === false);
+
+  // ПЕРЕХОД К ЧАНКУ: клик по источнику открывает просмотр чанков базы с
+  // фильтром по документу и НУЖНЫМ номером первым в списке — это и есть
+  // «перейти к просмотру конкретного чанка».
+  await click(firstCard, 120);
+  check('клик по источнику открыл просмотр чанков этой базы',
+    $('rag-chunks-modal').hidden === false
+    && $('rag-chunks-name').textContent === RAG.bases[0].name,
+    $('rag-chunks-name').textContent);
+  check('в просмотре подставлен документ фрагмента',
+    $('rag-chunks-source').value === 'guide.md', $('rag-chunks-source').value
+    + ' / ' + dom.window.eval('JSON.stringify(ragChunks)'));
+  const hitChunk = q('#rag-chunks-list .rag-chunk.hit');
+  check('нужный чанк открыт первым и подсвечен',
+    hitChunk.length === 1
+    && hitChunk[0] === q('#rag-chunks-list .rag-chunk')[0]
+    && hitChunk[0].textContent.indexOf('№ 7') >= 0,
+    hitChunk.length ? hitChunk[0].textContent.slice(0, 80) : '(нет подсветки)');
+  check('рядом видны соседние чанки того же документа',
+    q('#rag-chunks-list .rag-chunk').length > 1
+    && q('#rag-chunks-list .rag-chunk')[1].textContent.indexOf('guide.md') >= 0,
+    'чанков в списке: ' + q('#rag-chunks-list .rag-chunk').length);
+  await click($('rag-chunks-close'), 40);
+  check('просмотр чанков закрывается', $('rag-chunks-modal').hidden === true);
+  // Без источников нового блока под ответом не появляется
   RAG_SOURCES = null;
   await sendRequest('Ответ без документов');
   await click($('tm-confirm'), 60);
@@ -3196,6 +3363,109 @@ async function run() {
   check('без источников нового блока под ответом не появляется',
     q('#messages .rag-sources').length === 1,
     'блоков: ' + q('#messages .rag-sources').length);
+
+  // ---------------------------------------------------------------------
+  // РЕШЕНИЕ ПРИНИМАЕТ ПОЛЬЗОВАТЕЛЬ: порог отсёк всё найденное — агент
+  // останавливается и предлагает варианты. КАЖДЫЙ вариант обязан что-то делать:
+  // «снизить порог» — сначала применить настройку, потом повторить поиск;
+  // «уточнить вопрос» — позвать человека к вводу. Мёртвых кнопок быть не должно.
+  // ---------------------------------------------------------------------
+  RAG_CHOICES = {
+    message: '⚠ В документах проекта есть близкие фрагменты, но все они ниже '
+      + 'порога УВЕРЕННОСТИ модели (порог 0,85) — поэтому в ответ они не пошли.',
+    options: [
+      { title: 'Снизить порог до 0,67 и повторить поиск',
+        details: 'лучший из отсечённых фрагментов модель оценила в 0,72',
+        send: 'Как делается резервное копирование?', apply: { min_ce: 0.67 } },
+      { title: 'Ответить по общим знаниям',
+        details: 'ответ будет помечен как «не из ваших документов»',
+        send: 'ответить по общим знаниям' },
+      { title: 'Уточнить вопрос', details: 'формулировку, термин или контекст',
+        send: '', action: 'clarify' },
+    ],
+  };
+  RAG.search.min_ce = 0.85;
+  await sendRequest('Как делается резервное копирование?');
+  await wait(80);
+  const choiceBox = q('#messages .inv-options').slice(-1)[0];
+  const choiceButtons = choiceBox ? Array.from(choiceBox.querySelectorAll('.inv-option')) : [];
+  check('варианты продолжения нарисованы под сообщением о пустом поиске',
+    choiceButtons.length === 3, 'вариантов: ' + choiceButtons.length);
+  check('мёртвых кнопок среди вариантов нет',
+    choiceButtons.every(btn => btn.disabled === false),
+    choiceButtons.map(btn => btn.disabled).join(','));
+  const relaxBtn = choiceButtons[0];
+  check('у варианта «снизить порог» видно, что уйдёт запросом',
+    relaxBtn.textContent.indexOf('повторить поиск') >= 0
+    && relaxBtn.textContent.indexOf('отправить как запрос') >= 0,
+    relaxBtn.textContent.slice(0, 120));
+  const relaxCallsBefore = calls.filter(c => c === 'POST /api/agent/rag/relax').length;
+  const bodiesBeforeRelax = chatBodies.length;
+  await click(relaxBtn, 120);
+  check('клик по «снизить порог» применил новую настройку на сервере',
+    calls.filter(c => c === 'POST /api/agent/rag/relax').length === relaxCallsBefore + 1
+    && Math.abs(Number(RAG.search.min_ce) - 0.67) < 1e-6,
+    String(RAG.search.min_ce));
+  check('после снижения порога поиск пошёл ЗАНОВО по тому же запросу',
+    chatBodies.slice(bodiesBeforeRelax).some(
+      b => String(b.content || '').indexOf('резервное копирование') >= 0),
+    JSON.stringify(chatBodies.slice(bodiesBeforeRelax)
+      .map(b => String(b.content || '').slice(0, 40))));
+  // «Уточнить вопрос» — действие в интерфейсе: отправлять нечего, зато курсор
+  // встаёт в поле ввода, и человек видит, чего от него ждут.
+  await wait(120);
+  const clarifyBtn = Array.from(
+    q('#messages .inv-options').slice(-1)[0].querySelectorAll('.inv-option'))[2];
+  const bodiesBeforeClarify = chatBodies.length;
+  await click(clarifyBtn, 60);
+  check('«уточнить вопрос» не отправляет запрос, а подсвечивает поле ввода',
+    chatBodies.length === bodiesBeforeClarify
+    && $('input').classList.contains('need-clarify'),
+    $('input').className + ' / ' + (chatBodies.length - bodiesBeforeClarify));
+  // ВТОРОЙ СЛУЧАЙ: отсёк порог ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ (фильтрация). Вариант
+  // обязан править ИМЕННО его, а не порог второго этапа: шкалы разные.
+  RAG_CHOICES = {
+    message: '⚠ В документах проекта есть близкие фрагменты, но все они ниже '
+      + 'порога ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ (порог 0,85 — косинус + слова запроса, '
+      + 'то число, что видно в карточке источника).',
+    options: [
+      { title: 'Снизить порог первичной релевантности до 0,68 и повторить поиск',
+        details: 'лучший из отсечённых фрагментов имел 0,73',
+        send: 'Как делается резервное копирование?', apply: { min_score: 0.68 } },
+      { title: 'Уточнить вопрос', details: 'формулировку, термин или контекст',
+        send: '', action: 'clarify' },
+    ],
+  };
+  RAG.search.min_score = 0.85;
+  const ceBefore = Number(RAG.search.min_ce);
+  const scoreCallsBefore = calls.filter(c => c === 'POST /api/agent/rag/relax').length;
+  const bodiesBeforeScore = chatBodies.length;
+  await sendRequest('Как делается резервное копирование?');
+  await wait(80);
+  const scoreBox = q('#messages .inv-options').slice(-1)[0];
+  const scoreBtn = scoreBox ? scoreBox.querySelector('.inv-option') : null;
+  check('вариант по первичной релевантности нарисован и активен',
+    !!scoreBtn && scoreBtn.disabled === false
+    && scoreBtn.textContent.indexOf('первичной релевантности') >= 0,
+    scoreBtn ? scoreBtn.textContent.slice(0, 100) : '(нет кнопки)');
+  await click(scoreBtn, 120);
+  check('клик правит порог ПЕРВИЧНОЙ релевантности, а не второго этапа',
+    calls.filter(c => c === 'POST /api/agent/rag/relax').length === scoreCallsBefore + 1
+    && Math.abs(Number(RAG.search.min_score) - 0.68) < 1e-6
+    && Number(RAG.search.min_ce) === ceBefore,
+    RAG.search.min_score + ' / ' + RAG.search.min_ce + ' (было ' + ceBefore + ')');
+  check('и повторяет поиск тем же запросом',
+    chatBodies.slice(bodiesBeforeScore).some(
+      b => String(b.content || '').indexOf('резервное копирование') >= 0),
+    JSON.stringify(chatBodies.slice(bodiesBeforeScore)
+      .map(b => String(b.content || '').slice(0, 40))));
+
+  RAG_CHOICES = null;
+  // Пороги возвращаем к тем, что выставила панель в разделе [S]: строка состояния
+  // ниже сверяется именно с ними.
+  RAG.search.min_ce = 0.42;
+  RAG.search.min_score = 0.5;
+  $('input').classList.remove('need-clarify');
 
   // СТРОКА СОСТОЯНИЯ ДИАЛОГА: с включённой базой она говорит, что поиск идёт в
   // ответы (сколько фрагментов и с какой близостью), а без баз — что базу можно
@@ -3573,7 +3843,15 @@ async function run() {
   console.log('\n[V] Команда /test_rag: вопросы, ответы и оценка');
   const suiteChatCalls = chatCalls();
   const suiteStepCalls = stepCalls();
-  RAG_SOURCES = null;
+  // Источники ответа теста: те же данные, что сервер отдаёт событием `bot`
+  // (см. app/routers/chat.py, rag_test). База — та, что включена у проекта.
+  RAG_SOURCES = [
+    { base_id: RAG.bases[0].id, chunk_id: 'kb-1-0-1080', base: 'Инструкции оператора',
+      source: 'guide.md', number: 7, section: 'Глава 2 › Резервное копирование',
+      score: 1.16, base_score: 1.15, by_model: true, ce: 0.98,
+      vector_score: 0.33, lexical: 0.82, chars: 420,
+      snippet: 'Резервное копирование выполняется командой backup.sh.' },
+  ];
   await sendRequest('/test_rag', 80);
   await wait(120);
   check('команда ушла в СВОЙ маршрут, а не в чат агента',
@@ -3601,6 +3879,45 @@ async function run() {
     !!testAnswers[0] && testAnswers[0].querySelectorAll('strong').length === 1
     && testAnswers[0].textContent.indexOf('**') < 0,
     testAnswers[0] ? testAnswers[0].textContent.slice(0, 60) : '');
+
+  // ФРАГМЕНТЫ И ЦИТАТЫ ПОД ОТВЕТОМ ТЕСТА — как у агента (правка 03.10): под
+  // ответом карточка источника с цитатой, клик по ней открывает ИМЕННО этот
+  // чанк, а «[N]» в тексте раскрывает цитату источника N.
+  const suiteCards = q('#messages .msg.bot .rag-sources');
+  check('под ответом теста появился блок источников (как под ответом агента)',
+    suiteCards.length === 1
+    && suiteCards[0].querySelectorAll('.rag-source').length === RAG_SOURCES.length,
+    'блоков: ' + suiteCards.length);
+  const suiteCard = q('#messages .msg.bot .rag-source')[0];
+  check('источник теста показывает номер чанка и ЦИТАТУ фрагмента',
+    !!suiteCard
+    && suiteCard.querySelector('.rag-source-name').textContent.indexOf('№ 7') >= 0
+    && suiteCard.querySelector('.rag-source-quote')
+      .textContent.indexOf('backup.sh') >= 0,
+    suiteCard ? suiteCard.textContent.slice(0, 80) : '(нет строки)');
+  check('источник теста кликабелен (переход к этому чанку)',
+    !!suiteCard && suiteCard.classList.contains('openable')
+    && suiteCard.dataset.n === '1', suiteCard ? suiteCard.className : '');
+  const suiteCite = q('#messages .msg.bot .msg-cite');
+  check('ссылка «[1]» в ответе теста стала кликабельной',
+    suiteCite.length === 1 && suiteCite[0].textContent === '[1]',
+    suiteCite.map(node => node.textContent).join(' '));
+  await click(suiteCite[0], 20);
+  check('клик по «[1]» раскрывает цитату источника теста',
+    suiteCard.querySelector('.rag-source-quote').classList.contains('open'),
+    suiteCard.querySelector('.rag-source-quote').className);
+  // Клик по строке открывает просмотр чанков ЭТОЙ базы с нужным номером первым.
+  await click(suiteCard, 120);
+  const suiteHit = q('#rag-chunks-list .rag-chunk.hit');
+  check('клик по источнику теста открыл этот чанк в просмотре базы',
+    $('rag-chunks-modal').hidden === false && suiteHit.length === 1
+    && suiteHit[0].textContent.indexOf('№ 7') >= 0,
+    $('rag-chunks-modal').hidden ? 'окно закрыто' : 'подсвечено: ' + suiteHit.length);
+  await click($('rag-chunks-close'), 40);
+  check('у ответа БЕЗ найденных фрагментов блока источников нет',
+    q('#messages .msg.bot').filter(
+      el => el.textContent.indexOf('спас-броску') >= 0
+        && el.querySelector('.rag-sources')).length === 0);
   check('вопрос без ответа показан предупреждением, а не пустым ответом',
     q('#messages .msg.bot').some(el => el.textContent.indexOf('остался без ответа') >= 0));
   const verdict = q('#messages .msg.bot').filter(

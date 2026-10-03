@@ -63,7 +63,8 @@ from app.ai.agent import (
 from app.schemas import (
     ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
     McpApply, MemoryEntryCreate, NameUpdate, PeriodicUpdate, PlanUpdate, ProfileCreate,
-    ProfileFields, RagApply, RagJobDone, RagUpload, SessionCreate, TaskCreate,
+    ProfileFields, RagApply, RagJobDone, RagRelax, RagUpload, SessionCreate,
+    TaskCreate,
 )
 
 logger = logging.getLogger(__name__)
@@ -2113,14 +2114,18 @@ def _rag_alternatives(task: Dict[str, Any]) -> List[str]:
 
 def _rag_general_state(task: Dict[str, Any], text: str, *, reuse: bool,
                        machine_step: bool) -> str:
-    """Можно ли по ЭТОМУ запросу отвечать по общим знаниям. Три состояния:
+    """Можно ли по ЭТОМУ запросу отвечать без документов. ЧЕТЫРЕ состояния:
 
-      * "allowed" — пользователь разрешил сам (список формулировок —
-        `rag_search.allows_general_answer`): он выбрал вариант, который агент
-        предложил, и вопрос задавать больше не о чем;
+      * "allowed" — пользователь разрешил отвечать ПО ОБЩИМ ЗНАНИЯМ сам (список
+        формулировок — `rag_search.allows_general_answer`): он выбрал вариант,
+        который агент предложил, и вопрос задавать больше не о чем;
+      * "continue" — он выбрал ПРОДОЛЖЕНИЕ ВНЕ ДОКУМЕНТОВ (внешние инструменты
+        проекта, `rag_search.allows_continuation`): данные инструментов — не общие
+        знания модели, и правила для них другие. Состояние нужно ровно затем,
+        чтобы не спросить «как продолжить» ВТОРОЙ раз (это зациклило бы задачу);
       * "ask" — базы включены, настройка проекта «спрашивать, если в документах
-        ничего нет» включена, и это НОВЫЙ запрос пользователя: ответ по общим
-        знаниям без его согласия давать нельзя (см. `_rag_choice_view`);
+        ничего нет» включена, и это НОВЫЙ запрос пользователя: отвечать без его
+        согласия нельзя (см. `_rag_choice_view`);
       * "" — спрашивать некого или нечего: служебный шаг плана, подтверждение
         плана, автономный прогон периодической задачи, выключенная настройка.
         Тогда агент отвечает, но ОБЯЗАН пометить, что это не из документов.
@@ -2133,6 +2138,8 @@ def _rag_general_state(task: Dict[str, Any], text: str, *, reuse: bool,
         return ""
     if rag_search.allows_general_answer(text):
         return "allowed"
+    if rag_search.allows_continuation(text):
+        return "continue"
     return "ask" if workspace_store.rag_settings(task).get("ask_when_empty", True) else ""
 
 
@@ -2143,48 +2150,134 @@ def _rag_choice_view(data: Dict[str, Any], task: Dict[str, Any]) -> Dict[str, An
     останавливается и ждёт решения пользователя — ровно то, что просили («конечное
     решение же должен предоставлять юзер, если в базе ничего не найдено»).
 
-    Варианты — готовые ФРАЗЫ, которые можно отправить как запрос: по ним же
-    распознаётся выбор (`rag_search.allows_general_answer`), поэтому порядок и
-    формулировки вариантов задаёт код, а не модель.
+    ВАРИАНТЫ — ДЕЙСТВИЯ, А НЕ ЗАГОТОВКИ. У каждого варианта есть ровно один способ
+    сработать, и он описан данными:
+
+      * `send` — готовая ФРАЗА, которую интерфейс отправляет как запрос
+        пользователя: по ней сервер узнаёт решение (`rag_search.allows_general_answer`
+        / `allows_continuation`), поэтому формулировки задаёт код, а не модель;
+      * `apply` — ПРАВКА НАСТРОЙКИ перед повторным поиском (сейчас это снижение
+        порога уверенности до значения, которое пропустит лучший из отсечённых
+        фрагментов): интерфейс сначала применяет настройку, потом отправляет
+        `send` — и поиск идёт заново, уже с новым порогом;
+      * `action` — действие в интерфейсе, когда отправлять нечего (`clarify` —
+        поставить курсор в поле ввода: уточнять формулировку может только человек).
+
+    Мёртвых кнопок здесь быть не должно: раньше варианты без готовой фразы просто
+    гасились, и предложение «снизить порог» ничего не делало.
     """
     bases = "; ".join(
         "%s — %s" % (item.get("name") or "база", rag_search._base_outcome(item))
         for item in (data.get("bases") or [])) or "нет"
+    stages = data.get("stages") or {}
+    cut_kind = rag_search.cut_kind(data)
     cut = rag_search._cut_by_threshold(data)
-    if cut:
+    # Запрос, по которому шёл поиск: его повторяют варианты, меняющие настройку —
+    # «снизить порог и поискать снова» обязано искать то же самое, иначе это была
+    # бы подмена вопроса.
+    request = str(data.get("request") or data.get("query") or "").strip()
+    # У ДВУХ ПОРОГОВ ДВЕ ШКАЛЫ, и в сообщении это названо прямо: путать «порог
+    # первичной релевантности» (0…2, косинус + слова запроса — то число, что видно
+    # в карточке источника) и «порог уверенности модели» (0…1, второй этап) нельзя
+    # — ровно на этой путанице и строился живой случай 03.10.
+    if cut_kind == "ce":
         head = ("⚠ В документах проекта есть близкие фрагменты, но все они ниже "
-                "порога УВЕРЕННОСТИ модели (порог %s) — поэтому в ответ они не пошли."
-                % _fmt_score((data.get("stages") or {}).get("min_ce")))
+                "порога УВЕРЕННОСТИ МОДЕЛИ (порог %s) — это порог ВТОРОГО этапа, "
+                "реранкинга, поэтому в ответ они не пошли."
+                % _fmt_score(stages.get("min_ce")))
+    elif cut_kind == "score":
+        head = ("⚠ В документах проекта есть близкие фрагменты, но все они ниже "
+                "порога ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ (порог %s — косинус + слова "
+                "запроса, то число, что видно в карточке источника)."
+                % _fmt_score(stages.get("min_score")))
     else:
         head = "⚠ В документах проекта по этому запросу ничего не нашлось."
     text = (head + "\n\nПоиск уже выполнен по всем включённым базам: " + bases
             + ".\n\nОтвечать по общим знаниям без вашего решения я не буду — "
               "выберите, как продолжить (или напишите свой вариант):")
-    options = [{
+    options: List[Dict[str, Any]] = []
+    if cut:
+        # СНИЖАЕМ ТОТ ПОРОГ, КОТОРЫЙ ОТСЁК: у каждого своя настройка, и совет
+        # «снизить порог» без указания, какой именно, отправлял бы человека не туда.
+        if cut_kind == "ce":
+            field, best = "min_ce", float(stages.get("cut_best_ce") or 0.0)
+            which = "уверенности модели"
+            limit = 1.0
+        else:
+            field, best = "min_score", float(stages.get("cut_best_score") or 0.0)
+            which = "первичной релевантности"
+            limit = rag_search.MIN_SCORE_LIMIT
+        target = _relax_target(best)
+        # Слабый лучший фрагмент: снижать нечего, и это сказано словами, а не
+        # мёртвой кнопкой. Для порога уверенности «слабо» — ниже 0,2 (у мусора
+        # 0,00–0,02), для первичной релевантности — ниже базового отсева шума.
+        weak = best < (RELAX_MIN_BEST if field == "min_ce"
+                       else float(stages.get("floor") or 0.0))
+        if not weak and request:
+            options.append({
+                "title": "Снизить порог %s до %s и повторить поиск"
+                         % (which, _fmt_score(target)),
+                "details": "лучший из отсечённых фрагментов имел %s — порог "
+                           "опустится чуть ниже него, и поиск пойдёт заново по "
+                           "тому же запросу" % _fmt_score(best),
+                "send": request,
+                "apply": {field: target},
+            })
+        else:
+            options.append({
+                "title": "Снизить порог %s и поискать снова" % which,
+                "details": "порог %s отсёк всё, но и лучший из отсечённых "
+                           "фрагментов слабый (%s): похоже, в документах ответа "
+                           "действительно нет — снижать порог нечего"
+                           % (_fmt_score(stages.get(field)), _fmt_score(best)),
+                "send": "",
+            })
+    options.append({
         "title": "Ответить по общим знаниям",
         "details": "ответ будет помечен как «не из ваших документов»",
         "send": rag_search.GENERAL_CHOICE,
-    }]
-    if cut:
-        options.insert(0, {
-            "title": "Снизить порог и поискать снова",
-            "details": "в документах есть близкое, но порог уверенности %s его отсёк — "
-                       "снизьте ползунок в панели «Поиск и ответы» и повторите запрос"
-                       % _fmt_score((data.get("stages") or {}).get("min_ce")),
-            "send": "",
-        })
+    })
     for item in (data.get("alternatives") or []):
         low = str(item).lower()
-        if "общим знаниям" in low or "уточнить вопрос" in low:
+        if "mcp" not in low and "инструмент" not in low:
             continue
-        options.append({"title": str(item)[:120], "details": "", "send": ""})
+        mcp_phrase = ("%s: %s" % (rag_search.MCP_CHOICE, request or "")).strip()
+        options.append({
+            "title": "Поискать во внешних инструментах проекта",
+            "details": "данные придут от инструментов проекта (MCP), а не из "
+                       "документов; поиск пойдёт по тому же запросу",
+            "send": mcp_phrase,
+        })
     options.append({
         "title": "Уточнить вопрос",
-        "details": "формулировку, термин или контекст — или добавьте документ в базу",
+        "details": "формулировку, термин или контекст — напишите уточнение, и я "
+                   "начну новый поиск по нему (можно и добавить документ в базу)",
         "send": "",
+        "action": "clarify",
     })
     return {"message": text, "options": options, "kind": "rag_empty",
             "bases": data.get("bases") or []}
+
+
+# Снижать порог есть смысл, только если отсечённое было ПОХОЖЕ на ответ: у мусора
+# оценка 0,0–0,2, у нужного фрагмента — 0,45–1,00 (замер cross-encoder). Ниже
+# этого значения предложение «снизить порог» было бы советом показать модели шум.
+RELAX_MIN_BEST = 0.2
+
+
+def _relax_target(best: Any) -> float:
+    """До какого значения снизить порог, чтобы пропустить лучший отсечённый фрагмент.
+
+    Шаг — 0,05 вниз от его оценки: попап «снизить до 0» показывал бы модели весь
+    шум, а попап «снизить на волосок» не пропустил бы ничего. Ноль остаётся
+    законным значением («не отсекать»), но получается только из нулевой оценки.
+    Одна функция на ОБА порога: шкалы у них разные, а правило шага — одно.
+    """
+    try:
+        value = float(best or 0.0)
+    except (TypeError, ValueError):
+        value = 0.0
+    return max(0.0, round(value - 0.05, 2))
 
 
 def _fmt_score(value: Any) -> str:
@@ -2211,6 +2304,7 @@ def _rag_debug(settings: Any = None) -> str:
     data = settings if isinstance(settings, dict) else {}
     rerank = bool(data.get("rerank"))
     filter_on = bool(data.get("filter"))
+    min_score = float(data.get("min_score") or 0.0)
     min_ce = float(data.get("min_ce") or 0.0)
     parts = ["RAG: ищу фрагменты в подключённых базах знаний проекта"]
     if rerank:
@@ -2220,19 +2314,30 @@ def _rag_debug(settings: Any = None) -> str:
         parts.append("ДВА ЭТАПА: сначала широкий пул кандидатов (до %d с базы) "
                      "векторным поиском, затем реранкинг пула (%s)"
                      % (rag_search.top_k_before(), engine))
-        if filter_on and min_ce > 0:
-            parts.append("и отсечение фрагментов, в которых уверенность модели "
-                         "ниже %.2f" % min_ce)
     else:
         parts.append("реранкинг выключен, поэтому пула нет: беру %d лучших "
                      "фрагментов по вектору и словам" % rag_search.top_k())
+    # ДВА ПОРОГА, ДВЕ ШКАЛЫ — и в дебаге они названы раздельно. Порог уверенности
+    # модели принадлежит ВТОРОМУ этапу: без реранкинга он не применяется, и
+    # подменять его первичной релевантностью нельзя (шкалы разные).
+    if filter_on and min_score > 0:
+        parts.append("фрагменты с первичной релевантностью ниже %.2f (косинус + "
+                     "слова запроса — то число, что видно в карточке источника) "
+                     "отсею до реранкинга" % min_score)
+    if filter_on and min_ce > 0:
+        if rerank:
+            parts.append("фрагменты с уверенностью модели ниже %.2f отсею после "
+                         "реранкинга" % min_ce)
+        else:
+            parts.append("порог уверенности модели %.2f не применяется: он "
+                         "относится к реранкингу, а реранкинг выключен" % min_ce)
     if bool(data.get("rewrite")):
         parts.append("запрос перед поиском переформулирую служебным вызовом модели "
                      "(Query Rewrite: в базу идут ключевые слова, а не разговорный "
                      "вопрос; отключается галочкой в «Поиск и ответы»)")
-    return ("; ".join(parts) + ". Всё локально — эмбеддинги, перебор индекса"
-            + (" и реранкер" if rerank else "") + ", обращений к LLM за "
-            "фрагментами нет.")
+    return ("; ".join(parts) + ". Поиск локальный — эмбеддинги, перебор индекса"
+            + (" и реранкер" if rerank else "")
+            + "; обращений к LLM за фрагментами нет.")
 
 
 def _mcp_files_text(files: List[Dict[str, Any]]) -> str:
@@ -2979,14 +3084,24 @@ async def rag_apply(payload: RagApply) -> dict:
         # движок один — модель, нужная фильтрации. Здесь только проверяем, что она
         # есть, прежде чем включать фильтр.
         backend_now = settings_now.get("rerank_backend") or rag_rerank.backend()
-        # ФИЛЬТРАЦИЯ ТРЕБУЕТ МОДЕЛИ: вероятностей у признакового реранкинга нет, и
-        # «фильтровать по порогу» было бы нечем. Включение галочки без модели —
-        # ОШИБКА с причиной, а не тихая подмена шкалы (просьба от 02.10).
-        if payload.filter and not rag_rerank.filter_available(backend_now):
+        # ЧТО ТРЕБУЕТ МОДЕЛИ, А ЧТО НЕТ. Порог ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ считается
+        # без модели вообще — ему реранкер не нужен. А вот порог УВЕРЕННОСТИ
+        # МОДЕЛИ без модели-реранкера применить нечем: вероятностей у признакового
+        # бэкенда нет. Настроить такое «на будущее» можно, но включать реранкинг с
+        # неработающим порогом — нет: это ровно та настройка, которая выглядит
+        # действующей, а не действует.
+        next_ce = payload.min_ce if payload.min_ce is not None \
+            else settings_now.get("min_ce")
+        next_rerank = payload.rerank if payload.rerank is not None \
+            else settings_now.get("rerank")
+        if payload.filter and next_rerank and float(next_ce or 0.0) > 0 \
+                and not rag_rerank.filter_available(backend_now):
             raise HTTPException(
                 status_code=400,
-                detail="Фильтрация по порогу требует модель-реранкер: "
-                       + rag_rerank.filter_reason(backend_now))
+                detail="Порог уверенности модели требует модель-реранкер: "
+                       + rag_rerank.filter_reason(backend_now)
+                       + ". Порог первичной релевантности работает и без неё — "
+                         "им и можно отсекать фрагменты.")
         workspace_store.set_rag_search(
             task,
             rewrite=payload.rewrite,
@@ -2995,6 +3110,7 @@ async def rag_apply(payload: RagApply) -> dict:
             ask_when_empty=payload.ask_when_empty,
             top_k_before=payload.top_k_before,
             top_k_after=payload.top_k_after,
+            min_score=payload.min_score,
             min_ce=payload.min_ce)
         # Фрагменты прежнего запроса сбрасываются (dialog["rag"]): набор баз
         # изменился, и найденное ранее могло быть подобрано по базе, которую
@@ -3006,6 +3122,50 @@ async def rag_apply(payload: RagApply) -> dict:
             if isinstance(dialog, dict):
                 workspace_store.set_dialog_rag(dialog, "", "", {})
         await _persist()
+    return _rag_view(task)
+
+
+@router.post("/agent/rag/relax")
+async def rag_relax(payload: RagRelax) -> dict:
+    """СНИЖАЕТ ПОРОГ по выбору пользователя и разрешает новый поиск.
+
+    Порогов ДВА, и маршрут принимает любой из них (`min_score` — первичная
+    релевантность, `min_ce` — уверенность модели): у каждого своя шкала, и снижать
+    надо именно тот, который отсёк (см. `_rag_choice_view`).
+
+    Зачем отдельный маршрут. Порог отсёк ВСЁ найденное — агент останавливается и
+    предлагает варианты, один из них — «снизить порог до … и повторить поиск». Клик по варианту обязан что-то делать: здесь сервер
+    запоминает новое значение порога и СБРАСЫВАЕТ сохранённые фрагменты запроса
+    (`dialog["rag"]`) — без сброса следующий запрос с тем же текстом нашёл бы в
+    диалоге прежнюю пустую запись по ТОЙ ЖЕ подписи (базы + отпечаток + запрос) и
+    поиск не повторился бы: пользователь получил бы тот же вопрос заново, то есть
+    цикл.
+
+    Меняется ТОЛЬКО переданный порог: второй порог, реранкинг, выборки, галочки
+    баз и правила проекта остаются как были. Обращений к модели здесь нет — это настройка.
+    """
+    task = _current_task()
+    if task is None:
+        raise HTTPException(status_code=400,
+                            detail="Сначала создайте проект — настройка живёт на проекте")
+    if payload.min_ce is None and payload.min_score is None:
+        raise HTTPException(status_code=400,
+                            detail="Не передан новый порог (ни первичной "
+                                   "релевантности, ни уверенности модели)")
+    async with _workspace_lock:
+        settings_before = workspace_store.rag_settings(task)
+        workspace_store.set_rag_search(task, min_ce=payload.min_ce,
+                                       min_score=payload.min_score)
+        settings_after = workspace_store.rag_settings(task)
+        for session in task.get("sessions") or []:
+            dialog = session.get("dialog")
+            if isinstance(dialog, dict):
+                workspace_store.set_dialog_rag(dialog, "", "", {})
+        await _persist()
+    logger.info("RAG: порог снижен по выбору пользователя: первичная "
+                "релевантность %s → %s, уверенность модели %s → %s",
+                settings_before.get("min_score"), settings_after.get("min_score"),
+                settings_before.get("min_ce"), settings_after.get("min_ce"))
     return _rag_view(task)
 
 
@@ -3249,12 +3409,17 @@ async def rag_job_finish(payload: RagJobDone) -> dict:
 
 @router.get("/agent/rag/{base_id}/chunks")
 async def rag_chunks(base_id: str, offset: int = 0, limit: int = 10,
-                     source: str = "", q: str = "") -> dict:
+                     source: str = "", q: str = "", chunk: int = 0) -> dict:
     """Страница чанков базы: посмотреть своими глазами, как нарезан документ.
 
     Отдаёт текст чанков с их адресом (источник, раздел, номер, границы в
     документе) и общее число под фильтром. Фильтры: по документу (`source`) и
     по тексту (`q`). Постранично — база на 20 000 чанков в диалог не поместится.
+
+    `chunk` — номер чанка, к которому надо перейти (клик по источнику под ответом
+    агента): страница сдвигается так, чтобы он был первым. Так вариант «открыть
+    фрагмент, по которому получен ответ» действительно открывает ЕГО, а не первую
+    страницу базы.
 
     Чужую базу профиль не видит (404): просмотр — такая же работа с базой, как
     и удаление.
@@ -3263,7 +3428,8 @@ async def rag_chunks(base_id: str, offset: int = 0, limit: int = 10,
         raise HTTPException(status_code=404, detail="База знаний не найдена")
     try:
         return rag.chunks_view(base_id, profile=_current_profile_id(),
-                               offset=offset, limit=limit, source=source, query=q)
+                               offset=offset, limit=limit, source=source, query=q,
+                               chunk=chunk)
     except rag.RagError:
         raise HTTPException(status_code=404, detail="База знаний не найдена")
 
@@ -3303,7 +3469,10 @@ async def rag_test(request: Request) -> StreamingResponse:
       * `{"type": "test_start", "total": N, "bases": [...]}` — начали, столько-то
         вопросов по таким-то базам;
       * `{"type": "test_question", "n": i, "total": N, "text": "…"}` — вопрос;
-      * `{"type": "bot", "text": "…"}` — ответ модели по фрагментам;
+      * `{"type": "bot", "text": "…", "test": i, "sources": [...]}` — ответ модели
+        по фрагментам ВМЕСТЕ С ИСТОЧНИКАМИ (`rag_search.sources`): интерфейс рисует
+        под ним те же карточки, что под ответом агента — с цитатой и переходом к
+        чанку (иначе тест проверял бы поиск, но не то, что видит человек);
       * `{"type": "test_error", "n": i, "text": "…"}` — вопрос остался без ответа
         (прогон НЕ обрывается: остальные вопросы всё равно проверяются);
       * `{"type": "test_verdict", "text": …, "items": [...]}` — вердикт судьи;
@@ -3338,10 +3507,16 @@ async def rag_test(request: Request) -> StreamingResponse:
         meta = rag_store.get_base(base_id, profile=profile) or {}
         base_names.append(str(meta.get("name") or base_id))
 
-    def log(kind: str, text: str) -> None:
-        """Запись в журнал ЧАТА (не в память диалога): тест должен быть виден."""
+    def log(kind: str, text: str, sources: Any = None) -> None:
+        """Запись в журнал ЧАТА (не в память диалога): тест должен быть виден.
+
+        `sources` — фрагменты, по которым модель ответила на вопрос теста: узел
+        журнала хранит их тем же полем, что и ответ агента, поэтому карточки
+        источников (с цитатой и переходом к чанку) видны и после переключения
+        задачи или перезагрузки страницы.
+        """
         if dialog is not None:
-            workspace_store.add_log(dialog, kind, text)
+            workspace_store.add_log(dialog, kind, text, sources=sources)
 
     async def event_stream():
         # Прогон НЕ берёт блокировку задачи: он ничего не меняет в её состоянии, а
@@ -3443,9 +3618,17 @@ async def rag_test(request: Request) -> StreamingResponse:
                              ensure_ascii=False) + "\n"
             log(workspace_store.LOG_DEBUG, source_line)
             if row["answer"]:
-                log(workspace_store.LOG_ASSISTANT, row["answer"])
+                # ИСТОЧНИКИ — вместе с ответом, как у агента: по ним интерфейс
+                # рисует карточки фрагментов (файл, раздел, номер чанка, цитата) и
+                # делает кликабельными ссылки «[N]» в тексте ответа. В журнал они
+                # идут тем же полем `sources`, поэтому видны и после переключения
+                # задачи (см. workspace.add_log).
+                answer_sources = rag_search.sources(result)
+                log(workspace_store.LOG_ASSISTANT, row["answer"],
+                    sources=answer_sources)
                 yield json.dumps({"type": "bot", "text": row["answer"],
-                                  "test": number}, ensure_ascii=False) + "\n"
+                                  "test": number, "sources": answer_sources},
+                                 ensure_ascii=False) + "\n"
             else:
                 text = ("⚠ Вопрос %d остался без ответа: %s"
                         % (number, row["error"] or "причина неизвестна"))

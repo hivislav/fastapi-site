@@ -903,6 +903,13 @@
             border-color: var(--accent);
             box-shadow: 0 0 14px rgba(34, 211, 238, 0.15);
         }
+        /* Поле, к которому агент позвал за уточнением («Уточнить вопрос»):
+           подсветка нужна потому, что действие варианта — именно ввод текста, а
+           не отправка готовой фразы. */
+        .input-row input.need-clarify {
+            border-color: var(--accent-2);
+            box-shadow: 0 0 14px rgba(0, 255, 157, 0.18);
+        }
         .input-row button {
             padding: 12px 22px;
             border: 1px solid var(--line-strong);
@@ -1073,7 +1080,7 @@
             color: var(--muted);
             font-size: 0.82rem;
         }
-        .rag-sources-body { display: flex; flex-direction: column; gap: 2px; }
+        .rag-sources-body { display: flex; flex-direction: column; gap: 4px; }
         .rag-source {
             display: flex;
             flex-wrap: wrap;
@@ -1084,6 +1091,44 @@
         .rag-source-num { color: var(--muted); font-family: var(--mono); min-width: 18px; }
         .rag-source-name { color: var(--accent-2); font-weight: 600; word-break: break-all; }
         .rag-source-meta { color: var(--muted); font-size: 0.8rem; }
+        /* ИСТОЧНИК КЛИКАБЕЛЕН: по нему открывается ИМЕННО этот фрагмент в
+           просмотре чанков базы. Подчёркивание и курсор — единственный признак,
+           по которому человек догадывается, что строка нажимается. */
+        .rag-source.openable .rag-source-name,
+        .rag-source.openable .rag-source-num { cursor: pointer; text-decoration: underline dotted; }
+        .rag-source.openable:hover .rag-source-name { color: var(--accent); }
+        .rag-source.flash { background: var(--surface-2); border-radius: 6px; }
+        /* ЦИТАТА: сам фрагмент, из которого взят ответ. Показана двумя строками и
+           разворачивается по клику — иначе десять источников превращались бы в
+           простыню текста, которую никто не читает. */
+        .rag-source-quote {
+            flex: 1 1 100%;
+            margin: 2px 0 0 24px;
+            padding: 4px 8px;
+            border-left: 2px solid var(--line-strong);
+            color: var(--text-dim);
+            font-size: 0.8rem;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            cursor: pointer;
+        }
+        .rag-source-quote.open { -webkit-line-clamp: unset; display: block; }
+        .rag-source-quote-empty { color: var(--muted); font-style: italic; }
+        /* ССЫЛКА НА ФРАГМЕНТ В ОТВЕТЕ («[1]»): клик открывает цитату источника
+           под ответом. Номер — то же число, что в карточке источников. */
+        .msg-cite {
+            color: var(--accent-2);
+            cursor: pointer;
+            font-family: var(--mono);
+            font-size: 0.85em;
+            padding: 0 1px;
+        }
+        .msg-cite:hover { color: var(--accent); text-decoration: underline; }
         .inv-option {
             display: block;
             width: 100%;
@@ -1432,6 +1477,14 @@
             border-radius: 10px;
             background: var(--surface-2);
             padding: 11px 13px;
+        }
+        /* Фрагмент, к которому пришли по клику на источник под ответом: подсветка
+           нужна потому, что в списке он не один, а искать его глазами человек не
+           должен. */
+        .rag-chunk.hit {
+            border-color: var(--accent-2);
+            border-left-color: var(--accent-2);
+            box-shadow: 0 0 0 1px var(--accent-2);
         }
         .rag-chunk-head {
             display: flex;
@@ -2374,7 +2427,9 @@
                         перепиской: они уходят в модель только на время запроса.
                         <b>Проверка:</b> введите в чат команду <b>/test_rag</b> —
                         прогон контрольных вопросов по включённым базам; ответы
-                        сверяются эталонами, выписанными из самой базы.</p>
+                        сверяются эталонами, выписанными из самой базы. Под каждым
+                        ответом видны те же источники, что и в обычном ответе —
+                        с цитатой фрагмента и переходом к чанку.</p>
                     <div class="rag-list" id="rag-list"></div>
                     <p class="modal-hint rag-status" id="rag-status" hidden></p>
 
@@ -2388,14 +2443,15 @@
                     <div class="rag-search">
                         <h4>Поиск и ответы</h4>
                         <p class="rag-strategy-hint">Как документы попадают в ответ.
-                            Первый этап ищет кандидатов по смыслу и словам запроса,
-                            второй — реранкинг моделью-кросс-энкодером: она читает
-                            пару «вопрос + фрагмент» и решает, отвечает ли он
-                            (0…1). В ответ идут лучшие по этой оценке, а фрагменты,
-                            в которых модель уверена меньше порога, отбрасываются.
-                            Под ответом видно два числа: релевантность первичного
-                            поиска (косинус + слова, от 0 до 3) и оценка модели
-                            (0…1) — по ней и стоит настраивать строгость.</p>
+                            Первый этап ищет кандидатов по смыслу и словам запроса:
+                            его число — <b>первичная релевантность</b> (косинус +
+                            слова, 0…2), оно же видно в карточке источника. Второй
+                            этап (реранкинг) читает пару «вопрос + фрагмент»
+                            моделью-кросс-энкодером и даёт <b>уверенность
+                            модели</b> (0…1). Это ДВЕ РАЗНЫЕ ШКАЛЫ, и порога у
+                            каждой свой: фильтрация отсекает по первичной
+                            релевантности (работает всегда, модели не требует), а
+                            порог уверенности — настройка реранкинга.</p>
                         <div class="rag-flags">
                             <label class="rag-flag" for="rag-rewrite">
                                 <input type="checkbox" id="rag-rewrite">
@@ -2438,9 +2494,18 @@
                              её нет. Ручной переключатель на признаки остался в
                              окружении (RAG_RERANK_BACKEND) — на случай сбоя. -->
                         <p class="rag-strategy-hint" id="rag-rerank-note" hidden></p>
+                        <!-- ДВА ПОРОГА, ДВЕ ШКАЛЫ. Верхний — первичная
+                             релевантность (фильтрация): работает всегда, модели не
+                             требует. Нижний — уверенность модели (второй этап):
+                             без реранкинга не применяется. -->
                         <div class="rag-field rag-range-field">
-                            <label for="rag-min-ce">Порог уверенности модели (основной):
-                                <span id="rag-min-ce-value">—</span></label>
+                            <label for="rag-min-score">Порог первичной релевантности
+                                (фильтрация, 0…2): <span id="rag-min-score-value">—</span></label>
+                            <input type="range" id="rag-min-score" min="0" max="2" step="0.05">
+                        </div>
+                        <div class="rag-field rag-range-field">
+                            <label for="rag-min-ce">Порог уверенности модели
+                                (реранкинг, 0…1): <span id="rag-min-ce-value">—</span></label>
                             <input type="range" id="rag-min-ce" min="0" max="1" step="0.05">
                         </div>
 
@@ -5220,7 +5285,10 @@
             if (agentMsg) wrap.setAttribute('data-agent', '1');
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
-            renderMessageText(bubble, text);
+            // Ссылки на фрагменты («[1]») размечаются только в ответах агента: в
+            // его тексте это номера из блока баз знаний, а в реплике пользователя
+            // «[1]» может быть чем угодно.
+            renderMessageText(bubble, text, role === 'bot' && agentMsg);
             wrap.appendChild(bubble);
             // Время — у реплик пользователя и ответов агента; у служебной строки
             // (role="debug") его не показываем.
@@ -5250,8 +5318,12 @@
         // текстом как есть: выдумывать разметку, которой модель не писала, нельзя.
         const BOLD_RE = /\*\*([^*\n]+)\*\*/g;
         const BULLET_RE = /^(\s*)\*\s+/;
+        // ССЫЛКА НА ФРАГМЕНТ: модель ставит номер фрагмента из блока баз знаний —
+        // «[1]», «[3][4]». Такой номер показывается кликабельным: по клику
+        // раскрывается цитата источника под ответом (см. drawSourceCards).
+        const CITE_RE = /\[(\d{1,2})\]/g;
 
-        function renderMessageText(node, text) {
+        function renderMessageText(node, text, citations) {
             const lines = String(text == null ? '' : text).split('\n');
             lines.forEach((line, index) => {
                 if (index) node.appendChild(document.createTextNode('\n'));
@@ -5264,26 +5336,56 @@
                     node.appendChild(marker);
                     line = line.slice(bullet[0].length);
                 }
-                appendBold(node, line);
+                appendBold(node, line, citations);
             });
             return node;
         }
 
-        // Разбор строки на куски: обычный текст — текстовыми узлами, «**…**» — жирным.
-        function appendBold(node, line) {
+        // Разбор строки на куски: обычный текст — текстовыми узлами, «**…**»
+        // жирным, «[N]» — ссылкой на фрагмент (только в ответах агента: в реплике
+        // пользователя «[1]» вполне может быть просто текстом).
+        function appendBold(node, line, citations) {
             const text = String(line == null ? '' : line);
             let last = 0;
             BOLD_RE.lastIndex = 0;
             let match = BOLD_RE.exec(text);
             while (match) {
                 if (match.index > last) {
-                    node.appendChild(document.createTextNode(text.slice(last, match.index)));
+                    appendCitations(node, text.slice(last, match.index), citations);
                 }
                 const strong = document.createElement('strong');
                 strong.textContent = match[1];
                 node.appendChild(strong);
                 last = match.index + match[0].length;
                 match = BOLD_RE.exec(text);
+            }
+            if (last < text.length) {
+                appendCitations(node, text.slice(last), citations);
+            }
+            return node;
+        }
+
+        function appendCitations(node, chunk, citations) {
+            const text = String(chunk == null ? '' : chunk);
+            if (!citations) {
+                node.appendChild(document.createTextNode(text));
+                return;
+            }
+            let last = 0;
+            CITE_RE.lastIndex = 0;
+            let match = CITE_RE.exec(text);
+            while (match) {
+                if (match.index > last) {
+                    node.appendChild(document.createTextNode(text.slice(last, match.index)));
+                }
+                const cite = document.createElement('span');
+                cite.className = 'msg-cite';
+                cite.dataset.n = match[1];
+                cite.textContent = match[0];
+                cite.title = 'Фрагмент № ' + match[1] + ' — показать цитату источника';
+                node.appendChild(cite);
+                last = match.index + match[0].length;
+                match = CITE_RE.exec(text);
             }
             if (last < text.length) {
                 node.appendChild(document.createTextNode(text.slice(last)));
@@ -5342,10 +5444,11 @@
         }
 
         // Источники под ответом — ОДНИМ сообщением: заголовок и нумерованный
-        // список «номер чанка · файл · раздел · база · релевантность». В подсказке
-        // строки — отрывок фрагмента и из чего сложилась оценка (вектор + текст).
-        // Подпись честно говорит «подобраны по запросу»: попали ли эти фрагменты
-        // в текст ответа, решает модель.
+        // список «номер чанка · файл · раздел · база · релевантность» плюс ЦИТАТА
+        // (начало самого фрагмента). Строка КЛИКАБЕЛЬНА: по ней открывается именно
+        // этот фрагмент в просмотре чанков базы — по номеру чанка и базе, а не
+        // поиском глазами. Номер строки — тот же, что в ссылках вида «[1]» в
+        // тексте ответа: клик по ссылке раскрывает цитату источника.
         function drawSourceCards(wrap, sources) {
             const list = (sources || []).filter(item => item && item.source);
             if (!list.length) return;
@@ -5354,13 +5457,14 @@
             const head = document.createElement('div');
             head.className = 'rag-sources-head';
             head.textContent = 'Фрагменты баз знаний, подобранные по этому запросу '
-                + '(переданы модели):';
+                + '(переданы модели; клик по источнику открывает чанк):';
             box.appendChild(head);
             const body = document.createElement('div');
             body.className = 'rag-sources-body';
             list.forEach((item, index) => {
                 const line = document.createElement('div');
                 line.className = 'rag-source';
+                line.dataset.n = String(index + 1);
                 const num = document.createElement('span');
                 num.className = 'rag-source-num';
                 num.textContent = (index + 1) + '.';
@@ -5368,7 +5472,7 @@
                 const name = document.createElement('span');
                 name.className = 'rag-source-name';
                 // Номер чанка — тот же, что в окне «чанки» базы: по нему фрагмент
-                // находится глазами.
+                // находится глазами, а клик открывает его сразу.
                 name.textContent = (item.number ? '№ ' + fmtNum(item.number) + ' · ' : '')
                     + item.source;
                 line.appendChild(name);
@@ -5401,6 +5505,19 @@
                                  : ''))
                 ].filter(Boolean).join(' · ');
                 line.appendChild(meta);
+                // ЦИТАТА ФРАГМЕНТА: то, из чего взят ответ. Разворачивается кликом
+                // (клик по самой цитате не открывает окно чанков — иначе читать её
+                // было бы нельзя).
+                const quote = document.createElement('div');
+                quote.className = 'rag-source-quote';
+                quote.textContent = item.snippet || 'текст фрагмента не сохранён';
+                if (!item.snippet) quote.classList.add('rag-source-quote-empty');
+                quote.title = 'Цитата фрагмента. Клик — развернуть целиком';
+                quote.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    quote.classList.toggle('open');
+                });
+                line.appendChild(quote);
                 const parts = [];
                 if (typeof item.vector_score === 'number' || typeof item.lexical === 'number') {
                     // Разбор оценки: первый этап (вектор + текст) и добавки
@@ -5429,10 +5546,52 @@
                 }
                 if (item.snippet) parts.push(item.snippet);
                 if (parts.length) line.title = parts.join('\n\n');
+                // ПЕРЕХОД К ЧАНКУ: нужны база и номер. Нет базы (запись прежнего
+                // журнала) — строка остаётся простым текстом, а не мёртвой кнопкой.
+                if (item.base_id && item.number) {
+                    line.classList.add('openable');
+                    line.addEventListener('click', () => openSourceChunk(item));
+                }
                 body.appendChild(line);
             });
             box.appendChild(body);
             wrap.appendChild(box);
+            // ССЫЛКИ «[1]» В ТЕКСТЕ ОТВЕТА: клик раскрывает цитату источника с
+            // этим номером и прокручивает к ней. Слушатель один на сообщение —
+            // узлов-ссылок в тексте бывает много.
+            wrap.addEventListener('click', (event) => {
+                const cite = event.target.closest ? event.target.closest('.msg-cite') : null;
+                if (!cite) return;
+                const target = body.querySelector(
+                    '.rag-source[data-n="' + cite.dataset.n + '"]');
+                if (!target) return;
+                const quote = target.querySelector('.rag-source-quote');
+                if (quote) quote.classList.add('open');
+                target.classList.add('flash');
+                if (target.scrollIntoView) target.scrollIntoView({ block: 'center' });
+                setTimeout(() => target.classList.remove('flash'), 1200);
+            });
+        }
+
+        // Открывает фрагмент, по которому получен ответ, в просмотре чанков базы.
+        // Список баз берём из снимка RAG (`ragData`): он уже прочитан кнопкой
+        // «RAG»; если снимка нет — читаем его и повторяем попытку, иначе переход
+        // молча ничего бы не сделал.
+        async function openSourceChunk(item) {
+            if (!item || !item.base_id || !item.number) return;
+            let base = ((ragData && ragData.bases) || [])
+                .find(entry => entry.id === item.base_id);
+            if (!base) {
+                await loadRag(false);
+                base = ((ragData && ragData.bases) || [])
+                    .find(entry => entry.id === item.base_id);
+            }
+            if (!base) {
+                addMessage('bot', '⚠ База знаний этого фрагмента больше не доступна '
+                    + '(удалена или принадлежит другому профилю).', true);
+                return;
+            }
+            await openChunks(base, { number: item.number, source: item.source });
         }
 
         // Карточки файлов под сообщением агента: имя, размер, источник и ссылка
@@ -5480,9 +5639,16 @@
         // вариант — решение «главнее проект/задача»).
         // ВАРИАНТЫ ПРОДОЛЖЕНИЯ, КОГДА В ДОКУМЕНТАХ НИЧЕГО НЕТ. Это не варианты
         // инвариантов: там клик спрашивает сервер «что делать с номером», а здесь
-        // вариант — ГОТОВАЯ фраза, которую пользователь отправляет как запрос (по
-        // ней сервер и узнаёт его решение, см. rag_search.allows_general_answer).
-        // Поэтому кнопка просто отправляет текст, а не ходит в маршрут инвариантов.
+        // у варианта есть ДЕЙСТВИЕ, описанное данными (см. _rag_choice_view):
+        //   * send — готовая фраза, которая уходит как запрос пользователя (по ней
+        //     сервер и узнаёт решение, см. rag_search.allows_general_answer);
+        //   * apply — правка настройки ПЕРЕД повторным поиском (снижение порога):
+        //     сначала применяем её на сервере, потом отправляем запрос — иначе
+        //     поиск пошёл бы с прежним порогом и вернул то же самое;
+        //   * action "clarify" — действие в интерфейсе: уточнять формулировку
+        //     может только человек, поэтому ставим курсор в поле ввода.
+        // Мёртвых кнопок здесь быть не должно: раньше варианты без готовой фразы
+        // просто гасились.
         function drawRagChoices(wrap, analysis) {
             const list = (analysis.options || []).filter(item => item && item.title);
             if (!list.length) return;
@@ -5502,21 +5668,68 @@
                     details.textContent = item.details;
                     btn.appendChild(details);
                 }
+                const actionable = Boolean(item.send || item.action || item.apply);
                 if (item.send) {
                     const note = document.createElement('span');
                     note.className = 'inv-option-send';
                     note.textContent = 'отправить как запрос: «' + item.send + '»';
                     btn.appendChild(note);
-                    btn.addEventListener('click', () => sendUserText(item.send));
+                }
+                if (actionable) {
+                    btn.addEventListener('click', () => applyRagChoice(item));
                 } else {
-                    // Вариант-подсказка (например «снизить порог»): действия в чате
-                    // у него нет, и обещать кнопкой нечего.
+                    // Вариант-подсказка без действия: обещать кнопкой нечего.
                     btn.disabled = true;
                     btn.classList.add('inv-option-hint');
                 }
                 box.appendChild(btn);
             });
             wrap.appendChild(box);
+        }
+
+        // Выполняет выбранный вариант: правка настройки (если она есть), затем
+        // отправка фразы как нового запроса. Ошибку правки не скрываем — иначе
+        // пользователь решил бы, что поиск ушёл с новым порогом, хотя тот не
+        // изменился.
+        async function applyRagChoice(item) {
+            if (item.apply) {
+                // Правка ТОГО порога, который отсёк: у первичной релевантности и у
+                // уверенности модели разные шкалы, и «снизить порог» без указания,
+                // какой именно, отправило бы человека не туда.
+                const body = {};
+                let what = '';
+                if (item.apply.min_score !== undefined) {
+                    body.min_score = Number(item.apply.min_score);
+                    what = 'первичной релевантности';
+                }
+                if (item.apply.min_ce !== undefined) {
+                    body.min_ce = Number(item.apply.min_ce);
+                    what = 'уверенности модели';
+                }
+                if (Object.keys(body).length) {
+                    const data = await ragRequest('/api/agent/rag/relax',
+                        jsonOptions('POST', body));
+                    if (!data) {
+                        addMessage('bot', '⚠ Не удалось изменить порог — причина в '
+                            + 'чате выше. Попробуйте ещё раз или поменяйте пороги в '
+                            + 'панели «Поиск и ответы».', true);
+                        return;
+                    }
+                    ragData = data;
+                    addMessage('bot', '⚙ Порог ' + what + ' снижен до '
+                        + ragScoreText(Object.values(body)[0])
+                        + ' — повторяю поиск по тому же запросу.', true);
+                }
+            }
+            if (item.send) {
+                await sendUserText(item.send);
+                return;
+            }
+            if (item.action === 'clarify') {
+                input.focus();
+                input.placeholder = 'Уточните вопрос: формулировку, термин или контекст';
+                input.classList.add('need-clarify');
+            }
         }
 
         function drawInvariantOptions(wrap, analysis) {
@@ -6308,6 +6521,10 @@
         const ragTopAfterEl = document.getElementById('rag-top-after');
         const ragMinCeEl = document.getElementById('rag-min-ce');
         const ragMinCeValueEl = document.getElementById('rag-min-ce-value');
+        // Порог ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ — отдельный ползунок со своей шкалой (0…2):
+        // это настройка фильтрации, а не реранкинга.
+        const ragMinScoreEl = document.getElementById('rag-min-score');
+        const ragMinScoreValueEl = document.getElementById('rag-min-score-value');
 
         const ragSearchHintEl = document.getElementById('rag-search-hint');
         const ragChunksModal = document.getElementById('rag-chunks-modal');
@@ -6321,7 +6538,11 @@
         let ragData = null;
         // Состояние просмотра чанков: какую базу смотрим, сколько уже
         // показано и с каким фильтром (сервер отдаёт страницу и общее число).
-        let ragChunks = { base: null, offset: 0, total: 0, source: '', query: '' };
+        // `focus` — номер чанка, к которому надо перейти (клик по источнику под
+        // ответом агента): сервер отдаёт страницу с ним первым, интерфейс
+        // подсвечивает его и прокручивает к нему.
+        let ragChunks = { base: null, offset: 0, total: 0, source: '', query: '',
+                          focus: 0 };
         const ragProgressEl = document.getElementById('rag-progress');
         const ragProgressStageEl = document.getElementById('rag-progress-stage');
         const ragProgressPercentEl = document.getElementById('rag-progress-percent');
@@ -6643,6 +6864,11 @@
             ragMinCeEl.min = String(Number(ceLimits.min || 0));
             ragMinCeEl.max = String(Number(ceLimits.max || 1));
             ragMinCeEl.step = String(Number(ceLimits.step || 0.05));
+            // ДВА ПОЛЗУНКА, ДВЕ ШКАЛЫ: первичная релевантность (0…2, верхняя
+            // граница приходит С СЕРВЕРА) и уверенность модели (0…1).
+            ragMinScoreEl.max = String(Number((limits.min_score || {}).max) || 2);
+            ragMinScoreEl.step = String(Number((limits.min_score || {}).step) || 0.05);
+            ragMinScoreEl.value = String(Number(search.min_score || 0));
             ragMinCeEl.value = String(Number(search.min_ce || 0));
             renderRagSearchHint();
         }
@@ -6691,10 +6917,12 @@
             return Number(value || 0).toFixed(2).replace('.', ',');
         }
 
-        // Подпись под ползунком: что именно сейчас произойдёт с фрагментами.
-        // Ползунок без пояснения читается как «чем больше, тем лучше», а на
-        // самом деле это ОТСЕЧЕНИЕ: слишком высокий порог оставит модель без
-        // документов, слишком низкий пустит шум.
+        // Подпись под ползунками: что именно сейчас произойдёт с фрагментами.
+        // Ползунок без пояснения читается как «чем больше, тем лучше», а на самом
+        // деле это ОТСЕЧЕНИЕ — и порогов ДВА, с разными шкалами и разными этапами:
+        // первичная релевантность (фильтрация, 0…2) и уверенность модели
+        // (реранкинг, 0…1). Путать их нельзя: именно на этой путанице и строился
+        // живой случай «порог 0,85, а числа 0,73 в ответе».
         function renderRagSearchHint() {
             const search = (ragData && ragData.search) || {};
             const rerank = ragRerankEl.checked;
@@ -6702,12 +6930,12 @@
             const rewrite = ragRewriteEl.checked;
             const before = Number(ragTopBeforeEl.value) || 0;
             const after = Number(ragTopAfterEl.value) || 0;
+            const minCe = Number(ragMinCeEl.value) || 0;
+            const minScore = Number(ragMinScoreEl.value) || 0;
             // Поля, которые сейчас ни на что не влияют, гасим: иначе видно
-            // «настройку», которой поиск не пользуется.
-            // ПУЛ НУЖЕН ТОЛЬКО РЕРАНКИНГУ: переставлять и отсеивать можно лишь то,
-            // что нашлось. Без реранкинга поле выключено — и это не ограничение, а
-            // факт: взять 30 кандидатов и оставить 8 лучших по той же оценке даёт
-            // РОВНО те же 8, что взять сразу 8 (замер: выдача не меняется).
+            // «настройку», которой поиск не пользуется. ПУЛ нужен только второму
+            // этапу: без реранкинга переставлять нечего (замер: 30 кандидатов и 8
+            // по той же оценке дают ровно те же 8, что взять сразу 8).
             ragTopBeforeEl.disabled = !rerank;
             ragTopBeforeEl.title = rerank
                 ? 'Сколько кандидатов первый этап берёт из каждой базы: их '
@@ -6722,22 +6950,46 @@
             // БАЗОВЫЙ ОТСЕВ ШУМА (search.noise_floor) действует ВСЕГДА: фрагмент с
             // оценкой около нуля не уходит в модель ни при какой настройке.
             const floor = Number(search.noise_floor || 0);
-            const minCe = Number(ragMinCeEl.value) || 0;
             const modelReady = Boolean((ragData && ragData.rerank || {}).available);
-            ragMinCeEl.disabled = !filter;
+            // ПОРОГ ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ — часть ФИЛЬТРАЦИИ: модели не требует,
+            // работает всегда и режет ДО реранкинга. Его же число видно в карточке
+            // источника («релевантность 0,73»), поэтому человеку оно понятно.
+            ragMinScoreEl.disabled = !filter;
+            ragMinScoreValueEl.textContent = minScore > 0
+                ? ragScoreText(minScore) : 'не применяется';
+            ragMinScoreEl.title = !filter
+                ? 'Фильтрация выключена — порог первичной релевантности не применяется.'
+                : 'Первичная релевантность = косинус + доля слов запроса (0…2). Это '
+                  + 'то самое число, которое видно в карточке источника. Фрагменты '
+                  + 'ниже порога в модель не идут; считается БЕЗ модели и не '
+                  + 'зависит от реранкинга. 0,3 — значение по умолчанию (замер). '
+                  + '0 — не отсекать, но базовый отсев шума '
+                  + ragScoreText(floor) + ' работает всегда.';
+            // ПОРОГ УВЕРЕННОСТИ МОДЕЛИ — настройка ВТОРОГО этапа: без реранкинга
+            // пула нет, и вероятностей тоже нет.
+            ragMinCeEl.disabled = !(filter && rerank);
             ragMinCeValueEl.textContent = minCe > 0 ? ragScoreText(minCe) : 'не применяется';
             ragMinCeEl.title = !filter
-                ? 'Фильтрация по порогу выключена — порог уверенности тоже не применяется.'
-                : 'Фрагменты, в которых модель уверена меньше этого значения, в ответ '
-                  + 'не идут. 0 — не отсекать. Рекомендуется 0,3–0,5: у мусора '
-                  + 'уверенность 0,00–0,02, у нужного 0,45–1,00.';
-            // ФИЛЬТРАЦИЯ БЕЗ МОДЕЛИ — ОШИБКА, а не тихая подмена шкалы: вероятностей
-            // у признакового реранкинга нет, и фильтровать было бы нечем. Панель
-            // говорит это сразу, а сервер отказывает (400) при «применить».
-            modelWarning = filter && !modelReady
-                ? 'Фильтрация по порогу требует модель-реранкер (cross-encoder), '
-                  + 'а она недоступна: ' + ((ragData && ragData.rerank || {}).reason
-                      || 'причина неизвестна')
+                ? 'Фильтрация выключена — оба порога не применяются.'
+                : (!rerank
+                    ? 'Порог уверенности — настройка реранкинга: без него пула и '
+                      + 'вероятностей модели нет, поэтому порог не применяется. '
+                      + 'Он сохранится и заработает, когда включите «Reranking».'
+                    : 'Вероятность модели-реранкера (0…1): у мусора 0,00–0,02, у '
+                      + 'нужного 0,45–1,00. Рекомендуется 0,3–0,5: выше 0,7 '
+                      + 'отсекается и верное.');
+            // ЕДИНСТВЕННАЯ ОШИБКА НАСТРОЙКИ — когда отсекать нечем ВООБЩЕ: ни
+            // одного порога, ни модели. Тогда галочка фильтрации не делает ничего.
+            modelWarning = filter && minScore <= 0 && !(rerank && minCe > 0)
+                ? 'Фильтрация включена, но отсекать нечем: оба порога равны нулю. '
+                  + 'Задайте порог первичной релевантности — он работает без модели.'
+                : '';
+            const engineWarning = filter && rerank && minCe > 0 && !modelReady
+                ? 'Порог уверенности модели задан, но модель-реранкер недоступна ('
+                  + ((ragData && ragData.rerank || {}).reason || 'причина неизвестна')
+                  + '): пул посчитают признаки, вероятностей не будет — порог '
+                  + 'второго этапа не применится. Порог первичной релевантности '
+                  + 'работает и без модели.'
                 : '';
             [ragRewriteEl, ragRerankEl, ragFilterEl, ragAskEmptyEl].forEach(node => {
                 node.closest('.rag-flag').classList.toggle('off', !node.checked);
@@ -6756,23 +7008,46 @@
                 : `с каждой базы в ответ идут ${after} лучших по вектору и словам`);
             parts.push(`всего на запрос — до ${fmtNum(maxHits)} фрагментов `
                 + '(по всем базам, плюс соседние к лучшим)');
-            parts.push(filter
-                ? (minCe > 0
-                    ? `фрагменты с уверенностью модели ниже ${ragScoreText(minCe)} отбрасываются`
-                    : 'отсечения по уверенности модели нет (порог 0)')
-                : 'фильтрация выключена: остаётся только базовый отсев шума '
-                  + ragScoreText(floor));
+            if (!filter) {
+                parts.push('фильтрация выключена: остаётся только базовый отсев шума '
+                    + ragScoreText(floor));
+            } else {
+                parts.push(minScore > 0
+                    ? `первичная релевантность ниже ${ragScoreText(minScore)} — `
+                      + 'в модель не идёт'
+                    : 'порог первичной релевантности не задан (0)');
+                if (minCe > 0) {
+                    parts.push(rerank
+                        ? `уверенность модели ниже ${ragScoreText(minCe)} — `
+                          + 'отбрасывается после реранкинга'
+                        : `порог уверенности модели ${ragScoreText(minCe)} не `
+                          + 'применяется: это настройка реранкинга');
+                }
+            }
             parts.push(ragAskEmptyEl.checked
                 ? 'если в документах ничего нет — спрошу вас и предложу варианты'
                 : 'если в документах ничего нет — отвечу по общим знаниям с пометкой');
             let text = 'Сейчас: ' + parts.join('; ') + '.';
-            // ЗАВЫШЕННЫЙ ПОРОГ УВЕРЕННОСТИ — самая частая ошибка настройки: у
-            // нужных фрагментов уверенность 0,45–1,00, поэтому выше 0,7 начинает
-            // отсекаться и верное.
-            const tooHigh = filter && minCe >= 0.7;
+            // ЗАВЫШЕННЫЕ ПОРОГИ — самая частая ошибка настройки, и у каждого порога
+            // своя граница «слишком высоко»: у первичной релевантности точные
+            // попадания обычно 0,8…1,5, у уверенности модели 0,45–1,00.
+            const tooHigh = (filter && minScore >= 1.2)
+                || (filter && rerank && minCe >= 0.7);
+            if (filter && minScore >= 1.2) {
+                text += ' ⚠ Порог первичной релевантности ' + ragScoreText(minScore)
+                    + ' может отсечь и верное: точные попадания обычно 0,8…1,5.';
+            }
+            if (filter && rerank && minCe >= 0.7) {
+                text += ' ⚠ Порог уверенности ' + ragScoreText(minCe) + ' отсечёт и '
+                    + 'часть верного: у нужных фрагментов уверенность обычно '
+                    + '0,45–1,00.';
+            }
             if (tooHigh) {
-                text += ' ⚠ Порог ' + ragScoreText(minCe) + ' отсечёт и часть верного:'
-                    + ' у нужных фрагментов уверенность обычно 0,45–1,00.';
+                text += ' Если порог отсёк всё, я остановлюсь и предложу снизить его '
+                    + 'до нужного значения.';
+            }
+            if (engineWarning) {
+                text += ' ⓘ ' + engineWarning;
             }
             if (modelWarning) {
                 text += ' ⛔ ' + modelWarning;
@@ -6792,9 +7067,18 @@
                 parts.push(`до ${fmtNum(search.top_k_after)} фрагментов на запрос`);
             }
             if (search.filter) {
-                parts.push(Number(search.min_ce || 0) > 0
-                    ? `уверенность модели от ${ragScoreText(search.min_ce)}`
-                    : 'без отсечения по уверенности модели');
+                // Порогов два — в подписи названы оба и с указанием шкалы: без
+                // этого «релевантность от 0,85» читается как одно и то же число.
+                if (Number(search.min_score || 0) > 0) {
+                    parts.push(`первичная релевантность от ${ragScoreText(search.min_score)}`);
+                }
+                if (search.rerank && Number(search.min_ce || 0) > 0) {
+                    parts.push(`уверенность модели от ${ragScoreText(search.min_ce)}`);
+                }
+                if (Number(search.min_score || 0) <= 0
+                    && !(search.rerank && Number(search.min_ce || 0) > 0)) {
+                    parts.push('без отсечения по порогам');
+                }
             } else {
                 parts.push(`порог проекта не применяется (отсев шума от `
                     + `${ragScoreText(search.noise_floor)})`);
@@ -6902,6 +7186,8 @@
                 ask_when_empty: ragAskEmptyEl.checked,
                 top_k_before: Number(ragTopBeforeEl.value) || null,
                 top_k_after: Number(ragTopAfterEl.value) || null,
+                // Оба порога уходят вместе: у них разные шкалы и разные этапы.
+                min_score: Number(ragMinScoreEl.value) || 0,
                 min_ce: Number(ragMinCeEl.value) || 0,
             }));
             if (!data) return;
@@ -7263,6 +7549,10 @@
                 source: ragChunks.source || '',
                 q: ragChunks.query || '',
             });
+            // ПЕРЕХОД К КОНКРЕТНОМУ ЧАНКУ (клик по источнику под ответом): сервер
+            // сдвигает страницу так, чтобы этот номер был в ней первым. Без этого
+            // пользователь попадал на начало базы и искал фрагмент глазами.
+            if (ragChunks.focus) params.set('chunk', String(ragChunks.focus));
             const data = await ragRequest(
                 `/api/agent/rag/${encodeURIComponent(base.id)}/chunks?` + params.toString());
             if (!data) {
@@ -7270,10 +7560,22 @@
                 return;
             }
             ragChunks.total = Number(data.total || 0);
+            const focus = ragChunks.focus;
+            ragChunks.focus = 0;
             (data.chunks || []).forEach(chunk => {
-                ragChunksListEl.appendChild(chunkNode(chunk));
+                const node = chunkNode(chunk);
+                // Найденный фрагмент подсвечиваем и прокручиваем к нему: человек
+                // пришёл сюда именно за ним.
+                if (focus && Number(chunk.index) + 1 === Number(focus)) {
+                    node.classList.add('hit');
+                    setTimeout(() => {
+                        if (node.scrollIntoView) node.scrollIntoView({ block: 'center' });
+                    }, 0);
+                }
+                ragChunksListEl.appendChild(node);
             });
-            ragChunks.offset += (data.chunks || []).length;
+            // Смещение берём С СЕРВЕРА: при переходе к чанку он сам его посчитал.
+            ragChunks.offset = Number(data.offset || 0) + (data.chunks || []).length;
             if (!ragChunks.total) {
                 const empty = document.createElement('div');
                 empty.className = 'rag-chunk-empty';
@@ -7290,8 +7592,15 @@
             ragChunksMoreBtn.hidden = !data.has_more;
         }
 
-        async function openChunks(base) {
-            ragChunks = { base: base, offset: 0, total: 0, source: '', query: '' };
+        async function openChunks(base, focus) {
+            // `focus` — {number, source}: пришли по клику на источник под ответом,
+            // и нужный фрагмент надо открыть сразу. Документ в фильтре тоже
+            // подставляем: так в списке видны соседние чанки ТОГО ЖЕ файла, а не
+            // всей базы.
+            const wanted = focus && focus.number ? Number(focus.number) : 0;
+            const source = (focus && focus.source) ? String(focus.source) : '';
+            ragChunks = { base: base, offset: 0, total: 0, source: '', query: '',
+                          focus: 0 };
             ragChunksModal.hidden = false;
             document.getElementById('rag-chunks-name').textContent = base.name || base.id;
             ragChunksMetaEl.textContent =
@@ -7311,8 +7620,13 @@
                 option.textContent = `${item.source} (${fmtNum(item.chunks)})`;
                 ragChunksSourceEl.appendChild(option);
             });
+            ragChunks.source = source;
+            ragChunksSourceEl.value = source;
+            ragChunks.focus = wanted;
             ragChunksListEl.innerHTML = '';
-            ragChunksStatusEl.textContent = 'Читаю чанки…';
+            ragChunksStatusEl.textContent = wanted
+                ? `Открываю фрагмент № ${fmtNum(wanted)}…`
+                : 'Читаю чанки…';
             ragChunksMoreBtn.hidden = true;
             await loadChunks(true);
         }
@@ -7337,6 +7651,7 @@
          ragTopBeforeEl, ragTopAfterEl]
             .forEach(node => node.addEventListener('change', renderRagSearchHint));
         ragMinCeEl.addEventListener('input', renderRagSearchHint);
+        ragMinScoreEl.addEventListener('input', renderRagSearchHint);
         document.getElementById('rag-refresh').addEventListener('click', async () => {
             ragStatusEl.hidden = false;
             ragStatusEl.textContent = 'Читаю список баз знаний…';
@@ -7803,10 +8118,14 @@
             const streamEpoch = viewEpoch;
             // Узлы кладём в представление диалога (как pushAgentNode): тогда
             // перерисовка окна (ветка, возврат в задачу) их не потеряет.
-            const push = (role, text) => {
+            // `sources` — фрагменты, по которым модель ответила на вопрос теста:
+            // под ответом рисуются те же карточки, что у агента (с цитатой и
+            // переходом к чанку), а ссылки «[N]» в тексте становятся кликабельными.
+            const push = (role, text, sources) => {
                 const at = new Date().toISOString();
-                agentViewMessages().push({ role: role, text: text, at: at });
-                drawAgentNode(role, text, null, at);
+                agentViewMessages().push({ role: role, text: text, at: at,
+                                           sources: sources || null });
+                drawAgentNode(role, text, null, at, null, sources || null);
             };
             push('debug', '🧪 Запускаю контрольный прогон RAG: вопросы пойдут '
                 + 'поочерёдно, планирование и автомат задачи не участвуют.');
@@ -7850,7 +8169,9 @@
                         } else if (ev.type === 'test_question') {
                             push('test', '🧪 Вопрос ' + ev.n + '/' + ev.total + ': ' + ev.text);
                         } else if (ev.type === 'bot') {
-                            push('assistant', ev.text);
+                            // Ответ теста приходит с источниками: под ним — те же
+                            // карточки фрагментов, что под ответом агента.
+                            push('assistant', ev.text, ev.sources);
                         } else if (ev.type === 'test_error') {
                             push('error', ev.text);
                         } else if (ev.type === 'debug') {
@@ -8132,6 +8453,8 @@
                     await loadActiveDialog();
                 }
                 input.value = '';
+                // Подсветка «агент ждёт уточнения» снимается вместе с отправкой.
+                input.classList.remove('need-clarify');
                 // Запрос относится к ЭТОЙ задаче (шаг её прогона или сообщение
                 // пользователя): другие задачи на своих блокировках.
                 foregroundRequests.add(workspace.active_session);
@@ -8212,6 +8535,9 @@
             }
 
             input.value = '';
+            // Подсветка «агент ждёт уточнения» снимается вместе с отправкой: своё
+            // дело она сделала.
+            input.classList.remove('need-clarify');
             foregroundRequests.add(workspace.active_session || '');
             updateComposerState();
 

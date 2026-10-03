@@ -828,6 +828,13 @@ def _clean_sources(raw: Any) -> List[Dict[str, Any]]:
         if not source:
             continue
         out.append({
+            # ИДЕНТИФИКАТОР БАЗЫ и чанка: по ним интерфейс открывает ИМЕННО этот
+            # фрагмент в просмотре чанков — и сразу после перезагрузки страницы,
+            # когда список источников восстанавливается из журнала. Без них
+            # карточка знала только имя файла и номер чанка, а номер уникален
+            # внутри своей базы.
+            "base_id": str(item.get("base_id") or "").strip()[:40],
+            "chunk_id": str(item.get("chunk_id") or "").strip()[:120],
             "base": str(item.get("base") or "").strip()[:120],
             "source": source,
             "section": str(item.get("section") or "").strip()[:200],
@@ -846,8 +853,12 @@ def _clean_sources(raw: Any) -> List[Dict[str, Any]]:
             "address": _round3(item.get("address")),
             "penalty": _round3(item.get("penalty")),
             "ce": _round3(item.get("ce")),
+            "by_model": bool(item.get("by_model")),
+            "neighbour": bool(item.get("neighbour")),
+            "parent_chunk": _positive_int(item.get("parent_chunk")),
             "chars": _positive_int(item.get("chars")),
             "snippet": str(item.get("snippet") or "").strip()[:400],
+            "full_chars": _positive_int(item.get("full_chars")),
         })
     return out
 
@@ -1138,7 +1149,8 @@ def _normalize_rag(raw: Any) -> Dict[str, Any]:
 
     Формат: {"enabled": [<id базы>], "strategy": "structure", "chunk_size": 1000,
     "overlap": 70, "rewrite": true, "rerank": true, "filter": true,
-    "top_k_before": 30, "top_k_after": 8, "min_ce": 0.0, "ask_when_empty": true}.
+    "top_k_before": 30, "top_k_after": 8, "min_score": 0.3, "min_ce": 0.0,
+    "ask_when_empty": true}.
     Выбор ДВИЖКА реранкинга сюда не входит: он один (модель cross-encoder), а
     ручной переключатель на признаки остался в окружении (RAG_RERANK_BACKEND).
     Стратегия и размеры
@@ -1183,8 +1195,10 @@ def _normalize_rag(raw: Any) -> Dict[str, Any]:
         "filter": search["filter"],
         "top_k_before": search["top_k_before"],
         "top_k_after": search["top_k_after"],
-        # Порог УВЕРЕННОСТИ МОДЕЛИ (0…1) — ЕДИНСТВЕННАЯ шкала фильтра: у мусора
-        # вероятность cross-encoder 0,00–0,02, у нужного 0,45–1,00.
+        # ДВА ПОРОГА, ДВЕ ШКАЛЫ: первичная релевантность (фильтрация; 0…2, её
+        # число видно в карточке источника) и уверенность модели (второй этап,
+        # реранкинг; 0…1, вероятность cross-encoder).
+        "min_score": round(float(search["min_score"]), 4),
         "min_ce": round(float(search["min_ce"]), 4),
         "ask_when_empty": search["ask_when_empty"],
     }
@@ -1247,7 +1261,7 @@ def set_rag_search(task: Dict[str, Any], **fields: Any) -> Dict[str, Any]:
     settings = rag_settings(task)
     merged = dict(settings)
     for key in ("rewrite", "rerank", "rerank_backend", "filter", "top_k_before",
-                "top_k_after", "min_ce", "ask_when_empty"):
+                "top_k_after", "min_score", "min_ce", "ask_when_empty"):
         if key in fields and fields[key] is not None:
             merged[key] = fields[key]
     task[RAG_FIELD] = _normalize_rag(merged)

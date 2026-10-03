@@ -548,13 +548,18 @@ CHUNKS_PAGE_MAX = 50
 
 def chunks_view(base_id: Any, profile: Optional[str] = None, offset: int = 0,
                 limit: int = CHUNKS_PAGE, source: Any = "",
-                query: Any = "") -> Dict[str, Any]:
+                query: Any = "", chunk: int = 0) -> Dict[str, Any]:
     """Страница чанков базы для диалога просмотра.
 
     Отдаёт сам текст чанков вместе с их адресом (источник, раздел, номер,
     границы в документе) — это и есть «посмотреть, как стратегия порезала
     документ». Плюс список документов базы (для фильтра) и общее число чанков
     под фильтром, чтобы интерфейс мог показать «показано 10 из 42».
+
+    `chunk` — номер чанка, к которому надо ПЕРЕЙТИ (клик по источнику под
+    ответом агента): страница сдвигается так, чтобы этот фрагмент был первым.
+    Номер чанка — тот же, что в карточке источника («№ 1081»), поэтому по нему
+    фрагмент находится без поиска глазами.
     """
     meta = rag_store.get_base(base_id, profile=profile)
     if meta is None:
@@ -566,9 +571,9 @@ def chunks_view(base_id: Any, profile: Optional[str] = None, offset: int = 0,
     # означает «все документы», а не поиск файла с таким именем.
     filter_source = (str(source or "").strip().replace("\\", "/")
                      .rsplit("/", 1)[-1][:MAX_SOURCE_CHARS])
-    chunks, total = rag_store.chunks_page(
+    chunks, total, start = rag_store.chunks_page(
         base_id, offset=start, limit=size, source=filter_source,
-        query=str(query or "").strip()[:200])
+        query=str(query or "").strip()[:200], chunk=max(0, int(chunk or 0)))
     return {
         "base": {
             "id": meta.get("id") or "",

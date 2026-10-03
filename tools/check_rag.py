@@ -2022,6 +2022,9 @@ def section_workspace():
               "filter": rag_search.filter_enabled(),
               "top_k_before": rag_search.top_k_before(),
               "top_k_after": rag_search.top_k(),
+              # Порогов ДВА, и оба обязаны переживать запись файла: первичная
+              # релевантность (фильтрация) и уверенность модели (реранкинг).
+              "min_score": round(rag_search.min_score(), 4),
               "min_ce": round(rag_search.min_ce(), 4),
               "ask_when_empty": rag_search.ask_when_empty()},
           str(normalized.get("rag")))
@@ -2122,7 +2125,9 @@ def section_search():
     # НЕРЕЛЕВАНТНЫЙ ЗАПРОС: честное «не нашлось», а не случайные документы.
     empty = rag_search.search([base_id], "привет, как дела?", profile="p-search")
     check("на посторонний вопрос фрагменты не подбираются",
-          empty["hits"] == [] and empty["bases"][0]["found"] >= 1,
+          empty["hits"] == []
+          and empty["bases"][0]["raw"] >= 1
+          and empty["bases"][0]["found"] == 0,
           str(empty["bases"]))
     empty_block = rag_search.block(empty)
     check("модель получает честное «в документах этого не нашлось»",
@@ -2131,7 +2136,7 @@ def section_search():
           and "backup.sh" not in empty_block, empty_block[:140])
     check("в «не нашлось» названы опрошенные базы и причина",
           "ОПРОШЕННЫЕ БАЗЫ" in empty_block
-          and "все ниже порога" in empty_block, empty_block[-200:])
+          and "подходящих фрагментов нет" in empty_block, empty_block[-200:])
     check("в «не нашлось» модель обязана предложить, ЧЕМ продолжить",
           rag_search.NO_HITS_ALTERNATIVES_HEADER in empty_block
           and "по общим знаниям" in empty_block
@@ -2874,6 +2879,31 @@ async def section_suite():
           any(event.get("type") == "bot" for event in single)
           and any("ЭТАЛОН: Резервная копия" in text for text in LLM_CONTEXT),
           str([event.get("type") for event in single]))
+    # ИСТОЧНИКИ ВМЕСТЕ С ОТВЕТОМ ТЕСТА (правка 03.10): под ответом рисуются те же
+    # карточки, что у агента, — значит сервер обязан отдать их в событии `bot`
+    # И ПОЛОЖИТЬ В ЖУРНАЛ (иначе они пропадут после переключения задачи).
+    # Проверяем на вопросе, ответ которого в базе ЕСТЬ: у вопросов про Найт-Сити
+    # эта база-фикстура фрагментов не находит, и источников у них быть не должно.
+    single_answers = [event for event in single if event.get("type") == "bot"]
+    single_sources = [item for event in single_answers
+                      for item in (event.get("sources") or [])]
+    check("ответ теста приходит вместе с источниками (фрагментами)",
+          bool(single_answers) and all("sources" in event
+                                       for event in single_answers)
+          and bool(single_sources),
+          str([len(event.get("sources") or []) for event in single_answers]))
+    check("в источнике есть база, номер чанка и ЦИТАТА (по ним интерфейс "
+          "открывает сам фрагмент)",
+          bool(single_sources) and all(
+              item.get("base_id") and item.get("number") and item.get("snippet")
+              for item in single_sources),
+          str(single_sources[:1])[:220])
+    check("источники ответа теста переживают журнал (своим полем, как у агента)",
+          any(item.get("kind") == "assistant" and item.get("sources")
+              for item in ((await chat.agent_history()).get("log") or [])),
+          str([len(item.get("sources") or [])
+               for item in ((await chat.agent_history()).get("log") or [])
+               if item.get("sources")]))
     check("в диагностике теста видно, по какому запросу пошёл поиск",
           any(str(event.get("text") or "").startswith("запрос после rewriting: ")
               for event in single if event.get("type") == "debug"),
@@ -2893,6 +2923,20 @@ async def section_suite():
           bool(judge_payloads) and all(
               ("ВОПРОС %d:" % number) in judge_payloads[0]
               for number in range(1, rag_suite.total() + 1)))
+    # ВОПРОС 6 ЗАМЕНЁН по просьбе от 03.10: старый проверял понимание оглавления
+    # таблицы кибероружия, а не ответ по документу. Новый — по разделу TRAUMA TEAM,
+    # где текст распознан чисто и правило с числом есть прямо в чанке.
+    sixth = rag_suite.case(6)
+    check("вопрос 6 — новый, про темп исцеления Trauma Team (а не про таблицу оружия)",
+          sixth is not None and "Trauma Team" in sixth["question"]
+          and "1+1D6" in sixth["expected"] and "Спидхил" in sixth["expected"]
+          and "KPKH" not in sixth["question"],
+          str(sixth)[:200])
+    check("вопросы набора пронумерованы 1…N и у каждого есть эталон и источник",
+          rag_suite.total() == len(rag_suite.questions())
+          and all(case.get("expected") and case.get("source")
+                  for case in rag_suite.CASES),
+          "вопросов: %d" % rag_suite.total())
     check("расход прогона показан отдельной строкой (в замер задачи не входит)",
           "Расход теста" in events[-2]["text"] and "не входит" in events[-2]["text"])
     check("тест НЕ вызывает планировщика и приёмщика задачи",
@@ -2943,6 +2987,247 @@ TWO_STAGE_DOC = (
     "Обход территории выполняется по маршруту, копия маршрута лежит у "
     "дежурного, база наблюдений ведётся в журнале.\n"
 )
+
+
+# Документ для [16]: НЕСКОЛЬКО фрагментов про одно и то же — иначе пул окажется
+# из одного кандидата, и проверять отсечение порогом будет не на чем (порог режет
+# то, что есть; один фрагмент он либо пропускает, либо убирает целиком).
+THRESHOLD_DOC = (
+    "РЕЗЕРВНОЕ КОПИРОВАНИЕ БАЗЫ\n\n"
+    "Резервное копирование базы данных делается командой backup.sh: копия снимается "
+    "ежедневно, хранится тридцать дней и проверяется раз в неделю.\n\n"
+    "РАСПИСАНИЕ КОПИЙ\n\n"
+    "Резервная копия базы снимается ночью, а журнал копирования базы ведёт дежурный "
+    "администратор: в журнале отмечены время копии и её размер.\n\n"
+    "ВОССТАНОВЛЕНИЕ ИЗ КОПИИ\n\n"
+    "Восстановление базы из резервной копии выполняется командой restore.sh, копия "
+    "берётся с ленты, а перед восстановлением база останавливается.\n\n"
+    "ОПИСЬ ИМУЩЕСТВА\n\n"
+    "В описи перечислены столы, кресла и шкафы склада вместе с номерами инвентаря.\n"
+)
+
+
+def section_threshold():
+    print("\n[16] ДВА ПОРОГА: первичная релевантность (фильтрация) и уверенность модели (реранкинг)")
+    # ЖИВОЙ СЛУЧАЙ 03.10: в панели стоял «порог модели 0,85», а в ответ уходили
+    # фрагменты с релевантностью 0,63…0,73. Причина была в СМЕШЕНИИ ДВУХ НАСТРОЕК:
+    # число 0,73 — это первичная релевантность (косинус + слова запроса), а порог
+    # относился ко второму этапу, которого в той конфигурации не было. Разделение
+    # простое и проверяется здесь: у каждого порога своя шкала, свой этап и свой
+    # ползунок, а скрытой связи «выставил порог — включился реранкинг» нет.
+    base = rag.index_files([{"filename": "threshold.md", "text": THRESHOLD_DOC}],
+                           name="Порог", profile=chat._current_profile_id(),
+                           strategy="fixed", chunk_size=260, overlap=0)
+    base_id = base["id"]
+    question = "Как делается резервное копирование базы данных?"
+    profile = chat._current_profile_id()
+
+    # 1. ФИЛЬТРАЦИЯ — ПОРОГ ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ: работает без модели и
+    #    НЕЗАВИСИМО от реранкинга (это и есть та настройка, которой ждали).
+    plain = rag_search.search([base_id], question, profile=profile,
+                              settings={"rerank": False, "filter": False,
+                                        "min_score": 0.0, "top_k_after": 4})
+    top = [hit for hit in plain["hits"] if not hit.get("neighbour")]
+    best_score = float(top[0]["score"]) if top else 0.0
+    strict = rag_search.search([base_id], question, profile=profile,
+                               settings={"rerank": False, "filter": True,
+                                         "min_score": round(best_score + 0.2, 2),
+                                         "top_k_after": 4})
+    kept_strict = [hit for hit in strict["hits"] if not hit.get("neighbour")]
+    check("порог первичной релевантности отсекает фрагменты БЕЗ всякого реранкинга",
+          bool(top) and not kept_strict
+          and strict["stages"]["score_applied"] is True
+          and strict["stages"]["score_dropped"] > 0
+          and strict["stages"]["rerank"] is False,
+          str(strict["stages"]))
+    check("отсечённое порогом первичной релевантности объяснено в диагностике",
+          "порог первичной релевантности" in rag_search.results_note(strict)
+          and "отсеял" in rag_search.results_note(strict),
+          rag_search.results_note(strict)[:220])
+    check("«порог отсёк всё» (первичная релевантность) — это не «в документах нет»",
+          rag_search.cut_kind(strict) == "score"
+          and rag_search._cut_by_threshold(strict) is True,
+          str(strict["stages"]))
+    check("лучшая отсечённая оценка сохранена — из неё вариант «снизить порог»",
+          abs(float(strict["stages"]["cut_best_score"]) - best_score) < 0.01,
+          "%s против %s" % (strict["stages"].get("cut_best_score"), best_score))
+    # ПОРОГ ТОЛЬКО УБИРАЕТ: он не «улучшает» ответ, а отсекает. Ноль означает
+    # «не отсекать порогом» — остаётся базовый отсев шума.
+    loose = rag_search.search([base_id], question, profile=profile,
+                              settings={"rerank": False, "filter": True,
+                                        "min_score": 0.0, "top_k_after": 4})
+    base_hits = [hit["number"] for hit in loose["hits"] if not hit.get("neighbour")]
+    plain_hits = [hit["number"] for hit in plain["hits"] if not hit.get("neighbour")]
+    check("порог 0 ничего не отсекает: выдача та же, что без порога вовсе",
+          loose["stages"]["score_applied"] is False
+          and loose["stages"]["score_dropped"] == 0
+          and base_hits == plain_hits, "%s против %s" % (base_hits, plain_hits))
+    # Посторонний запрос: отсев шума — это НЕ порог, и «порог отсёк» говорить нельзя.
+    junk = rag_search.search([base_id], "привет, как дела?", profile=profile,
+                             settings={"rerank": False, "filter": True,
+                                       "min_score": 0.85, "top_k_after": 4})
+    check("посторонний запрос не выдаётся за «порог отсёк найденное»",
+          rag_search.cut_kind(junk) == "" and rag_search._cut_by_threshold(junk) is False
+          and bool(junk["bases"]) and junk["bases"][0]["found"] == 0,
+          str(junk["stages"])[:160])
+
+    # 2. ПОРОГ УВЕРЕННОСТИ МОДЕЛИ — НАСТРОЙКА ВТОРОГО ЭТАПА. Без реранкинга он не
+    #    применяется, и это сказано прямо; с реранкингом — применяется по
+    #    вероятности cross-encoder (заглушка задаёт её по порядку пар).
+    class FakeScores:
+        """Модель-заглушка: выдаёт ЗАДАННЫЕ вероятности по порядку пар.
+
+        Сеть в проверках запрещена, а оценки нужны предсказуемые: список задан
+        так, что порог 0,85 пропускает только первый фрагмент пула.
+        """
+
+        def __init__(self, values):
+            self.values = list(values)
+
+        def predict(self, pairs, batch_size=16, show_progress_bar=False):
+            return [self.values[index % len(self.values)]
+                    for index in range(len(pairs))]
+
+    saved_load = rag_rerank._load_model
+    rag_rerank._load_model = lambda allow_download: (
+        FakeScores([0.92, 0.72, 0.31, 0.05, 0.01, 0.01, 0.01, 0.01]), "")
+    try:
+        # Реранкинг ВЫКЛЮЧЕН: порог уверенности не применяется, и модель не
+        # вызывается вовсе (никакого скрытого включения второго этапа).
+        off = rag_search.search([base_id], question, profile=profile,
+                                settings={"rerank": False, "filter": True,
+                                          "rerank_backend": "cross-encoder",
+                                          "top_k_before": 8, "top_k_after": 4,
+                                          "min_score": 0.0, "min_ce": 0.85})
+        on = rag_search.search([base_id], question, profile=profile,
+                               settings={"rerank": True, "filter": True,
+                                         "rerank_backend": "cross-encoder",
+                                         "top_k_before": 8, "top_k_after": 4,
+                                         "min_score": 0.0, "min_ce": 0.85})
+    finally:
+        rag_rerank._load_model = saved_load
+        rag_rerank.reset_state()
+    kept_off = [hit for hit in off["hits"] if not hit.get("neighbour")]
+    # «Модель не звалась» проверяется по ДАННЫМ, а не по настройке: `rerank_model`
+    # заполняет только сам реранкинг, и при выключенном втором этапе он пуст, а у
+    # фрагментов нет вероятностей.
+    check("без реранкинга порог уверенности НЕ применяется и модель не зовётся",
+          off["stages"]["ce_applied"] is False
+          and off["stages"]["ce_required"] is False
+          and off["stages"]["rerank_model"] == ""
+          and bool(kept_off)
+          and all(float(hit.get("ce") or 0.0) == 0.0 for hit in kept_off),
+          str(off["stages"]))
+    check("без реранкинга диагностика говорит, почему порог не действует",
+          "не применяется" in rag_search.results_note(off), 
+          rag_search.results_note(off)[:220])
+    kept_on = [hit for hit in on["hits"] if not hit.get("neighbour")]
+    check("с реранкингом порог уверенности отсекает по вероятности модели",
+          on["stages"]["ce_applied"] is True
+          and bool(kept_on)
+          and all(float(hit.get("ce") or 0.0) >= 0.85 for hit in kept_on),
+          str([(hit.get("number"), hit.get("ce")) for hit in kept_on])
+          + " " + str(on["stages"]))
+    check("лучшая вероятность отсечённых сохранена",
+          abs(float(on["stages"]["cut_best_ce"]) - 0.72) < 1e-6,
+          str(on["stages"].get("cut_best_ce")))
+    check("реранкинг выключен — пул не берётся даже с заданным порогом уверенности",
+          off["stages"]["candidates"] <= off["stages"]["top_k_after"],
+          str(off["stages"]))
+
+    # 3. КОМБИНАЦИЯ: оба порога вместе, каждый на своём месте — первичная
+    #    релевантность режет ДО реранкинга, уверенность — ПОСЛЕ.
+    both = rag_search.search([base_id], question, profile=profile,
+                             settings={"rerank": False, "filter": True,
+                                       "min_score": round(max(0.0, best_score - 0.05), 2),
+                                       "min_ce": 0.5, "top_k_after": 4})
+    check("два порога живут вместе и не подменяют друг друга",
+          both["stages"]["score_applied"] is True
+          and both["stages"]["ce_applied"] is False
+          and both["stages"]["min_score"] > 0 and both["stages"]["min_ce"] == 0.5,
+          str(both["stages"]))
+
+    # 4. ВАРИАНТЫ РЕШЕНИЯ: «снизить порог» называет ТОТ порог, который отсёк.
+    view = chat._rag_choice_view(dict(strict, request=question), {"id": "t-rag",
+                                                                  "rag": {}})
+    relax = [item for item in view["options"] if item.get("apply")]
+    check("отсечение по первичной релевантности предлагает снизить ЕГО порог",
+          len(relax) == 1 and "min_score" in relax[0]["apply"]
+          and "min_ce" not in relax[0]["apply"]
+          and relax[0]["send"] == question,
+          str(relax))
+    check("в сообщении назван именно порог первичной релевантности",
+          "ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ" in view["message"], view["message"][:200])
+    ce_view = chat._rag_choice_view(
+        dict(on, request=question, hits=[],
+             stages=dict(on["stages"], ce_applied=True, min_ce=0.85,
+                         cut_best_ce=0.72)), {"id": "t-rag", "rag": {}})
+    ce_relax = [item for item in ce_view["options"] if item.get("apply")]
+    check("отсечение по уверенности модели предлагает снизить min_ce",
+          len(ce_relax) == 1 and "min_ce" in ce_relax[0]["apply"]
+          and "min_score" not in ce_relax[0]["apply"],
+          str(ce_relax))
+    check("в сообщении назван порог ВТОРОГО этапа",
+          "УВЕРЕННОСТИ МОДЕЛИ" in ce_view["message"], ce_view["message"][:200])
+    check("варианты продолжают быть действиями, а не заглушками",
+          any(item.get("send") == rag_search.GENERAL_CHOICE
+              for item in view["options"])
+          and any(item.get("action") == "clarify" for item in view["options"]),
+          str([item.get("title") for item in view["options"]]))
+
+    # 5. МАРШРУТ СНИЖЕНИЯ ПОРОГА: меняет ТОЛЬКО переданный порог и разрешает
+    #    новый поиск (иначе тот же запрос нашёл бы прежнюю запись по той же
+    #    подписи и получился бы цикл).
+    if chat._current_task() is None:
+        skip("маршрут снижения порога меняет настройку и разрешает новый поиск",
+             "нет проекта")
+    else:
+        task_now = chat._current_task()
+        workspace_store.set_rag_search(task_now, min_score=0.85, min_ce=0.5,
+                                       rerank=True)
+        session_now = {"dialog": {"rag": {"signature": "sig"}}}
+        task_now["sessions"] = [session_now]
+        asyncio.run(chat.rag_relax(chat.RagRelax(min_score=0.3)))
+        settings_now = workspace_store.rag_settings(task_now)
+        check("маршрут снижения порога меняет ТОЛЬКО его и разрешает новый поиск",
+              abs(float(settings_now["min_score"]) - 0.3) < 1e-6
+              and abs(float(settings_now["min_ce"]) - 0.5) < 1e-6
+              and settings_now["rerank"] is True
+              and not (session_now["dialog"].get("rag") or {}).get("signature"),
+              "%s / %s" % (settings_now.get("min_score"), settings_now.get("min_ce")))
+        asyncio.run(chat.rag_relax(chat.RagRelax(min_ce=0.2)))
+        check("второй порог правится тем же маршрутом и первый не сбрасывает",
+              abs(float(workspace_store.rag_settings(task_now)["min_ce"]) - 0.2) < 1e-6
+              and abs(float(workspace_store.rag_settings(task_now)["min_score"]) - 0.3) < 1e-6,
+              str(workspace_store.rag_settings(task_now)))
+
+    # 6. ИСТОЧНИКИ: клик открывает ИМЕННО этот чанк, поэтому в карточке нужны база,
+    #    номер и ЦИТАТА — и всё это обязано переживать запись журнала.
+    src = rag_search.sources(loose)
+    check("в источнике есть база, номер чанка и ЦИТАТА фрагмента",
+          bool(src) and all(item.get("base_id") and item.get("number")
+                            and item.get("snippet") for item in src),
+          str(src[:1])[:200])
+    cleaned = workspace_store._clean_sources(src)
+    check("база, номер чанка и цитата переживают запись журнала",
+          bool(cleaned) and all(item.get("base_id") and item.get("snippet")
+                                and item.get("number") for item in cleaned),
+          str(cleaned[:1])[:200])
+
+    # 7. ПЕРЕХОД К ЧАНКУ: сервер отдаёт страницу, где нужный фрагмент ПЕРВЫЙ.
+    total_chunks = int((base.get("stats") or {}).get("chunks") or 0)
+    wanted = min(2, max(1, total_chunks))
+    page = rag.chunks_view(base_id, profile=profile, chunk=wanted, limit=2)
+    check("страница чанков сдвигается к запрошенному номеру",
+          bool(page["chunks"]) and int(page["chunks"][0]["index"]) + 1 == wanted
+          and int(page["offset"]) == wanted - 1,
+          "первый чанк %s, offset %s" % (page["chunks"][0]["index"] + 1
+                                         if page["chunks"] else None,
+                                         page["offset"]))
+    plain_page = rag.chunks_view(base_id, profile=profile, limit=2)
+    check("без перехода страница начинается с начала базы",
+          plain_page["chunks"] and int(plain_page["chunks"][0]["index"]) == 0
+          and int(plain_page["offset"]) == 0, str(plain_page["offset"]))
 
 
 def section_two_stage():
@@ -3152,8 +3437,8 @@ def section_two_stage():
                                threshold=round(best + 0.5, 3))
     check("порог отсекает фрагменты ниже него и это видно в счётчиках",
           not [hit for hit in strict["hits"] if not hit.get("neighbour")]
-          and strict["stages"]["dropped"] == strict["stages"]["considered"]
-          and strict["stages"]["dropped"] > 0, str(strict["stages"]))
+          and strict["stages"]["candidates"] == 0
+          and strict["stages"]["floor_dropped"] > 0, str(strict["stages"]))
     # ГАЛОЧКА — ВЫКЛЮЧАТЕЛЬ ПОРОГА ПРОЕКТА, а не «порога вообще»: снятая галочка
     # оставляет БАЗОВЫЙ ОТСЕВ ШУМА (`noise_floor`, прежний RAG_MIN_SCORE 0,1),
     # иначе в модель пошли бы фрагменты с оценкой около нуля. Проверяем это ОДНИМ
@@ -3222,7 +3507,7 @@ def section_two_stage():
     check("строка диагностики называет этапы, порог и переформулировку",
           "Два этапа поиска" in rag_search.results_note(strict)
           and ("базовый отсев шума" in rag_search.results_note(strict)
-               or "порог уверенности" in rag_search.results_note(strict))
+               or "первичной релевантности" in rag_search.results_note(strict))
           and "переформулировка запроса" in rag_search.results_note(strict),
           rag_search.results_note(strict)[:220])
 
@@ -3237,10 +3522,27 @@ def section_two_stage():
           "ДВА ЭТАПА" not in off_line and "реранкинг выключен" in off_line
           and "порог" not in off_line.lower().replace("порог уверенности", ""),
           off_line[:200])
-    check("с включёнными настройками дебаг называет этапы, реранкер и порог",
+    check("с включёнными настройками дебаг называет этапы, реранкер и ОБА порога",
           "ДВА ЭТАПА" in on_line and "cross-encoder" in on_line
-          and "уверенность модели ниже 0.30" in on_line
-          and "переформулирую" in on_line, on_line[:220])
+          and "уверенностью модели ниже 0.30" in on_line
+          and "переформулирую" in on_line, on_line[:260])
+    both_line = chat._rag_debug({"rerank": True, "filter": True, "rewrite": False,
+                                 "rerank_backend": "cross-encoder", "min_ce": 0.4,
+                                 "min_score": 0.6})
+    check("дебаг называет ОБА порога раздельно и с их шкалами",
+          "первичной релевантностью ниже 0.60" in both_line
+          and "уверенностью модели ниже 0.40" in both_line
+          and "до реранкинга" in both_line and "после реранкинга" in both_line,
+          both_line[:300])
+    # ПОРОГ ВТОРОГО ЭТАПА БЕЗ РЕРАНКИНГА НЕ ПРИМЕНЯЕТСЯ — и дебаг говорит это
+    # прямо, а не молчит: скрытой связи «выставил порог — включился реранкинг»
+    # быть не должно (живое замечание 03.10: «причём здесь реранкинг?»).
+    ce_without_rerank = chat._rag_debug({"rerank": False, "filter": True,
+                                         "rewrite": False, "min_ce": 0.85})
+    check("без реранкинга дебаг честно говорит, что порог уверенности не действует",
+          "не применяется" in ce_without_rerank
+          and "реранкинг" in ce_without_rerank
+          and "cross-encoder" not in ce_without_rerank, ce_without_rerank[:220])
     # ПУЛ БЕЗ РЕРАНКИНГА НИЧЕГО НЕ МЕНЯЕТ (замер): взять 30 кандидатов и оставить
     # 8 лучших по той же оценке даёт ровно те же 8, что взять сразу 8. Поэтому
     # поле «пул» и выключено, когда реранкинг не включён.
@@ -3319,26 +3621,61 @@ def section_two_stage():
           confident["stages"]["ce_applied"] is True
           and all(float(hit.get("ce") or 0) >= 0.5 for hit in kept_ce),
           str([hit.get("ce") for hit in kept_ce]))
+    # ПОРОГ ГЛАВНЕЕ ГАЛОЧКИ: если он задан, вероятности обязаны быть — иначе
+    # порог молча ничего не делал бы (живой случай 03.10: в панели стояло 0,85, а
+    # в ответ уходили фрагменты с 0,63…0,73, потому что реранкинг был выключен).
+    # Здесь выбран ПРИЗНАКОВЫЙ бэкенд, но модель в этом окружении доступна —
+    # значит пул обязан посчитать cross-encoder.
     features_only = rag_search.search([base_id], question,
                                       profile=chat._current_profile_id(),
                                       settings={"rerank": True, "filter": True,
                                                 "rerank_backend": "features",
                                                 "top_k_before": 20, "top_k_after": 5,
                                                 "min_ce": 0.9})
-    # С РАБОТАЮЩЕЙ МОДЕЛЬЮ фильтр — уверенность, а порог по оценке поиска НЕ
-    # применяется: у суммы шкала до 3 и человеку она непонятна (живой случай —
-    # порог 2,0 при оценке 2,49). Запасной порог остаётся для случая, когда
-    # модель недоступна и пул считают признаки.
+    check("с признаковым реранкингом порог уверенности НЕ применяется (нет вероятностей)",
+          features_only["stages"]["ce_applied"] is False
+          and features_only["stages"]["ce_required"] is True
+          and bool(features_only["stages"]["ce_skipped"]),
+          str(features_only["stages"]))
+    check("и об этом прямо сказано в строке диагностики (а не молчание)",
+          "НЕ ПРИМЕНЁН" in rag_search.results_note(features_only),
+          rag_search.results_note(features_only)[:260])
+    check("реранкинг не подменяется признаками: пул считали признаки, а не модель",
+          features_only["stages"]["rerank_backend"] == "features",
+          str(features_only["stages"]["rerank_backend"]))
+    # МОДЕЛИ НЕТ ВОВСЕ (пакет, кэш, сбой счёта): вероятностей взять негде — и это
+    # НЕ повод молча пропустить порог второго этапа. Причина ложится в данные, а
+    # диагностика и блок для модели говорят об этом прямо.
+    saved_ready = rag_rerank.model_ready
+    rag_rerank.model_ready = lambda: False
+    try:
+        no_model = rag_search.search([base_id], question,
+                                     profile=chat._current_profile_id(),
+                                     settings={"rerank": True, "filter": True,
+                                               "rerank_backend": "features",
+                                               "top_k_before": 20, "top_k_after": 5,
+                                               "min_ce": 0.9})
+    finally:
+        rag_rerank.model_ready = saved_ready
+    check("без модели порог второго этапа помечен как НЕ применённый",
+          no_model["stages"]["ce_applied"] is False
+          and no_model["stages"]["ce_required"] is True
+          and bool(no_model["stages"]["ce_skipped"]),
+          str(no_model["stages"]))
+    check("и это сказано и в диагностике, и в блоке для модели",
+          "НЕ ПРИМЕНЁН" in rag_search.results_note(no_model)
+          and "ПОРОГ УВЕРЕННОСТИ МОДЕЛИ" in rag_search.block(no_model),
+          rag_search.block(no_model)[-320:])
     ce_mode = rag_search.search([base_id], question,
                                profile=chat._current_profile_id(),
                                settings={"rerank": True, "filter": True,
                                          "rerank_backend": "cross-encoder",
                                          "top_k_before": 20, "top_k_after": 5,
                                          "min_ce": 0.0})
-    check("порога по «оценке поиска» в настройках проекта больше нет",
-          "min_score" not in rag_search.settings()
-          and "min_score" not in rag_search.limits()
-          and set(rag_search.limits()) == {"top_k", "min_ce", "max_hits"},
+    check("в панели ДВЕ шкалы порогов — первичная релевантность и уверенность модели",
+          set(rag_search.limits()) == {"top_k", "min_score", "min_ce", "max_hits"}
+          and rag_search.limits()["min_score"]["max"] == rag_search.MIN_SCORE_LIMIT
+          and rag_search.limits()["min_ce"]["max"] == 1.0,
           str(sorted(rag_search.limits())))
     check("без заданного порога уверенности отсева нет (только базовый шум)",
           ce_mode["stages"]["ce_applied"] is False
@@ -3349,9 +3686,9 @@ def section_two_stage():
           and "оценка модели" in rag_search.results_note(ce_mode)
           and "оценка поиска 2.49" not in rag_search.results_note(ce_mode),
           rag_search.results_note(ce_mode)[:220])
-    # ФИЛЬТРАЦИЯ БЕЗ МОДЕЛИ — ОШИБКА (а не тихая подмена шкалы). Модель в этом
-    # окружении скачана, поэтому «недоступность» подменяем: проверяем и код
-    # маршрута, и текст причины.
+    # ПОРОГ УВЕРЕННОСТИ ТРЕБУЕТ МОДЕЛИ-РЕРАНКЕРА — и это ОШИБКА настройки, а не
+    # тихая подмена шкалы (порог первичной релевантности при этом работает: он
+    # модели не требует вовсе).
     saved_ready = rag_rerank.model_ready
     rag_rerank.model_ready = lambda: False
     try:
@@ -3362,38 +3699,38 @@ def section_two_stage():
         status = 0
         detail = ""
         try:
-            asyncio.run(chat.rag_apply(RagApply(enabled=[], filter=True)))
+            asyncio.run(chat.rag_apply(RagApply(enabled=[], rerank=True,
+                                                filter=True, min_ce=0.3)))
         except HTTPException as exc:
             status = exc.status_code
             detail = str(exc.detail)
+        # А порог ПЕРВИЧНОЙ РЕЛЕВАНТНОСТИ без модели включается спокойно.
+        score_only = asyncio.run(chat.rag_apply(RagApply(
+            enabled=[], rerank=False, filter=True, min_score=0.5, min_ce=0.0)))
     finally:
         rag_rerank.model_ready = saved_ready
-    # С ДОСТУПНОЙ моделью фильтрацию включают. В проверках движок пришпилен к
-    # признакам (детерминизм), поэтому на один вызов подменяем его на «авто» —
+    check("порог уверенности без модели-реранкера включить нельзя — ошибка с причиной",
+          status == 400 and "требует модель-реранкер" in detail,
+          "%s: %s" % (status, detail[:160]))
+    check("а порог первичной релевантности работает и без модели",
+          abs(float((score_only.get("search") or {}).get("min_score") or 0) - 0.5) < 1e-6
+          and bool((score_only.get("search") or {}).get("filter")),
+          str((score_only.get("search") or {}).get("min_score")))
+    # С ДОСТУПНОЙ моделью порог уверенности включают. В проверках движок пришпилен
+    # к признакам (детерминизм), поэтому на один вызов подменяем его на «авто» —
     # именно так ведёт себя приложение, где модель есть.
     saved_backend = rag_rerank.backend
     rag_rerank.backend = lambda: "auto"
     try:
         allowed = asyncio.run(chat.rag_apply(RagApply(enabled=[base_id], filter=True,
-                                                      min_ce=0.3)))
+                                                      rerank=True, min_ce=0.3)))
     finally:
         rag_rerank.backend = saved_backend
-    check("включить фильтрацию без модели нельзя — ошибка с причиной",
-          status == 400 and "требует модель-реранкер" in detail,
-          "%s: %s" % (status, detail[:160]))
-    check("фильтрацию с доступной моделью включают без ошибок",
-          bool((allowed.get("search") or {}).get("filter")) and rag_rerank.model_ready(),
+    check("фильтрацию с моделью и порогом уверенности включают без ошибок",
+          bool((allowed.get("search") or {}).get("filter")) and rag_rerank.model_ready()
+          and abs(float((allowed.get("search") or {}).get("min_ce") or 0) - 0.3) < 1e-6,
           str(rag_rerank.filter_reason("auto")))
 
-    check("с признаковым реранкингом порог уверенности НЕ применяется (нет вероятности)",
-          features_only["stages"]["ce_applied"] is False
-          and bool([hit for hit in features_only["hits"]
-                    if not hit.get("neighbour")]),
-          str(features_only["stages"]["ce_applied"]))
-    check("в панели одна шкала — уверенность модели 0…1",
-          rag_search.limits()["min_ce"]["max"] == 1.0
-          and "min_score" not in rag_search.limits(),
-          str(rag_search.limits()))
     check("в диагностике видно ДВА числа: релевантность первичного поиска и оценку модели",
           "релевантность" in rag_search.results_note(ce_mode)
           and ("оценка модели" in rag_search.results_note(ce_mode)
@@ -3561,26 +3898,28 @@ def section_two_stage():
         try:
             applied = asyncio.run(chat.rag_apply(RagApply(
                 enabled=[], rewrite=True, rerank=False, filter=True,
-                top_k_before=12, top_k_after=3, min_ce=0.42)))
+                top_k_before=12, top_k_after=3, min_score=0.5, min_ce=0.42)))
         finally:
             rag_rerank.backend = saved_backend
         view = (applied.get("search") or {})
-        check("«применить» в диалоге RAG сохраняет настройки поиска",
+        check("«применить» в диалоге RAG сохраняет ОБА порога поиска",
               view.get("rewrite") is True and view.get("rerank") is False
               and view.get("top_k_before") == 12 and view.get("top_k_after") == 3
               and abs(float(view.get("min_ce") or 0) - 0.42) < 1e-6
-              and "min_score" not in view, str(view))
+              and abs(float(view.get("min_score") or 0) - 0.5) < 1e-6,
+              str(view))
         # Движок реранкинга в снимке ЕСТЬ, но это состояние (чем работает), а не
         # настройка проекта: в панели его не выбирают.
         check("движок реранкинга в снимке — состояние, а не выбор проекта",
               view.get("rerank_backend") in rag_rerank.BACKENDS
               and "rerank_backend" not in workspace_store.rag_settings(chat._current_task()),
               str(workspace_store.rag_settings(chat._current_task())))
-        check("снимок отдаёт границы полей панели поиска",
+        check("снимок отдаёт границы полей панели поиска (обе шкалы порогов)",
               (applied.get("search_limits") or {}).get("top_k", {}).get("max")
               == rag_search.MAX_TOP_K
               and (applied.get("search_limits") or {}).get("min_ce", {}).get("max") == 1.0
-              and "min_score" not in (applied.get("search_limits") or {}),
+              and (applied.get("search_limits") or {}).get("min_score", {}).get("max")
+              == rag_search.MIN_SCORE_LIMIT,
               str(applied.get("search_limits")))
 
     # 7. ВЕБ-СЛОЙ: переформулировка идёт ДО поиска, её строка уходит в чат,
@@ -3690,6 +4029,7 @@ def main():
     asyncio.run(section_answer())
     asyncio.run(section_suite())
     section_two_stage()
+    section_threshold()
 
     print()
     if FAILURES:
