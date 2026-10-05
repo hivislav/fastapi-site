@@ -305,6 +305,75 @@
             border-bottom: 1px solid var(--line-soft);
         }
         .task-block[hidden] { display: none; }
+        /* ИСТОЧНИК ОТВЕТА: локальная модель (MLX на этом же Mac) или удалённая
+           (облако). Строка живёт в панели workspace рядом с проектом: источник
+           ОДИН на всё приложение, поэтому переключатель стоит там, где видно
+           текущий проект и его задачи, а не внутри одного режима. */
+        .llm-source {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--line-soft);
+        }
+        .llm-source[hidden] { display: none; }
+        .llm-source-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 6px;
+            font-size: 0.78rem;
+            color: var(--text-dim);
+        }
+        .llm-source-toggle { display: flex; gap: 4px; }
+        .llm-source-toggle button {
+            flex: 1;
+            padding: 6px 8px;
+            border: 1px solid var(--line-strong);
+            border-radius: 8px;
+            background: rgba(0, 255, 157, 0.04);
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.76rem;
+            cursor: pointer;
+            transition: background 0.2s, color 0.2s, border-color 0.2s;
+        }
+        .llm-source-toggle button:hover { color: var(--accent-2); }
+        .llm-source-toggle button.on {
+            background: rgba(0, 255, 157, 0.16);
+            border-color: var(--accent-2);
+            color: var(--accent-2);
+        }
+        .llm-source-toggle button:disabled { cursor: progress; opacity: 0.65; }
+        /* Состояние источника: отвечает ли сервер и что делать, если нет.
+           Текст приходит С СЕРВЕРА (поле hint) — интерфейс его не выдумывает. */
+        .llm-source-state {
+            font-family: var(--mono);
+            font-size: 0.7rem;
+            line-height: 1.35;
+            color: var(--muted);
+            word-break: break-word;
+        }
+        .llm-source-state.warn { color: var(--danger); }
+        /* Кнопка управления сервером модели: одна на два действия — её смысл
+           задаёт состояние с сервера (остановить работающий / запустить
+           остановленный). */
+        .llm-server-btn {
+            align-self: flex-start;
+            padding: 5px 8px;
+            border: 1px solid var(--line-strong);
+            border-radius: 8px;
+            background: none;
+            color: var(--muted);
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            cursor: pointer;
+            transition: color 0.2s, border-color 0.2s;
+        }
+        .llm-server-btn:hover { color: var(--accent-2); border-color: var(--accent-2); }
+        .llm-server-btn[hidden] { display: none; }
+        .llm-server-btn:disabled { cursor: progress; opacity: 0.65; }
         .task-head {
             display: flex;
             align-items: center;
@@ -2216,6 +2285,34 @@
                 </select>
                 <button type="button" class="task-new" id="task-new">Новый проект</button>
             </div>
+            <!-- ИСТОЧНИК ОТВЕТА: локальная модель (MLX на этом же Mac) или
+                 удалённая (облако). Источник ОДИН на всё приложение — обычный
+                 режим, эксперт, судья, AI-агент и RAG берут модель отсюда,
+                 поэтому переключатель стоит в панели workspace, рядом с
+                 проектом и его задачами. Локальный сервер модели живёт
+                 отдельным процессом: строка состояния говорит, отвечает ли он,
+                 и что делать, если нет (текст приходит с сервера). -->
+            <div class="llm-source" id="llm-source" hidden>
+                <div class="llm-source-head">
+                    <span>Модель</span>
+                    <span class="llm-source-toggle">
+                        <button type="button" id="llm-source-local"
+                                title="Локальная модель MLX на этом компьютере: запросы не уходят в сеть, счёт за токены не выставляется. Сервер модели запускается автоматически.">🧠 Локальная</button>
+                        <button type="button" id="llm-source-remote"
+                                title="Удалённая модель в облаке (DeepSeek): запросы уходят в сеть и тарифицируются по токенам.">☁️ Удалённая</button>
+                    </span>
+                </div>
+                <div class="llm-source-state" id="llm-source-state"></div>
+                <!-- Управление САМИМ сервером модели: он живёт отдельным
+                     процессом и занимает около шести гигабайт памяти, поэтому
+                     его жизнь должна быть видна и управляема руками. Кнопка
+                     одна и меняет смысл по состоянию с сервера: «⏹ Остановить»
+                     (сервер работает), «▶ Запустить» (источник локальный, а
+                     сервер стоит). При переключении на удалённую модель сервер
+                     гаснет сам — с отсрочкой, чтобы сравнение ответов не стоило
+                     перезагрузки весов. -->
+                <button type="button" class="llm-server-btn" id="llm-server-action" hidden></button>
+            </div>
             <div id="history" class="user-history">
                 <div class="history-empty">Здесь появится, что вы вводили</div>
             </div>
@@ -3871,6 +3968,241 @@
             sessionModeButtons[key].addEventListener('click', () => setSessionMode(key));
         });
 
+        // ---------- Источник ответа: локальная модель или удалённая ----------
+        // Кнопки в панели workspace. Источник ОДИН на всё приложение (обычный
+        // режим, эксперт, судья, AI-агент, RAG) — это адрес и модель по
+        // умолчанию, а не настройка одного режима. Состояние приходит С СЕРВЕРА
+        // (что выбрано, отвечает ли локальный сервер, что делать, если нет):
+        // интерфейс ничего не додумывает и сам модель не запускает — он только
+        // просит сервер переключиться.
+        const llmSourceBox = document.getElementById('llm-source');
+        const llmSourceStateEl = document.getElementById('llm-source-state');
+        const llmServerBtn = document.getElementById('llm-server-action');
+        const llmSourceButtons = {
+            local: document.getElementById('llm-source-local'),
+            remote: document.getElementById('llm-source-remote')
+        };
+        // Последнее состояние источника с сервера (null — ещё не спрашивали).
+        let llmState = null;
+        // Опрос состояния: он нужен, пока что-то ПРОИСХОДИТ — сервер
+        // запускается (веса читаются десятки секунд) или ждёт автоостановки
+        // (переключились на удалённую). Без опроса человек видел бы «запускается»
+        // до следующего клика.
+        let llmPollTimer = null;
+        // Сколько раз опрашивали: ограничение от вечного опроса.
+        let llmPollTries = 0;
+        const LLM_POLL_MS = 2000;
+        const LLM_POLL_LIMIT = 90;
+        // Автоостановка — процесс неспешный (отсрочка измеряется минутами),
+        // поэтому и опрос реже, и попыток больше.
+        const LLM_STOP_POLL_MS = 20000;
+        const LLM_STOP_POLL_LIMIT = 20;
+
+        const LLM_SOURCE_NOTES = {
+            local: '🧠 Источник ответа: ЛОКАЛЬНАЯ модель на этом компьютере — '
+                + 'запросы не уходят в сеть и не тарифицируются.',
+            remote: '☁️ Источник ответа: УДАЛЁННАЯ модель в облаке — запросы уходят '
+                + 'в сеть и считаются по тарифу провайдера.'
+        };
+
+        function llmBusy(busy) {
+            Object.keys(llmSourceButtons).forEach(key => {
+                llmSourceButtons[key].disabled = !!busy;
+            });
+            llmServerBtn.disabled = !!busy;
+        }
+
+        function stopLlmPoll() {
+            if (llmPollTimer) clearInterval(llmPollTimer);
+            llmPollTimer = null;
+        }
+
+        // Рисует переключатель по последнему состоянию с сервера. Виден только в
+        // режиме агента: это панель workspace.
+        function renderLlmSource() {
+            llmSourceBox.hidden = !agentModeOn();
+            const source = (llmState && llmState.source) || 'remote';
+            Object.keys(llmSourceButtons).forEach(key => {
+                llmSourceButtons[key].classList.toggle('on', key === source);
+            });
+            if (!llmState) {
+                llmSourceStateEl.textContent = '';
+                llmServerBtn.hidden = true;
+                return;
+            }
+            const server = llmState.server || {};
+            let text = llmState.hint || '';
+            if (llmState.error) text = '⚠️ ' + llmState.error;
+            llmSourceStateEl.textContent = text;
+            llmSourceStateEl.classList.toggle(
+                'warn', !llmState.ready && !server.starting);
+            // Кнопка сервера называет то, что БУДЕТ сделано: работающий сервер
+            // (он занимает память) — «остановить», остановленный при локальном
+            // источнике — «запустить». При удалённом источнике и остановленном
+            // сервере показывать нечего.
+            if (server.running) {
+                llmServerBtn.textContent = server.stop_in
+                    ? '⏹ Остановить сейчас' : '⏹ Остановить сервер';
+                llmServerBtn.hidden = false;
+            } else if (source === 'local') {
+                llmServerBtn.textContent = '▶ Запустить сервер';
+                llmServerBtn.hidden = false;
+            } else {
+                llmServerBtn.hidden = true;
+            }
+        }
+
+        // Снимок источника с сервера. К модели этот маршрут не обращается —
+        // только короткий опрос «жив ли сервер», поэтому его можно звать и при
+        // каждой загрузке страницы, и в опросе.
+        async function loadLlmSource() {
+            try {
+                const res = await fetch('/api/agent/llm');
+                if (!res.ok) return;
+                llmState = await res.json();
+            } catch (e) {
+                return;   // связи нет — показываем то, что уже знаем
+            }
+            renderLlmSource();
+        }
+
+        // Опрос, пока не наступит ожидаемое: `done(state)` — «уже то, что ждём».
+        function pollLlm(done, intervalMs, limit, onDone) {
+            stopLlmPoll();
+            llmPollTries = 0;
+            llmPollTimer = setInterval(async () => {
+                llmPollTries += 1;
+                await loadLlmSource();
+                const state = llmState || {};
+                const server = state.server || {};
+                if (server.error) {
+                    stopLlmPoll();
+                    addMessage('bot', '⚠️ ' + server.error, true);
+                    return;
+                }
+                if (done(state) || llmPollTries >= limit) {
+                    stopLlmPoll();
+                    if (onDone) onDone(state);
+                }
+            }, intervalMs);
+        }
+
+        // Сервер поднимается: веса читаются с диска.
+        function pollLlmReady() {
+            pollLlm(state => (state.server || {}).running,
+                LLM_POLL_MS, LLM_POLL_LIMIT,
+                () => addMessage('debug', '🧠 Локальная модель загружена и отвечает.',
+                    true));
+        }
+
+        // Сервер доживает отсрочку автоостановки: ждём, пока погаснет сам.
+        function pollLlmStopped() {
+            pollLlm(state => !(state.server || {}).running,
+                LLM_STOP_POLL_MS, LLM_STOP_POLL_LIMIT,
+                () => addMessage('debug',
+                    '💤 Локальный сервер остановлен — память освобождена.', true));
+        }
+
+        // Кнопка управления сервером модели: «остановить» работающий или
+        // «запустить» остановленный. Сервер — отдельный процесс, поэтому это
+        // единственный способ погасить его из интерфейса (кроме автоостановки).
+        async function llmServerAction() {
+            if (!llmState) return;
+            const action = (llmState.server || {}).running ? 'stop' : 'start';
+            stopLlmPoll();
+            llmBusy(true);
+            llmServerBtn.textContent = action === 'stop' ? 'Останавливаю…' : 'Запускаю…';
+            let ok = false;
+            try {
+                const res = await fetch('/api/agent/llm/server',
+                    jsonOptions('POST', { action: action }));
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    addMessage('bot', '⚠️ ' + (detail || 'Не удалось выполнить действие.'), true);
+                    await loadLlmSource();
+                } else {
+                    llmState = await res.json();
+                    ok = true;
+                }
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+            } finally {
+                llmBusy(false);
+            }
+            renderLlmSource();
+            if (!ok) return;
+            if (action === 'stop') {
+                addMessage('debug', '💤 Локальный сервер остановлен — память освобождена.',
+                    true);
+            } else {
+                addMessage('debug', '🧠 Локальный сервер запускается: читаю веса — это '
+                    + 'занимает десятки секунд.', true);
+                pollLlmReady();
+            }
+        }
+
+        // Переключение источника: сервер сохраняет выбор и, если выбрана
+        // локальная модель, поднимает её сервер отдельным процессом (ответ
+        // приходит сразу, готовность догоняем опросом).
+        async function setLlmSource(source) {
+            if (switching) return;
+            if (llmState && llmState.source === source) {
+                // Повторный клик по активной кнопке — просьба поднять сервер
+                // (например, его остановили вручную).
+                if (source !== 'local' || (llmState.server || {}).running) return;
+            }
+            stopLlmPoll();
+            llmBusy(true);
+            llmSourceStateEl.textContent = source === 'local'
+                ? 'Переключаю на локальную модель…'
+                : 'Переключаю на удалённую модель…';
+            try {
+                const res = await fetch('/api/agent/llm/source',
+                    jsonOptions('POST', { source: source, autostart: true }));
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    addMessage('bot', '⚠️ ' + (detail || 'Не удалось переключить источник ответа.'), true);
+                    await loadLlmSource();
+                } else {
+                    llmState = await res.json();
+                    renderLlmSource();
+                    addMessage('debug', LLM_SOURCE_NOTES[source], true);
+                }
+            } catch (e) {
+                addMessage('bot', '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.', true);
+            } finally {
+                llmBusy(false);
+            }
+            const server = (llmState && llmState.server) || {};
+            if (llmState && llmState.source === 'local' && !server.running) {
+                if (server.starting) {
+                    addMessage('debug', '🧠 Локальная модель запускается: читаю веса — '
+                        + 'это занимает десятки секунд.', true);
+                    pollLlmReady();
+                } else if (llmState.error) {
+                    addMessage('bot', '⚠️ ' + llmState.error, true);
+                } else if (llmState.hint) {
+                    addMessage('bot', '⚠️ ' + llmState.hint, true);
+                }
+            } else if (llmState && llmState.source === 'remote' && server.stop_in) {
+                // Переход на удалённую гасит локальный сервер с отсрочкой: об этом
+                // надо сказать прямо — иначе «почему модель ещё в памяти» и
+                // «почему вернулся мгновенно» остаются загадкой.
+                addMessage('debug', '💤 Локальный сервер остановится сам через ~'
+                    + Math.max(1, Math.round(server.stop_in / 60)) + ' мин и освободит '
+                    + 'память; вернётесь на локальную раньше — ничего перезагружать '
+                    + 'не придётся.', true);
+                pollLlmStopped();
+            }
+        }
+
+        Object.keys(llmSourceButtons).forEach(key => {
+            llmSourceButtons[key].addEventListener('click', () => setLlmSource(key));
+        });
+        llmServerBtn.addEventListener('click', llmServerAction);
+
         // Периодическая ли задача (по расписанию из снимка workspace). Нужна и
         // прогону шагов, и подсказкам: у периодической задачи ход работы другой —
         // план строится один раз, итоговой проверки нет, «готово» не ставится, а
@@ -5326,6 +5658,9 @@
             // возвращается вместе с режимом.
             if (!on) document.body.classList.remove('session-answer');
             renderSessionMode();
+            // Переключатель источника ответа живёт в панели workspace: вне
+            // режима агента панели нет — и переключателя тоже.
+            renderLlmSource();
             // Панель «Токены диалога» — только в режиме агента (то же место и
             // размер, что у панели статистики в экспертном режиме).
             agentPanel.hidden = !on;
@@ -8283,6 +8618,10 @@
             if (!p) return '';
             const m = p.rub_per_mtok || {};
             const num = (v, d) => (Number(v) || 0).toFixed(d).replace('.', ',');
+            // Локальная модель: ставок нет вовсе — «вход 0,00 ₽ за 1M токенов»
+            // читалось бы как неизвестный тариф, поэтому строка называет причину
+            // нуля (текст берётся с сервера, интерфейс его не выдумывает).
+            if (p.provider === 'local') return `Тариф ${p.model} — ${p.tariff}`;
             let text = `Тариф ${p.model} — ${p.tariff}: вход ${num(m.cache_miss, 2)}`;
             if (Number(m.cache_hit) !== Number(m.cache_miss)) {
                 text += ` (из кэша ${num(m.cache_hit, 3)})`;
@@ -9051,6 +9390,10 @@
         showAgentStrategyRows();
         renderWorkspace();
         loadProfiles();
+        // Источник ответа (локальная модель или удалённая) — с сервера: он один
+        // на всё приложение и переживает перезапуск, поэтому состояние берём
+        // сразу при открытии страницы, а не при первом переключении.
+        loadLlmSource();
         setAgentMode(true);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         input.focus();

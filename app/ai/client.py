@@ -559,7 +559,7 @@ def _perform_call(
         expert_mode = False
         payload_messages = messages
 
-    used_model = model or spec["model"] or config.LLM_MODEL
+    used_model = model or spec["model"] or config.active_model()
     payload: Dict[str, Any] = {"model": used_model, "messages": payload_messages}
 
     # max_tokens уходит ровно тем значением, которое задал пользователь.
@@ -590,11 +590,18 @@ def _perform_call(
     # У модели по умолчанию (провайдер deepseek-official) reasoning выключен
     # ВСЕГДА — thinking: disabled уходит в каждом запросе к ней (config.LLM_DISABLE_THINKING).
     # Моделям, которые поля не принимают (alice), оно не отправляется — иначе 400.
+    # Провайдер с thinking="ignore" (локальный сервер MLX) поля НЕ знает вовсе:
+    # рассуждения у локальной модели выключаются настройкой её шаблона чата
+    # (см. app/ai/local_llm.py), а не полем запроса.
     if (
-        spec["thinking"] == "disabled"
-        or max_tokens or stop_sequences or expert_mode or temperature is not None
-        or disable_thinking
-    ) and _supports_thinking(used_model):
+        spec["thinking"] != "ignore"
+        and (
+            spec["thinking"] == "disabled"
+            or max_tokens or stop_sequences or expert_mode or temperature is not None
+            or disable_thinking
+        )
+        and _supports_thinking(used_model)
+    ):
         payload["thinking"] = {"type": "disabled"}
 
     # Потоковый режим: ответ читается по частям, а usage (если провайдер его

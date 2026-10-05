@@ -142,7 +142,7 @@ def generate_response(
         max_tokens=max_tokens,
         stop=stop,
     )
-    analytics = [_analytics_row("ответ", config.LLM_MODEL, metrics)]
+    analytics = [_analytics_row("ответ", config.active_model(), metrics)]
 
     # JSON-режим: никогда не показываем «ошибку» вместо ответа. Если ответ не
     # парсится (обрезан лимитом), дочиняем или оборачиваем в валидный JSON.
@@ -284,7 +284,7 @@ def _judge_analyst(
     )
     verdict, metrics = client.call_llm_with_metrics(
         "\n\n".join(parts), system_prompt=system)
-    row = _analytics_row("судья-аналитик", config.LLM_MODEL, metrics)
+    row = _analytics_row("судья-аналитик", config.active_model(), metrics)
     if not verdict:
         return None, row
     parsed = _parse_judge_json(verdict)
@@ -369,7 +369,7 @@ def _judge_model_test(answers: list, analytics: list) -> list:
     verdict, metrics = client.call_llm_with_metrics(
         "Ответы и метрики моделей:\n\n" + "\n\n".join(blocks), system_prompt=system
     )
-    row = _analytics_row("судья-аналитик", config.LLM_MODEL, metrics)
+    row = _analytics_row("судья-аналитик", config.active_model(), metrics)
     if not verdict:
         return [], row
     return _parse_model_summaries(verdict), row
@@ -534,7 +534,7 @@ def _temperature_responses(
         results.append(
             {"temperature": t, "text": _normalize_answer(user_text, answer, response_format)}
         )
-        analytics.append(_analytics_row(f"temperature {t}", config.LLM_MODEL, metrics))
+        analytics.append(_analytics_row(f"temperature {t}", config.active_model(), metrics))
     # Если после фильтра значений не осталось — ведём себя как обычный режим.
     if not results:
         answer, metrics = client.call_llm_with_metrics(
@@ -549,7 +549,7 @@ def _temperature_responses(
                 "text": _normalize_answer(user_text, answer, response_format),
             }
         ]
-        analytics = [_analytics_row("обычный ответ", config.LLM_MODEL, metrics)]
+        analytics = [_analytics_row("обычный ответ", config.active_model(), metrics)]
     return results, analytics
 
 
@@ -675,12 +675,12 @@ def _expert_response(
 
     system_prompt = _build_expert_system_prompt(mode, roles)
     answer, metrics = client.call_llm_with_metrics(user_text, system_prompt=system_prompt)
-    analytics = [_analytics_row("ответ эксперта", config.LLM_MODEL, metrics)]
+    analytics = [_analytics_row("ответ эксперта", config.active_model(), metrics)]
     if answer:
         # Вердикт о верности даёт отдельный служебный вызов судьи — его расход
         # тоже показываем (и токены, и стоимость).
         correct, judge_metrics = _judge_correctness_metrics(user_text, answer, mode)
-        analytics.append(_analytics_row("судья (верность)", config.LLM_MODEL,
+        analytics.append(_analytics_row("судья (верность)", config.active_model(),
                                         judge_metrics))
         return answer, correct, analytics
 

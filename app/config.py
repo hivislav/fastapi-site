@@ -80,6 +80,35 @@ YANDEX_MODEL = os.getenv(
 )
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "")
 
+# --- ЛОКАЛЬНАЯ модель (MLX) — третий источник ответа ---
+# Отдельный провайдер "local": сервер mlx_lm.server (пакет mlx-lm) работает на
+# ЭТОМ ЖЕ Mac по адресу LOCAL_LLM_BASE_URL и отдаёт OpenAI-совместимый
+# /chat/completions. Ни ключа, ни сети не нужно — но клиент требует непустой
+# ключ, поэтому у локального провайдера он условный ("local").
+#
+# Всё окружение и веса живут ВНУТРИ проекта (data/local_llm, каталог в
+# .gitignore): свой venv с mlx-lm (его ставит tools/local_llm.sh — интерпретатор
+# берётся системный, Python 3.11+), веса в HF_HOME — наружу (в ~/.cache) не
+# пишется ничего.
+LOCAL_LLM_HOME = os.getenv(
+    "LOCAL_LLM_HOME", os.path.join(PROJECT_ROOT, "data", "local_llm"),
+)
+LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080/v1")
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "mlx-community/Qwen3-8B-4bit")
+LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "local")
+# Человекочитаемое имя модели — для подписи в интерфейсе (в промпт не идёт).
+LOCAL_LLM_TITLE = os.getenv("LOCAL_LLM_TITLE", "Qwen3-8B-4bit (MLX)")
+LOCAL_LLM_HOST = os.getenv("LOCAL_LLM_HOST", "127.0.0.1")
+LOCAL_LLM_PORT = int(os.getenv("LOCAL_LLM_PORT", "8080"))
+# Файл выбранного источника ответа (кнопка «локальная/удалённая» в панели
+# workspace): выбор переживает перезапуск приложения.
+LLM_SOURCE_FILE = os.getenv(
+    "LLM_SOURCE_FILE", os.path.join(LOCAL_LLM_HOME, "source.json"),
+)
+# Источник ДО первого переключения (дальше решает файл выше): "remote" —
+# как было всегда, "local" — сразу локальная модель.
+LLM_SOURCE_DEFAULT = os.getenv("LLM_SOURCE", "remote")
+
 # Ключа модели по умолчанию нет (например, .env не обновлён после перехода на
 # официальный DeepSeek): обычные запросы уйдут в демо-режим, а старые модели
 # «Теста моделей» продолжат работать, если задан YANDEX_API_KEY. Пишем об этом
@@ -249,7 +278,13 @@ def usage_cost(
     completion = max(0, int(completion_tokens or 0))
     hit = max(0, min(int(cache_hit_tokens or 0), prompt))
     miss = prompt - hit
-    if (provider or provider_for_model(model)) == "yandex":
+    name = provider or provider_for_model(model)
+    if name == "local":
+        # Локальная модель считает на своём железе: счёт за токены не
+        # выставляется ни в какой валюте. Ноль здесь — не «тариф неизвестен»,
+        # а именно отсутствие оплаты (в панели это видно по подписи тарифа).
+        return 0.0
+    if name == "yandex":
         # Yandex кэш отдельно не тарифицирует: весь вход стоит одинаково,
         # поэтому переданные кэш-токены здесь игнорируются (иначе вход из
         # «кэша» оказался бы бесплатным).
@@ -271,9 +306,13 @@ def model_price(model: str, provider: Optional[str] = None,
 
     Для показа «сколько стоит тысяча токенов»: у официального DeepSeek это
     цена входа мимо кэша и цена выхода на текущий момент (пик/непик), у
-    моделей Yandex — их рублёвый тариф. Неизвестная модель — нули, без выдумок.
+    моделей Yandex — их рублёвый тариф, у локальной модели — нули (счёт не
+    выставляется). Неизвестная модель — нули, без выдумок.
     """
-    if (provider or provider_for_model(model)) == "yandex":
+    name = provider or provider_for_model(model)
+    if name == "local":
+        return {"input": 0.0, "output": 0.0}
+    if name == "yandex":
         return _yandex_price(model)
     rates = deepseek_tariff(model, when)
     return {
@@ -291,8 +330,24 @@ def pricing_info(model: Optional[str] = None, provider: Optional[str] = None,
     строку тарифа под таблицей расхода, чтобы цифра стоимости была объяснимой
     (какой тариф, пиковый ли, по какому курсу).
     """
-    used = model or LLM_MODEL
+    used = model or active_model()
     name = provider or provider_for_model(used)
+    if name == "local":
+        # Локальная модель: тарифа нет вовсе — подпись говорит об этом прямо,
+        # иначе «0,00 ₽» читалось бы как «тариф неизвестен» или «ошибка расчёта».
+        return {
+            "provider": "local",
+            "model": used,
+            "peak": False,
+            "tariff": "локальная модель — платить не за что",
+            "usd_rub": None,
+            "usd_per_mtok": None,
+            "rub_per_mtok": {"cache_hit": 0.0, "cache_miss": 0.0, "output": 0.0},
+            "peak_note": (
+                "Модель работает на этом же компьютере (MLX, Apple Silicon): "
+                "запросы не уходят в сеть, счёт за токены не выставляется."
+            ),
+        }
     if name == "yandex":
         price = _yandex_price(used)
         return {
@@ -332,21 +387,98 @@ def pricing_info(model: Optional[str] = None, provider: Optional[str] = None,
 
 
 # ---------------------------------------------------------------------------
+# Источник ответа: локальная модель или удалённая (переключатель в интерфейсе)
+# ---------------------------------------------------------------------------
+# У приложения ОДИН действующий источник ответа на весь процесс: переключатель
+# «локальная / удалённая» в панели workspace меняет его для ВСЕХ обращений к
+# модели (обычный режим, эксперт, «Температура», судья, AI-агент, RAG), потому
+# что источник — это адрес и модель по умолчанию, а не настройка одного режима.
+#
+# Различие с «Тестом моделей» намеренное: там модель выбирается ВРУЧНУЮ и её
+# провайдер приходит в клиент явно (MODEL_SPECS), поэтому сравнить локальный и
+# удалённый ответы можно в любой момент, независимо от переключателя.
+SOURCES = ("remote", "local")
+
+_llm_source = str(LLM_SOURCE_DEFAULT or "").strip().lower()
+if _llm_source not in SOURCES:
+    _llm_source = "remote"
+
+
+def llm_source() -> str:
+    """Действующий источник ответа: "remote" (провайдер по умолчанию) или "local"."""
+    return _llm_source
+
+
+def set_llm_source(name: Optional[str]) -> str:
+    """Переключает источник ответа. Неизвестное имя — ошибка, а не «тихий remote».
+
+    Опечатка в имени не должна молча оставлять человека на удалённой модели:
+    он думает, что запросы больше не уходят в сеть, а они уходят.
+    """
+    key = str(name or "").strip().lower()
+    if key not in SOURCES:
+        raise ValueError(f"Неизвестный источник ответа: {name!r}")
+    global _llm_source
+    _llm_source = key
+    return _llm_source
+
+
+def active_provider() -> str:
+    """Провайдер по умолчанию: локальный сервер MLX или официальный DeepSeek."""
+    return "local" if _llm_source == "local" else DEFAULT_PROVIDER
+
+
+def active_model() -> str:
+    """Модель по умолчанию у действующего источника.
+
+    ЕЮ обслуживаются все обращения к модели, где модель не задана явно
+    (обычный запрос, судья, шаги агента, панель токенов): раньше на этих местах
+    стоял config.LLM_MODEL — удалённая модель.
+    """
+    return LOCAL_LLM_MODEL if _llm_source == "local" else LLM_MODEL
+
+
+def source_info() -> Dict[str, Any]:
+    """Источник ответа для интерфейса: что за модель и куда уходит запрос."""
+    if _llm_source == "local":
+        return {
+            "source": "local",
+            "provider": "local",
+            "title": LOCAL_LLM_TITLE,
+            "model": LOCAL_LLM_MODEL,
+            "base_url": LOCAL_LLM_BASE_URL,
+            "remote": False,
+        }
+    return {
+        "source": "remote",
+        "provider": DEFAULT_PROVIDER,
+        "title": "DeepSeek (облако)",
+        "model": LLM_MODEL,
+        "base_url": LLM_BASE_URL,
+        "remote": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Выбор провайдера
 # ---------------------------------------------------------------------------
 def provider_spec(name: Optional[str] = None) -> Dict[str, Any]:
     """Параметры провайдера: адрес, ключ, модель по умолчанию и режим thinking.
 
-    `name` — "deepseek-official" (официальный API DeepSeek, по умолчанию) или
-    "yandex" (Yandex Cloud AI Studio — модели «Теста моделей»). Неизвестное имя
-    трактуется как провайдер по умолчанию: опечатка в ключе модели не должна
-    отправлять запрос «в никуда» с чужим ключом.
+    `name` — "deepseek-official" (официальный API DeepSeek, провайдер по
+    умолчанию), "local" (локальный сервер MLX на этом же Mac) или "yandex"
+    (Yandex Cloud AI Studio — модели «Теста моделей»). Не задано имя —
+    берётся ДЕЙСТВУЮЩИЙ источник (active_provider); неизвестное имя трактуется
+    так же: опечатка в ключе модели не должна отправлять запрос «в никуда» с
+    чужим ключом.
 
     Возвращает словарь с полями provider / title / base_url / api_key / model /
     thinking, где thinking = "disabled" — reasoning выключать в КАЖДОМ запросе
-    (так работает модель по умолчанию), "auto" — по общим правилам клиента.
+    (так работает модель по умолчанию), "auto" — по общим правилам клиента,
+    "ignore" — поля thinking у провайдера НЕТ и отправлять его нельзя
+    (локальный сервер MLX его не знает).
     """
-    key = str(name or DEFAULT_PROVIDER or "").strip()
+    key = str(name or "").strip() or active_provider()
     if key == "yandex":
         return {
             "provider": "yandex",
@@ -355,6 +487,15 @@ def provider_spec(name: Optional[str] = None) -> Dict[str, Any]:
             "api_key": YANDEX_API_KEY,
             "model": YANDEX_MODEL,
             "thinking": "auto",
+        }
+    if key == "local":
+        return {
+            "provider": "local",
+            "title": LOCAL_LLM_TITLE,
+            "base_url": LOCAL_LLM_BASE_URL,
+            "api_key": LOCAL_LLM_API_KEY,
+            "model": LOCAL_LLM_MODEL,
+            "thinking": "ignore",
         }
     return {
         "provider": "deepseek-official",
@@ -369,13 +510,20 @@ def provider_spec(name: Optional[str] = None) -> Dict[str, Any]:
 def provider_for_model(model: Optional[str]) -> str:
     """Имя провайдера по идентификатору модели.
 
-    Модели старого провайдера — URI вида «gpt://…» (Yandex); всё остальное
-    обслуживает провайдер по умолчанию. Нужно там, где модель пришла строкой
-    (агент, история диалога), а адрес и ключ надо выбрать ДО запроса.
+    Модели старого провайдера — URI вида «gpt://…» (Yandex); идентификатор
+    локальной модели обслуживает локальный сервер MLX; идентификатор удалённой
+    модели по умолчанию — официальный DeepSeek. Всё остальное (модель не
+    названа, имя неизвестно) обслуживает ДЕЙСТВУЮЩИЙ источник: так обычные
+    запросы и шаги агента уходят туда, куда переключён переключатель.
     """
-    if str(model or "").strip().lower().startswith("gpt://"):
+    key = str(model or "").strip().lower()
+    if key.startswith("gpt://"):
         return "yandex"
-    return DEFAULT_PROVIDER
+    if key and key in ("local", str(LOCAL_LLM_MODEL).strip().lower()):
+        return "local"
+    if key and key == str(LLM_MODEL).strip().lower():
+        return DEFAULT_PROVIDER
+    return active_provider()
 
 
 # Предел длины ответа ШАГА агента, если пользователь не задал «Длину» (0 — нет

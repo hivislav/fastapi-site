@@ -935,7 +935,7 @@ class Agent:
             #    Служебные вызовы (сжатие памяти, обновление фактов) идут
             #    отдельно. Вызов выполняется в отдельном потоке и event loop
             #    не блокирует.
-            short_model = (params["model"] or config.LLM_MODEL).split("/")[-1]
+            short_model = (params["model"] or config.active_model()).split("/")[-1]
             await emit(self._step(
                 "debug",
                 f"{self.name}: отправляю запрос в LLM как есть (модель {short_model}, thinking выключен) — жду…",
@@ -1097,7 +1097,7 @@ class Agent:
 
         content, metrics = await client.call_llm_async(
             user_text=payload,
-            model=self.config.model or config.LLM_MODEL,
+            model=self.config.model or config.active_model(),
             disable_thinking=True,   # служебный вызов — без reasoning
             max_tokens=PLAN_MAX_TOKENS,  # JSON не должен обрезаться провайдером
             messages=[
@@ -1378,7 +1378,7 @@ class Agent:
 
         content, metrics = await client.call_llm_async(
             user_text=payload,
-            model=self.config.model or config.LLM_MODEL,
+            model=self.config.model or config.active_model(),
             disable_thinking=True,      # служебный вызов — без reasoning
             max_tokens=REVIEW_MAX_TOKENS,
             messages=[
@@ -1859,7 +1859,7 @@ class Agent:
         payload = f"{current}\n\nПоследний обмен репликами:\n{exchange}"
         content, metrics = await client.call_llm_async(
             user_text=payload,
-            model=self.config.model or config.LLM_MODEL,
+            model=self.config.model or config.active_model(),
             disable_thinking=True,  # служебный вызов — reasoning не нужен
             max_tokens=FACTS_MAX_TOKENS,  # JSON фактов не должен обрезаться
             messages=[
@@ -1976,7 +1976,7 @@ class Agent:
                 ))
             content, metrics = await client.call_llm_async(
                 user_text=payload,
-                model=self.config.model or config.LLM_MODEL,
+                model=self.config.model or config.active_model(),
                 disable_thinking=True,  # планирование — служебный вызов, без reasoning
                 max_tokens=BRANCH_MAX_TOKENS,  # JSON не должен обрезаться
                 messages=[
@@ -2016,7 +2016,7 @@ class Agent:
                 "по последним сообщениям диалога.",
             ))
             messages = self._build_plain_context(text)
-            short_model = (params["model"] or config.LLM_MODEL).split("/")[-1]
+            short_model = (params["model"] or config.active_model()).split("/")[-1]
             fallback_content, fallback_metrics, elapsed = await self._call_model(text, messages, params)
             self._track_usage(fallback_metrics)
             self.last_usage["overflow"] = self._is_limit_exceeded(fallback_metrics, params.get("max_tokens"))
@@ -2120,7 +2120,7 @@ class Agent:
         messages.append({"role": "user", "content": text})
         messages = self._cap_context(messages)
 
-        short_model = (params["model"] or config.LLM_MODEL).split("/")[-1]
+        short_model = (params["model"] or config.active_model()).split("/")[-1]
         await emit(self._step(
             "debug",
             f"{self.name}: отправляю запрос в LLM (ветка {branch_id}, модель {short_model}, "
@@ -2372,7 +2372,7 @@ class Agent:
             # пиковый или непиковый, ставки, курс): панель показывает его рядом
             # со стоимостью, иначе цифра в рублях ничем не объяснена. Тариф
             # берётся на момент запроса, поэтому смена пика в панели видна.
-            "pricing": config.pricing_info(config.LLM_MODEL),
+            "pricing": config.pricing_info(config.active_model()),
             "service": {},
         }
 
@@ -2602,7 +2602,7 @@ class Agent:
         )
         content, metrics = await client.call_llm_async(
             user_text=rendered,
-            model=self.config.model or config.LLM_MODEL,
+            model=self.config.model or config.active_model(),
             disable_thinking=True,  # служебный вызов — reasoning не нужен
             messages=[
                 {"role": "system", "content": SUMMARIZE_PROMPT},
@@ -2683,7 +2683,9 @@ class Agent:
         )
 
         # --- model: всегда пользователь/конфигурация ---
-        params["model"] = cfg.model or config.LLM_MODEL
+        # Не задана — берётся модель ДЕЙСТВУЮЩЕГО источника (локальная или
+        # удалённая): переключатель в панели workspace меняет её для всех шагов.
+        params["model"] = cfg.model or config.active_model()
 
         return params, notes
 

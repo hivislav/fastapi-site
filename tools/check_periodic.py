@@ -1508,4 +1508,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.get_event_loop().run_until_complete(main()))
+    # Цикл создаётся ЯВНО: asyncio.get_event_loop() устарел в Python 3.12.
+    sys.exit(asyncio.run(main()))

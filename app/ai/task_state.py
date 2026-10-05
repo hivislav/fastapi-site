@@ -32,10 +32,22 @@ execution → execution (cycle_done: цикл пройден, план сохр�
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def now_utc() -> datetime:
+    """Текущий момент в НАИВНОМ UTC — как в файлах задач (без сдвига зоны).
+
+    `datetime.utcnow()` объявлен устаревшим в Python 3.12 и будет удалён, но
+    формат хранения менять нельзя: в журналах и в истории переходов лежат
+    наивные строки ISO без зоны, и появление «+00:00» сломало бы разбор и
+    сравнение СТАРЫХ записей. Поэтому берём момент с зоной и снимаем её —
+    значение остаётся тем же самым, а предупреждение уходит.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # Этап задачи. planning/execution/validation/done — базовые,
 # awaiting_user/failed/cancelled — допустимые расширения.
@@ -185,8 +197,8 @@ class TaskState:
     request: str = ""
     reason: str = ""
     history: List[Dict[str, Any]] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=now_utc)
+    updated_at: datetime = field(default_factory=now_utc)
 
     # ------------------------------------------------------------------
     # Шаги плана
@@ -330,7 +342,7 @@ class TaskState:
             "from": from_stage,
             "to": to_stage,
             "step": step,
-            "at": datetime.utcnow().isoformat(timespec="seconds"),
+            "at": now_utc().isoformat(timespec="seconds"),
             "reason": _short(reason, REASON_LIMIT),
         }
         if paused is not None:
@@ -339,7 +351,7 @@ class TaskState:
         if len(self.history) > MAX_HISTORY:
             self.history = self.history[-MAX_HISTORY:]
         self.reason = record["reason"]
-        self.updated_at = datetime.utcnow()
+        self.updated_at = now_utc()
 
 
 # ---------------------------------------------------------------------------
@@ -763,7 +775,7 @@ def reset(
             "from": previous.stage,
             "to": "planning",
             "step": previous.current_step,
-            "at": datetime.utcnow().isoformat(timespec="seconds"),
+            "at": now_utc().isoformat(timespec="seconds"),
             "reason": _short(reason, REASON_LIMIT),
             "reset": True,
         })
@@ -1274,7 +1286,7 @@ def _parse_dt(value: Any) -> datetime:
             return datetime.fromisoformat(text)
         except ValueError:
             pass
-    return datetime.utcnow()
+    return now_utc()
 
 
 def _clean_history(raw: Any, limit: int = MAX_HISTORY) -> List[Dict[str, Any]]:

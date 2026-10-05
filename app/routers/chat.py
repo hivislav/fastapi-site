@@ -44,6 +44,7 @@ from app.ai import attachments as attach_store
 from app.ai import client as llm_client
 from app.ai import service
 from app.ai import invariants as invariants_store
+from app.ai import local_llm
 from app.ai import mcp as mcp_store
 from app.ai import periodic as periodic_store
 from app.ai import profiles as profile_store
@@ -64,6 +65,7 @@ from app.ai.agent import (
 )
 from app.schemas import (
     ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
+    LlmServerAction, LlmSourceUpdate,
     McpApply, MemoryEntryCreate, NameUpdate, PeriodicUpdate, PlanUpdate, ProfileCreate,
     ProfileFields, RagApply, RagDialogTest, RagJobDone, RagRelax, RagUpload,
     SessionCreate, SessionMode, TaskCreate,
@@ -932,6 +934,21 @@ async def chat(msg: ChatMessage) -> dict:
     """Принимает сообщение пользователя и возвращает ответ бота."""
     if not msg.content.strip():
         return {"user": msg.content, "bot": "Пожалуйста, введите сообщение."}
+    # Выбрана локальная модель — сервер MLX обязан отвечать ДО вызова: иначе
+    # обычный режим молча подменил бы недоступную модель ДЕМО-ОТВЕТОМ, и это
+    # выглядело бы как «модель ответила ерунду». Недоступный источник — понятная
+    # причина текстом (как и другие сообщения этого маршрута), а не пустой ответ.
+    if config.llm_source() == "local":
+        try:
+            await asyncio.to_thread(local_llm.prepare)
+        except local_llm.LocalLlmError as exc:
+            return {
+                "user": msg.content,
+                "bot": (f"⚠ Локальная модель не готова: {exc}. Источник ответа "
+                        "переключается в панели слева («Локальная модель» / "
+                        "«Удалённая модель»)."),
+                "correct": None,
+            }
     answer, correct, analytics = service.generate_response(
         msg.content,
         msg.format,
@@ -1002,6 +1019,66 @@ async def workspace_get() -> dict:
     # workspace не должна ждать конца шага агента (он держит блокировку СВОЕЙ
     # задачи весь стрим) — иначе переключение задач «зависало».
     return _snapshot()
+
+
+# ---------------------------------------------------------------------------
+# Источник ответа: локальная модель (MLX на этом же Mac) или удалённая
+#
+# Переключатель в панели workspace. Источник ОДИН на всё приложение — это
+# адрес и модель по умолчанию, а не настройка одного режима (см.
+# app/ai/local_llm.py и config.active_model). Опрос состояния — короткий
+# HTTP-запрос к локальному серверу, поэтому и он, и команды серверу уходят в
+# поток: event loop не должен ждать ни опроса, ни запуска.
+# ---------------------------------------------------------------------------
+@router.get("/agent/llm")
+async def llm_get() -> dict:
+    """Состояние действующего источника ответа.
+
+    Возвращает {"source", "provider", "title", "model", "remote", "installed",
+    "server", "ready", "hint"}: что выбрано, отвечает ли локальный сервер, что
+    установлено (venv, веса) и что делать, если ответить нечем. К модели этот
+    маршрут НЕ обращается — только короткий опрос «жив ли сервер», иначе
+    открытие панели стоило бы токенов.
+    """
+    return await asyncio.to_thread(local_llm.status)
+
+
+@router.post("/agent/llm/source")
+async def llm_source_set(payload: LlmSourceUpdate) -> dict:
+    """Переключает источник ответа («локальная / удалённая») и сохраняет выбор.
+
+    Выбор переживает перезапуск приложения (config.LLM_SOURCE_FILE). При
+    переходе на локальную модель сервер поднимается ОТДЕЛЬНЫМ процессом
+    (autostart) и загружает веса десятки секунд — маршрут этого не ждёт: в
+    ответе `server.starting` = true, готовность интерфейс видит опросом
+    GET /api/agent/llm. Неизвестное имя источника — 400, а не «тихий remote»:
+    человек не должен думать, что запросы больше не уходят в сеть, когда уходят.
+    """
+    try:
+        state = await asyncio.to_thread(local_llm.switch, payload.source,
+                                        payload.autostart)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return state
+
+
+@router.post("/agent/llm/server")
+async def llm_server_action(payload: LlmServerAction) -> dict:
+    """Запускает или останавливает локальный сервер модели.
+
+    Сервер живёт отдельным процессом и переживает перезапуск приложения,
+    поэтому его жизнь управляется явно. `start` не ждёт загрузки весов (в ответе
+    `server.starting`), `stop` ждёт завершения процесса: иначе следующий запуск
+    упёрся бы в занятый порт. Неустановленное окружение — 409 с причиной.
+    """
+    try:
+        if payload.action == "start":
+            state = await asyncio.to_thread(local_llm.start)
+        else:
+            state = await asyncio.to_thread(local_llm.stop)
+    except local_llm.LocalLlmError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return state
 
 
 @router.post("/agent/tasks")
@@ -3657,7 +3734,7 @@ async def rag_test(request: Request) -> StreamingResponse:
                 # 2. ОТВЕТ модели по найденным фрагментам — ОДИН вызов, без плана.
                 content, metrics = await llm_client.call_llm_async(
                     user_text=rag_suite.answer_payload(case_data, block),
-                    model=config.LLM_MODEL,
+                    model=config.active_model(),
                     disable_thinking=True,
                     max_tokens=rag_suite.ANSWER_MAX_TOKENS,
                     messages=[
@@ -3721,7 +3798,7 @@ async def rag_test(request: Request) -> StreamingResponse:
             try:
                 content, metrics = await llm_client.call_llm_async(
                     user_text=payload,
-                    model=config.LLM_MODEL,
+                    model=config.active_model(),
                     disable_thinking=True,
                     max_tokens=rag_suite.JUDGE_MAX_TOKENS,
                     messages=[
@@ -3926,7 +4003,7 @@ async def _rag_dialog_turn(question: str, *, memory: Dict[str, Any],
         memory_store.block(memory), rag_search.block(result), history, question,
         profile)
     content, metrics = await llm_client.call_llm_async(
-        user_text=question, model=config.LLM_MODEL, disable_thinking=True,
+        user_text=question, model=config.active_model(), disable_thinking=True,
         max_tokens=rag_dialog.ANSWER_MAX_TOKENS, messages=messages,
         timeout=_rag_test_timeout())
     tracker.note_usage(metrics, None)
@@ -3972,7 +4049,7 @@ async def _rag_memory_update(question: str, answer: str, memory: Dict[str, Any],
     content = ""
     try:
         content, metrics = await llm_client.call_llm_async(
-            user_text=payload, model=config.LLM_MODEL, disable_thinking=True,
+            user_text=payload, model=config.active_model(), disable_thinking=True,
             max_tokens=rag_dialog.MEMORY_MAX_TOKENS,
             messages=[{"role": "system", "content": memory_store.EXTRACT_PROMPT},
                       {"role": "user", "content": payload}],
@@ -4225,7 +4302,7 @@ async def rag_dialog_test(payload: RagDialogTest) -> StreamingResponse:
                     sc, number, rag_dialog.history_text(history), memory)
                 try:
                     content, metrics = await llm_client.call_llm_async(
-                        user_text=payload_text, model=config.LLM_MODEL,
+                        user_text=payload_text, model=config.active_model(),
                         disable_thinking=True,
                         max_tokens=rag_dialog.ANSWER_MAX_TOKENS,
                         messages=[{"role": "system",
@@ -4306,7 +4383,7 @@ async def rag_dialog_test(payload: RagDialogTest) -> StreamingResponse:
             judge_payload = rag_dialog.judge_payload(sc, rows, memory)
             try:
                 content, metrics = await llm_client.call_llm_async(
-                    user_text=judge_payload, model=config.LLM_MODEL,
+                    user_text=judge_payload, model=config.active_model(),
                     disable_thinking=True, max_tokens=rag_suite.JUDGE_MAX_TOKENS,
                     messages=[{"role": "system",
                                "content": rag_dialog.JUDGE_PROMPT},
@@ -4731,7 +4808,8 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                 session_now: Dict[str, Any],
                                 dialog_now: Dict[str, Any],
                                 state: "task_state.TaskState", text: str,
-                                reason: str, analyzer: Agent,
+                                reason: str, offer_plan: bool,
+                                analyzer: Agent,
                                 invariants_now: Dict[str, Any], profile: str,
                                 memory_now: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         """ПРЯМОЙ ОТВЕТ ПО ИСТОЧНИКАМ — второй путь ОДНОГО режима «AI-агент».
@@ -4755,10 +4833,19 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         # замерами автомата (у того свои служебные вызовы).
         tracker = Agent(AgentConfig())
         total: Dict[str, Any] = {}
-        yield {"type": "debug", "text": (
-            f"{_MACHINE}: отвечаю по источникам — {reason}. План и шаги не строю; "
-            "если это была работа, под ответом будет вариант «⚙ Разложить работу "
-            "на шаги».")}
+        # Про источники и вариант «разложить на шаги» говорим ТОЛЬКО когда они
+        # есть. Иначе строка обещала бы то, чего нет: «отвечаю по источникам» при
+        # выключенном RAG и MCP — лишний шум, а вариант под ответом на простой
+        # вопрос выглядит как навязанная работа. Причину выбора пути уже назвала
+        # строка гейта выше — здесь она не повторяется.
+        has_sources = bool(workspace_store.rag_enabled(task_now)
+                           or workspace_store.mcp_enabled(task_now))
+        note = (f"{_MACHINE}: отвечаю по источникам." if has_sources
+                else f"{_MACHINE}: отвечаю сразу.")
+        if offer_plan:
+            note += (" План и шаги не строю; если это была работа, под ответом "
+                     "будет вариант «⚙ Разложить работу на шаги».")
+        yield {"type": "debug", "text": note}
         # 1. ПРАВИЛА ПРОЕКТА: тот же гейт, что и перед планом. Запрос, нарушающий
         #    правило, не выполняется НИ ОДНИМ путём — иначе объединение путей
         #    стало бы лазейкой в правилах.
@@ -4812,14 +4899,16 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
             extra_blocks=[invariants_store.block(invariants_now),
                           mcp_store.block(mcp_data)])
         content, metrics = await llm_client.call_llm_async(
-            user_text=text, model=config.LLM_MODEL, disable_thinking=True,
+            user_text=text, model=config.active_model(), disable_thinking=True,
             max_tokens=rag_dialog.ANSWER_MAX_TOKENS, messages=messages,
             timeout=_rag_test_timeout())
         tracker.note_usage(metrics)
         if not str(content or "").strip():
-            yield {"type": "error", "text": (
-                "⚠ Ответа от модели нет: вызов не удался. Повторите запрос или "
-                "отправьте его как задачу (вариант «⚙ Разложить работу на шаги»).")}
+            hint = (" Повторите запрос." if not offer_plan else
+                    (" Повторите запрос или отправьте его как задачу (вариант "
+                     "«⚙ Разложить работу на шаги»)."))
+            yield {"type": "error",
+                   "text": "⚠ Ответа от модели нет: вызов не удался." + hint}
             yield {"type": "usage",
                    "usage": merge_usage(total, tracker.usage_snapshot())}
             return
@@ -4835,12 +4924,18 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         # 6. ВОССТАНОВЛЕНИЕ ПОСЛЕ ОШИБКИ ГЕЙТА: та же работа, но планом. Вариант
         #    отправляет ГОТОВУЮ ФРАЗУ (см. rag_dialog.plan_choice) — сервер узнаёт
         #    по ней решение, и кнопка работает даже после перезагрузки страницы.
-        option = rag_dialog.plan_choice(text)
-        offer = ("Если это была работа, а не вопрос, её можно разложить на шаги: "
-                 "план с подтверждением, шаги и проверка результата.")
-        yield {"type": "choices", "text": offer, "options": [option],
-               "analysis": {"message": offer, "options": [option],
-                            "kind": "plan_offer"}}
+        #    Показывается он ТОЛЬКО когда путь выбран не «просто вопросом»
+        #    (пустая причина гейта): под ответом на обычный вопрос это выглядело
+        #    навязанной работой, а не подсказкой. Кому нужно — у того есть тип
+        #    задачи «всегда сразу ответ» или просьба «ответь прямо»: там причина
+        #    названа, и вариант на месте.
+        if offer_plan:
+            option = rag_dialog.plan_choice(text)
+            offer = ("Если это была работа, а не вопрос, её можно разложить на шаги: "
+                     "план с подтверждением, шаги и проверка результата.")
+            yield {"type": "choices", "text": offer, "options": [option],
+                   "analysis": {"message": offer, "options": [option],
+                                "kind": "plan_offer"}}
         yield {"type": "usage",
                "usage": merge_usage(total, tracker.usage_snapshot())}
 
@@ -4962,6 +5057,32 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 fallback_answer = False
                 errors: List[str] = []
                 stored = False
+
+                # 0. ИСТОЧНИК ОТВЕТА. Выбрана локальная модель — сервер MLX
+                #    должен отвечать ДО первого вызова: иначе запрос ушёл бы в
+                #    закрытую дверь, а ответ вернулся пустым (и выглядел бы как
+                #    «модель промолчала»). Если сервер не запущен, он поднимается
+                #    сам, а ожидание загрузки весов идёт в отдельном потоке:
+                #    человек видит строку прогресса, а не зависший чат.
+                if config.llm_source() == "local":
+                    source_now = await asyncio.to_thread(local_llm.status)
+                    if not source_now["server"]["running"]:
+                        yield encode({"type": "debug", "text": (
+                            "🧠 Локальная модель: запускаю сервер и читаю веса — "
+                            "это занимает десятки секунд."
+                        )})
+                        try:
+                            await asyncio.to_thread(local_llm.prepare)
+                        except local_llm.LocalLlmError as exc:
+                            yield encode(_state_event(session_now, state))
+                            yield encode({"type": "error", "text": (
+                                f"⚠ Локальная модель не готова: {exc}. "
+                                "Источник ответа переключается в панели слева "
+                                "(«Локальная модель» / «Удалённая модель»)."
+                            )})
+                            yield encode({"type": "done", "usage": {},
+                                          "state": _state_snapshot(session_now, state)})
+                            return
 
                 # 1. ПАУЗА. Автомат остановлен кнопкой «Пауза»: шаг не
                 #    выполняем, просим нажать «Продолжить».
@@ -5145,6 +5266,11 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                 task_now=task_now, session_now=session_now,
                                 dialog_now=dialog_now, state=state, text=text,
                                 reason=plan_reason or "работа в один шаг",
+                                # Пустая причина гейта = «просто вопрос» (ни
+                                # признаков работы, ни просьбы ответить без плана):
+                                # только тогда вариант «разложить на шаги» под
+                                # ответом не показывается.
+                                offer_plan=bool(str(plan_reason or "").strip()),
                                 analyzer=analyzer, invariants_now=invariants_now,
                                 profile=profile, memory_now=task_memory_now):
                             kind = event.get("type")

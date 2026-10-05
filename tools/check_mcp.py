@@ -1964,7 +1964,9 @@ def main():
     test_client()
     test_parse_calls()
     test_storage()
-    loop = asyncio.get_event_loop()
+    # Цикл создаётся ЯВНО: asyncio.get_event_loop() устарел в Python 3.12.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     loop.run_until_complete(test_routes())
     loop.run_until_complete(test_dialog())
     test_http()

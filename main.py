@@ -9,6 +9,13 @@
 «Новая периодическая задача») и складывает результат в чат этих задач. Работает
 в том же процессе и цикле событий, поэтому видит те же задачи, что и API;
 выключается настройкой PERIODIC_ENABLED=0.
+
+Перед запуском восстанавливается ВЫБРАННЫЙ ИСТОЧНИК ОТВЕТА (переключатель
+«локальная / удалённая модель» в панели workspace, см. app/ai/local_llm.py):
+выбор хранится в config.LLM_SOURCE_FILE и переживает перезапуск приложения.
+Локальный сервер модели приложение само не поднимает — это делает
+переключатель или tools/local_llm.sh, чтобы запуск веб-приложения не ждал
+загрузки весов (гигабайты в память) и не решал за человека.
 """
 
 from contextlib import asynccontextmanager
@@ -17,7 +24,13 @@ from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 
 from app import periodic_runner
+from app.ai import local_llm
 from app.routers import chat, pages
+
+# Источник ответа из файла настроек — ДО первого запроса к модели: иначе
+# приложение начало бы работу на удалённой модели, хотя человек выбрал
+# локальную (и наоборот).
+local_llm.apply_saved_source()
 
 
 @asynccontextmanager

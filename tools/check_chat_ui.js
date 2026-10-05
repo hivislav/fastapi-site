@@ -672,6 +672,38 @@ const usageBySession = { 's-1': [], 's-2': [] };
 let pauseRequests = 0;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ИСТОЧНИК ОТВЕТА (переключатель «локальная / удалённая модель»): состояние
+// живёт на сервере, здесь — его заглушка. script задаёт сценарий ответа на
+// переключение: 'running' — локальный сервер сразу отвечает, 'starting' — веса
+// читаются (интерфейс обязан опрашивать готовность), 'error' — отвечать нечем,
+// 'stopping' — сервер ждёт автоостановки (перешли на удалённую: он погаснет сам).
+const LLM_STATE = {
+  source: 'remote', script: 'running', ready: true,
+  error: null, switches: [], polls: 0, server_actions: [],
+  installed: { home: '/tmp/local_llm', venv: true, mlx: true, model: true,
+               model_bytes: 4607835174 },
+  server: { running: false, starting: false, pid: 0, models: [], error: null,
+            stop_at: null, stop_in: 0, log: '/tmp/local_llm/logs/server.log' },
+  hint: 'Запросы уходят в облако: DeepSeek (облако).',
+};
+
+function llmPayload() {
+  const local = LLM_STATE.source === 'local';
+  return Object.assign({}, LLM_STATE, {
+    provider: local ? 'local' : 'deepseek-official',
+    title: local ? 'Qwen3-8B-4bit (MLX)' : 'DeepSeek (облако)',
+    model: local ? 'mlx-community/Qwen3-8B-4bit' : 'deepseek-v4-flash',
+    base_url: local ? 'http://127.0.0.1:8080/v1' : 'https://api.deepseek.com',
+    remote: !local,
+    installed: LLM_STATE.installed,
+    server: LLM_STATE.server,
+    ready: LLM_STATE.ready,
+    hint: LLM_STATE.hint,
+    switches: undefined, polls: undefined, script: undefined,
+    server_actions: undefined,
+  });
+}
+
 function jsonResponse(data, ok) {
   return { ok: ok !== false, status: ok === false ? 400 : 200,
     json: async () => data, text: async () => JSON.stringify(data) };
@@ -813,6 +845,73 @@ function makeFetch() {
     const body = typeof rawBody === 'string' ? JSON.parse(rawBody) : {};
 
     if (url === '/api/agent/workspace') return jsonResponse(workspacePayload());
+    // Источник ответа (переключатель «локальная / удалённая модель»): состояние
+    // отдаёт СЕРВЕР, интерфейс его только рисует. Ответ на переключение — то же
+    // состояние, но с запускающимся локальным сервером (веса читаются десятки
+    // секунд), поэтому проверяется и опрос готовности.
+    if (url === '/api/agent/llm' && method === 'GET') {
+      LLM_STATE.polls += 1;
+      return jsonResponse(llmPayload());
+    }
+    if (url === '/api/agent/llm/source' && method === 'POST') {
+      LLM_STATE.switches.push(body || {});
+      LLM_STATE.source = (body && body.source) || LLM_STATE.source;
+      LLM_STATE.error = null;
+      if (LLM_STATE.source === 'local' && LLM_STATE.script === 'starting') {
+        LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+          running: false, starting: true, pid: 4242, error: null,
+        });
+        LLM_STATE.hint = 'Локальный сервер запускается — веса модели читаются с диска.';
+      } else if (LLM_STATE.source === 'local' && LLM_STATE.script === 'error') {
+        const reason = 'веса модели не скачаны — выполните tools/local_llm.sh install';
+        LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+          running: false, starting: false, pid: 0, error: reason,
+        });
+        LLM_STATE.error = reason;
+        LLM_STATE.hint = reason;
+      } else if (LLM_STATE.source === 'remote' && LLM_STATE.script === 'stopping') {
+        // Перешли на удалённую, а сервер ещё работает: он доживает отсрочку и
+        // погаснет сам — интерфейс обязан это показать и дождаться остановки.
+        LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+          running: true, starting: false, pid: 4242, error: null,
+          stop_at: 1791219961, stop_in: 120,
+        });
+        LLM_STATE.hint = 'Запросы уходят в облако: DeepSeek (облако). Локальный '
+          + 'сервер ещё работает и остановится сам через ~2 мин.';
+      } else {
+        LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+          running: LLM_STATE.source === 'local', starting: false, pid: 4242,
+          error: null, stop_at: null, stop_in: 0,
+        });
+        LLM_STATE.hint = LLM_STATE.source === 'local'
+          ? 'Локальный сервер отвечает, модель: mlx-community/Qwen3-8B-4bit.'
+          : 'Запросы уходят в облако: DeepSeek (облако).';
+      }
+      LLM_STATE.ready = LLM_STATE.source === 'remote' || LLM_STATE.server.running;
+      return jsonResponse(llmPayload());
+    }
+    if (url === '/api/agent/llm/server' && method === 'POST') {
+      // Команда серверу модели: как на сервере — stop гасит процесс, start
+      // поднимает (веса читаются, готовность интерфейс догоняет опросом).
+      LLM_STATE.server_actions.push(body || {});
+      if ((body || {}).action === 'stop') {
+        LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+          running: false, starting: false, pid: 0, stop_at: null, stop_in: 0,
+        });
+        LLM_STATE.script = 'running';
+        LLM_STATE.hint = LLM_STATE.source === 'local'
+          ? 'Локальный сервер не запущен — нажмите «🧠 Локальная» ещё раз '
+            + '(сервер поднимется) или выполните tools/local_llm.sh start.'
+          : 'Запросы уходят в облако: DeepSeek (облако).';
+      } else {
+        LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+          running: false, starting: true, pid: 4545, stop_at: null, stop_in: 0,
+        });
+        LLM_STATE.hint = 'Локальный сервер запускается — веса модели читаются с диска.';
+      }
+      LLM_STATE.ready = LLM_STATE.source === 'remote' || LLM_STATE.server.running;
+      return jsonResponse(llmPayload());
+    }
     if (url.indexOf('/api/agent/sessions/') === 0 && url.indexOf('/mode') > 0
         && method === 'POST') {
       // Смена ТИПА задачи: как сервер — тип хранится у ЗАДАЧИ и приходит в снимке.
@@ -4359,6 +4458,217 @@ async function run() {
   check('строка без тарифа пояснения не создаёт',
     (dom.window.eval('pricingNotes([{ label: "D", cost_rub: 0.04 }])')
       .match(/tariff-note/g) || []).length === 0);
+
+  // -------------------------------------------------------------------------
+  // [L] Источник ответа: локальная модель или удалённая (переключатель в панели
+  //     workspace). Состояние приходит С СЕРВЕРА; интерфейс только рисует его,
+  //     просит сервер переключиться и, если локальный сервер запускается,
+  //     опрашивает готовность — веса читаются десятки секунд, и человек должен
+  //     видеть, что работа идёт.
+  console.log('\n[L] Источник ответа: локальная модель / удалённая');
+  LLM_STATE.source = 'remote';
+  LLM_STATE.script = 'running';
+  LLM_STATE.switches = [];
+  LLM_STATE.polls = 0;
+  LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+    running: false, starting: false, pid: 0, error: null });
+  LLM_STATE.hint = 'Запросы уходят в облако: DeepSeek (облако).';
+  LLM_STATE.ready = true;
+  LLM_STATE.error = null;
+  dom.window.eval('setAgentMode(true)');
+  await dom.window.eval('loadLlmSource()');
+  await sleep(20);
+  check('переключатель источника виден в панели workspace',
+    $('llm-source').hidden === false);
+  check('активной показана кнопка действующего источника (удалённая)',
+    $('llm-source-remote').classList.contains('on')
+    && !$('llm-source-local').classList.contains('on'));
+  check('строка состояния показывает то, что сказал сервер',
+    $('llm-source-state').textContent.includes('облако'),
+    $('llm-source-state').textContent);
+
+  // Переключение на локальную: интерфейс ПРОСИТ сервер (сам ничего не решает) и
+  // передаёт просьбу поднять сервер модели.
+  const switchesBefore = LLM_STATE.switches.length;
+  LLM_STATE.script = 'starting';
+  $('llm-source-local').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(30);
+  check('клик по «Локальная» отправляет выбор на сервер',
+    LLM_STATE.switches.length === switchesBefore + 1
+    && LLM_STATE.switches.slice(-1)[0].source === 'local'
+    && LLM_STATE.switches.slice(-1)[0].autostart === true,
+    JSON.stringify(LLM_STATE.switches.slice(-1)));
+  check('активной стала локальная кнопка',
+    $('llm-source-local').classList.contains('on')
+    && !$('llm-source-remote').classList.contains('on'));
+  check('человеку сказано, что источник переключён',
+    q('#messages .msg.debug').some(el => el.textContent.includes('ЛОКАЛЬНАЯ модель')),
+    String(q('#messages .msg.debug').length));
+  check('запуск сервера показан словами (веса читаются)',
+    q('#messages .msg.debug').some(el => el.textContent.includes('запускается'))
+    && $('llm-source-state').textContent.includes('запускается'),
+    $('llm-source-state').textContent);
+
+  // Опрос готовности: пока сервер запускается, интерфейс сам спрашивает состояние.
+  const pollsBefore = LLM_STATE.polls;
+  await sleep(2300);
+  check('пока сервер запускается, состояние опрашивается',
+    LLM_STATE.polls > pollsBefore, `опросов: ${LLM_STATE.polls - pollsBefore}`);
+
+  // Сервер поднялся: опрос прекращается, а человеку приходит весть о готовности.
+  LLM_STATE.script = 'running';
+  LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+    running: true, starting: false, pid: 4242, models: ['mlx-community/Qwen3-8B-4bit'] });
+  LLM_STATE.hint = 'Локальный сервер отвечает, модель: mlx-community/Qwen3-8B-4bit.';
+  LLM_STATE.ready = true;
+  await sleep(2300);
+  check('готовая модель названа в чате',
+    q('#messages .msg.debug').some(el => el.textContent.includes('загружена и отвечает')),
+    String(q('#messages .msg.debug').map(el => el.textContent).slice(-3)));
+  check('состояние показывает, что сервер отвечает',
+    $('llm-source-state').textContent.includes('отвечает')
+    && !$('llm-source-state').classList.contains('warn'),
+    $('llm-source-state').textContent);
+  const pollsAfterReady = LLM_STATE.polls;
+  await sleep(2300);
+  check('после готовности опрос прекращён',
+    LLM_STATE.polls === pollsAfterReady,
+    `опросов добавлено: ${LLM_STATE.polls - pollsAfterReady}`);
+
+  // Повторный клик по активной кнопке при работающем сервере — НЕ запрос к серверу.
+  const switchesReady = LLM_STATE.switches.length;
+  $('llm-source-local').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(30);
+  check('повторный клик по активной кнопке ничего не отправляет',
+    LLM_STATE.switches.length === switchesReady,
+    String(LLM_STATE.switches.length - switchesReady));
+
+  // Возврат на удалённую модель.
+  $('llm-source-remote').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(30);
+  check('возврат на удалённую модель: выбор ушёл на сервер',
+    LLM_STATE.switches.slice(-1)[0].source === 'remote'
+    && $('llm-source-remote').classList.contains('on'));
+
+  // АВТООСТАНОВКА. Переход на удалённую гасит локальный сервер — но с отсрочкой:
+  // сервер ещё работает и занимает память, поэтому состояние обязано сказать об
+  // этом словами, кнопка — предложить остановить сейчас, а интерфейс — опрашивать,
+  // пока сервер не погаснет сам.
+  // Сначала возвращаемся на локальную: клик по УЖЕ активной «Удалённой» ничего не
+  // отправляет (это проверено выше), а нам нужен именно переход.
+  LLM_STATE.script = 'running';
+  LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+    running: true, starting: false, stop_at: null, stop_in: 0 });
+  await dom.window.eval('loadLlmSource()');
+  $('llm-source-local').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(40);
+  check('подготовка к автоостановке: источник снова локальный',
+    LLM_STATE.source === 'local' && $('llm-source-local').classList.contains('on'),
+    LLM_STATE.source);
+  LLM_STATE.script = 'stopping';
+  LLM_STATE.switches = [];
+  // Опрос автоостановки идёт раз в 20 с — «вживую» его ждать проверке незачем:
+  // перехватываем запланированный интервал и вызываем его callback сами (ровно
+  // тот код, что сработал бы по времени).
+  const realSetInterval = dom.window.setInterval;
+  let lastInterval = null;
+  dom.window.setInterval = function (fn, ms) {
+    lastInterval = fn;
+    return realSetInterval.call(dom.window, fn, ms);
+  };
+  $('llm-source-remote').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(40);
+  check('переход на удалённую отправляет выбор на сервер',
+    (LLM_STATE.switches.slice(-1)[0] || {}).source === 'remote',
+    JSON.stringify(LLM_STATE.switches.slice(-1)));
+  check('строка состояния говорит об автоостановке',
+    $('llm-source-state').textContent.includes('остановится сам'),
+    $('llm-source-state').textContent);
+  check('в чате сказано, что сервер погаснет сам',
+    q('#messages .msg.debug').some(el => el.textContent.includes('остановится сам через')),
+    String(q('#messages .msg.debug').map(el => el.textContent.slice(0, 34)).slice(-2)));
+  check('кнопка предлагает остановить работающий сервер СЕЙЧАС',
+    $('llm-server-action').hidden === false
+    && $('llm-server-action').textContent.includes('Остановить'),
+    $('llm-server-action').textContent);
+  check('опрос автоостановки запущен', typeof lastInterval === 'function');
+
+  LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+    running: false, stop_in: 0, stop_at: null });
+  await lastInterval();
+  check('остановка сервера показана в чате',
+    q('#messages .msg.debug').some(el => el.textContent.includes('память освобождена')),
+    String(q('#messages .msg.debug').map(el => el.textContent.slice(0, 34)).slice(-2)));
+  check('при остановленном сервере и удалённом источнике кнопка скрыта',
+    $('llm-server-action').hidden === true);
+  dom.window.setInterval = realSetInterval;
+
+  // Кнопка «▶ Запустить сервер»: при локальном источнике и остановленном сервере
+  // она поднимает его, не дожидаясь запроса в чат.
+  LLM_STATE.source = 'local';
+  LLM_STATE.script = 'running';
+  LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+    running: false, starting: false, error: null });
+  await dom.window.eval('loadLlmSource()');
+  check('при остановленном сервере кнопка предлагает запуск',
+    $('llm-server-action').hidden === false
+    && $('llm-server-action').textContent.includes('Запустить'),
+    $('llm-server-action').textContent);
+  LLM_STATE.server_actions = [];
+  $('llm-server-action').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(40);
+  check('клик по кнопке запускает сервер',
+    LLM_STATE.server_actions.slice(-1)[0].action === 'start',
+    JSON.stringify(LLM_STATE.server_actions.slice(-1)));
+  check('запуск сервера кнопкой показан в чате',
+    q('#messages .msg.debug').some(el => el.textContent.includes('Локальный сервер запускается')));
+  dom.window.eval('stopLlmPoll()');
+
+  // И «⏹ Остановить»: сервер работает — память освобождается сразу.
+  LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+    running: true, starting: false, error: null });
+  await dom.window.eval('loadLlmSource()');
+  LLM_STATE.server_actions = [];
+  $('llm-server-action').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(40);
+  check('клик по кнопке останавливает сервер',
+    LLM_STATE.server_actions.slice(-1)[0].action === 'stop',
+    JSON.stringify(LLM_STATE.server_actions.slice(-1)));
+  check('остановка кнопкой показана в чате',
+    q('#messages .msg.debug').some(el => el.textContent.includes('память освобождена')));
+  check('после остановки кнопка предлагает запуск (источник локальный)',
+    $('llm-server-action').hidden === false
+    && $('llm-server-action').textContent.includes('Запустить'),
+    $('llm-server-action').textContent);
+
+  // Отвечать нечем: причина показывается человеку, а не «кнопка не работает».
+  LLM_STATE.script = 'error';
+  $('llm-source-local').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(30);
+  check('неудачный запуск: причина названа в строке состояния',
+    $('llm-source-state').textContent.includes('local_llm.sh install')
+    && $('llm-source-state').classList.contains('warn'),
+    $('llm-source-state').textContent);
+  check('неудачный запуск: причина названа и в чате',
+    q('#messages .msg.bot').some(el => el.textContent.includes('local_llm.sh install')),
+    String(q('#messages .msg.bot').map(el => el.textContent.slice(0, 40)).slice(-2)));
+
+  // Вне режима агента панели workspace нет — переключателя тоже.
+  dom.window.eval('setAgentMode(false)');
+  await sleep(20);
+  check('вне режима агента переключатель скрыт', $('llm-source').hidden === true);
+  dom.window.eval('setAgentMode(true)');
+  $('llm-source-remote').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await sleep(30);
+  LLM_STATE.script = 'running';
+  LLM_STATE.source = 'remote';
+  LLM_STATE.server = Object.assign({}, LLM_STATE.server, {
+    running: false, starting: false, pid: 0, error: null,
+    stop_at: null, stop_in: 0 });
+  LLM_STATE.hint = 'Запросы уходят в облако: DeepSeek (облако).';
+  LLM_STATE.ready = true;
+  LLM_STATE.error = null;
+  dom.window.eval('stopLlmPoll()');
 
   console.log('\nИтог: ' + (failures ? 'ПРОВАЛЕНО проверок: ' + failures : 'все проверки пройдены'));
   dom.window.close();

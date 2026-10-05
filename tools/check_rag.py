@@ -4597,11 +4597,13 @@ async def section_direct_answer():
     check("задача осталась на планировании, шагов нет (автомат не тронут)",
           state["stage"] == "planning" and not state.get("steps"),
           str(state["stage"]))
-    check("под ответом предложен вариант «разложить на шаги»",
-          any(event.get("type") == "choices"
-              and any("на шаги" in str(item.get("title") or "")
-                      for item in (event.get("options") or []))
-              for event in events), str(kinds))
+    check("под ответом на простой ВОПРОС варианта «разложить на шаги» нет",
+          "choices" not in kinds, str(kinds))
+    check("строка о пути ответа не обещает того, чего нет",
+          all("Разложить работу на шаги" not in str(event.get("text") or "")
+              for event in events if event.get("type") == "debug"),
+          str([event.get("text", "")[:80] for event in events
+               if event.get("type") == "debug"]))
     dialog = chat._current_session()["dialog"]
     check("реплики прямого ответа записаны в память диалога",
           len(dialog["messages"]) == 2
@@ -4614,6 +4616,57 @@ async def section_direct_answer():
     check("расход хода записан одной записью",
           len(dialog["usage"]) == 1 and dialog["usage"][0].get("requests"),
           str([item.get("requests") for item in dialog["usage"]]))
+    # ПРОСЬБА ОТВЕТИТЬ БЕЗ ПЛАНА: причина гейта названа, значит вариант «разложить
+    # на шаги» уместен — здесь он и должен быть (у простого вопроса его нет).
+    calls.update({"plan": 0, "answer": 0})
+    llm_client.call_llm_async = direct_fake
+    try:
+        asked_events = await run_agent_chat(
+            "Ответь прямо, без плана: как быстро приезжает Trauma Team после вызова?")
+    finally:
+        llm_client.call_llm_async = saved
+    check("просьба «ответь прямо»: вариант «разложить на шаги» показан",
+          any(event.get("type") == "choices"
+              and any("на шаги" in str(item.get("title") or "")
+                      for item in (event.get("options") or []))
+              for event in asked_events),
+          str([event.get("type") for event in asked_events]))
+    # БАЗЫ ВЫКЛЮЧЕНЫ (RAG не подключён): ответ не должен ни ссылаться на
+    # несуществующие фрагменты, ни рассказывать про базы знаний и поиск —
+    # иначе человек читает «[1]…[5]» там, где документов нет вообще.
+    global LLM_ANSWER
+    saved_answer = LLM_ANSWER
+    LLM_ANSWER = ("Вечером можно почитать книгу [1], погулять [2] и заняться "
+                  "спортом [3].")
+    LLM_CONTEXT.clear()
+    await chat.rag_apply(RagApply(enabled=[], rewrite=False, rerank=False,
+                                 filter=True, min_score=0.2, top_k_after=5))
+    llm_client.call_llm_async = direct_fake
+    try:
+        off_events = await run_agent_chat("Чем заняться вечером")
+    finally:
+        llm_client.call_llm_async = saved
+        LLM_ANSWER = saved_answer
+    off_bots = [event for event in off_events if event.get("type") == "bot"]
+    off_text = str(off_bots[-1]["text"]) if off_bots else ""
+    check("выдуманных ссылок [N] в ответе нет", not rag_dialog.has_citation(off_text),
+          off_text[:160])
+    check("строки источников про неподключённые базы нет",
+          rag_dialog.SOURCES_MARK not in off_text, off_text[:160])
+    check("о базах знаний и поиске в ответе не говорится",
+          "базы знаний" not in off_text.lower()
+          and "баз не подключено" not in off_text.lower(), off_text[:160])
+    check("модели сказано, что фрагментов нет (ссылок быть не должно)",
+          any("ФРАГМЕНТОВ ДОКУМЕНТОВ НЕТ" in context for context in LLM_CONTEXT),
+          str([context[:60] for context in LLM_CONTEXT][:3]))
+    check("строка о пути ответа не обещает источников",
+          any("отвечаю сразу" in str(event.get("text") or "")
+              for event in off_events if event.get("type") == "debug"),
+          str([event.get("text", "")[:80] for event in off_events
+               if event.get("type") == "debug"][:2]))
+    await chat.rag_apply(RagApply(enabled=[uploaded["base"]["id"]], rewrite=False,
+                                 rerank=False, filter=True, min_score=0.2,
+                                 top_k_after=5))
     # ВАРИАНТ «РАЗЛОЖИТЬ НА ШАГИ»: та же фраза с признаком работы — и это уже план.
     calls.update({"plan": 0, "answer": 0})
     llm_client.call_llm_async = fake_call_llm_async

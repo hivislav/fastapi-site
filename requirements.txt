@@ -6,16 +6,24 @@ uvicorn[standard]==0.34.0
 # эмбеддингов (stdlib, без сети), а PDF отвечает понятной причиной отказа.
 # Ставятся отдельно и по желанию:
 #
-#   pip install pypdf                  # чтение PDF (текстовый слой)
-#   pip install sentence-transformers  # семантические эмбеддинги (тянет torch)
+#   pip install pypdf                   # чтение PDF (текстовый слой)
+#   pip install sentence-transformers   # семантические эмбеддинги и реранкер (тянет torch)
+#   pip install Pillow                  # нужен ТОЛЬКО проверке OCR (check_rag.py
+#                                       # рисует скан, чтобы распознаванию было что читать)
 #
-# ВАЖНО про Python 3.9 (версия venv проекта): свежие sentence-transformers
-# требуют 3.10+, поэтому ставятся пинованные версии:
+# ПИНОВ ПО ВЕРСИИ PYTHON БОЛЬШЕ НЕТ. venv проекта — Python 3.12 (был 3.9), поэтому
+# прежняя связка «numpy<2 + torch==2.2.2 + sentence-transformers==4.1.0» не нужна:
+# она стояла только потому, что свежие версии требуют 3.10+. Проверено на 3.12:
+# torch 2.14.1, sentence-transformers 6.1.0, numpy 2.5.3 — качество поиска на
+# настоящих базах ТО ЖЕ, что было на старых пинах (tools/check_rag_quality.py
+# --reranker cross-encoder даёт строку в строку те же попадания и места).
 #
-#   pip install "numpy<2" "torch==2.2.2" "sentence-transformers==4.1.0"
+# Модели скачиваются один раз в RAG_MODEL_CACHE (data/rag/models) и дальше
+# работают без сети. Подробности — в app/ai/rag_embedding.py и .env.example.
 #
-# Модель скачивается один раз в RAG_MODEL_CACHE (data/rag/models) и дальше
-# работает без сети. Подробности — в app/ai/rag_embedding.py и .env.example.
+# Заодно с sentence-transformers приходит httpx — с ним работает
+# `fastapi.testclient` (раньше его в проекте не было, и маршруты проверялись
+# вызовом функций, а не запросами).
 #
 # Распознавание сканов (OCR) НЕ требует ни brew, ни pip: используется встроенный
 # в macOS Vision, а хелпер (tools/vision_ocr.swift) собирается один раз через уже
@@ -26,4 +34,5 @@ uvicorn[standard]==0.34.0
 # близость при поиске по базе (с ним 5 000 чанков ищутся за 4 мс, без него —
 # перебором на Python за 1,2 с). Приходит вместе с torch/sentence-transformers.
 #pypdf>=4.0
-#sentence-transformers==4.1.0
+#sentence-transformers>=6.0
+#Pillow

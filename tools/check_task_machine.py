@@ -2192,13 +2192,22 @@ def main():
     print("Проверка Task State Machine (без сети и LLM)")
     test_core()
     test_workspace()
-    asyncio.get_event_loop().run_until_complete(test_routes())
-    asyncio.get_event_loop().run_until_complete(test_invariants())
-    asyncio.get_event_loop().run_until_complete(test_request_compliance())
-    asyncio.get_event_loop().run_until_complete(test_suggestion_verification())
-    asyncio.get_event_loop().run_until_complete(test_chosen_alternative())
-    asyncio.get_event_loop().run_until_complete(test_project_ban_wins())
-    asyncio.get_event_loop().run_until_complete(test_plan_gate())
+    # ОДИН цикл событий на все прогоны: блокировки задач создаются при первом
+    # обращении и привязаны к циклу, поэтому отдельный цикл на каждый прогон дал
+    # бы «Lock is bound to a different event loop». Создаётся он ЯВНО:
+    # asyncio.get_event_loop() устарел в Python 3.12 и будет удалён.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(test_routes())
+        loop.run_until_complete(test_invariants())
+        loop.run_until_complete(test_request_compliance())
+        loop.run_until_complete(test_suggestion_verification())
+        loop.run_until_complete(test_chosen_alternative())
+        loop.run_until_complete(test_project_ban_wins())
+        loop.run_until_complete(test_plan_gate())
+    finally:
+        loop.close()
     print("\nИтог: " + (f"ПРОВАЛЕНО проверок: {len(FAILURES)} → {FAILURES}"
                        if FAILURES else "все проверки пройдены"))
     return 1 if FAILURES else 0
