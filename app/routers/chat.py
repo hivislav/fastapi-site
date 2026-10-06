@@ -4066,7 +4066,13 @@ async def _rag_memory_update(question: str, answer: str, memory: Dict[str, Any],
         if not update.get(key):
             update[key] = local.get(key) or []
     merged = memory_store.merge(memory, update)
-    yield {"type": "task_memory", "memory": memory_store.snapshot(merged),
+    # ИЗМЕНИЛАСЬ ли память: строка в чате нужна, когда есть новость. Повторный
+    # тот же вопрос ничего не добавляет — и «🧠 Память задачи — цель: …» второй раз
+    # подряд выглядела как поломка (жалоба 05.10).
+    before = memory_store.snapshot(memory)
+    after = memory_store.snapshot(merged)
+    changed = after != before
+    yield {"type": "task_memory", "memory": after, "changed": changed,
            "text": "🧠 Память задачи — " + memory_store.summary_line(merged)}
 
 
@@ -5287,8 +5293,12 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                                 # если пользователь его попросит) её видит.
                                 workspace_store.set_task_memory_value(
                                     dialog_now, event.get("memory") or {})
-                                yield encode({"type": "debug",
-                                              "text": event.get("text")})
+                                # Строку в чат пишем, ТОЛЬКО когда память
+                                # изменилась: иначе повторный вопрос давал бы ту
+                                # же строку второй раз подряд.
+                                if event.get("changed") is not False:
+                                    yield encode({"type": "debug",
+                                                  "text": event.get("text")})
                                 continue
                             elif kind == "choices":
                                 # Варианты («разложить на шаги») — в журнал: по нему

@@ -4589,6 +4589,9 @@ async def section_direct_answer():
           bool(bots) and bots[-1].get("sources")
           and rag_dialog.SOURCES_MARK in bots[-1]["text"],
           str(bots[-1].get("sources"))[:160] if bots else "ответа нет")
+    check("при найденных фрагментах модели уходит промпт ПО ДОКУМЕНТАМ",
+          any("называй источники" in context for context in LLM_CONTEXT),
+          str([context[:60] for context in LLM_CONTEXT][:2]))
     check("решение гейта объяснено в чате («плана не будет»)",
           any("плана не будет" in str(event.get("text") or "")
               for event in events if event.get("type") == "debug"),
@@ -4641,6 +4644,9 @@ async def section_direct_answer():
     LLM_CONTEXT.clear()
     await chat.rag_apply(RagApply(enabled=[], rewrite=False, rerank=False,
                                  filter=True, min_score=0.2, top_k_after=5))
+    # СВЕЖАЯ задача: у памяти нет цели, поэтому первый ответ её ЗАПИШЕТ и строка
+    # о памяти появится — на этом и проверяется правило «строка = новость».
+    await chat.task_create(chat.TaskCreate(name="Без документов"))
     llm_client.call_llm_async = direct_fake
     try:
         off_events = await run_agent_chat("Чем заняться вечером")
@@ -4656,14 +4662,32 @@ async def section_direct_answer():
     check("о базах знаний и поиске в ответе не говорится",
           "базы знаний" not in off_text.lower()
           and "баз не подключено" not in off_text.lower(), off_text[:160])
-    check("модели сказано, что фрагментов нет (ссылок быть не должно)",
-          any("ФРАГМЕНТОВ ДОКУМЕНТОВ НЕТ" in context for context in LLM_CONTEXT),
-          str([context[:60] for context in LLM_CONTEXT][:3]))
+    check("модели уходит промпт БЕЗ документов (правил про ссылки в нём нет)",
+          any("ДОКУМЕНТОВ НЕТ" in context for context in LLM_CONTEXT)
+          and not any("называй источники" in context for context in LLM_CONTEXT),
+          str([context[:70] for context in LLM_CONTEXT][:3]))
     check("строка о пути ответа не обещает источников",
           any("отвечаю сразу" in str(event.get("text") or "")
               for event in off_events if event.get("type") == "debug"),
           str([event.get("text", "")[:80] for event in off_events
                if event.get("type") == "debug"][:2]))
+    # ПАМЯТЬ ЗАДАЧИ: строка в чате — только когда память ИЗМЕНИЛАСЬ. Тот же
+    # вопрос второй раз ничего не добавляет, и повторять строку незачем.
+    memory_lines = [str(event.get("text") or "") for event in off_events
+                    if event.get("type") == "debug"
+                    and "Память задачи" in str(event.get("text") or "")]
+    check("после первой реплики память задачи показана", len(memory_lines) == 1,
+          str(memory_lines))
+    llm_client.call_llm_async = direct_fake
+    try:
+        again_events = await run_agent_chat("Чем заняться вечером")
+    finally:
+        llm_client.call_llm_async = saved
+    again_lines = [str(event.get("text") or "") for event in again_events
+                   if event.get("type") == "debug"
+                   and "Память задачи" in str(event.get("text") or "")]
+    check("повторный тот же вопрос строку о памяти НЕ повторяет",
+          not again_lines, str(again_lines))
     await chat.rag_apply(RagApply(enabled=[uploaded["base"]["id"]], rewrite=False,
                                  rerank=False, filter=True, min_score=0.2,
                                  top_k_after=5))
