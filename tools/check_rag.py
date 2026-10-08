@@ -2688,10 +2688,15 @@ async def section_answer():
     # на вопрос «в каком жанре играют samurai» агент молча ответил по общим
     # знаниям (да ещё неточно), хотя в базе лежала статья про группу Samurai —
     # её отсёк высокий порог.
+    #
+    # ГАЛОЧКА ВКЛЮЧАЕТСЯ ЯВНО: по умолчанию она снята (как и остальные
+    # выключатели этапов, см. rag_search.defaults), и тогда агент отвечает сам с
+    # пометкой. Здесь проверяется именно ОСТАНОВ с выбором — то есть включённая
+    # настройка, а не умолчание.
     await chat.task_create(chat.TaskCreate(name="RAG пусто"))
     # База включается у НОВОЙ задачи: настройка живёт на задаче, и включение
     # «где-то раньше» до неё не дотянулось бы.
-    await chat.rag_apply(RagApply(enabled=[base_id]))
+    await chat.rag_apply(RagApply(enabled=[base_id], ask_when_empty=True))
     empty_question = "в каком жанре играют samurai"
     LLM_CONTEXT.clear()          # контексты прошлых запросов тут не считаем
     events = await run_agent_chat(empty_question, force_plan=True)
@@ -2771,7 +2776,10 @@ async def section_suite():
         files=[RagFile(filename="guide.md", content_base64=payload)],
         strategy="structure", chunk_size=400, overlap=60))
     base_id = uploaded["base"]["id"]
-    await chat.rag_apply(RagApply(enabled=[base_id]))
+    # ПЕРЕФОРМУЛИРОВКА ВКЛЮЧАЕТСЯ ЯВНО: по умолчанию она снята (как и остальные
+    # выключатели этапов, см. rag_search.defaults), а прогон проверяет и её —
+    # строку «по какому запросу пошёл поиск» и служебный вызов перед ответом.
+    await chat.rag_apply(RagApply(enabled=[base_id], rewrite=True))
 
     # Заглушка модели: отвечает по вопросу теста, судья — вердикт по всем 10.
     LLM_CONTEXT.clear()
@@ -3953,6 +3961,76 @@ def section_two_stage():
               and (applied.get("search_limits") or {}).get("min_score", {}).get("max")
               == rag_search.MIN_SCORE_LIMIT,
               str(applied.get("search_limits")))
+
+        # НАСТРОЙКИ ПО УМОЛЧАНИЮ ДЛЯ КНОПКИ «ПО УМОЛЧАНИЮ». Кнопка в панели
+        # заполняет поля значениями С СЕРВЕРА (`search_defaults`) — тем, что
+        # получил бы проект с чистого листа. Здесь проверяется, что снимок их
+        # отдаёт, что они не зависят от настроек проекта (в проекте как раз
+        # выставлены нестандартные: пороги 0.5/0.42, пул 12→3, реранкинг выкл) и
+        # что «заполнить и нажать применить» ДЕЙСТВИТЕЛЬНО возвращает проект к
+        # умолчаниям — иначе кнопка обещала бы сброс, которого нет.
+        defaults = applied.get("search_defaults") or {}
+        expected_defaults = rag_search.settings(None)
+        check("снимок отдаёт настройки поиска ПО УМОЛЧАНИЮ (для кнопки «по умолчанию»)",
+              bool(defaults) and all(
+                  defaults.get(key) == expected_defaults[key]
+                  for key in ("rewrite", "rerank", "filter", "ask_when_empty",
+                              "top_k_before", "top_k_after")),
+              str({key: defaults.get(key) for key in
+                   ("rewrite", "rerank", "filter", "ask_when_empty",
+                    "top_k_before", "top_k_after")}))
+        check("умолчания — ВСЕ выключатели этапов сняты (чистый первый этап)",
+              defaults.get("rewrite") is False and defaults.get("filter") is False
+              and defaults.get("rerank") is False
+              and defaults.get("ask_when_empty") is False,
+              str({key: defaults.get(key) for key in
+                   ("rewrite", "rerank", "filter", "ask_when_empty")}))
+        check("умолчания — рабочие ЧИСЛА поиска, а не нули",
+              defaults.get("top_k_before") == rag_search.DEFAULT_TOP_K_BEFORE
+              and defaults.get("top_k_after") == rag_search.DEFAULT_TOP_K
+              and abs(float(defaults.get("min_score") or 0)
+                      - rag_search.DEFAULT_MIN_SCORE) < 1e-6
+              and float(defaults.get("min_ce") or 0) == 0.0,
+              str({key: defaults.get(key) for key in
+                   ("top_k_before", "top_k_after", "min_score", "min_ce")}))
+        # Умолчания — ЭТАЛОН, а не «то, что сейчас у проекта»: у проекта выше
+        # выставлены свои числа (пул 12→3, порог 0,5), и снимок обязан отдавать
+        # именно умолчания — иначе кнопке «по умолчанию» было бы нечего вернуть.
+        check("умолчания НЕ подменяются настройками проекта (в проекте свои числа)",
+              view.get("min_score") != defaults.get("min_score")
+              and view.get("top_k_after") != defaults.get("top_k_after")
+              and view.get("top_k_before") != defaults.get("top_k_before"),
+              "проект: %s | умолчания: %s" % (view, defaults))
+        # Что делает кнопка: заполняет поля умолчаниями и сохраняет их обычным
+        # «применить» (одна и та же запись в проект — POST /api/agent/rag).
+        chunking_before = {key: workspace_store.rag_settings(chat._current_task()).get(key)
+                           for key in ("strategy", "chunk_size", "overlap")}
+        reset = asyncio.run(chat.rag_apply(RagApply(
+            enabled=[], rewrite=defaults.get("rewrite"),
+            rerank=defaults.get("rerank"), filter=defaults.get("filter"),
+            ask_when_empty=defaults.get("ask_when_empty"),
+            top_k_before=defaults.get("top_k_before"),
+            top_k_after=defaults.get("top_k_after"),
+            min_score=defaults.get("min_score"), min_ce=defaults.get("min_ce"))))
+        reset_view = reset.get("search") or {}
+        check("«по умолчанию» + «применить» возвращает проект к умолчаниям",
+              all(abs(float(reset_view.get(key) or 0)
+                      - float(defaults.get(key) or 0)) < 1e-6
+                  for key in ("min_score", "min_ce"))
+              and reset_view.get("rewrite") == defaults.get("rewrite")
+              and reset_view.get("rerank") == defaults.get("rerank")
+              and reset_view.get("filter") == defaults.get("filter")
+              and reset_view.get("top_k_before") == defaults.get("top_k_before")
+              and reset_view.get("top_k_after") == defaults.get("top_k_after")
+              and reset_view.get("ask_when_empty") == defaults.get("ask_when_empty"),
+              "стало: %s | умолчания: %s" % (reset_view, defaults))
+        # Базы и разбиение кнопка НЕ трогает: разбиение определяет будущую
+        # индексацию, а не фильтрацию, и сбрасывать его молча нельзя.
+        chunking_after = {key: workspace_store.rag_settings(chat._current_task()).get(key)
+                          for key in ("strategy", "chunk_size", "overlap")}
+        check("сброс умолчаний не трогает параметры разбиения проекта",
+              chunking_after == chunking_before, 
+              "было: %s | стало: %s" % (chunking_before, chunking_after))
 
     # 7. ВЕБ-СЛОЙ: переформулировка идёт ДО поиска, её строка уходит в чат,
     #    а расход служебного вызова возвращается вызывающему.

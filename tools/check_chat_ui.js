@@ -363,6 +363,15 @@ let RAG = {
   searchLimits: { top_k: { min: 1, max: 50 }, max_hits: { min: 1, max: 50 },
                   min_score: { min: 0, max: 2, step: 0.05 },
                   min_ce: { min: 0, max: 1, step: 0.05 } },
+  // НАСТРОЙКИ ПОИСКА ПО УМОЛЧАНИЮ (кнопка «по умолчанию»): их считает СЕРВЕР
+  // (rag_search.defaults) и отдаёт снимком `search_defaults`. ПО УМОЛЧАНИЮ ВСЕ
+  // ГАЛОЧКИ СНЯТЫ (чистый первый этап), а числа — рабочие (пул 30, в ответ 8,
+  // порог 0,3): в заглушке они НАРОЧНО отличаются от настроек проекта (20/5,
+  // пороги 0.3/0, галочки стоят) — иначе проверка не отличила бы «кнопка взяла
+  // умолчания» от «кнопка ничего не сделала».
+  searchDefaults: { top_k: 8, top_k_after: 8, top_k_before: 30, ask_when_empty: false,
+                    min_score: 0.3, min_ce: 0, rewrite: false, rerank: false,
+                    filter: false },
   // Состояние РЕРАНКЕРА (app/ai/rag_rerank.py, status): чем реранкить сейчас,
   // какая модель, скачана ли она и почему работает не то, что выбрано.
   rerank: {
@@ -566,6 +575,7 @@ function ragPayload() {
     strategies: RAG_STRATEGIES,
     settings: Object.assign({}, RAG.settings),
     search: Object.assign({}, RAG.search),
+    search_defaults: JSON.parse(JSON.stringify(RAG.searchDefaults)),
     search_limits: JSON.parse(JSON.stringify(RAG.searchLimits)),
     rerank: JSON.parse(JSON.stringify(RAG.rerank)),
     defaults: { strategy: 'structure', chunk_size: 1000, overlap: 150 },
@@ -1208,6 +1218,9 @@ function makeFetch() {
         }
         if (body.min_ce !== undefined && body.min_ce !== null) {
           RAG.search.min_ce = Number(body.min_ce);
+        }
+        if (body.min_score !== undefined && body.min_score !== null) {
+          RAG.search.min_score = Number(body.min_score);
         }
       }
       return jsonResponse(ragPayload());
@@ -3149,6 +3162,73 @@ async function run() {
     && $('rag-min-ce-value').textContent === '0,42',
     [$('rag-rewrite').checked, $('rag-top-before').value,
      $('rag-top-after').value, $('rag-min-ce-value').textContent].join(' / '));
+
+  // ---------------------------------------------------------------------
+  // КНОПКА «ПО УМОЛЧАНИЮ»: возвращает НАСТРОЙКИ ПОИСКА к значениям, которые
+  // считает СЕРВЕР (снимок `search_defaults`), — это то, что получил бы проект с
+  // чистого листа. Кнопка только ЗАПОЛНЯЕТ поля: запись в проект делает обычное
+  // «применить» (один путь записи, и человек видит, что сохранится). Базы и
+  // параметры разбиения она не трогает — они не про фильтрацию.
+  const ragSearchBeforeDefaults = JSON.parse(JSON.stringify(RAG.search));
+  check('в панели есть кнопка «по умолчанию»',
+    $('rag-defaults') !== null && $('rag-defaults').type === 'button',
+    $('rag-defaults') ? $('rag-defaults').type : 'кнопки нет');
+  // МЕСТО КНОПКИ — СЕМАНТИКА: она возвращает к умолчаниям ТОЛЬКО «Поиск и
+  // ответы» (этапы, выборки, оба порога) и не трогает галочки баз с параметрами
+  // разбиения. Значит, и стоять она должна ВНУТРИ этого блока, а не в нижнем ряду
+  // действий всего диалога рядом с «обновить/закрыть/применить».
+  check('кнопка «по умолчанию» стоит ПОД настройками «Поиск и ответы»',
+    $('rag-defaults').closest('.rag-search') !== null
+    && $('rag-defaults').closest('.rag-search').contains($('rag-search-hint'))
+    && !$('rag-apply').parentElement.contains($('rag-defaults')),
+    'ряд действий диалога: ' + $('rag-apply').parentElement.textContent.trim());
+  const ragPostsBeforeDefaults = calls.filter(c => c === 'POST /api/agent/rag').length;
+  await click($('rag-defaults'), 60);
+  check('«по умолчанию» НЕ пишет в проект — только заполняет поля',
+    calls.filter(c => c === 'POST /api/agent/rag').length === ragPostsBeforeDefaults,
+    calls.slice(-3).join(' | '));
+  check('«по умолчанию» вернуло галочки этапов к умолчаниям',
+    $('rag-rewrite').checked === RAG.searchDefaults.rewrite
+    && $('rag-rerank').checked === RAG.searchDefaults.rerank
+    && $('rag-filter').checked === RAG.searchDefaults.filter
+    && $('rag-ask-empty').checked === RAG.searchDefaults.ask_when_empty,
+    [$('rag-rewrite').checked, $('rag-rerank').checked, $('rag-filter').checked,
+     $('rag-ask-empty').checked].join(' / '));
+  check('«по умолчанию» вернуло выборки и ОБА порога к умолчаниям',
+    $('rag-top-before').value === String(RAG.searchDefaults.top_k_before)
+    && $('rag-top-after').value === String(RAG.searchDefaults.top_k_after)
+    && Number($('rag-min-score').value) === RAG.searchDefaults.min_score
+    && Number($('rag-min-ce').value) === RAG.searchDefaults.min_ce,
+    [$('rag-top-before').value, $('rag-top-after').value,
+     $('rag-min-score').value, $('rag-min-ce').value].join(' / '));
+  check('подсказка говорит, что умолчания ещё НЕ сохранены',
+    $('rag-search-hint').textContent.indexOf('ПО УМОЛЧАНИЮ') >= 0
+    && $('rag-search-hint').textContent.indexOf('«применить»') >= 0,
+    $('rag-search-hint').textContent.slice(0, 160));
+  await click($('rag-apply'), 80);
+  check('«по умолчанию» + «применить» записали умолчания в проект',
+    RAG.search.rewrite === RAG.searchDefaults.rewrite
+    && RAG.search.rerank === RAG.searchDefaults.rerank
+    && RAG.search.filter === RAG.searchDefaults.filter
+    && RAG.search.ask_when_empty === RAG.searchDefaults.ask_when_empty
+    && RAG.search.top_k_before === RAG.searchDefaults.top_k_before
+    && RAG.search.top_k_after === RAG.searchDefaults.top_k_after
+    && RAG.search.min_score === RAG.searchDefaults.min_score
+    && RAG.search.min_ce === RAG.searchDefaults.min_ce,
+    JSON.stringify(RAG.search));
+  // Повторное открытие: панель показывает то, что СОХРАНЕНО, а несохранённых
+  // умолчаний в подсказке больше нет.
+  await click($('project-rag'), 80);
+  check('после сохранения панель показывает умолчания с сервера',
+    $('rag-rewrite').checked === RAG.searchDefaults.rewrite
+    && $('rag-top-before').value === String(RAG.searchDefaults.top_k_before)
+    && $('rag-min-score').value === String(RAG.searchDefaults.min_score)
+    && $('rag-search-hint').textContent.indexOf('ПО УМОЛЧАНИЮ') < 0,
+    $('rag-search-hint').textContent.slice(0, 160));
+  // Возвращаем настройки проекта к тем, с которыми работает остальная часть
+  // раздела (строка состояния ниже сверяется именно с ними).
+  RAG.search = ragSearchBeforeDefaults;
+  await click($('project-rag'), 80);
 
   // ---------------------------------------------------------------------
   // ПРОСМОТР ЧАНКОВ: у каждой базы есть кнопка, диалог показывает текст

@@ -127,17 +127,25 @@ def _fetch_json(url: str, timeout: float = PROBE_TIMEOUT) -> Optional[dict]:
 def probe(timeout: float = PROBE_TIMEOUT) -> dict:
     """Отвечает ли локальный сервер и какие модели он объявляет.
 
-    Возвращает {"running", "models": [id, …], "error": str|None}. Ошибка сети —
+    Возвращает {"running", "models": [id, …], "loaded", "error"}. Ошибка сети —
     не исключение: «сервер не запущен» это обычное состояние, а не сбой.
+
+    `loaded` — ОБЪЯВИЛ ли сервер модель. «Отвечает» и «может сгенерировать» —
+    не одно и то же: у сервера, которому не нашлись веса, умирает поток
+    генерации, а HTTP-часть продолжает жить и отвечает на /v1/models пустым
+    списком (mlx_lm пишет об этом только в свой журнал). Считать такой сервер
+    готовым — значит пропустить вызов в пустоту и показать человеку «модель
+    промолчала» вместо причины.
     """
     data = _fetch_json(_models_url(), timeout)
     if data is None:
-        return {"running": False, "models": [], "error": None}
+        return {"running": False, "models": [], "loaded": False, "error": None}
     models: List[str] = []
     for item in data.get("data") or []:
         if isinstance(item, dict) and item.get("id"):
             models.append(str(item["id"]))
-    return {"running": True, "models": models, "error": None}
+    return {"running": True, "models": models, "loaded": bool(models),
+            "error": None}
 
 
 def _models_url() -> str:
@@ -313,14 +321,19 @@ def status(with_probe: bool = True) -> dict:
     """Полное состояние локальной модели для интерфейса и проверок.
 
     Возвращает {"source", "provider", "title", "model", "base_url", "remote",
-    "installed": {...}, "server": {"running", "pid", "models", "starting",
-    "log", "error"}, "ready", "hint"}. Ни одного обращения к модели здесь нет:
-    только короткий опрос «жив ли сервер».
+    "installed": {...}, "server": {"running", "pid", "models", "loaded",
+    "starting", "log", "error"}, "ready", "hint"}. Ни одного обращения к модели
+    здесь нет: только короткий опрос «жив ли сервер».
+
+    `ready` требует не только ответа, но и объявленной модели: сервер, у которого
+    не нашлись веса, отвечает и при этом не может сгенерировать ни токена
+    (см. `probe`) — «готов» про него сказано не будет.
     """
     global _started_at
     info = config.source_info()
     installed = _installed()
-    server = probe() if with_probe else {"running": False, "models": [], "error": None}
+    server = probe() if with_probe else {"running": False, "models": [],
+                                         "loaded": False, "error": None}
     pid = _read_pid()
     state = _pid_state(pid)
     # ЗАПУСК и ОШИБКА — разные вещи: пока процесс жив, идёт загрузка весов
@@ -348,14 +361,16 @@ def status(with_probe: bool = True) -> dict:
         "stop_in": (max(0, int(_stop_deadline - time.time()))
                     if _stop_deadline else 0),
     })
-    ready = server["running"] or info["source"] == "remote"
+    ready = (server["running"] and bool(server.get("loaded"))) \
+        or info["source"] == "remote"
     return {
         **info,
         "installed": installed,
         "server": server,
         # ready — можно ли СЕЙЧАС получить ответ от действующего источника:
         # удалённый готов всегда (сеть и ключ — его забота), локальный — когда
-        # сервер отвечает.
+        # сервер отвечает И объявил модель (см. `probe`: отвечающий сервер без
+        # модели — это сбой загрузки весов, а не готовность).
         "ready": ready,
         "hint": _hint(info, installed, server),
     }
@@ -382,9 +397,17 @@ def _hint(info: dict, installed: dict, server: dict) -> str:
             return (text + " Локальный сервер работает, хотя выбран удалённый "
                     "источник: он не используется — остановите кнопкой ниже.")
         return text
-    if server["running"]:
+    if server["running"] and server.get("loaded"):
         loaded = ", ".join(server["models"][:3]) or config.LOCAL_LLM_MODEL
         return f"Локальный сервер отвечает, модель: {loaded}."
+    if server["running"]:
+        # Отвечает, но модели не объявил: веса не нашлись (см. `probe`). Молчать
+        # об этом нельзя — иначе каждый запрос возвращался бы пустым ответом, а
+        # человек искал бы причину в документах и в промпте.
+        return ("Локальный сервер отвечает, но модель НЕ загружена: веса не "
+                "нашлись (причина — в журнале %s). Остановите сервер кнопкой "
+                "ниже и запустите снова; если не поможет — "
+                "tools/local_llm.sh restart." % log_path())
     if server["starting"]:
         return "Локальный сервер запускается — веса модели читаются с диска."
     if server["error"]:
@@ -466,9 +489,19 @@ def _server_env() -> Dict[str, str]:
     HF_HOME уводит каталог моделей в data/local_llm/models (иначе mlx-lm полез
     бы в ~/.cache), а HF_HUB_OFFLINE запрещает серверу ходить в сеть за весами:
     локальная модель обязана работать без интернета — веса уже скачаны.
+
+    HF_HUB_CACHE задаётся ЯВНО и перекрывает унаследованный, и это не мелочь:
+    тот же процесс приложения настраивает кэш HuggingFace для моделей RAG
+    (`HF_HUB_CACHE` = data/rag/models/hub, см. app/ai/rag_embedding.py), а
+    HF_HUB_CACHE СИЛЬНЕЕ HF_HOME. Наследуй сервер этот каталог — он искал бы
+    веса ЛОКАЛЬНОЙ МОДЕЛИ в кэше моделей RAG, не нашёл бы их (дозагрузку
+    запрещает HF_HUB_OFFLINE=1) и остался бы жить процессом, который отвечает
+    на /v1/models пустым списком и не выдаёт ни одного токена: поиск по базе
+    работает, а ответа нет — «модель промолчала» вместо причины.
     """
     env = dict(os.environ)
     env["HF_HOME"] = models_dir()
+    env["HF_HUB_CACHE"] = os.path.join(models_dir(), "hub")
     env["HF_HUB_OFFLINE"] = "1"
     env["HF_HUB_DISABLE_TELEMETRY"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
@@ -532,14 +565,19 @@ def start(wait: float = 0.0) -> dict:
 
 
 def wait_ready(timeout: float = START_TIMEOUT, step: float = 1.0) -> bool:
-    """Ждёт, пока сервер начнёт отвечать. True — дождались.
+    """Ждёт, пока сервер начнёт отвечать И объявит модель. True — дождались.
 
     Ждём, ПОКА ПРОЦЕСС ЖИВ: если он умер, ждать нечего; а «спросить систему о
     процессе нельзя» — не повод бросить ожидание (см. `_pid_state`).
+
+    Ответа мало: пока веса читаются, сервер молчит, а сервер, которому веса не
+    нашлись, отвечает пустым списком моделей и генерировать не может — готовым
+    считается только тот, что объявил модель (см. `probe`).
     """
     deadline = time.time() + max(0.0, timeout)
     while time.time() < deadline:
-        if probe()["running"]:
+        info = probe()
+        if info["running"] and info["loaded"]:
             return True
         pid = _read_pid()
         if pid and _pid_state(pid) == "dead":
@@ -591,20 +629,38 @@ def prepare(autostart: bool = True, wait: float = START_TIMEOUT) -> dict:
     сам повторяет вызовы, см. app/ai/client.py).
     """
     state = status()
-    if state["source"] == "remote" or state["server"]["running"]:
+    if state["source"] == "remote" or _serving(state):
         return state
+    if state["server"]["running"]:
+        # Сервер ОТВЕЧАЕТ, но модель не объявлена: веса не загрузились (см.
+        # `probe`). Это не «запускается» — поднимать нечего, порт занят своим же
+        # процессом, и ждать бессмысленно. Причина называется сразу: пустой ответ
+        # модели выглядел бы как «модель промолчала».
+        raise LocalLlmError(state["hint"])
     if autostart and not state["server"]["starting"]:
         state = start()
-        if state["server"]["running"]:
+        if _serving(state):
             return state
-    if state["server"]["running"]:
+    if _serving(state):
         return state
     if wait > 0 and wait_ready(wait):
         return status()
     state = status()
-    if state["server"]["running"]:
+    if _serving(state):
         return state
     raise LocalLlmError(state["hint"])
+
+
+def _serving(state: dict) -> bool:
+    """Может ли сервер СГЕНЕРИРОВАТЬ ответ: отвечает И объявил модель.
+
+    «Сервер отвечает» — ещё не «сервер готов»: у сервера, которому не нашлись
+    веса, HTTP-часть живёт, а поток генерации умирает, и /v1/models отдаёт пустой
+    список (см. `probe`). Такой источник — НЕГОТОВЫЙ, и вызывающий код обязан
+    назвать причину, а не пропустить вызов в пустоту.
+    """
+    server = state.get("server") or {}
+    return bool(server.get("running")) and bool(server.get("loaded", True))
 
 
 # ---------------------------------------------------------------------------

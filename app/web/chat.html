@@ -1761,6 +1761,9 @@
         .rag-upload-status { margin: 8px 0 0; font-size: 0.82rem; color: var(--accent-2); line-height: 1.5; }
         .rag-upload-status.bad { color: var(--warn); }
         .rag-upload .modal-actions { margin-top: 6px; }
+        /* Кнопка «по умолчанию» — под настройками «Поиск и ответы»: она к ним и
+           относится (возвращает к умолчаниям только их, а не весь диалог). */
+        .rag-search .modal-actions { margin-top: 8px; }
         /* Полоса прогресса индексации: идёт в фоне, поэтому её видно и после
            закрытия диалога — на самой кнопке «RAG» (см. renderRagMarks). */
         .rag-progress {
@@ -2693,6 +2696,20 @@
 
 
                         <p class="rag-strategy-hint rag-search-hint" id="rag-search-hint"></p>
+                        <!-- КНОПКА «ПО УМОЛЧАНИЮ» — ЧАСТЬ ЭТОЙ НАСТРОЙКИ, а не
+                             действие всего диалога: она возвращает к умолчаниям
+                             только «Поиск и ответы» (этапы, выборки, оба порога) и
+                             не трогает ни галочки баз, ни параметры разбиения.
+                             Поэтому стоит она внутри своего блока, а не в нижнем
+                             ряду действий диалога.
+                             Кнопка только ЗАПОЛНЯЕТ поля значениями с сервера
+                             (снимок `search_defaults`): сохраняет их обычное
+                             «применить» — путь записи один, и человек видит, что
+                             уйдёт в проект. -->
+                        <div class="modal-actions rag-search-actions">
+                            <button type="button" class="clear" id="rag-defaults"
+                                    title="Проставить в полях настройки фильтрации по умолчанию (значения считает сервер). Сохранит их кнопка «применить».">по умолчанию</button>
+                        </div>
                     </div>
 
                     <div class="rag-upload">
@@ -7133,6 +7150,12 @@
         const ragMinScoreValueEl = document.getElementById('rag-min-score-value');
 
         const ragSearchHintEl = document.getElementById('rag-search-hint');
+        // Кнопка «по умолчанию»: проставляет в полях значения с сервера.
+        const ragDefaultsBtn = document.getElementById('rag-defaults');
+        // В полях — значения по умолчанию, но в проект они ещё НЕ записаны:
+        // подсказка панели обязана сказать это прямо, иначе человек уйдёт с
+        // мыслью, что настройки уже сброшены.
+        let ragDefaultsPending = false;
         const ragChunksModal = document.getElementById('rag-chunks-modal');
         const ragChunksListEl = document.getElementById('rag-chunks-list');
         const ragChunksSourceEl = document.getElementById('rag-chunks-source');
@@ -7457,6 +7480,9 @@
         function renderRagSearch(data) {
             const search = data.search || {};
             const limits = data.search_limits || {};
+            // Снимок с сервера — это то, чем поиск работает СЕЙЧАС: несохранённых
+            // значений по умолчанию в полях быть не может.
+            ragDefaultsPending = false;
             ragRewriteEl.checked = Boolean(search.rewrite);
             ragRerankEl.checked = Boolean(search.rerank);
             ragFilterEl.checked = Boolean(search.filter);
@@ -7476,6 +7502,45 @@
             ragMinScoreEl.step = String(Number((limits.min_score || {}).step) || 0.05);
             ragMinScoreEl.value = String(Number(search.min_score || 0));
             ragMinCeEl.value = String(Number(search.min_ce || 0));
+            renderRagSearchHint();
+        }
+
+        // КНОПКА «ПО УМОЛЧАНИЮ»: возвращает НАСТРОЙКИ ПОИСКА к значениям по
+        // умолчанию. Значения приходят с сервера (`search_defaults`) — то же
+        // самое, что получил бы проект с чистого листа: значения окружения
+        // (RAG_REWRITE, RAG_FILTER, RAG_MIN_SCORE…) и встроенные умолчания
+        // (app/ai/rag_search.py). Интерфейс их НЕ считает: иначе кнопка
+        // проставляла бы числа, придуманные страницей, и панель показывала бы не
+        // то, чем поиск работает.
+        //
+        // Кнопка только ЗАПОЛНЯЕТ поля: запись в проект делает обычное
+        // «применить» — человек видит, что именно сохранится, и путь записи
+        // остаётся один (POST /api/agent/rag). Галочки баз и параметры разбиения
+        // не трогаются: они не про фильтрацию, а разбиение определяет будущую
+        // индексацию — сбрасывать его молча нельзя.
+        function resetRagSearchDefaults() {
+            const defaults = (ragData && ragData.search_defaults) || {};
+            // СЕРВЕР СТАРЫЙ (снимка с умолчаниями нет) — выдумывать значения
+            // здесь нельзя, и говорить об этом надо прямо. Проверяем по НАЛИЧИЮ
+            // известных полей, а не по их значениям: умолчанием законно бывает и
+            // «выключено» (галочка снята в окружении, RAG_REWRITE=0).
+            const known = ['rewrite', 'rerank', 'filter', 'ask_when_empty',
+                           'top_k_before', 'top_k_after', 'min_score', 'min_ce'];
+            if (!known.some(key => defaults[key] !== undefined)) {
+                addMessage('bot', '⚠ Сервер не отдал значения по умолчанию — '
+                    + 'обновите страницу или перезапустите приложение.', true);
+                return;
+            }
+            const limits = (ragData && ragData.search_limits) || {};
+            ragRewriteEl.checked = Boolean(defaults.rewrite);
+            ragRerankEl.checked = Boolean(defaults.rerank);
+            ragFilterEl.checked = Boolean(defaults.filter);
+            ragAskEmptyEl.checked = defaults.ask_when_empty !== false;
+            fillRagTopK(ragTopBeforeEl, defaults.top_k_before, limits.top_k);
+            fillRagTopK(ragTopAfterEl, defaults.top_k_after, limits.top_k);
+            ragMinScoreEl.value = String(Number(defaults.min_score || 0));
+            ragMinCeEl.value = String(Number(defaults.min_ce || 0));
+            ragDefaultsPending = true;
             renderRagSearchHint();
         }
 
@@ -7658,6 +7723,13 @@
             if (modelWarning) {
                 text += ' ⛔ ' + modelWarning;
             }
+            // НЕСОХРАНЁННЫЕ ЗНАЧЕНИЯ ПО УМОЛЧАНИЮ: кнопка «по умолчанию» только
+            // заполняет поля, поэтому подсказка обязана сказать, что в проект они
+            // ещё не записаны — иначе человек уйдёт с мыслью, что уже сбросил.
+            if (ragDefaultsPending) {
+                text = '⭐ В полях — значения ПО УМОЛЧАНИЮ; в проекте они ещё не '
+                    + 'сохранены — нажмите «применить». ' + text;
+            }
             ragSearchHintEl.textContent = text;
             ragSearchHintEl.classList.toggle('off', tooHigh || Boolean(modelWarning));
             ragSearchHintEl.classList.toggle('rag-search-hint', true);
@@ -7798,6 +7870,9 @@
             }));
             if (!data) return;
             ragData = data;
+            // Настройки сохранены — несохранённых значений по умолчанию в полях
+            // больше нет (см. ragDefaultsPending).
+            ragDefaultsPending = false;
             renderRag();
             closeRagModal();
             const counts = data.counts || {};
@@ -8245,6 +8320,10 @@
         projectRagBtn.addEventListener('click', openRagModal);
         document.getElementById('rag-close').addEventListener('click', closeRagModal);
         document.getElementById('rag-apply').addEventListener('click', applyRag);
+        // «По умолчанию»: только заполняет поля панели поиска (сохраняет
+        // «применить»). Снимок настроек обязан быть под рукой — панель его уже
+        // загрузила при открытии (см. openRagModal).
+        ragDefaultsBtn.addEventListener('click', resetRagSearchDefaults);
         ragUploadBtn.addEventListener('click', uploadRag);
         document.getElementById('rag-progress-cancel')
             .addEventListener('click', cancelRagJob);

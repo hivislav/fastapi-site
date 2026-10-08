@@ -34,7 +34,8 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import (Any, AsyncIterator, Callable, Dict, List, Optional,
+                    Tuple)
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -938,17 +939,13 @@ async def chat(msg: ChatMessage) -> dict:
     # обычный режим молча подменил бы недоступную модель ДЕМО-ОТВЕТОМ, и это
     # выглядело бы как «модель ответила ерунду». Недоступный источник — понятная
     # причина текстом (как и другие сообщения этого маршрута), а не пустой ответ.
-    if config.llm_source() == "local":
-        try:
-            await asyncio.to_thread(local_llm.prepare)
-        except local_llm.LocalLlmError as exc:
-            return {
-                "user": msg.content,
-                "bot": (f"⚠ Локальная модель не готова: {exc}. Источник ответа "
-                        "переключается в панели слева («Локальная модель» / "
-                        "«Удалённая модель»)."),
-                "correct": None,
-            }
+    reason = await local_source_guard()
+    if reason:
+        return {
+            "user": msg.content,
+            "bot": LOCAL_SOURCE_NOT_READY % reason,
+            "correct": None,
+        }
     answer, correct, analytics = service.generate_response(
         msg.content,
         msg.format,
@@ -1079,6 +1076,60 @@ async def llm_server_action(payload: LlmServerAction) -> dict:
     except local_llm.LocalLlmError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     return state
+
+
+# ---------------------------------------------------------------------------
+# ГОТОВНОСТЬ ИСТОЧНИКА ОТВЕТА ПЕРЕД ВЫЗОВОМ МОДЕЛИ
+#
+# Выбрана локальная модель — сервер MLX обязан ОТВЕЧАТЬ до первого вызова
+# (см. §5.14 в SESSION_PROMPT): иначе запрос уходит в закрытую дверь, а ответ
+# возвращается пустым и выглядит как «модель промолчала». Гейт ОДИН и общий для
+# ВСЕХ маршрутов, которые зовут модель: чат агента, обычный режим, а также
+# мини-чат по документам, `/test_rag` и контрольные диалоги RAG — они ходят к
+# модели напрямую, своими вызовами, и раньше готовность источника не проверяли
+# вовсе: при остановленном сервере мини-чат отвечал «не получил ответа от
+# модели», хотя сервер достаточно было поднять.
+#
+# Строки тоже ОДНИ на все маршруты: причина отказа читается одинаково, откуда бы
+# запрос ни пришёл.
+# ---------------------------------------------------------------------------
+LOCAL_SOURCE_START_NOTE = (
+    "🧠 Локальная модель: запускаю сервер и читаю веса — это занимает десятки "
+    "секунд.")
+LOCAL_SOURCE_NOT_READY = (
+    "⚠ Локальная модель не готова: %s. Источник ответа переключается в панели "
+    "слева («Локальная модель» / «Удалённая модель»).")
+
+
+async def local_source_guard(
+        notify: Optional[Callable[[str], None]] = None) -> str:
+    """Готовит ИСТОЧНИК ОТВЕТА перед работой: пустая строка — можно звать модель.
+
+    Выбран удалённый источник — ждать нечего (сеть и ключ — забота клиента).
+    Выбран локальный — сервер поднимается ЗДЕСЬ, и ожидание загрузки весов идёт
+    в отдельном потоке, а не в цикле событий. Не дождались — возвращается
+    понятная причина (`local_llm.status()["hint"]`), и маршрут выдаёт её
+    человеку вместо пустого ответа модели.
+
+    `notify` — необязательный обработчик строки прогресса: он вызывается ПЕРЕД
+    ожиданием весов (только если сервер придётся запускать), чтобы потоковый
+    маршрут успел сказать «запускаю сервер» до многосекундной тишины.
+    """
+    if config.llm_source() != "local":
+        return ""
+    state = await asyncio.to_thread(local_llm.status)
+    # `ready` у локального источника — это «сервер отвечает И объявил модель»:
+    # отвечающий сервер, которому не нашлись веса, генерировать не может, и
+    # пропустить в него вызов значило бы получить пустой ответ без причины.
+    if state["ready"]:
+        return ""
+    if notify is not None and not state["server"]["running"]:
+        notify(LOCAL_SOURCE_START_NOTE)
+    try:
+        await asyncio.to_thread(local_llm.prepare)
+    except local_llm.LocalLlmError as exc:
+        return str(exc)
+    return ""
 
 
 @router.post("/agent/tasks")
@@ -3666,6 +3717,26 @@ async def rag_test(request: Request) -> StreamingResponse:
     async def event_stream():
         # Прогон НЕ берёт блокировку задачи: он ничего не меняет в её состоянии, а
         # держать на нём замок значило бы блокировать настоящую работу.
+        #
+        # 0. ИСТОЧНИК ОТВЕТА. Прогон зовёт модель на КАЖДОМ вопросе и ещё раз на
+        #    вердикте судьи — при выбранной локальной модели сервер обязан
+        #    отвечать ДО первого вызова: иначе все вопросы вернулись бы ошибкой
+        #    связи, а причина («сервер не запущен») осталась бы не названной:
+        #    человек прочитал бы «вопрос остался без ответа» и не понял, почему.
+        notes: List[str] = []
+        reason = await local_source_guard(notes.append)
+        for note in notes:
+            log(workspace_store.LOG_DEBUG, note)
+            yield json.dumps({"type": "debug", "text": note},
+                             ensure_ascii=False) + "\n"
+        if reason:
+            text = LOCAL_SOURCE_NOT_READY % reason
+            log(workspace_store.LOG_ERROR, text)
+            yield json.dumps({"type": "error", "text": text},
+                             ensure_ascii=False) + "\n"
+            yield json.dumps({"type": "done", "usage": {}},
+                             ensure_ascii=False) + "\n"
+            return
         rows: List[Dict[str, Any]] = []
         usage: Dict[str, Any] = {}
         start = {"type": "test_start", "total": rag_suite.total(),
@@ -4140,59 +4211,86 @@ async def rag_dialog_chat(msg: ChatMessage) -> StreamingResponse:
                 return
             dialog_now: Dict[str, Any] = session_now["dialog"]
             log_target["dialog"] = dialog_now
-            _running_sessions.add(str(session_now["id"]))
             workspace_store.add_log(dialog_now, workspace_store.LOG_USER, question)
-            yield encode({"type": "debug", "text": (
-                "💬 Мини-чат: отвечаю по документам проекта (план задачи не "
-                "участвует). Базы: %d, настройки поиска — как у проекта."
-                % len(enabled))})
-            usage: Dict[str, Any] = {}
-            answer = ""
-            sources: List[Dict[str, Any]] = []
-            memory = workspace_store.task_memory(dialog_now)
-            turn = int(len([m for m in dialog_now["messages"]
-                            if m.get("role") == "user"]) or 0) + 1
-            tracker = Agent(AgentConfig(max_tokens=rag_dialog.ANSWER_MAX_TOKENS))
+            # Пометку «задача выполняется» мини-чат ставит и ОБЯЗАН снять:
+            # ход держит диалог задачи, и пока он идёт, «Пауза» откладывается, а
+            # периодический повтор считает задачу занятой. Снимается в finally —
+            # иначе после первой же реплики задача осталась бы «занятой» навсегда
+            # (как у чата агента, см. хвост `agent_chat`).
+            _running_sessions.add(str(session_now["id"]))
             try:
-                async for event in _rag_dialog_turn(
-                        question, memory=memory,
-                        history=rag_dialog.history_text(dialog_now["messages"]),
-                        profile=profile, profile_id=profile_id, settings=settings,
-                        enabled=enabled, tracker=tracker):
-                    kind = event.get("type")
-                    if kind == "bot":
-                        answer = str(event.get("text") or "")
-                        sources = list(event.get("sources") or [])
-                    elif kind == "task_memory":
-                        # Память задачи — в диалог: следующий ход (и обычный
-                        # запрос агента) обязан её видеть.
-                        memory = workspace_store.set_task_memory_value(
-                            dialog_now, event.get("memory") or {})
-                        yield encode({"type": "debug", "text": event.get("text")})
-                        continue
-                    yield encode(event)
-            except Exception as exc:            # сбой хода — ответа нет, поток жив
-                logger.warning("Мини-чат: ход не выполнен — %s", str(exc)[:200])
-                yield encode({"type": "error", "text": (
-                    "⚠ Мини-чат не смог ответить: %s"
-                    % llm_client.redact_secrets(str(exc))[:300])})
-            # ЗАПИСЬ ХОДА: реплики — в память диалога, расход — одной записью,
-            # память задачи — в диалог. Состояние автомата НЕ трогаем.
-            delta = tracker.usage_snapshot()
-            if answer:
-                dialog_now["messages"].append({"role": "user", "content": question})
-                dialog_now["messages"].append({"role": "assistant", "content": answer})
-                usage = merge_usage(usage, delta)
-                if usage:
-                    dialog_now["usage"].append(dict(usage))
-                    _usage_matches_history(dialog_now)
-            elif delta.get("requests") or delta.get("failed_requests"):
-                # Ответа нет (сбой модели), но вызовы были — расход не теряем.
-                dialog_now.setdefault("usage", []).append(
-                    dict(delta, kind="service"))
-            await _persist()
-            yield encode({"type": "done", "usage": dict(usage),
-                          "memory": memory_store.snapshot(memory)})
+                # 0. ИСТОЧНИК ОТВЕТА: мини-чат ходит к модели сам (ответ, память
+                #    задачи), поэтому готовность источника проверяет здесь, а не
+                #    только в чате агента. Неготовый источник — понятная причина в
+                #    потоке, а не «не получил ответа от модели» (см. §5.14).
+                notes: List[str] = []
+                reason = await local_source_guard(notes.append)
+                for note in notes:
+                    yield encode({"type": "debug", "text": note})
+                if reason:
+                    yield encode({"type": "error",
+                                  "text": LOCAL_SOURCE_NOT_READY % reason})
+                    yield encode({"type": "done", "usage": {},
+                                  "memory": memory_store.snapshot(
+                                      workspace_store.task_memory(dialog_now))})
+                    return
+                yield encode({"type": "debug", "text": (
+                    "💬 Мини-чат: отвечаю по документам проекта (план задачи не "
+                    "участвует). Базы: %d, настройки поиска — как у проекта."
+                    % len(enabled))})
+                usage: Dict[str, Any] = {}
+                answer = ""
+                sources: List[Dict[str, Any]] = []
+                memory = workspace_store.task_memory(dialog_now)
+                turn = int(len([m for m in dialog_now["messages"]
+                                if m.get("role") == "user"]) or 0) + 1
+                tracker = Agent(AgentConfig(max_tokens=rag_dialog.ANSWER_MAX_TOKENS))
+                try:
+                    async for event in _rag_dialog_turn(
+                            question, memory=memory,
+                            history=rag_dialog.history_text(dialog_now["messages"]),
+                            profile=profile, profile_id=profile_id, settings=settings,
+                            enabled=enabled, tracker=tracker):
+                        kind = event.get("type")
+                        if kind == "bot":
+                            answer = str(event.get("text") or "")
+                            sources = list(event.get("sources") or [])
+                        elif kind == "task_memory":
+                            # Память задачи — в диалог: следующий ход (и обычный
+                            # запрос агента) обязан её видеть.
+                            memory = workspace_store.set_task_memory_value(
+                                dialog_now, event.get("memory") or {})
+                            yield encode({"type": "debug", "text": event.get("text")})
+                            continue
+                        yield encode(event)
+                except Exception as exc:        # сбой хода — ответа нет, поток жив
+                    logger.warning("Мини-чат: ход не выполнен — %s", str(exc)[:200])
+                    yield encode({"type": "error", "text": (
+                        "⚠ Мини-чат не смог ответить: %s"
+                        % llm_client.redact_secrets(str(exc))[:300])})
+                # ЗАПИСЬ ХОДА: реплики — в память диалога, расход — одной записью,
+                # память задачи — в диалог. Состояние автомата НЕ трогаем.
+                delta = tracker.usage_snapshot()
+                if answer:
+                    dialog_now["messages"].append({"role": "user",
+                                                   "content": question})
+                    dialog_now["messages"].append({"role": "assistant",
+                                                   "content": answer})
+                    usage = merge_usage(usage, delta)
+                    if usage:
+                        dialog_now["usage"].append(dict(usage))
+                        _usage_matches_history(dialog_now)
+                elif delta.get("requests") or delta.get("failed_requests"):
+                    # Ответа нет (сбой модели), но вызовы были — расход не теряем.
+                    dialog_now.setdefault("usage", []).append(
+                        dict(delta, kind="service"))
+                await _persist()
+                yield encode({"type": "done", "usage": dict(usage),
+                              "memory": memory_store.snapshot(memory)})
+            finally:
+                # Пометка «задача выполняется» снимается ВСЕГДА: и сбой хода, и
+                # обрыв потока не должны оставлять задачу занятой навсегда.
+                _running_sessions.discard(str(session_now["id"]))
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
@@ -4268,6 +4366,25 @@ async def rag_dialog_test(payload: RagDialogTest) -> StreamingResponse:
             workspace_store.add_log(dialog, kind, text, sources=sources)
 
     async def event_stream():
+        # 0. ИСТОЧНИК ОТВЕТА. Контрольный разговор зовёт модель особенно много:
+        #    имитация пользователя, каждый ответ по документам, оценка хода и
+        #    память задачи. При выбранной локальной модели сервер обязан отвечать
+        #    ДО первой реплики: иначе весь прогон превратился бы в десять ошибок
+        #    связи, а причина осталась бы не названной (см. §5.14).
+        notes: List[str] = []
+        reason = await local_source_guard(notes.append)
+        for note in notes:
+            log(workspace_store.LOG_DEBUG, note)
+            yield json.dumps({"type": "debug", "text": note},
+                             ensure_ascii=False) + "\n"
+        if reason:
+            text = LOCAL_SOURCE_NOT_READY % reason
+            log(workspace_store.LOG_ERROR, text)
+            yield json.dumps({"type": "error", "text": text},
+                             ensure_ascii=False) + "\n"
+            yield json.dumps({"type": "done", "usage": {}},
+                             ensure_ascii=False) + "\n"
+            return
         rows: List[Dict[str, Any]] = []
         # ПАМЯТЬ ЗАДАЧИ прогона — ЛОКАЛЬНАЯ: синтетический разговор не должен
         # подменять память рабочей задачи. Начинается с пустой: тест проверяет,
@@ -5070,25 +5187,17 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                 #    «модель промолчала»). Если сервер не запущен, он поднимается
                 #    сам, а ожидание загрузки весов идёт в отдельном потоке:
                 #    человек видит строку прогресса, а не зависший чат.
-                if config.llm_source() == "local":
-                    source_now = await asyncio.to_thread(local_llm.status)
-                    if not source_now["server"]["running"]:
-                        yield encode({"type": "debug", "text": (
-                            "🧠 Локальная модель: запускаю сервер и читаю веса — "
-                            "это занимает десятки секунд."
-                        )})
-                        try:
-                            await asyncio.to_thread(local_llm.prepare)
-                        except local_llm.LocalLlmError as exc:
-                            yield encode(_state_event(session_now, state))
-                            yield encode({"type": "error", "text": (
-                                f"⚠ Локальная модель не готова: {exc}. "
-                                "Источник ответа переключается в панели слева "
-                                "(«Локальная модель» / «Удалённая модель»)."
-                            )})
-                            yield encode({"type": "done", "usage": {},
-                                          "state": _state_snapshot(session_now, state)})
-                            return
+                notes: List[str] = []
+                reason = await local_source_guard(notes.append)
+                for note in notes:
+                    yield encode({"type": "debug", "text": note})
+                if reason:
+                    yield encode(_state_event(session_now, state))
+                    yield encode({"type": "error",
+                                  "text": LOCAL_SOURCE_NOT_READY % reason})
+                    yield encode({"type": "done", "usage": {},
+                                  "state": _state_snapshot(session_now, state)})
+                    return
 
                 # 1. ПАУЗА. Автомат остановлен кнопкой «Пауза»: шаг не
                 #    выполняем, просим нажать «Продолжить».

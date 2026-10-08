@@ -20,7 +20,15 @@
       задача и обычный запрос получают ПОНЯТНУЮ ПРИЧИНУ, а не пустой ответ
       (в обычном режиме он подменился бы демо-ответом);
   [6] маршруты источника ответа и безопасность остановки сервера (чужой
-      процесс по записи в pid-файле не убивается).
+      процесс по записи в pid-файле не убивается);
+  [7] автоостановка сервера при переходе на удалённый источник (с отсрочкой);
+  [9] окружение сервера модели: кэш моделей RAG не уводит веса локальной
+      модели (HF_HUB_CACHE сильнее HF_HOME, и унаследованный каталог ломал
+      загрузку весов: сервер отвечал, но генерировать не мог);
+  [8] RAG при локальном источнике: поиск по базам локальный, а генерация идёт
+      через локальную модель — маршруты RAG (мини-чат, `/test_rag`, контрольный
+      диалог) ждут готовности сервера и называют причину, если он не поднялся,
+      а пометка «задача выполняется» после хода снимается.
 
 Настоящий сервер модели не поднимается: вместо него — локальная заглушка на
 http.server или заведомо закрытый адрес. Рабочие данные не трогаются: каталог
@@ -54,11 +62,18 @@ os.environ["RAG_DIR"] = os.path.join(_TMP, "rag")
 # никто, и «сервер не запущен» проверяется без ожидания таймаута.
 CLOSED_URL = "http://127.0.0.1:1/v1"
 os.environ["LOCAL_LLM_BASE_URL"] = CLOSED_URL
+# Поиск RAG в проверке детерминирован и без сети: эмбеддинги считает встроенный
+# офлайн-бэкенд, второй этап — признаки (в рабочем проекте движок выбирает
+# окружение, см. app/ai/rag_embedding.py и rag_rerank.py).
+os.environ["RAG_EMBED_BACKEND"] = "hashing"
+os.environ["RAG_RERANK_BACKEND"] = "features"
 
 from app import config  # noqa: E402
-from app.ai import client, local_llm  # noqa: E402
+from app.ai import client, local_llm, rag, rag_embedding  # noqa: E402
 from app.routers import chat  # noqa: E402
-from app.schemas import ChatMessage, LlmServerAction, LlmSourceUpdate, TaskCreate  # noqa: E402
+from app.schemas import (ChatMessage, LlmServerAction, LlmSourceUpdate,  # noqa: E402
+                         RagApply, RagDialogTest, TaskCreate)
+from starlette.requests import Request  # noqa: E402
 
 FAILURES = []
 # Зовы модели: ни один маршрут не должен дойти до модели, пока локальный
@@ -88,6 +103,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/").endswith("/models"):
+            if _STUB.get("empty_models"):
+                # Сервер ОТВЕЧАЕТ, но модель не объявил — так выглядит сервер, у
+                # которого не нашлись веса: поток генерации умирает, а HTTP-часть
+                # продолжает отвечать пустым списком моделей (см. probe).
+                self._json({"object": "list", "data": []})
+                return
             self._json({"object": "list", "data": [
                 {"id": config.LOCAL_LLM_MODEL, "object": "model"}]})
         else:
@@ -285,6 +306,35 @@ def test_status(server):
           and config.LOCAL_LLM_MODEL in state["server"]["models"], str(state["server"]))
     check("подсказка говорит, что сервер отвечает", "отвечает" in state["hint"],
           state["hint"])
+
+    # ОТВЕЧАЕТ — НЕ ЗНАЧИТ ГОТОВ. Сервер, которому не нашлись веса, живёт и
+    # отвечает на /v1/models пустым списком, но не выдаёт ни одного токена:
+    # живой прогон 07.10 показал, как такой сервер выглядел «готовым», а ответы
+    # возвращались пустыми («модель промолчала») — вместо причины.
+    _STUB["empty_models"] = True
+    try:
+        state = local_llm.status()
+        check("сервер отвечает без модели: источник НЕ готов",
+              state["server"]["running"] and not state["server"]["loaded"]
+              and not state["ready"], str(state["server"]))
+        check("подсказка называет причину: модель не загружена",
+              "НЕ загружена" in state["hint"] and "restart" in state["hint"],
+              state["hint"])
+        config.set_llm_source("local")
+        try:
+            local_llm.prepare()
+            prepared_error = None
+        except local_llm.LocalLlmError as exc:
+            prepared_error = str(exc)
+        check("prepare() отказывает с причиной, а не пропускает вызов в пустоту",
+              bool(prepared_error) and "НЕ загружена" in prepared_error,
+              str(prepared_error))
+        config.set_llm_source("remote")
+    finally:
+        _STUB["empty_models"] = False
+    state = local_llm.status()
+    check("объявивший модель сервер снова готов",
+          state["ready"] and state["server"]["loaded"], str(state["server"]))
     config.LOCAL_LLM_BASE_URL = CLOSED_URL
     check("probe() не бросает исключений на закрытом адресе",
           local_llm.probe()["running"] is False)
@@ -536,7 +586,173 @@ def test_auto_stop(server):
         config.LOCAL_LLM_BASE_URL = CLOSED_URL
 
 
+# ---------------------------------------------------------------------------
+# 8. RAG при локальном источнике: поиск локальный, генерация — локальная модель
+#
+# ЧТО ПРОВЕРЯЕТСЯ. Маршруты RAG (мини-чат по документам, `/test_rag`, контрольный
+# диалог) зовут модель САМИ, своими вызовами — мимо чата агента. Значит, и
+# готовность источника они обязаны проверять сами: при выбранной локальной модели
+# и остановленном сервере человек должен прочитать ПРИЧИНУ («сервер не запущен»,
+# чем поднять), а не «мини-чат не получил ответа от модели». Проверка ловит ровно
+# этот разрыв: до неё мини-чат при остановленном сервере отвечал ошибкой связи,
+# хотя сервер достаточно было поднять.
+#
+# Поиск при этом остаётся ЛОКАЛЬНЫМ и без модели: его проверяет `check_rag.py`
+# (там же — качество ранжирования). Здесь важно другое: до модели дело не доходит
+# раньше, чем источник готов, а после состоявшегося хода задача не остаётся
+# «выполняющейся» навсегда.
+# ---------------------------------------------------------------------------
+RAG_DOC = (
+    "Ночные Клинки — банда из Найт-Сити. Основана в 2006 году. "
+    "Лидер — Морган Блэкхенд. Специализация: охрана и наёмная работа."
+)
+
+
+def _test_request() -> Request:
+    """POST-запрос без тела: маршруту `/test_rag` тело не нужно."""
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request({"type": "http", "method": "POST",
+                    "path": "/api/agent/rag/test", "headers": []}, receive)
+
+
+async def run_stream(target):
+    """Собирает события NDJSON-потока маршрута (как клиент чата)."""
+    response = await target if asyncio.iscoroutine(target) else target
+    events = []
+    async for chunk in response.body_iterator:
+        for line in str(chunk).splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+    return events
+
+
+async def test_rag_local_source():
+    print("\n[8] RAG при локальном источнике: мини-чат, /test_rag, диалог")
+    config.set_llm_source("remote")
+    install_llm_stub()
+    profile = chat._current_profile_id()
+    base = rag.index_files([{"filename": "заметка.txt", "text": RAG_DOC}],
+                           name="Проверка локального RAG", profile=profile)
+    await chat.task_create(TaskCreate(name="RAG и локальная модель"))
+    await chat.session_create()
+    session = chat._current_session()
+    await chat.rag_apply(RagApply(enabled=[base["id"]], rewrite=False))
+    check("проект с включённой базой готов к прогону",
+          bool(chat._current_task()) and bool((base.get("stats") or {}).get("chunks")),
+          f"чанков: {(base.get('stats') or {}).get('chunks')}")
+
+    question = "Кто такие Ночные Клинки?"
+    # ЛОКАЛЬНЫЙ ИСТОЧНИК, СЕРВЕР МОДЕЛИ НЕ ОТВЕЧАЕТ: причина, а не пустой ответ.
+    config.LOCAL_LLM_HOME = HOME_EMPTY
+    config.LOCAL_LLM_BASE_URL = CLOSED_URL
+    config.set_llm_source("local")
+
+    CALLS["count"] = 0
+    events = await run_stream(chat.rag_dialog_chat(ChatMessage(content=question)))
+    errors = [str(e.get("text") or "") for e in events if e.get("type") == "error"]
+    check("мини-чат: модель НЕ звалась, пока локальный сервер не отвечает",
+          CALLS["count"] == 0, f"вызовов: {CALLS['count']}")
+    check("мини-чат: названа причина и что делать",
+          bool(errors) and "Локальная модель не готова" in errors[0]
+          and "local_llm.sh install" in errors[0], str(errors)[:200])
+    check("мини-чат: поток закрыт событием done",
+          bool(events) and events[-1].get("type") == "done",
+          str(events[-1])[:120])
+
+    CALLS["count"] = 0
+    events = await run_stream(chat.rag_test(_test_request()))
+    errors = [str(e.get("text") or "") for e in events if e.get("type") == "error"]
+    check("`/test_rag`: модель НЕ звалась, причина названа",
+          CALLS["count"] == 0 and bool(errors)
+          and "Локальная модель не готова" in errors[0], str(errors)[:200])
+    check("`/test_rag`: поток закрыт событием done",
+          bool(events) and events[-1].get("type") == "done",
+          str(events[-1])[:120])
+
+    CALLS["count"] = 0
+    events = await run_stream(chat.rag_dialog_test(RagDialogTest(scenario=1)))
+    errors = [str(e.get("text") or "") for e in events if e.get("type") == "error"]
+    check("контрольный диалог: модель НЕ звалась, причина названа",
+          CALLS["count"] == 0 and bool(errors)
+          and "Локальная модель не готова" in errors[0], str(errors)[:200])
+    check("контрольный диалог: поток закрыт событием done",
+          bool(events) and events[-1].get("type") == "done",
+          str(events[-1])[:120])
+
+    # СЕРВЕР ОТВЕЧАЕТ: тот же вопрос отвечается по документам, а пометка
+    # «задача выполняется» после хода СНИМАЕТСЯ (иначе задача осталась бы занятой
+    # навсегда: «Пауза» откладывалась бы, а периодический повтор считал бы её
+    # идущей).
+    config.LOCAL_LLM_HOME = HOME_INSTALLED
+    config.LOCAL_LLM_BASE_URL = f"http://127.0.0.1:{_STUB['server'].server_port}/v1"
+    CALLS["count"] = 0
+    events = await run_stream(chat.rag_dialog_chat(ChatMessage(content=question)))
+    bot = next((e for e in events if e.get("type") == "bot"), None)
+    check("готовый локальный сервер: ответ получен, модель звалась",
+          bot is not None and CALLS["count"] > 0,
+          f"вызовов: {CALLS['count']}, события: {[e.get('type') for e in events]}")
+    check("ответ по документам пришёл СО СТРОКОЙ ИСТОЧНИКОВ",
+          bool(bot) and "📄 Источники:" in str(bot.get("text") or ""),
+          str((bot or {}).get("text"))[:200])
+    check("пометка «задача выполняется» снята после хода",
+          str(session["id"]) not in chat._running_sessions,
+          str(chat._running_sessions))
+
+    config.LOCAL_LLM_BASE_URL = CLOSED_URL
+    config.LOCAL_LLM_HOME = HOME_EMPTY
+    config.set_llm_source("remote")
+
+
 _STUB = {}
+
+
+# ---------------------------------------------------------------------------
+# 9. Окружение сервера: кэш моделей RAG не уводит веса локальной модели
+#
+# ЧТО ПРОВЕРЯЕТСЯ. Поиск по базам знаний настраивает кэш HuggingFace ВНУТРИ
+# проекта (`HF_HUB_CACHE` = data/rag/models/hub, см. app/ai/rag_embedding.py), и
+# это настройка ПРОЦЕССА. Сервер локальной модели запускается из того же процесса
+# отдельным процессом, а HF_HUB_CACHE СИЛЬНЕЕ HF_HOME: наследуй он каталог
+# моделей RAG — веса искались бы не там, где лежат, и при HF_HUB_OFFLINE=1 не
+# нашлись бы вовсе. Сервер при этом остаётся жить и отвечает пустым списком
+# моделей: поиск по документам работает, а генерации нет — ровно тот случай,
+# который проверяет [3] и который в живом прогоне 07.10 выглядел как «модель
+# промолчала».
+# ---------------------------------------------------------------------------
+def test_server_env():
+    print("\n[9] Окружение сервера: кэш RAG не уводит веса локальной модели")
+    config.LOCAL_LLM_HOME = HOME_INSTALLED
+    saved = {key: os.environ.get(key)
+             for key in ("HF_HOME", "HF_HUB_CACHE", "HF_XET_CACHE")}
+    try:
+        for key in saved:
+            os.environ.pop(key, None)
+        rag_cache = os.path.join(_TMP, "rag-models")
+        rag_embedding._configure_hf_env(rag_cache)
+        check("поиск RAG уводит кэш HuggingFace в свой каталог (настройка процесса)",
+              os.environ.get("HF_HUB_CACHE") == os.path.join(rag_cache, "hub"),
+              str(os.environ.get("HF_HUB_CACHE")))
+        env = local_llm._server_env()
+        check("сервер модели получает СВОЙ кэш, а не кэш моделей RAG",
+              env["HF_HUB_CACHE"] == os.path.join(local_llm.models_dir(), "hub")
+              and env["HF_HOME"] == local_llm.models_dir(),
+              f"HF_HUB_CACHE={env.get('HF_HUB_CACHE')}")
+        check("веса модели ищутся там, где они лежат",
+              os.path.isdir(os.path.join(
+                  env["HF_HUB_CACHE"],
+                  "models--" + config.LOCAL_LLM_MODEL.replace("/", "--"))),
+              str(os.listdir(env["HF_HUB_CACHE"]))
+              if os.path.isdir(env["HF_HUB_CACHE"]) else "каталога нет")
+        check("сервер модели остаётся офлайн (веса уже скачаны)",
+              env["HF_HUB_OFFLINE"] == "1", str(env.get("HF_HUB_OFFLINE")))
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def main():
@@ -553,6 +769,7 @@ def main():
         test_status(_STUB["server"])
         test_source_switch()
         test_auto_stop(_STUB["server"])
+        test_server_env()
         # Цикл событий — ОДИН на оба прогона (блокировки задач привязаны к циклу);
         # создаётся явно: asyncio.get_event_loop() устарел в Python 3.12.
         loop = asyncio.new_event_loop()
@@ -560,6 +777,7 @@ def main():
         try:
             loop.run_until_complete(test_routes_guard())
             loop.run_until_complete(test_source_routes())
+            loop.run_until_complete(test_rag_local_source())
         finally:
             loop.close()
     finally:
