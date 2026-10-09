@@ -34,7 +34,8 @@ from app.ai import client, invariants as invariants_store  # noqa: E402
 from app.ai import task_state, workspace as workspace_store  # noqa: E402
 from app.routers import chat  # noqa: E402
 from app.schemas import (  # noqa: E402
-    ChatMessage, InvariantCreate, InvariantPick, InvariantResolve, PlanUpdate,
+    ChatMessage, InvariantCreate, InvariantPick, InvariantResolve, LlmParams,
+    PlanUpdate,
 )
 
 FAILURES = []
@@ -125,7 +126,12 @@ async def fake_call_llm_async(*args, **kwargs):
     messages = kwargs.get("messages") or []
     system = str(messages[0].get("content") or "") if messages else ""
     CALLS.append({"system": system[:40], "messages": len(messages),
-                  "user_text": kwargs.get("user_text")})
+                  "user_text": kwargs.get("user_text"),
+                  # Параметры генерации вызова: по ним проверяется, что настройка
+                  # проекта (temperature и предел ответа) ДОШЛА до модели, а
+                  # служебные вызовы её не получили.
+                  "temperature": kwargs.get("temperature"),
+                  "max_tokens": kwargs.get("max_tokens")})
     if messages:
         LAST_USER_TEXTS.append(str(messages[-1].get("content") or ""))
     if system.startswith("Ты — планировщик"):
@@ -2188,6 +2194,193 @@ async def _raises(coro_fn, status=404):
     return False
 
 
+# ---------------------------------------------------------------------------
+# 10. Параметры модели проекта (temperature и предел длины ответа)
+# ---------------------------------------------------------------------------
+def _answer_calls(calls):
+    """Вызовы ОТВЕТА агента (без служебных: план, проверка, арбитр, память).
+
+    Именно к ним применяется настройка проекта: служебные вызовы возвращают JSON
+    и идут со своими пределами — высокая температура сломала бы их разбор.
+    """
+    return [c for c in calls if not c["system"].startswith(("Ты —", "Ты проверяешь"))]
+
+
+async def test_llm_params():
+    print("\n[10] Параметры модели проекта: хранение, маршруты, применение")
+    global PLAN_STEPS, INVARIANTS_ANALYSIS
+    PLAN_STEPS = ["Собрать данные"]
+    INVARIANTS_ANALYSIS = {"вердикт": "clear", "объяснение": "", "варианты": []}
+
+    # 10.1 Хранение: поле есть у новой задачи, значение переживает запись файла.
+    await chat.task_create(chat.TaskCreate(name="Проект с параметрами"))
+    task = chat._current_task()
+    await chat.session_create()
+    check("у нового проекта параметры «не заданы»",
+          workspace_store.llm_settings(task) == {"temperature": None, "max_tokens": None},
+          str(workspace_store.llm_settings(task)))
+    check("поле llm есть в нормализованной задаче (иначе терялось бы при записи)",
+          "llm" in workspace_store._normalize_task({"name": "п"}))
+
+    await chat.llm_params_set(LlmParams(temperature="0.7", max_tokens="2000"))
+    check("параметры записаны в проект",
+          workspace_store.llm_settings(task) == {"temperature": 0.7, "max_tokens": 2000},
+          str(workspace_store.llm_settings(task)))
+    saved = workspace_store.load_workspace()
+    saved_task = workspace_store.find_task(saved, task["id"])
+    check("параметры пережили запись и чтение файла",
+          (saved_task or {}).get("llm") == {"temperature": 0.7, "max_tokens": 2000},
+          str((saved_task or {}).get("llm")))
+
+    # 10.2 Битая настройка в файле зажимается молча (приложение не падает),
+    #      а значения из интерфейса — отказ с причиной.
+    check("значение вне границ из файла зажимается",
+          workspace_store._normalize_llm({"temperature": 9, "max_tokens": -5})
+          == {"temperature": 2.0, "max_tokens": 1})
+    check("мусор из файла читается как «не задано»",
+          workspace_store._normalize_llm({"temperature": "abc", "max_tokens": ""})
+          == {"temperature": None, "max_tokens": None})
+    settings, error = workspace_store.llm_params_from_form("0.7", "2000")
+    check("значения из интерфейса разбираются", settings == {"temperature": 0.7,
+                                                            "max_tokens": 2000}
+          and not error, str(settings) + " / " + error)
+    check("пустые поля — это «не задано», а не отказ",
+          workspace_store.llm_params_from_form("", "") ==
+          ({"temperature": None, "max_tokens": None}, ""))
+    check("ноль в температуре — осознанное значение, а не «пусто»",
+          workspace_store.llm_params_from_form("0", "")[0]["temperature"] == 0.0)
+    check("нечисловая температура — причина отказа",
+          "числом" in workspace_store.llm_params_from_form("тепло", "")[1],
+          workspace_store.llm_params_from_form("тепло", "")[1])
+    check("температура вне границ — причина отказа",
+          "вне границ" in workspace_store.llm_params_from_form("3", "")[1],
+          workspace_store.llm_params_from_form("3", "")[1])
+    check("дробный предел ответа — причина отказа",
+          "целое" in workspace_store.llm_params_from_form("", "2.5")[1],
+          workspace_store.llm_params_from_form("", "2.5")[1])
+
+    # 10.3 Маршруты: снимок, отказ без проекта, отказ с причиной.
+    view = await chat.llm_params_get()
+    check("снимок отдаёт значения и границы полей",
+          view["temperature"] == 0.7 and view["max_tokens"] == 2000
+          and view["limits"]["temperature"] == [0.0, 2.0]
+          and view["limits"]["max_tokens"][1] >= 2000,
+          str(view))
+    check("маршрут записи отвергает значение вне границ",
+          await _raises(lambda: chat.llm_params_set(
+              LlmParams(temperature="9", max_tokens="")), status=400))
+    check("отказ не испортил сохранённую настройку",
+          workspace_store.llm_settings(task)["temperature"] == 0.7)
+    check("маршрут записи отвергает текст вместо числа",
+          await _raises(lambda: chat.llm_params_set(
+              LlmParams(temperature="", max_tokens="много")), status=400))
+
+    # 10.4 Настройка — на ПРОЕКТЕ: у другого проекта она своя (и пустая).
+    await chat.task_create(chat.TaskCreate(name="Другой проект"))
+    other = chat._current_task()
+    check("у другого проекта параметры свои (не заданы)",
+          workspace_store.llm_settings(other)
+          == {"temperature": None, "max_tokens": None},
+          str(workspace_store.llm_settings(other)))
+    await chat.task_select(task["id"])
+    check("возврат в проект возвращает его параметры",
+          (await chat.llm_params_get())["temperature"] == 0.7)
+
+    # 10.5 Применение в режиме агента: values доходят до модели.
+    session = chat._current_session()
+    session["dialog"] = workspace_store.empty_dialog(session["id"])
+    task["invariants"] = []
+    session["dialog"]["invariants"] = []
+    CALLS.clear()
+    PLAN_QUEUE[:] = [PLAN_STEPS]
+    events = await run_chat("Собери отчёт по продажам")
+    plan_calls = [c for c in CALLS if c["system"].startswith("Ты — планировщик")]
+    check("служебный вызов плана температуру проекта НЕ получает",
+          plan_calls and all(c["temperature"] is None for c in plan_calls),
+          str([c["temperature"] for c in plan_calls]))
+    check("служебный вызов плана идёт со своим пределом ответа",
+          plan_calls and all(c["max_tokens"] != 2000 for c in plan_calls),
+          str([c["max_tokens"] for c in plan_calls]))
+
+    CALLS.clear()
+    events = await run_chat("ок", max_tokens=None)   # подтверждение → шаг
+    answer_calls = _answer_calls(CALLS)
+    check("ответ шага получил temperature проекта",
+          answer_calls and all(c["temperature"] == 0.7 for c in answer_calls),
+          str([c["temperature"] for c in answer_calls]))
+    check("ответ шага получил предел ответа проекта",
+          answer_calls and all(c["max_tokens"] == 2000 for c in answer_calls),
+          str([c["max_tokens"] for c in answer_calls]))
+    check("в чате сказано, откуда параметры",
+          any("temperature=0.7" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[:200])
+
+    # 10.6 «Длина» в шапке чата — лимит РАЗОВОГО запроса и главнее проекта.
+    await chat.session_create()
+    PLAN_QUEUE[:] = [PLAN_STEPS]
+    CALLS.clear()
+    events = await run_chat("Собери отчёт по продажам заново", max_tokens=777)
+    events = await run_chat("ок", max_tokens=777)
+    answer_calls = _answer_calls(CALLS)
+    check("«Длина» из шапки перебивает предел проекта",
+          answer_calls and all(c["max_tokens"] == 777 for c in answer_calls),
+          str([c["max_tokens"] for c in answer_calls]))
+    check("температура при этом остаётся проектной",
+          answer_calls and all(c["temperature"] == 0.7 for c in answer_calls),
+          str([c["temperature"] for c in answer_calls]))
+
+    # 10.7 Прямой ответ по источникам — тот же режим: параметры проекта тоже.
+    await chat.session_create()
+    CALLS.clear()
+    events = await run_chat("Ответь прямо: сколько было продаж?")
+    answer_calls = [c for c in CALLS if c["system"].startswith("Ты ведёшь РАЗГОВОР")]
+    check("прямой ответ получил параметры проекта",
+          answer_calls and answer_calls[0]["temperature"] == 0.7
+          and answer_calls[0]["max_tokens"] == 2000,
+          str(answer_calls[:1]))
+    check("в прямом ответе названы параметры проекта",
+          any("Параметры модели проекта" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[:200])
+
+    # 10.8 Снятие настройки: параметры больше не уходят в API вовсе.
+    await chat.llm_params_set(LlmParams(temperature="", max_tokens=""))
+    check("снятая настройка не хранится",
+          workspace_store.llm_settings(task)
+          == {"temperature": None, "max_tokens": None})
+    await chat.session_create()
+    CALLS.clear()
+    events = await run_chat("Ответь прямо: сколько было продаж?")
+    answer_calls = [c for c in CALLS if c["system"].startswith("Ты ведёшь РАЗГОВОР")]
+    check("без настройки temperature в запрос не уходит",
+          answer_calls and answer_calls[0]["temperature"] is None,
+          str(answer_calls[:1]))
+    check("без настройки предел ответа — свой у движка разговора",
+          answer_calls and answer_calls[0]["max_tokens"] > 0,
+          str([c["max_tokens"] for c in answer_calls]))
+
+    # 10.9 Без проекта параметры негде хранить — маршрут отказывает.
+    #      Проектов у профиля к этому месту несколько (их завели прошлые
+    #      разделы), поэтому убираем ВСЕ: проверяем поведение «проекта нет».
+    for item in list(workspace_store.profile_tasks(chat._workspace,
+                                                   chat._current_profile_id())):
+        await chat.task_delete(item["id"])
+    check("у профиля не осталось проектов", chat._current_task() is None)
+    check("GET без проекта отдаёт пустой снимок",
+          (await chat.llm_params_get())["project_id"] is None)
+    check("POST без проекта — 400",
+          await _raises(lambda: chat.llm_params_set(
+              LlmParams(temperature="0.5", max_tokens="100")), status=400))
+
+
+async def _raises(coro_fn, status=404):
+    """True, если вызов бросил HTTPException с ожидаемым кодом."""
+    try:
+        await coro_fn()
+    except Exception as exc:  # noqa: BLE001
+        return getattr(exc, "status_code", None) == status
+    return False
+
+
 def main():
     print("Проверка Task State Machine (без сети и LLM)")
     test_core()
@@ -2206,6 +2399,7 @@ def main():
         loop.run_until_complete(test_chosen_alternative())
         loop.run_until_complete(test_project_ban_wins())
         loop.run_until_complete(test_plan_gate())
+        loop.run_until_complete(test_llm_params())
     finally:
         loop.close()
     print("\nИтог: " + (f"ПРОВАЛЕНО проверок: {len(FAILURES)} → {FAILURES}"

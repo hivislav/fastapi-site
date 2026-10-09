@@ -62,11 +62,12 @@
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app import config
 from app.ai import attachments as attach_store
@@ -222,6 +223,25 @@ MAX_MCP_SERVERS = 10
 # проверяет маршрут (app/ai/rag.py: filter_enabled).
 RAG_FIELD = "rag"
 MAX_RAG_BASES = 50
+
+# ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА (temperature и предел длины ответа) — настройка
+# ПРОЕКТА, как MCP и RAG: поле "llm" задачи-workspace, правится в окне
+# шестерёнки ⚙️ проекта. Действует в режиме «AI-агент» (ответ шага и прямой ответ
+# по источникам) и уходит в модель ДЕЙСТВУЮЩЕГО источника — и в локальную, и в
+# удалённую: адрес и ключ выбирает клиент (app/ai/client.py), а параметры
+# генерации он передаёт как есть.
+#
+# Пустое значение (None) — «пользователь ничего не задал»: параметр в запрос к
+# API не отправляется вовсе, и действует значение провайдера (как было до этой
+# настройки). Так «пусто» и «0» не путаются: temperature=0 — это осознанный
+# выбор (полностью детерминированный ответ), а не «не задано».
+LLM_FIELD = "llm"
+# Границы полей: temperature — как в OpenAI-совместимом API (шире не принимает
+# ни один провайдер), предел ответа — с запасом на длинные шаги задачи.
+LLM_TEMPERATURE_MIN = 0.0
+LLM_TEMPERATURE_MAX = 2.0
+LLM_MAX_TOKENS_MIN = 1
+LLM_MAX_TOKENS_MAX = 65536
 
 # Заголовок пустой сессии (пока пользователь не отправил ни одного запроса).
 EMPTY_SESSION_TITLE = "Новая задача"
@@ -1363,6 +1383,119 @@ def set_rag_search(task: Dict[str, Any], **fields: Any) -> Dict[str, Any]:
     return dict(task[RAG_FIELD])
 
 
+def _llm_temperature(value: Any) -> Optional[float]:
+    """temperature настройки проекта: число в границах или None («не задана»).
+
+    Пустая строка, None и мусор означают «не задана»: тогда параметр в запрос к
+    API уходит НЕ вовсе (действует значение провайдера). Так «пусто» и «0» не
+    путаются: temperature=0 — осознанный выбор, а не отсутствие настройки.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):  # NaN и ∞
+        return None
+    return round(min(max(number, LLM_TEMPERATURE_MIN), LLM_TEMPERATURE_MAX), 4)
+
+
+def _llm_max_tokens(value: Any) -> Optional[int]:
+    """Предел ответа настройки проекта: целое в границах или None («не задан»)."""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        number = int(float(text))
+    except (TypeError, ValueError):
+        return None
+    return max(LLM_MAX_TOKENS_MIN, min(number, LLM_MAX_TOKENS_MAX))
+
+
+def _normalize_llm(raw: Any) -> Dict[str, Any]:
+    """Приводит настройку параметров модели к рабочему виду.
+
+    Формат: {"temperature": 0.7 | None, "max_tokens": 2000 | None}. Пустое
+    значение — «пользователь ничего не задал» (действует значение провайдера).
+
+    Значения из ФАЙЛА здесь ЗАЖИМАЮТСЯ в границы, а не отбрасываются: битая
+    настройка не должна ломать приложение (в отличие от значений из интерфейса —
+    их разбирает `llm_params_from_form` и честно отказывает с причиной).
+    """
+    data = raw if isinstance(raw, dict) else {}
+    return {
+        "temperature": _llm_temperature(data.get("temperature")),
+        "max_tokens": _llm_max_tokens(data.get("max_tokens")),
+    }
+
+
+def llm_params_from_form(temperature: Any,
+                         max_tokens: Any) -> Tuple[Dict[str, Any], str]:
+    """Разбирает значения полей «Параметры модели»: (настройка, причина отказа).
+
+    Пустое поле — «не задано» (None), это НЕ ошибка. А вот текст, который числом
+    не является, и число вне границ — отказ с понятной причиной: пользователь
+    видит, что именно он ввёл, вместо тихого зажатия до границы (так же ведут
+    себя поля «Стратегии» в интерфейсе).
+    """
+    result: Dict[str, Any] = {"temperature": None, "max_tokens": None}
+    text = "" if temperature is None else str(temperature).strip().replace(",", ".")
+    if text:
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            return result, ("Температура должна быть числом (например 0.7), "
+                            f"а не «{temperature}»")
+        if number != number or number in (float("inf"), float("-inf")):
+            return result, "Температура должна быть числом (например 0.7)"
+        if not (LLM_TEMPERATURE_MIN <= number <= LLM_TEMPERATURE_MAX):
+            return result, (f"Температура должна быть от {LLM_TEMPERATURE_MIN:g} "
+                            f"до {LLM_TEMPERATURE_MAX:g}: {number:g} — вне границ")
+        result["temperature"] = round(number, 4)
+    text = "" if max_tokens is None else str(max_tokens).strip()
+    if text:
+        if not re.fullmatch(r"\d+", text):
+            return result, ("Предел длины ответа — целое число токенов "
+                            f"(например 2000), а не «{max_tokens}»")
+        number = int(text)
+        if not (LLM_MAX_TOKENS_MIN <= number <= LLM_MAX_TOKENS_MAX):
+            return result, (f"Предел длины ответа — от {LLM_MAX_TOKENS_MIN} до "
+                            f"{LLM_MAX_TOKENS_MAX} токенов: {number} — вне границ")
+        result["max_tokens"] = number
+    return result, ""
+
+
+def llm_settings(task: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Настройка параметров модели проекта (нормализует поле на месте, если его нет).
+
+    Как mcp_settings() и rag_settings(): задача, созданная в памяти и ещё не
+    записанная в файл, не имеет поля — оно появляется при первом обращении.
+    """
+    if not task:
+        return {"temperature": None, "max_tokens": None}
+    if not isinstance(task.get(LLM_FIELD), dict):
+        task[LLM_FIELD] = _normalize_llm(task.get(LLM_FIELD))
+    return task[LLM_FIELD]
+
+
+def set_llm_params(task: Dict[str, Any], temperature: Any = None,
+                   max_tokens: Any = None) -> Dict[str, Any]:
+    """Запоминает параметры модели проекта (полное состояние, а не правку полей).
+
+    Приходит ВСЁ состояние сразу: None означает «настройка снята» — иначе пустое
+    поле в интерфейсе не смогло бы вернуть проект к значению провайдера.
+    """
+    task[LLM_FIELD] = _normalize_llm({"temperature": temperature,
+                                      "max_tokens": max_tokens})
+    return dict(task[LLM_FIELD])
+
+
 def exceptions(dialog: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Решения пользователя по противоречиям правил (нормализует поле на месте).
 
@@ -1705,6 +1838,10 @@ def _normalize_task(raw: Any) -> Optional[Dict[str, Any]]:
         # ключ молча терялся бы при первой же записи workspace — как это было бы
         # с "mcp".
         "rag": _normalize_rag(raw.get("rag")),
+        # ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА: temperature и предел длины ответа для режима
+        # «AI-агент» (шестерёнка ⚙️ проекта). Строка обязательна по той же
+        # причине: без неё настройка исчезала бы при первой записи файла.
+        "llm": _normalize_llm(raw.get("llm")),
     }
 
 

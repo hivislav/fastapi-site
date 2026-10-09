@@ -1392,6 +1392,62 @@
         }
         .inv-add button:hover { background: rgba(34, 211, 238, 0.2); }
         .inv-add button:disabled { opacity: 0.4; cursor: not-allowed; }
+        /* ---------- Параметры модели ПРОЕКТА (шестерёнка проекта) ----------
+           temperature и предел длины ответа: живут на проекте, как MCP и RAG, и
+           действуют в режиме «AI-агент» — у шага плана и у прямого ответа по
+           источникам. Блок стоит НИЖЕ правил и только в модалке ПРОЕКТА: у
+           задачи своих параметров модели нет. */
+        .inv-llm {
+            margin-top: 6px;
+            padding: 14px 16px;
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            background: var(--surface-2);
+        }
+        .inv-llm[hidden] { display: none; }
+        .inv-llm h4 { margin-bottom: 6px; }
+        .inv-llm-fields { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+        .inv-llm-fields label {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            flex: 1 1 190px;
+            font-size: 0.84rem;
+            color: var(--text-dim);
+        }
+        /* Поля ввода параметров модели — свои, а НЕ .roles-field: тот класс
+           собирается в общий список полей экспертных ролей (roleInputs), и
+           чужие поля в нём сбивали бы нумерацию ролей. */
+        .inv-llm-fields input {
+            width: 100%;
+            margin-bottom: 0;
+            padding: 10px 12px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-family: inherit;
+            background: var(--surface);
+            outline: none;
+            color: var(--text);
+            box-sizing: border-box;
+        }
+        .inv-llm-fields input::placeholder { color: var(--muted); }
+        .inv-llm-fields input:focus { border-color: var(--accent); }
+        .inv-llm-fields button {
+            flex: 0 0 auto;
+            padding: 11px 20px;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: rgba(34, 211, 238, 0.12);
+            color: var(--accent);
+            font-size: 0.94rem;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .inv-llm-fields button:hover { background: rgba(34, 211, 238, 0.2); }
+        .inv-llm-fields button:disabled { opacity: 0.4; cursor: not-allowed; }
+        .inv-llm-state { margin: 12px 0 0; font-size: 0.84rem; line-height: 1.5; color: var(--text-dim); }
+        .inv-llm-state.warn { color: var(--warn); }
 
         /* ---------- MCP: внешние инструменты проекта (кнопка «MCP») ---------- */
         .modal-box.mcp-modal {
@@ -2550,6 +2606,38 @@
                                 <button type="button" id="inv-task-add">добавить</button>
                             </div>
                         </div>
+                    </div>
+                    <!-- ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА: temperature и предел длины
+                         ответа. Это настройка ПРОЕКТА (как MCP и RAG), поэтому
+                         она стоит в модалке шестерёнки ПРОЕКТА — у задачи своих
+                         параметров модели нет. Значения уходят в модель
+                         ДЕЙСТВУЮЩЕГО источника (локальную или удалённую) и
+                         действуют в режиме «AI-агент»: ответ шага плана и прямой
+                         ответ по источникам. ПУСТОЕ ПОЛЕ — «не задано»:
+                         параметр в запрос к API не отправляется вовсе, и
+                         работает значение провайдера (так же было до этой
+                         настройки). Ноль в поле температуры — не «пусто», а
+                         осознанный выбор детерминированного ответа. -->
+                    <div class="inv-section inv-llm" id="inv-llm-section" hidden>
+                        <h4>Параметры модели проекта</h4>
+                        <p class="inv-note">Действуют в режиме «AI-агент» — у ответа шага
+                            плана и у прямого ответа по источникам, — и для локальной модели,
+                            и для удалённой. Служебные вызовы (план, проверка результата,
+                            разбор правил) идут со своими значениями: они возвращают JSON.</p>
+                        <div class="inv-llm-fields">
+                            <label>temperature
+                                <input id="inv-llm-temperature"
+                                       inputmode="decimal" autocomplete="off"
+                                       placeholder="напр. 0.7 · пусто — как у провайдера">
+                            </label>
+                            <label>Предел ответа, токенов
+                                <input id="inv-llm-max-tokens"
+                                       inputmode="numeric" autocomplete="off"
+                                       placeholder="напр. 2000 · пусто — как у провайдера">
+                            </label>
+                            <button type="button" id="inv-llm-save">сохранить</button>
+                        </div>
+                        <p class="inv-llm-state" id="inv-llm-state"></p>
                     </div>
                     <div class="modal-actions">
                         <button type="button" class="accept" id="inv-close">закрыть</button>
@@ -5077,6 +5165,132 @@
         // проекта (по ним считается противоречие).
         let invModal = { scope: 'project', sessionId: null };
 
+        // ---------- ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА (в той же модалке) ----------
+        // temperature и предел длины ответа — настройка ПРОЕКТА (как MCP и RAG),
+        // поэтому она живёт в модалке шестерёнки ПРОЕКТА: у задачи своих
+        // параметров модели нет. Действует в режиме «AI-агент» (ответ шага и
+        // прямой ответ по источникам) и уходит в модель действующего источника —
+        // локальную или удалённую. Значения С СЕРВЕРА: панель не догадывается,
+        // что сейчас действует, а показывает снимок (как тумблер источника).
+        const invLlmSection = document.getElementById('inv-llm-section');
+        const invLlmTemperature = document.getElementById('inv-llm-temperature');
+        const invLlmMaxTokens = document.getElementById('inv-llm-max-tokens');
+        const invLlmSave = document.getElementById('inv-llm-save');
+        const invLlmState = document.getElementById('inv-llm-state');
+        // Последний снимок с сервера: null — «поле пустое» (не задано).
+        let llmParams = { temperature: null, max_tokens: null, limits: null };
+        // Трогал ли пользователь поля: пока не трогал, снимок с сервера их
+        // перезаполняет (модалку перерисовывают переключения проекта), а после
+        // правки — уже нет, иначе ввод затирался бы на лету.
+        let llmFieldsTouched = false;
+
+        function fmtLlmNumber(value, digits) {
+            if (value === null || value === undefined) return '';
+            const num = Number(value);
+            if (!isFinite(num)) return '';
+            return digits ? String(Number(num.toFixed(digits))) : String(num);
+        }
+
+        function llmParamsText() {
+            const parts = [];
+            if (llmParams.temperature !== null && llmParams.temperature !== undefined) {
+                parts.push('temperature ' + fmtLlmNumber(llmParams.temperature, 4));
+            }
+            if (llmParams.max_tokens !== null && llmParams.max_tokens !== undefined) {
+                parts.push('предел ответа ' + llmParams.max_tokens + ' токенов');
+            }
+            return parts.length ? parts.join(', ') : 'значения провайдера';
+        }
+
+        function renderLlmParams() {
+            // Блок — только в модалке ПРОЕКТА: параметры принадлежат проекту.
+            const projectModal = invModal.scope === 'project' && !!workspace.active_task;
+            invLlmSection.hidden = !projectModal;
+            if (!projectModal) return;
+            if (!llmFieldsTouched) {
+                invLlmTemperature.value = fmtLlmNumber(llmParams.temperature, 4);
+                invLlmMaxTokens.value = fmtLlmNumber(llmParams.max_tokens, 0);
+            }
+            const limits = llmParams.limits || {};
+            const tRange = limits.temperature || [0, 2];
+            const mRange = limits.max_tokens || [1, 65536];
+            invLlmTemperature.title = 'temperature для ответов агента: от '
+                + tRange[0] + ' до ' + tRange[1] + '. Пусто — значение провайдера.';
+            invLlmMaxTokens.title = 'Предел длины ответа агента: от ' + mRange[0]
+                + ' до ' + mRange[1] + ' токенов. «Длина» в шапке чата главнее — '
+                + 'она задаёт лимит разового запроса. Пусто — значение провайдера.';
+            invLlmState.classList.remove('warn');
+            invLlmState.textContent = 'Сейчас в проекте: ' + llmParamsText()
+                + '. Пустое поле — как у провайдера; «Длина» в шапке чата главнее '
+                + 'и задаёт лимит разового запроса.';
+        }
+
+        // Снимок параметров проекта с сервера: обновляет поля, но НЕ затирает
+        // то, что пользователь уже начал править.
+        async function refreshLlmParams() {
+            try {
+                const res = await fetch('/api/agent/llm/params');
+                if (!res.ok) return;
+                llmParams = await res.json();
+            } catch (e) {
+                return;   // сервер без маршрута — просто не показываем значения
+            }
+            if (!invariantsModal.hidden) renderLlmParams();
+            // Подпись шестерёнки называет действующие параметры: она обновляется
+            // тем же снимком, а не только при правке правил.
+            renderInvariantsMarks();
+        }
+
+        async function saveLlmParams() {
+            if (!workspace.active_task) {
+                invLlmState.classList.add('warn');
+                invLlmState.textContent = 'Проект не создан — параметры привязаны к проекту.';
+                return;
+            }
+            invLlmSave.disabled = true;
+            try {
+                const res = await fetch('/api/agent/llm/params', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        temperature: invLlmTemperature.value.trim(),
+                        max_tokens: invLlmMaxTokens.value.trim()
+                    })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    invLlmState.classList.add('warn');
+                    invLlmState.textContent = '⚠️ ' + (data.detail
+                        || 'Не удалось сохранить параметры модели.');
+                    return;
+                }
+                llmParams = data;
+                llmFieldsTouched = false;
+                renderLlmParams();
+                invLlmState.textContent = 'Сохранено. Сейчас в проекте: '
+                    + llmParamsText() + '.';
+                renderInvariantsMarks();
+            } catch (e) {
+                invLlmState.classList.add('warn');
+                invLlmState.textContent = '⚠️ Ошибка связи с сервером. Попробуйте ещё раз.';
+            } finally {
+                invLlmSave.disabled = false;
+            }
+        }
+
+        invLlmSave.addEventListener('click', saveLlmParams);
+        [invLlmTemperature, invLlmMaxTokens].forEach(field => {
+            field.addEventListener('input', () => {
+                llmFieldsTouched = true;
+                // Правка ещё НЕ действует: пока не нажато «сохранить», в проекте
+                // прежние значения. Молчать об этом нельзя — человек решил бы,
+                // что настройка уже применилась.
+                invLlmState.classList.remove('warn');
+                invLlmState.textContent = 'Изменения не сохранены — нажмите '
+                    + '«сохранить». В проекте сейчас: ' + llmParamsText() + '.';
+            });
+        });
+
         function openConfirmModal(title, text, onSubmit) {
             confirmModalTitle.textContent = title;
             confirmModalText.textContent = text;
@@ -6661,6 +6875,8 @@
             // Модалка открыта — перерисовываем и её: правила задачи у каждого
             // диалога свои, а проект/задачу могли переключить из-под модалки.
             if (!invariantsModal.hidden) renderInvariants();
+            // Параметры модели живут на проекте: при его смене они тоже другие.
+            if (agentModeOn()) refreshLlmParams();
         }
 
         // Помечает шестерёнки: у проекта — своя, у каждой задачи в списке — своя.
@@ -6676,7 +6892,10 @@
             projectInvariantsBtn.classList.remove('conflict');
             projectInvariantsBtn.title = 'Инварианты проекта: правила, которые агент '
                 + 'не имеет права нарушить' + (total ? ` (всего правил: ${total})` : '')
-                + (exceptions ? `. Утверждённых решений: ${exceptions}` : '');
+                + (exceptions ? `. Утверждённых решений: ${exceptions}` : '')
+                // Параметры модели — та же шестерёнка проекта: видно, что задано,
+                // не открывая модалку (пусто — работают значения провайдера).
+                + '. Параметры модели: ' + llmParamsText();
             document.querySelectorAll('.session-item').forEach(item => {
                 const gear = item.querySelector('.session-invariants');
                 if (!gear) return;
@@ -6795,6 +7014,10 @@
             const projectEditable = projectModal && !!data.project_id;
             invProjectInput.disabled = !projectEditable;
             document.getElementById('inv-project-add').disabled = !projectEditable;
+            // Параметры модели проекта — рядом с правилами проекта (та же
+            // шестерёнка): значения берутся со снимка сервера, а не из полей —
+            // иначе перерисовка модалки затирала бы незаконченный ввод.
+            renderLlmParams();
             // Проверки на противоречие касаются обеих областей сразу, поэтому
             // показываются в любой модалке (это состояние ПАРЫ правил).
             renderInvariantsMarks();
@@ -6824,6 +7047,8 @@
         async function openInvariantsModal(scope, sessionId) {
             invModal = { scope: scope === 'task' ? 'task' : 'project',
                          sessionId: sessionId || null };
+            // Свежий ввод: снимок параметров модели снова заполняет поля.
+            llmFieldsTouched = false;
             // Показываем ТОЛЬКО свою область: чужой список очищаем сразу, чтобы
             // правила другой области не мелькали до прихода снимка.
             const projectModal = invModal.scope === 'project';
@@ -6838,6 +7063,8 @@
                 if (res.ok) invariantsData = await res.json();
             } catch (e) { /* покажем то, что уже есть */ }
             renderInvariants();
+            // Параметры модели — второй снимок той же модалки (у задачи их нет).
+            if (projectModal) await refreshLlmParams();
         }
 
         function closeInvariantsModal() {

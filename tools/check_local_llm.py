@@ -247,6 +247,12 @@ def test_client_payload(server):
           payload.get("model") == config.LOCAL_LLM_MODEL, str(payload.get("model")))
     check("поля thinking в запросе НЕТ (локальный сервер его не знает)",
           "thinking" not in payload, str(sorted(payload.keys())))
+    # Параметры генерации (temperature и предел ответа) локальному серверу идут
+    # ТЕМ ЖЕ путём, что и удалённому: их выбирает клиент, а адрес и ключ берутся у
+    # действующего провайдера. Это и есть «настройка работает для обеих моделей».
+    check("температура и предел ответа дошли до ЛОКАЛЬНОГО сервера",
+          payload.get("temperature") == 0.5 and payload.get("max_tokens") == 100,
+          str({key: payload.get(key) for key in ("temperature", "max_tokens")}))
     check("ответ и метрики получены",
           content == ANSWER and metrics and metrics["prompt_tokens"] == 21,
           f"{content!r} / {metrics}")
@@ -258,11 +264,22 @@ def test_client_payload(server):
     CALLS["payloads"] = []
     config.set_llm_source("remote")
     config.LLM_BASE_URL = f"http://127.0.0.1:{port}/v1"
-    client.call_llm_with_metrics("Привет", max_tokens=100)
+    client.call_llm_with_metrics("Привет", max_tokens=100, temperature=0.5)
     remote_payload = (CALLS.get("payloads") or [{}])[-1]
     check("у удалённого провайдера thinking по-прежнему отправляется",
           remote_payload.get("thinking") == {"type": "disabled"},
           str(remote_payload.get("thinking")))
+    check("у УДАЛЁННОГО провайдера параметры генерации уходят так же",
+          remote_payload.get("temperature") == 0.5
+          and remote_payload.get("max_tokens") == 100,
+          str({key: remote_payload.get(key) for key in ("temperature", "max_tokens")}))
+    # А вот НЕзаданный параметр не уходит ни одному провайдеру: пустое поле
+    # настройки проекта означает «как у провайдера», а не «ноль».
+    CALLS["payloads"] = []
+    client.call_llm_with_metrics("Привет")
+    bare_payload = (CALLS.get("payloads") or [{}])[-1]
+    check("пустая настройка не подставляет ноль",
+          bare_payload.get("temperature") is None, str(bare_payload.get("temperature")))
     check("удалённый вызов считается по тарифу (не ноль)",
           client.call_llm_with_metrics("Привет")[1]["cost_rub"] > 0.0)
     config.LOCAL_LLM_BASE_URL = CLOSED_URL

@@ -66,7 +66,7 @@ from app.ai.agent import (
 )
 from app.schemas import (
     ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
-    LlmServerAction, LlmSourceUpdate,
+    LlmParams, LlmServerAction, LlmSourceUpdate,
     McpApply, MemoryEntryCreate, NameUpdate, PeriodicUpdate, PlanUpdate, ProfileCreate,
     ProfileFields, RagApply, RagDialogTest, RagJobDone, RagRelax, RagUpload,
     SessionCreate, SessionMode, TaskCreate,
@@ -1057,6 +1057,71 @@ async def llm_source_set(payload: LlmSourceUpdate) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return state
+
+
+def _llm_params_view(task: Optional[Dict[str, Any]], saved: bool = False) -> dict:
+    """Снимок параметров модели проекта (окно шестерёнки ⚙️ проекта).
+
+    Отдаёт {"project_id", "temperature", "max_tokens", "limits", "saved"}:
+    действующие значения проекта (None — «не задано»: параметр в запрос к API не
+    отправляется, работает значение провайдера), границы полей и признак
+    `saved` — «значения только что сохранены» (интерфейс по нему показывает
+    подтверждение, а не догадывается по разнице чисел).
+    """
+    settings = workspace_store.llm_settings(task)
+    return {
+        "project_id": (task or {}).get("id"),
+        "temperature": settings["temperature"],
+        "max_tokens": settings["max_tokens"],
+        "limits": {
+            "temperature": [workspace_store.LLM_TEMPERATURE_MIN,
+                            workspace_store.LLM_TEMPERATURE_MAX],
+            "max_tokens": [workspace_store.LLM_MAX_TOKENS_MIN,
+                           workspace_store.LLM_MAX_TOKENS_MAX],
+        },
+        "saved": bool(saved),
+    }
+
+
+@router.get("/agent/llm/params")
+async def llm_params_get() -> dict:
+    """Параметры модели проекта (temperature и предел длины ответа).
+
+    Настройка ПРОЕКТА, как «MCP» и «RAG»: правится в окне шестерёнки ⚙️ проекта и
+    действует во всех его задачах-диалогах. Значения уходят в модель
+    ДЕЙСТВУЮЩЕГО источника — и в локальную, и в удалённую. К модели маршрут НЕ
+    обращается: это данные.
+    """
+    return _llm_params_view(_current_task())
+
+
+@router.post("/agent/llm/params")
+async def llm_params_set(payload: LlmParams) -> dict:
+    """Запоминает параметры модели проекта (полное состояние, а не правка полей).
+
+    Пустое поле — «настройка снята» (None): параметр перестаёт уходить в запрос к
+    API, и действует значение провайдера. Так «пусто» и «0» не путаются:
+    temperature=0 — осознанный выбор пользователя.
+
+    Значения проверяются ЗДЕСЬ и отказ называет причину (текст вместо числа,
+    число вне границ) — тихое зажатие до границы выглядело бы как «настройка не
+    применилась». Файл при чтении зажимается молча (app/ai/workspace.py:
+    _normalize_llm): битая настройка в файле ломать приложение не должна.
+    """
+    task = _current_task()
+    if task is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Сначала создайте проект — параметры модели привязаны к проекту")
+    settings, error = workspace_store.llm_params_from_form(payload.temperature,
+                                                           payload.max_tokens)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    async with _workspace_lock:
+        workspace_store.set_llm_params(task, settings["temperature"],
+                                       settings["max_tokens"])
+        await _persist()
+    return _llm_params_view(task, saved=True)
 
 
 @router.post("/agent/llm/server")
@@ -4890,9 +4955,19 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
     # модель первым системным блоком; собирается заново на каждый запрос,
     # поэтому смена профиля действует сразу.
     profile = _profile_block()
+    # ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА — temperature и предел длины ответа (шестерёнка ⚙️
+    # проекта, app/ai/workspace.py: llm_settings). Действуют во всех задачах
+    # проекта и уходят в модель ДЕЙСТВУЮЩЕГО источника: и в локальную, и в
+    # удалённую — адрес и ключ выбирает клиент, а параметры генерации передаются
+    # как есть. Поле «Длина» в шапке чата — лимит РАЗОВОГО запроса и главнее
+    # настройки проекта: раз пусто, решение отдаётся проекту (пусто и там —
+    # параметр в API не уходит вовсе, работает предел провайдера).
+    project_llm = workspace_store.llm_settings(task)
+    agent_max_tokens = (msg.max_tokens if msg.max_tokens is not None
+                        else project_llm["max_tokens"])
     # Настройки генерации общие для ответа и для служебного плана.
     agent_settings = dict(
-        max_tokens=msg.max_tokens,
+        max_tokens=agent_max_tokens,
         stop=msg.stop,
         strategy=msg.agent_strategy,
         summary_size=msg.summary or DEFAULT_SUMMARY_SIZE,
@@ -4903,7 +4978,14 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
     # значения читаются генератором при каждом шаге, а диалог за время ответа
     # мог быть переключён.
     invariants_now = _invariants_snapshot(task, session)
-    agent = Agent(AgentConfig(**agent_settings))
+    # Температура проекта — ТОЛЬКО ответу шага (и прямому ответу по источникам):
+    # у служебных вызовов свои задачи. План, проверка результата, разбор
+    # инвариантов и память задачи возвращают JSON, и высокая температура ломала бы
+    # его разбор — такие вызовы температуру не передают вовсе (значение
+    # провайдера), а предел их ответа задан их собственными константами
+    # (PLAN_MAX_TOKENS, REVIEW_MAX_TOKENS, …), а не «Длиной» и не проектом.
+    agent = Agent(AgentConfig(**agent_settings,
+                              temperature=project_llm["temperature"]))
     # Планировщик — отдельный агент с теми же настройками: он делает служебный
     # вызов плана (Agent.build_plan), и его токены складываются с токенами
     # ответа (merge_usage), попадая в панель «Токены диалога».
@@ -4956,6 +5038,15 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         # замерами автомата (у того свои служебные вызовы).
         tracker = Agent(AgentConfig())
         total: Dict[str, Any] = {}
+        # ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА действуют и на этом пути: это тот же режим
+        # «AI-агент», и ответ строится тем же источником. Предел «Длины» из шапки
+        # главнее проекта; пусто и там — предел ответа берётся из константы
+        # движка разговора (rag_dialog.ANSWER_MAX_TOKENS). Температура — из
+        # проекта; не задана — в запрос не уходит (значение провайдера).
+        project_llm = workspace_store.llm_settings(task_now)
+        answer_max_tokens = (msg.max_tokens if msg.max_tokens is not None
+                             else project_llm["max_tokens"]
+                             or rag_dialog.ANSWER_MAX_TOKENS)
         # Про источники и вариант «разложить на шаги» говорим ТОЛЬКО когда они
         # есть. Иначе строка обещала бы то, чего нет: «отвечаю по источникам» при
         # выключенном RAG и MCP — лишний шум, а вариант под ответом на простой
@@ -4965,6 +5056,16 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                            or workspace_store.mcp_enabled(task_now))
         note = (f"{_MACHINE}: отвечаю по источникам." if has_sources
                 else f"{_MACHINE}: отвечаю сразу.")
+        if project_llm["temperature"] is not None or project_llm["max_tokens"]:
+            # Настройка проекта — из шестерёнки ⚙️: человек должен видеть, что она
+            # ДЕЙСТВУЕТ, а не молча надеяться на неё (у шага с планом такую
+            # строку пишет сам агент, см. Agent._merge_params).
+            parts: List[str] = []
+            if project_llm["temperature"] is not None:
+                parts.append(f"temperature {project_llm['temperature']:g}")
+            if project_llm["max_tokens"] is not None:
+                parts.append(f"предел ответа {project_llm['max_tokens']} токенов")
+            note += " Параметры модели проекта: " + ", ".join(parts) + "."
         if offer_plan:
             note += (" План и шаги не строю; если это была работа, под ответом "
                      "будет вариант «⚙ Разложить работу на шаги».")
@@ -5023,7 +5124,8 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                           mcp_store.block(mcp_data)])
         content, metrics = await llm_client.call_llm_async(
             user_text=text, model=config.active_model(), disable_thinking=True,
-            max_tokens=rag_dialog.ANSWER_MAX_TOKENS, messages=messages,
+            max_tokens=answer_max_tokens,
+            temperature=project_llm["temperature"], messages=messages,
             timeout=_rag_test_timeout())
         tracker.note_usage(metrics)
         if not str(content or "").strip():

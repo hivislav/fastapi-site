@@ -714,6 +714,29 @@ function llmPayload() {
   });
 }
 
+// ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА (temperature и предел длины ответа): настройка
+// ПРОЕКТА, живёт в модалке шестерёнки проекта. Заглушка ведёт снимок так же, как
+// сервер: null — «не задано» (параметр в запрос к API не уходит).
+const LLM_PARAMS = {
+  project_id: 't-1',
+  temperature: null,
+  max_tokens: null,
+  limits: { temperature: [0, 2], max_tokens: [1, 65536] },
+  saved: false,
+  gets: 0,
+  saves: [],
+};
+
+function llmParamsPayload() {
+  return {
+    project_id: LLM_PARAMS.project_id,
+    temperature: LLM_PARAMS.temperature,
+    max_tokens: LLM_PARAMS.max_tokens,
+    limits: LLM_PARAMS.limits,
+    saved: LLM_PARAMS.saved,
+  };
+}
+
 function jsonResponse(data, ok) {
   return { ok: ok !== false, status: ok === false ? 400 : 200,
     json: async () => data, text: async () => JSON.stringify(data) };
@@ -862,6 +885,33 @@ function makeFetch() {
     if (url === '/api/agent/llm' && method === 'GET') {
       LLM_STATE.polls += 1;
       return jsonResponse(llmPayload());
+    }
+    if (url === '/api/agent/llm/params') {
+      // ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА (temperature и предел ответа). Заглушка ведёт
+      // себя как сервер: GET отдаёт снимок проекта, POST принимает ПОЛНОЕ
+      // состояние (пустое поле = «не задано») и отказывает с причиной на текст
+      // вместо числа и на значение вне границ.
+      if (method === 'POST') {
+        LLM_PARAMS.saves.push(body || {});
+        const limits = LLM_PARAMS.limits;
+        const t = String((body || {}).temperature || '').trim();
+        const m = String((body || {}).max_tokens || '').trim();
+        if (t && (isNaN(Number(t)) || Number(t) < limits.temperature[0]
+                  || Number(t) > limits.temperature[1])) {
+          return jsonResponse({ detail: 'Температура должна быть от 0 до 2: '
+            + t + ' — вне границ' }, false);
+        }
+        if (m && !/^\d+$/.test(m)) {
+          return jsonResponse({ detail: 'Предел длины ответа — целое число токенов '
+            + '(например 2000), а не «' + m + '»' }, false);
+        }
+        LLM_PARAMS.temperature = t ? Number(t) : null;
+        LLM_PARAMS.max_tokens = m ? Number(m) : null;
+        LLM_PARAMS.saved = true;
+        return jsonResponse(llmParamsPayload());
+      }
+      LLM_PARAMS.gets += 1;
+      return jsonResponse(llmParamsPayload());
     }
     if (url === '/api/agent/llm/source' && method === 'POST') {
       LLM_STATE.switches.push(body || {});
@@ -2456,6 +2506,124 @@ async function run() {
   await wait(60);
   check('при возврате в режим агента панель с шестерёнками снова видна',
     $('task-block').hidden === false);
+
+  console.log('\n[L2] Параметры модели проекта: temperature и предел ответа');
+  // Настройка ПРОЕКТА (как MCP и RAG) — живёт в ТОЙ ЖЕ модалке шестерёнки
+  // проекта, ниже правил. Значения приходят с сервера; пустое поле — «не
+  // задано» (параметр в запрос к API не уходит вовсе).
+  LLM_PARAMS.temperature = null;
+  LLM_PARAMS.max_tokens = null;
+  LLM_PARAMS.saved = false;
+  LLM_PARAMS.gets = 0;
+  LLM_PARAMS.saves.length = 0;
+
+  // Шестерёнка ЗАДАЧИ: параметров модели там быть не должно — они на проекте.
+  await click(q('.session-item')[0].querySelector('.session-invariants'), 60);
+  check('в модалке задачи блока параметров модели нет',
+    sectionHidden($('inv-llm-section')),
+    'hidden=' + $('inv-llm-section').hidden);
+  await click($('inv-close'), 30);
+
+  // Шестерёнка ПРОЕКТА: блок виден, поля заполнены значениями С СЕРВЕРА.
+  LLM_PARAMS.temperature = 0.7;
+  LLM_PARAMS.max_tokens = 2000;
+  await click($('project-invariants'), 80);
+  check('в модалке проекта блок параметров модели виден',
+    $('inv-llm-section').hidden === false
+    && dom.window.getComputedStyle($('inv-llm-section')).display !== 'none',
+    'hidden=' + $('inv-llm-section').hidden);
+  check('параметры запрошены у сервера',
+    calls.some(c => c === 'GET /api/agent/llm/params'),
+    calls.slice(-3).join(' | '));
+  check('поля заполнены значениями С СЕРВЕРА',
+    $('inv-llm-temperature').value === '0.7' && $('inv-llm-max-tokens').value === '2000',
+    JSON.stringify([$('inv-llm-temperature').value, $('inv-llm-max-tokens').value]));
+  check('одно открытие модалки не пишет настройку',
+    LLM_PARAMS.saves.length === 0 && calls.indexOf('POST /api/agent/llm/params') < 0,
+    JSON.stringify(LLM_PARAMS.saves));
+  check('в подписи шестерёнки проекта видны действующие параметры',
+    $('project-invariants').title.includes('temperature 0.7')
+    && $('project-invariants').title.includes('2000'),
+    $('project-invariants').title);
+  check('в блоке сказано, что пустое поле — как у провайдера, а «Длина» главнее',
+    $('inv-llm-state').textContent.includes('как у провайдера')
+    && $('inv-llm-state').textContent.includes('Длина'),
+    $('inv-llm-state').textContent.slice(0, 120));
+  check('пояснение про служебные вызовы на месте',
+    $('inv-llm-section').textContent.includes('Служебные вызовы'),
+    $('inv-llm-section').textContent.slice(0, 120));
+
+  // Правка поля ещё НЕ действует: пока не нажато «сохранить», в проекте прежние
+  // значения — интерфейс об этом говорит, а не молчит.
+  $('inv-llm-temperature').value = '0.9';
+  $('inv-llm-temperature').dispatchEvent(new dom.window.Event('input'));
+  check('правка без сохранения названа словами',
+    $('inv-llm-state').textContent.includes('не сохранены')
+    && $('inv-llm-state').textContent.includes('temperature 0.7'),
+    $('inv-llm-state').textContent.slice(0, 140));
+  check('правка без сохранения на сервер не уходит', LLM_PARAMS.saves.length === 0);
+  $('inv-llm-temperature').value = '0.7';
+
+  // Сохранение: значения уходят строками, снимок приходит с сервера.
+  $('inv-llm-temperature').value = '0.2';
+  $('inv-llm-max-tokens').value = '500';
+  await click($('inv-llm-save'), 80);
+  check('настройка отправлена на сервер',
+    LLM_PARAMS.saves.length === 1
+    && LLM_PARAMS.saves[0].temperature === '0.2'
+    && LLM_PARAMS.saves[0].max_tokens === '500',
+    JSON.stringify(LLM_PARAMS.saves));
+  check('подтверждение сохранения показано без перезагрузки',
+    $('inv-llm-state').textContent.includes('Сохранено')
+    && $('inv-llm-state').textContent.includes('0.2'),
+    $('inv-llm-state').textContent.slice(0, 120));
+  check('после сохранения подпись шестерёнки обновилась',
+    $('project-invariants').title.includes('temperature 0.2'),
+    $('project-invariants').title);
+  check('модалка осталась открытой после сохранения',
+    $('invariants-modal').hidden === false);
+
+  // Отказ сервера показывается ПРИЧИНОЙ, а не «настройка не применилась».
+  $('inv-llm-temperature').value = '9';
+  await click($('inv-llm-save'), 80);
+  check('отказ сервера показан причиной',
+    $('inv-llm-state').textContent.includes('⚠️')
+    && $('inv-llm-state').textContent.includes('вне границ'),
+    $('inv-llm-state').textContent.slice(0, 140));
+  check('отказ помечен тревожным цветом', $('inv-llm-state').classList.contains('warn'));
+  check('прежнее значение в проекте не пострадало',
+    LLM_PARAMS.temperature === 0.2, String(LLM_PARAMS.temperature));
+  check('кнопка сохранения снова доступна', $('inv-llm-save').disabled === false);
+
+  // Пустые поля — «не задано»: параметр перестаёт уходить в запрос к API.
+  $('inv-llm-temperature').value = '';
+  $('inv-llm-max-tokens').value = '';
+  await click($('inv-llm-save'), 80);
+  check('пустые поля уходят как «не задано», а не как отказ',
+    LLM_PARAMS.saves.length === 3
+    && LLM_PARAMS.saves[2].temperature === ''
+    && LLM_PARAMS.saves[2].max_tokens === '',
+    JSON.stringify(LLM_PARAMS.saves[2]));
+  check('снятая настройка показана словами',
+    LLM_PARAMS.temperature === null && LLM_PARAMS.max_tokens === null
+    && $('inv-llm-state').textContent.includes('значения провайдера'),
+    $('inv-llm-state').textContent.slice(0, 120));
+  await click($('inv-close'), 40);
+  check('модалка с параметрами закрылась', $('invariants-modal').hidden === true);
+
+  // Проект не выбран — параметры привязаны к проекту, показывать нечего.
+  const savedTask = workspace.active_task;
+  workspace.active_task = null;
+  dom.window.eval('workspace.active_task = null');
+  LLM_PARAMS.saves.length = 0;
+  await click($('project-invariants'), 60);
+  check('без проекта блок параметров модели скрыт', sectionHidden($('inv-llm-section')),
+    'hidden=' + $('inv-llm-section').hidden);
+  await click($('inv-close'), 30);
+  workspace.active_task = savedTask;
+  dom.window.eval('workspace.active_task = ' + JSON.stringify(savedTask));
+  LLM_PARAMS.temperature = null;
+  LLM_PARAMS.max_tokens = null;
 
   console.log('\n[M] Разбор запроса: отказ и кликабельные варианты');
   // Возвращаем проект и задачу: раздел [K] их опустошал.
