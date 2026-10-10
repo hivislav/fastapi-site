@@ -104,6 +104,10 @@ DESCRIPTION_CHARS = 400
 TOOL_DESCRIPTION_CHARS = 200
 ARG_HINT_CHARS = 80
 ARG_LIMIT = 12
+# Вложенные объекты (массив объектов / объект) показываем ИМЕНАМИ И ТИПАМИ полей,
+# без подсказок: имена уже говорят, что куда подставлять, а подсказки внутри
+# объекта стоят дороже, чем приносят (список уходит в КАЖДЫЙ вызов диспетчера).
+NESTED_ARG_LIMIT = 24
 TOOLS_TEXT_CHARS = 12000
 TOOLS_MAX_TOKENS = 700
 # Предел времени на служебный вызов диспетчера. 45 с хватало удалённой модели, но
@@ -431,6 +435,17 @@ TOOLS_PROMPT = (
     "(`countryCode`) — по языку запроса (для русского названия `language` «ru», "
     "для российского города `countryCode` «RU»): у геокодеров язык влияет на "
     "поиск, и без него русское название может не найтись.\n"
+    "4а) АРГУМЕНТ-СПИСОК ЗАПИСЕЙ (`array<object>` — строки таблицы; в схеме у "
+    "него перечислены поля в фигурных скобках: `{поле: тип; ...}`) заполняется "
+    "ДАННЫМИ ИЗ РЕЗУЛЬТАТОВ: по одному объекту на строку прочитанного результата "
+    "(день прогноза, место, запись), поля — ровно те, что перечислены в схеме. "
+    "Поля верхнего уровня у такого инструмента — только значения ПО УМОЛЧАНИЮ, и "
+    "они записи НЕ заменяют: вызов без списка записей сервер отклонит («нечего "
+    "сохранять»). Числа передавай ЧИСЛАМИ и по отдельным полям, а не строкой "
+    "диапазона: если в результате «temp: 2.2..12», то в полях-минимуме и "
+    "полях-максимуме должны стоять 2.2 и 12, а не строка «2.2..12». Повторять "
+    "отклонённый вызов с ТЕМИ ЖЕ аргументами бессмысленно — исправляй по тексту "
+    "ошибки.\n"
     "5) Если в запросе не хватает обязательного для вызова сведения (например, "
     "не назван город) — НЕ вызывай инструмент: пусть агент сначала уточнит "
     "запрос у пользователя.\n"
@@ -1805,6 +1820,31 @@ def next_step_hints(tools: Optional[List[Dict[str, Any]]],
     return hints
 
 
+def record_args(tool: Any, limit: int = 4) -> List[str]:
+    """Имена аргументов-СПИСКОВ ЗАПИСЕЙ (`array<object>`) у инструмента.
+
+    Строится по СХЕМЕ сервера, поэтому годится для любого инструмента: у одного
+    это `entries`, у другого `rows`, `items`, `records`. Нужен там, где модели
+    надо НАЗВАТЬ, что инструмент принимает данные построчно (см. digest и
+    TOOLS_PROMPT, правило 4а): без этого список записей считался необязательным и
+    вызов уходил без данных.
+    """
+    schema = tool.get("schema") if isinstance(tool, dict) else None
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict):
+        return []
+    names = []
+    for name, spec in props.items():
+        if not isinstance(spec, dict) or spec.get("type") != "array":
+            continue
+        items = spec.get("items") if isinstance(spec.get("items"), dict) else {}
+        if items.get("type") == "object" or items.get("properties"):
+            names.append(str(name))
+        if len(names) >= limit:
+            break
+    return names
+
+
 def digest(results: Any, ids: Optional[Dict[str, str]] = None,
            hints: Optional[List[str]] = None,
            tools: Optional[List[Dict[str, Any]]] = None) -> str:
@@ -1857,6 +1897,13 @@ def digest(results: Any, ids: Optional[Dict[str, str]] = None,
         schema = tool.get("schema") if isinstance(tool.get("schema"), dict) else {}
         required = [str(key) for key in (schema.get("required") or [])]
         hint = f" — обязательные аргументы: {', '.join(required)}" if required else ""
+        # Аргумент-СПИСОК ЗАПИСЕЙ (array<object>) называется отдельно: без этого
+        # модель считала, что данные можно не передавать, и повторяла отклонённый
+        # сервером вызов (живой случай 10.10, см. _nested_args).
+        records = record_args(tool)
+        if records:
+            hint += ("; принимает ЗАПИСИ (данные из результатов, по объекту на "
+                     "строку): " + ", ".join(records))
         unused.append(f"{name} (сервер {server_id}){hint}")
     # Кандидаты для аргументов: значения, найденные в результатах и НЕ названные
     # в запросе. Без них модель подставляла в аргументы слово из запроса.
@@ -1871,6 +1918,20 @@ def digest(results: Any, ids: Optional[Dict[str, str]] = None,
                  " Если инструменту нужен аргумент, которого в запросе НЕТ, — бери "
                  "его значение из РЕЗУЛЬТАТОВ выше, а не из текста запроса):\n"
                  + "\n".join(f"- {name}" for name in unused))
+    # ОТКЛОНЁННЫЕ вызовы — последним блоком. Ошибку модель уже видела рядом с
+    # результатом, но в длинном дайджесте теряла её и повторяла тот же вызов
+    # чуть изменённым (живой случай 10.10: «Nothing to save…» — вызов уходил
+    # дважды подряд). Текст блока строится из ОТВЕТОВ сервера, а не из имён
+    # инструментов: он не про конкретный случай, а про «этот вызов не принят».
+    failed = [item for item in data if not item.get("ok")]
+    if failed:
+        tail += ("\n\nВЫЗОВЫ, КОТОРЫЕ СЕРВЕР ОТКЛОНИЛ (они НЕ выполнены и ничего не "
+                 "сохранили; повторять их с ТЕМИ ЖЕ аргументами бессмысленно — "
+                 "исправляй причину из текста ошибки):\n"
+                 + "\n".join(
+                     f"- {item['server']} · {item['tool']}: "
+                     + " ".join(str(item.get("error") or "").split())[:300]
+                     for item in failed))
     budget = max(800, CHAIN_DIGEST_CHARS - len(tail))
     return (head[:budget] + tail)[:CHAIN_DIGEST_CHARS]
 
@@ -2207,6 +2268,141 @@ def produced_ids(calls: Any) -> Dict[str, str]:
     return out
 
 
+# Ниже какой длины значение идентификатора вообще ищется в СВОБОДНОМ тексте
+# результатов (см. `_value_in_text`). Короткие значения допустимы только как
+# ЯВНО названные («dataset_id: "1"», их находит extract_ids) или как выданные
+# создающим вызовом.
+FREE_TEXT_ID_MIN_LEN = 3
+
+
+def done_keys_of(results: Any) -> set:
+    """Ключи вызовов, которые УЖЕ ДАЛИ РЕЗУЛЬТАТ (ok) — их повторять нельзя.
+
+    Отличие от «просто списка выполненных вызовов» принципиально, и это живой
+    случай 10.10: сохранение набора сперва ОТКАЗАЛО (модель передала числа
+    строками, сервер ответил ошибкой валидации), и выгрузка, которая зависела от
+    него, честно отказала — «нет такого набора». Со второй попытки сохранение
+    прошло, но выгрузку охрана уже ОТБРОСИЛА как повтор («такой вызов уже
+    выполнялся»), и файла не появилось вовсе: шаг задачи ушёл в доработку по
+    кругу. Поэтому «выполнено» — это только УСПЕШНЫЙ вызов, а отказавший можно
+    повторить (пределы раундов и вызовов не дают зациклиться).
+    """
+    keys = set()
+    for item in normalize_results(results):
+        if not item.get("ok"):
+            continue
+        key = call_key({"server": item.get("server"), "tool": item.get("tool"),
+                        "arguments": item.get("arguments")})
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _value_in_text(value: str, text: str) -> bool:
+    """Встречается ли значение в тексте результатов КАК ОТДЕЛЬНЫЙ ТОКЕН.
+
+    «Входит подстрокой» — слишком слабая проверка, и это не теория: живой случай
+    10.10 — модель выдумала `dataset_id: "1"`, а единица в результатах нашлась
+    (в «Found 2 match(es)» и в координатах вида 55.75204), поэтому охрана
+    пропустила вызов: сервер ответил «No saved summary with id "1"», шаг задачи
+    провалился, и автомат ушёл в доработку по кругу.
+
+    Поэтому: 1) значения короче `FREE_TEXT_ID_MIN_LEN` знаков в свободном тексте не
+    ищутся вовсе; 2) длинные ищутся по границам — рядом не должно быть букв или
+    цифр, иначе «12» нашлось бы внутри «3712».
+    """
+    probe = str(value or "").strip()
+    if len(probe) < FREE_TEXT_ID_MIN_LEN:
+        return False
+    return re.search(r"(?<![A-Za-z0-9])" + re.escape(probe) + r"(?![A-Za-z0-9])",
+                     str(text or "")) is not None
+
+
+def records_missing(calls: Any, tools: Optional[List[Dict[str, Any]]],
+                    results: Any, ids: Optional[Dict[str, str]] = None
+                    ) -> List[Dict[str, Any]]:
+    """Вызовы, которые сервер отклонит: инструмент принимает ЗАПИСИ, а их нет.
+
+    Проверка выведена из СХЕМЫ сервера (см. record_args) и НЕ знает ни одного
+    имени инструмента: у любого инструмента с аргументом-списком объектов вызов
+    без этого списка бессмысленен — сохранять нечего. Живой случай 10.10: и
+    удалённая, и локальная модель выбирали `save_weather_summary` и передавали
+    только поля верхнего уровня («умолчания»), сервер отвечал «Nothing to save…»,
+    модель повторяла вызов, и задача уходила в доработку по кругу. Локальный
+    отказ дешевле серверного: раунд MCP не тратится, а диспетчер получает
+    уточнение про записи (см. records_note), а не строчку ошибки в конце
+    длинного дайджеста.
+
+    Не считаем ошибкой два случая, иначе проверка мешала бы верным вызовам:
+    в результатах ЕЩЁ НЕТ данных (записи неоткуда взять) и вызов опирается на
+    идентификатор из результатов (у таких инструментов бывает второй путь —
+    «сохрани то, что сервер уже собрал по идентификатору»).
+    """
+    if not results or not tools:
+        return []
+    known = {str(value) for value in extract_ids(results).values() if str(value)}
+    for value in (ids or {}).values():
+        if str(value):
+            known.add(str(value))
+    out: List[Dict[str, Any]] = []
+    for call in normalize_calls(calls):
+        schema = _schema_of(tools, call["server"], call["tool"])
+        names = record_args({"schema": schema})
+        if not names:
+            continue
+        arguments = call.get("arguments") or {}
+        if any(isinstance(arguments.get(name), list) and arguments.get(name)
+               for name in names):
+            continue
+        if any(str(value) in known for value in arguments.values() if str(value)):
+            continue
+        out.append(call)
+    return out
+
+
+def records_note(missing: List[Dict[str, Any]],
+                 tools: Optional[List[Dict[str, Any]]],
+                 results: Any = None) -> str:
+    """Уточнение диспетчеру: собери ЗАПИСИ для вызова из результатов.
+
+    Текст строится из схемы (имена аргумента-списка и его полей) и из текста
+    результатов, поэтому пригоден для любого инструмента и любой предметной
+    области. Данные в записи модель обязана ПЕРЕНЕСТИ: сервер сам их не найдёт.
+    """
+    lines = []
+    for call in missing:
+        schema = _schema_of(tools or [], call["server"], call["tool"])
+        names = record_args({"schema": schema})
+        props = schema.get("properties") if isinstance(schema, dict) else {}
+        for name in names:
+            spec = (props or {}).get(name) if isinstance(props, dict) else {}
+            spec = spec if isinstance(spec, dict) else {}
+            item = spec.get("items") if isinstance(spec.get("items"), dict) else {}
+            lines.append(f"- {call['server']} · {call['tool']}: аргумент «{name}» — "
+                         "список ЗАПИСЕЙ, по объекту на строку данных; поля записи: "
+                         + (_nested_args(item) or "(см. схему)"))
+    defaults = []
+    for call in missing:
+        schema = _schema_of(tools or [], call["server"], call["tool"])
+        props = schema.get("properties") if isinstance(schema, dict) else {}
+        names = record_args({"schema": schema})
+        others = [str(name) for name in (props or {}) if str(name) not in names]
+        if others:
+            defaults.append(f"- {call['tool']}: остальные аргументы ({', '.join(others[:8])}) "
+                            "— только значения ПО УМОЛЧАНИЮ, записи они НЕ заменяют.")
+    return (
+        "ЗАМЕЧАНИЕ ПО АРГУМЕНТАМ. Твой вызов отклонён ЛОКАЛЬНО (сервер отклонил бы "
+        "его так же): инструмент принимает данные ПОСТРОЧНО, а в вызове этих записей "
+        "нет — сохранять нечего. Собери записи ИЗ РЕЗУЛЬТАТОВ выше: по одному "
+        "объекту на каждую строку полученных данных (день, место, запись), значения "
+        "переноси как есть, числа — числами (диапазон из текста раздели на поля "
+        "минимума и максимума).\n" + "\n".join(lines)
+        + (("\n" + "\n".join(defaults)) if defaults else "")
+        + "\nЕсли данных для записей в результатах нет — верни пустой список "
+          "вызовов, а не вызов без записей."
+    )
+
+
 def guard_calls(calls: Any, results: Any, tools: Optional[List[Dict[str, Any]]],
                 user_text: str = "",
                 done_keys: Optional[set] = None,
@@ -2229,10 +2425,20 @@ def guard_calls(calls: Any, results: Any, tools: Optional[List[Dict[str, Any]]],
        просит удалить/остановить.
     4. **Повторов нет.** Тот же вызов с теми же аргументами не выполняется дважды
        (результат уже есть; для пишущих инструментов это ещё и дубль на сервере).
+       Набор «уже выполненных» не изменяется: его пополняет тот, кто ВЫПОЛНИЛ
+       вызов и получил успешный результат.
     """
     allowed: List[Dict[str, Any]] = []
     rejected: List[Dict[str, str]] = []
-    keys = done_keys if isinstance(done_keys, set) else set()
+    # КОПИЯ, а не ссылка на набор вызывающего. Охрана не имеет права помечать
+    # вызов выполненным: «выполнено» — это УСПЕШНЫЙ вызов (см. done_keys_of), а
+    # разрешённый вызов может быть ещё и не отправлен (например, его отбросил
+    # гейт записей, см. records_missing). С прежней мутацией по ссылке вызов,
+    # который никуда не ушёл, считался выполненным, и повтор ТОГО ЖЕ вызова
+    # молча отклонялся как «уже выполнялся» — живой случай 10.10: сохранение без
+    # записей отклонили локально, а его исправленный повтор с теми же аргументами
+    # до сервера уже не доходил.
+    keys = set(done_keys) if isinstance(done_keys, set) else set()
     # Текст всех результатов — область, в которой ищем «настоящие» значения.
     haystack = "\n".join(str(item.get("text") or "") + " " + str(item.get("error") or "")
                          for item in normalize_results(results))
@@ -2265,7 +2471,7 @@ def guard_calls(calls: Any, results: Any, tools: Optional[List[Dict[str, Any]]],
                            "токен без путей и пробелов)")
                     break
                 continue
-            if text in known or text in issued or text in haystack:
+            if text in known or text in issued or _value_in_text(text, haystack):
                 continue
             bad = (f"значение {arg}={text} не найдено в результатах — идентификатор "
                    "нельзя выдумывать, сначала вызови инструмент, который его выдаёт "
@@ -2281,6 +2487,52 @@ def guard_calls(calls: Any, results: Any, tools: Optional[List[Dict[str, Any]]],
             for arg, value in produced_ids([call]).items():
                 issued.add(value)
     return allowed, rejected
+
+
+def flag_retry(call: Any, result: Any,
+               tools: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """Повтор вызова с флагом, который назвал САМ сервер (иначе None).
+
+    Живой случай 10.10 (локальная модель, реальный сервер): сохранение набора
+    вернуло «A dataset with id … already exists … Pass `replace: true` to
+    overwrite» — то есть сервер назвал и флаг, и его значение. Модель вместо
+    повтора с флагом написала пользователю «уточните, что делать с конфликтом
+    идентификаторов», шаг задачи остался не выполненным. Повтор с флагом — не
+    знание предметной области, а разбор ответа сервера и СХЕМЫ: флаг берётся
+    только из boolean-аргументов ЭТОГО инструмента и только если ошибка называет
+    его как указание. Что именно означает флаг, код не знает и не предполагает.
+    """
+    if not isinstance(result, dict) or result.get("ok"):
+        return None
+    if not isinstance(call, dict):
+        return None
+    error = " ".join(str(result.get("error") or "").split())
+    if not error:
+        return None
+    schema = _schema_of(tools or [], call.get("server"), call.get("tool"))
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict):
+        return None
+    arguments = dict(call.get("arguments") or {})
+    for name, spec in props.items():
+        name = str(name)
+        if not isinstance(spec, dict) or spec.get("type") != "boolean":
+            continue
+        if arguments.get(name) is True:
+            continue
+        # Указание, а не случайное упоминание: «replace: true», «replace=true»,
+        # «Pass replace», «передайте replace», «use the replace flag».
+        patterns = (
+            rf"{re.escape(name)}\s*[:=]\s*true",
+            rf"(?:pass|set|use|with|укаж\w*|переда\w*|использу\w*|включ\w*)"
+            rf"[^.]{{0,40}}\b{re.escape(name)}\b",
+        )
+        if not any(re.search(pattern, error, re.IGNORECASE) for pattern in patterns):
+            continue
+        fixed = dict(call)
+        fixed["arguments"] = {**arguments, name: True}
+        return fixed
+    return None
 
 
 def attachments_of(results: Any) -> List[Dict[str, Any]]:
@@ -2423,12 +2675,60 @@ def tools_text(tools: List[Dict[str, Any]]) -> str:
     return text[:TOOLS_TEXT_CHARS]
 
 
+def _type_text(spec: Any) -> str:
+    """Тип аргумента из схемы одним словом (`number|null`, `array<string>`)."""
+    spec = spec if isinstance(spec, dict) else {}
+    kind = spec.get("type")
+    if isinstance(kind, list):
+        kinds = [str(item) for item in kind if str(item) != "null"]
+        text = "|".join(kinds) if kinds else "any"
+        return text + ("|null" if any(str(item) == "null" for item in kind) else "")
+    kind = str(kind or "any")
+    if kind == "array":
+        item = spec.get("items") if isinstance(spec.get("items"), dict) else {}
+        return f"array<{_type_text(item)}>"
+    return kind
+
+
+def _nested_args(spec: Any) -> str:
+    """Поля ВЛОЖЕННОГО объекта строкой `{имя: тип; ...}` — или пусто.
+
+    Зачем это нужно. Сжатый список показывает только ВЕРХНИЙ уровень схемы, и у
+    инструмента с аргументом-массивом объектов модель не видит, ИЗ ЧЕГО собирать
+    элемент: она подставляет либо выдуманные ключи, либо соседние поля верхнего
+    уровня (`location`/`latitude` — «значения по умолчанию»). Живой случай 10.10:
+    сохранение прогноза отклонялось сервером («Nothing to save. Pass `entries`
+    with one object per place-and-day…»), модель получала эту ошибку и повторяла
+    ТО ЖЕ САМОЕ, а задача уходила в цикл «шаг не выполнен, доработок 1 из 2» — ни
+    удалённая, ни локальная модель не могли собрать `entries`, потому что в
+    списке инструментов была только строка «entries: array<object>». Ошибка не
+    про погоду: невидимыми были поля ЛЮБОГО вложенного объекта, поэтому поля
+    печатаются из СХЕМЫ сервера, без знания конкретных инструментов.
+
+    Подсказки полей не печатаются сознательно (см. NESTED_ARG_LIMIT): имена и
+    типы дают модели всё нужное для сборки аргумента, а текст уходит в каждый
+    вызов диспетчера — это самая дорогая его часть.
+    """
+    props = spec.get("properties") if isinstance(spec, dict) else None
+    if not isinstance(props, dict) or not props:
+        return ""
+    required = {str(name) for name in (spec.get("required") or [])}
+    parts = []
+    for name, sub in list(props.items())[:NESTED_ARG_LIMIT]:
+        mark = "!" if str(name) in required else ""
+        parts.append(f"{name}{mark}: {_type_text(sub)}")
+    if len(props) > NESTED_ARG_LIMIT:
+        parts.append(f"…ещё {len(props) - NESTED_ARG_LIMIT} полей")
+    return "{" + "; ".join(parts) + "}"
+
+
 def _schema_args(schema: Any) -> str:
     """Сжатое описание аргументов: `имя: тип (подсказка)` + обязательные.
 
     Обязательные помечаются `!`. Подсказка — первый осмысленный кусок описания
     поля (до ~ARG_HINT_CHARS): без него модель путает смысл полей, с полным
-    описанием — платит за него на каждом вызове.
+    описанием — платит за него на каждом вызове. Вложенные объекты разворачиваются
+    на один уровень (`{поле: тип; ...}`) — см. _nested_args.
     """
     if not isinstance(schema, dict):
         return ""
@@ -2439,13 +2739,12 @@ def _schema_args(schema: Any) -> str:
     parts: List[str] = []
     for name, spec in list(props.items())[:ARG_LIMIT]:
         spec = spec if isinstance(spec, dict) else {}
-        kind = str(spec.get("type") or "any")
-        if kind == "array":
-            item = spec.get("items") if isinstance(spec.get("items"), dict) else {}
-            kind = f"array<{item.get('type') or 'any'}>"
+        kind = _type_text(spec)
+        inner = spec.get("items") if kind.startswith("array<") else spec
+        nested = _nested_args(inner if isinstance(inner, dict) else {})
         hint = _short(str(spec.get("description") or ""), ARG_HINT_CHARS)
         required_mark = "!" if str(name) in required else ""
-        parts.append(f"{name}{required_mark}: {kind}" + (f" — {hint}" if hint else ""))
+        parts.append(f"{name}{required_mark}: {kind}{nested}" + (f" — {hint}" if hint else ""))
     return "; ".join(parts)
 
 

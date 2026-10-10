@@ -2159,7 +2159,12 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
     Возвращает накопленные результаты, вызовы, расход и строки диагностики.
     """
     lines = list(lines or [])
-    done_keys = {mcp_store.call_key(call) for call in calls}
+    # «ВЫПОЛНЕНО» — ЭТО УСПЕШНЫЙ ВЫЗОВ, а не попытка (см. mcp_store.done_keys_of):
+    # отказавший вызов повторить можно, а его идентификатор нельзя выдавать за
+    # существующий. Живой случай 10.10: сохранение сперва упало (числа переданы
+    # строками), выгрузка из-за этого отказала, а после удачного повтора
+    # сохранения выгрузку отбросили как «уже выполнялась» — файла не было вовсе.
+    done_keys = mcp_store.done_keys_of(results)
     chain_ids = mcp_store.extract_ids(results)
     for key, value in ((chain_state or {}).get("ids") or {}).items():
         chain_ids.setdefault(str(key), str(value))
@@ -2173,6 +2178,20 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
     # диспетчера повторно — иначе это превратилось бы в цикл уговоров.
     nudge_pending = ""
     nudged = False
+    # Инструменты, которым уже говорили «собери записи» (см. records_missing):
+    # уговариваем по одному разу на инструмент, иначе это был бы цикл уговоров.
+    records_warned: set = set()
+    # Признак «раунд отброшен локально из-за отсутствия записей»: следующая
+    # итерация обязана спросить диспетчера заново (с уточнением про записи),
+    # а не считать цепочку законченной.
+    records_pending = False
+    # ОТЛОЖЕННЫЕ ЭФФЕКТЫ: вызовы, которые диспетчер выбрал ДО «ок», а выполнять их
+    # до подтверждения нельзя (сохранение, выгрузка). Хранятся в состоянии цепочки
+    # целиком — после подтверждения их выполняем САМИ, а не надеемся, что модель
+    # предложит их снова (см. ниже).
+    deferred_calls: List[Dict[str, Any]] = [
+        dict(item) for item in ((chain_state or {}).get("deferred") or [])
+        if isinstance(item, dict)]
     # До подтверждения плана изменения откладываются: признак «цепочка не
     # доиграна» уходит в диалог, и после «ок» её продолжит `_resume_mcp_chain`.
     pending = False
@@ -2181,16 +2200,82 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
     # выполняется следующим раундом БЕЗ вызова диспетчера.
     auto_call: Optional[Dict[str, Any]] = None
     for round_number in range(1, mcp_store.MAX_CHAIN_ITERATIONS + 1):
-        if time.monotonic() > deadline:
-            lines.append("MCP: время, отведённое на цепочку, вышло — останавливаюсь "
-                         "на том, что уже получено.")
-            break
         remaining = mcp_store.MAX_TOTAL_CALLS_PER_REQUEST - len(calls)
         if remaining <= 0:
             lines.append(f"MCP: предел вызовов за запрос "
                          f"({mcp_store.MAX_TOTAL_CALLS_PER_REQUEST}) достигнут — "
                          "цепочка остановлена.")
             break
+        if approved and deferred_calls:
+            # ВЫПОЛНЯЕМ ОТЛОЖЕННОЕ САМИ И БЕЗ ВОПРОСА МОДЕЛИ. Эти вызовы уже выбраны
+            # диспетчером до «ок» и одобрены вместе с планом — спрашивать заново
+            # нечего, а «спросить» означало бы зависеть от того, вспомнит ли модель
+            # о сохранении. Живой случай 10.10: сохранение набора потерялось,
+            # выгрузка ушла с выдуманным dataset_id «1», сервер отказал, и автомат
+            # ушёл в доработку по кругу, повторяя один и тот же отказ.
+            allowed, rejected = mcp_store.guard_calls(
+                deferred_calls, results, tools, user_text=request_text,
+                done_keys=done_keys, issued_ids=issued)
+            deferred_calls = []
+            for item in rejected:
+                lines.append(f"MCP: отложенный вызов {item['server']} · "
+                             f"{item['tool']} отброшен — {item['reason']}.")
+            # Вызов, который сервер отклонит из-за отсутствия ЗАПИСЕЙ, не
+            # отправляем: дешевле переспросить диспетчера с точным уточнением,
+            # чем тратить раунд и получать отказ (см. records_missing). Записи
+            # собираются из уже полученных результатов — они у цепочки есть.
+            missing = [call for call in mcp_store.records_missing(allowed, tools, results)
+                       if (call["server"], call["tool"]) not in records_warned]
+            if missing:
+                allowed = [call for call in allowed if call not in missing]
+                # Уговор НЕ расходуется: отложенный вызов выбран ДО появления
+                # результатов, и уточнение по нему — не «второй шанс» для ответа
+                # модели. Иначе следующий (свежий) ответ диспетчера уходил бы на
+                # сервер без проверки: живой случай 10.10 — предупреждение съел
+                # устаревший вызов, и повторно полученный вызов без записей был
+                # отправлен, снова отклонён, задача снова ушла в доработку.
+                lines.append("MCP: отложенный вызов "
+                             + mcp_store.calls_note(missing)
+                             + " не выполняю — инструмент принимает данные построчно, "
+                               "а записей в вызове нет; прошу диспетчера собрать их "
+                               "из результатов.")
+                nudge_pending = mcp_store.records_note(missing, tools, results)
+                records_pending = True
+            if allowed:
+                allowed = allowed[:remaining]
+                fresh_results = await mcp_store.async_run_calls(allowed)
+                mcp_store.mark_call_kinds(allowed, tools)
+                results = results + fresh_results
+                calls = calls + allowed
+                done_keys |= mcp_store.done_keys_of(fresh_results)
+                chain_ids.update(mcp_store.extract_ids(fresh_results))
+                succeeded = [call for call, result in zip(allowed, fresh_results)
+                             if isinstance(result, dict) and result.get("ok")]
+                issued.update(mcp_store.produced_ids(succeeded))
+                keep_ids = dict(chain_ids)
+                for key, value in issued.items():
+                    keep_ids.setdefault(key, value)
+                workspace_store.set_dialog_mcp(
+                    dialog, signature, request_text, results, calls=calls,
+                    chain={"ids": keep_ids, "keys": sorted(done_keys),
+                           "iterations": round_number, "pending": False})
+                lines.append("MCP: выполняю отложенное (одобрено вместе с планом): "
+                             + ", ".join(f"{call['server']} · {call['tool']}"
+                                         for call in allowed) + ".")
+                lines.append(mcp_store.results_note(fresh_results))
+                # СЛЕДУЮЩИЙ ШАГ — как после обычного раунда: если осталась ровно
+                # одна очевидная достройка результата и все её аргументы-идентификаторы
+                # уже известны (например, выгрузка файла по dataset_id из ответа
+                # сохранения), она выполнится БЕЗ вызова диспетчера — иначе мы
+                # потеряли бы эту экономию: полный промпт диспетчера самый дорогой.
+                done_pairs = {(str(call.get("server") or ""),
+                               str(call.get("tool") or "")) for call in calls}
+                auto_call = mcp_store.auto_followup(
+                    tools, done_pairs, keep_ids,
+                    kinds=mcp_store.unsatisfied_kinds(request_text, calls))
+                # Диспетчер увидит результаты отложенного вызова в следующем раунде
+                # (идентификатор сохранённого набора — для выгрузки файла).
+                continue
         if auto_call is not None:
             # ОЧЕВИДНАЯ ДОСТРОЙКА БЕЗ МОДЕЛИ: остался ровно один невызванный
             # инструмент результата, и все его обязательные аргументы — уже
@@ -2201,6 +2286,17 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
                          f"без диспетчера ({auto_call['server']} · {auto_call['tool']}).")
             auto_call = None
         else:
+            # ПРЕДЕЛ ВРЕМЕНИ ПРОВЕРЯЕТСЯ ТОЛЬКО ПЕРЕД ВЫЗОВОМ МОДЕЛИ. Детерминированные
+            # шаги (отложенное по плану, повтор с флагом, названным сервером, и
+            # очевидная достройка результата) стоят одного обращения к серверу и без
+            # модели: раньше их съедал общий предел раунда, и задача «прогноз →
+            # сохрани → выгрузи» на ЛОКАЛЬНОЙ модели обрывалась на самом сохранении
+            # («время, отведённое на цепочку, вышло»), хотя решение уже было принято
+            # и оставалось его выполнить (живой случай 10.10).
+            if time.monotonic() > deadline:
+                lines.append("MCP: время, отведённое на цепочку, вышло — "
+                             "останавливаюсь на том, что уже получено.")
+                break
             extra = mcp_store.chain_note(round_number, mcp_store.MAX_CHAIN_ITERATIONS,
                                          remaining, signals)
             if nudge_pending:
@@ -2233,14 +2329,37 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
             if effects:
                 names = mcp_store.calls_note(effects)
                 deferred_names.extend(str(call.get("tool") or "") for call in effects)
+                # Сами вызовы — в состояние цепочки: их выполнит шаг после «ок».
+                deferred_calls.extend(dict(call) for call in effects)
                 # Формулировка честна в обоих случаях: до «ок» (плана ещё нет) и на
                 # промежуточном шаге после «ок» — изменения в любом случае ждут
                 # ПОСЛЕДНЕГО шага плана.
                 lines.append("MCP: изменения сейчас не выполняю — сохранение и "
                              f"выгрузка идут на последнем шаге плана: {names}.")
             allowed = reads
+        # Пишущий вызов БЕЗ ЗАПИСЕЙ отправлять некуда: сервер ответит «нечего
+        # сохранять», модель повторит его же, и задача уйдёт в доработку по кругу
+        # (живой случай 10.10). Такой вызов не выполняем, а переспрашиваем
+        # диспетчера с уточнением про записи — данные для них уже в результатах.
+        missing = [call for call in mcp_store.records_missing(allowed, tools, results)
+                   if (call["server"], call["tool"]) not in records_warned]
+        if missing:
+            allowed = [call for call in allowed if call not in missing]
+            for call in missing:
+                records_warned.add((call["server"], call["tool"]))
+            lines.append("MCP: вызов " + mcp_store.calls_note(missing)
+                         + " отброшен локально — инструмент принимает данные "
+                           "построчно, а записей в вызове нет; прошу диспетчера "
+                           "собрать их из результатов.")
+            nudge_pending = mcp_store.records_note(missing, tools, results)
+            records_pending = True
         allowed = allowed[:remaining]
         if not allowed:
+            if approved and records_pending:
+                # Записи не собраны — единственный вызов раунда отброшен локально.
+                # Спрашиваем диспетчера заново: уточнение про записи уже готово.
+                records_pending = False
+                continue
             reason = str((decision or {}).get("reason") or "").strip()
             if not approved and deferred_names:
                 # Отложенная часть есть, но выполнять её до «ок» нельзя: цепочка
@@ -2253,7 +2372,8 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
                 workspace_store.set_dialog_mcp(
                     dialog, signature, request_text, results, calls=calls,
                     chain={"ids": keep_ids, "keys": sorted(done_keys),
-                           "iterations": round_number, "pending": True})
+                           "iterations": round_number, "pending": True,
+                           "deferred": deferred_calls})
                 break
             # Запрос просил «сделать с данными ещё шаг», а вызовов для этого нет:
             # спрашиваем диспетчера ЕЩЁ РАЗ, назвав невызванные инструменты, которые
@@ -2299,12 +2419,17 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
         fresh_results = await mcp_store.async_run_calls(allowed, limit=remaining)
         results = list(results) + fresh_results
         calls = list(calls) + allowed
-        done_keys |= {mcp_store.call_key(call) for call in allowed}
+        done_keys |= mcp_store.done_keys_of(fresh_results)
         chain_ids.update(mcp_store.extract_ids(fresh_results))
-        # Идентификаторы, названные создающими вызовами (save_/create_/…): сервер их
-        # принял, значит они существуют. Храним их вместе с цепочкой — повтор
+        # Идентификаторы, названные создающими вызовами (save_/create_/…): их можно
+        # переиспользовать дальше — но ТОЛЬКО ЕСЛИ ВЫЗОВ УДАЛСЯ. Сервер, ответивший
+        # ошибкой валидации, ничего не сохранил, а «выданный» им идентификатор
+        # уводил следующий вызов (выгрузку файла) в отказ «нет такого набора» —
+        # именно так и сорвалась задача 10.10. Храним их вместе с цепочкой: повтор
         # периодической задачи обновляет ТОТ ЖЕ набор, а не заводит новый.
-        issued.update(mcp_store.produced_ids(allowed))
+        succeeded = [call for call, result in zip(allowed, fresh_results)
+                     if isinstance(result, dict) and result.get("ok")]
+        issued.update(mcp_store.produced_ids(succeeded))
         keep_ids = dict(chain_ids)
         for key, value in issued.items():
             keep_ids.setdefault(key, value)
@@ -2318,7 +2443,8 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
             dialog, signature, request_text, results, calls=calls,
             chain={"ids": keep_ids, "keys": sorted(done_keys),
                    "iterations": round_number,
-                   "pending": bool(deferred_names) and not approved})
+                   "pending": bool(deferred_names) and not approved,
+                   "deferred": deferred_calls})
         mcp_store.mark_actions(stored.get("results") or [], tools)
         fresh_started = mcp_store.started_calls(stored.get("results") or [], tools)
         if fresh_started:
@@ -2342,6 +2468,22 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
                 lines.append("MCP: файл выдан, других инструментов результата нет — "
                              "цепочка завершена.")
                 break
+        # СЕРВЕР САМ НАЗВАЛ ФЛАГ — повторяем вызов с ним, без диспетчера.
+        # Живой случай 10.10: сохранение ответило «…already exists … Pass
+        # `replace: true` to overwrite», а модель вместо повтора спросила
+        # пользователя, что делать с конфликтом идентификаторов. Разбор ответа и
+        # схемы (см. mcp_store.flag_retry) закрывает такие отказы там же, где они
+        # возникли; что означает флаг — решает сервер, а не агент.
+        if approved and not pending:
+            for call, result in zip(allowed, fresh_results):
+                fixed = mcp_store.flag_retry(call, result, tools)
+                if not fixed:
+                    continue
+                lines.append("MCP: сервер назвал аргумент-флаг — повторяю вызов с ним: "
+                             f"{fixed['server']} · {fixed['tool']} "
+                             f"{mcp_store.arguments_text(fixed.get('arguments'))}.")
+                auto_call = fixed
+                break
         # Осталась одна очевидная достройка результата? Выполним её без модели
         # (см. auto_followup): решение однозначно, а вызов диспетчера — самый
         # дорогой вызов задачи. Берём только те виды результата, которые запрос
@@ -2350,9 +2492,14 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
         if approved and not pending:
             done_pairs = {(str(call.get("server") or ""), str(call.get("tool") or ""))
                           for call in calls}
-            auto_call = mcp_store.auto_followup(
+            follow = mcp_store.auto_followup(
                 tools, done_pairs, keep_ids,
                 kinds=mcp_store.unsatisfied_kinds(request_text, calls))
+            # ПОВТОР С ФЛАГОМ ВАЖНЕЕ ДОСТРОЙКИ: он исправляет уже отклонённый
+            # вызов, а достройка (например, выгрузка файла) после него будет
+            # пересчитана заново. Присваивание без проверки затирало повтор —
+            # в живом случае он терялся, и цепочка останавливалась на отказе.
+            auto_call = auto_call or follow
     else:
         lines.append(f"MCP: исчерпан предел раундов цепочки "
                      f"({mcp_store.MAX_CHAIN_ITERATIONS}) — останавливаюсь на "

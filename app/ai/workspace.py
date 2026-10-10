@@ -702,10 +702,27 @@ def _clean_chain(raw: Any) -> Dict[str, Any]:
     except (TypeError, ValueError):
         iterations = 0
     pending = bool(raw.get("pending"))
-    if not ids and not keys and not pending:
+    # ОТЛОЖЕННЫЕ ВЫЗОВЫ (эффекты, выбранные до «ок»). Хранятся ЦЕЛИКОМ, а не
+    # только именами: после подтверждения плана их надо ВЫПОЛНИТЬ, а не просить
+    # модель вспомнить о них заново. Живой случай 10.10: сохранение набора было
+    # отложено до «ок», после подтверждения диспетчер о нём «не вспомнил», выгрузка
+    # ушла с выдуманным dataset_id, сервер отказал, и задача ушла в доработку по
+    # кругу. Предел — как у вызовов за запрос (см. mcp.MAX_TOTAL_CALLS_PER_REQUEST).
+    deferred: List[Dict[str, Any]] = []
+    for item in list(raw.get("deferred") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        server_id = str(item.get("server") or "").strip()[:80]
+        tool = str(item.get("tool") or "").strip()[:80]
+        if not server_id or not tool:
+            continue
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        deferred.append({"server": server_id, "tool": tool,
+                         "arguments": dict(arguments)})
+    if not ids and not keys and not pending and not deferred:
         return {}
     return {"ids": ids, "keys": list(dict.fromkeys(keys))[:20],
-            "iterations": iterations, "pending": pending}
+            "iterations": iterations, "pending": pending, "deferred": deferred}
 
 
 def _clean_files(raw: Any) -> List[Dict[str, Any]]:

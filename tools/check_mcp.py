@@ -1061,7 +1061,12 @@ CHAIN_TOOLS = [
      "description": "Сохраняет таблицу значений на сервере под идентификатором",
      "schema": {"type": "object",
                 "properties": {"dataset_id": {"type": "string"},
-                               "entries": {"type": "array"},
+                               # Как у настоящего сервера: записи — список
+                               # ОБЪЕКТОВ (см. регрессию «вызов без записей»).
+                               "entries": {"type": "array",
+                                           "items": {"type": "object", "properties": {
+                                               "location": {"type": "string"},
+                                               "date": {"type": "string"}}}},
                                # Как у настоящего сервера: без флага перезаписи
                                # сохранение под существующим id отклоняется.
                                "replace": {"type": "boolean"}},
@@ -1196,6 +1201,20 @@ async def test_chain():
          "ok": True, "text": f"Таблица сохранена. dataset_id: \"{DATASET_ID}\"", "error": ""},
         {"server": CHAIN_ID, "tool": "get_forecast", "arguments": {},
          "ok": True, "text": "Наблюдение активно. watch_id: \"w-1\"", "error": ""}]
+    # ВЫДУМАННЫЙ КОРОТКИЙ ИДЕНТИФИКАТОР (живой случай 10.10): модель прислала
+    # dataset_id «1», и охрана ПРОПУСКАЛА вызов — единица находилась в тексте
+    # результатов подстрокой (в «Found 2 match(es)» и в координатах 55.75204).
+    # Сервер отвечал «No saved summary with id "1"», шаг задачи проваливался, и
+    # автомат уходил в доработку по кругу. Короткие значения в свободном тексте
+    # больше не ищутся: только явно названные идентификаторы.
+    fake_short = [{"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                   "arguments": {"dataset_id": "1"}}]
+    noisy = [{"server": CHAIN_ID, "tool": "get_forecast", "ok": True,
+              "text": "Found 2 match(es): 1. Москва coordinates: 55.75204, 37.61781"}]
+    allowed, rejected = mcp_store.guard_calls(fake_short, noisy, flat,
+                                              user_text="выгрузи в эксель")
+    check("выдуманный короткий dataset_id отброшен (не найден в результатах)",
+          not allowed and bool(rejected), str(rejected))
     allowed, rejected = mcp_store.guard_calls([export_call], saved_results, flat,
                                               user_text=DELIVER_REQUEST)
     check("идентификатор из результатов пропускается", bool(allowed) and not rejected,
@@ -1205,11 +1224,43 @@ async def test_chain():
                                               issued_ids={"dataset_id": DATASET_ID})
     check("идентификатор, названный сохранением, тоже годится",
           bool(allowed) and not rejected, str(rejected))
+    # ОТКАЗАВШИЙ ВЫЗОВ — НЕ ВЫПОЛНЕННЫЙ (регрессия живого случая 10.10).
+    # Сохранение набора сперва упало (модель передала числа строками — сервер
+    # ответил ошибкой валидации), и дальше произошли два неверных вывода сразу:
+    # отказ засчитался как «идентификатор выдан» (выгрузка ушла с несуществующим
+    # набором), а после удачного повтора сохранения выгрузку отбросили как повтор
+    # («такой вызов уже выполнялся»). Файла не появилось, шаг ушёл в доработку
+    # по кругу.
+    failed_save = [{"server": CHAIN_ID, "tool": "save_weather_summary", "ok": False,
+                    "arguments": {"dataset_id": DATASET_ID},
+                    "error": "Invalid input: expected number, received string"}]
+    check("отказавший вызов НЕ считается выполненным (его можно повторить)",
+          mcp_store.done_keys_of(failed_save) == set(),
+          str(mcp_store.done_keys_of(failed_save)))
+    saved_ok = [{"server": CHAIN_ID, "tool": "save_weather_summary", "ok": True,
+                 "arguments": {"dataset_id": DATASET_ID}, "text": "Saved summary"}]
+    check("успешный вызов считается выполненным (повторять его нельзя)",
+          mcp_store.done_keys_of(saved_ok) == {mcp_store.call_key(saved_ok[0])},
+          str(mcp_store.done_keys_of(saved_ok)))
+    allowed, rejected = mcp_store.guard_calls([export_call], failed_save, flat,
+                                              user_text=DELIVER_REQUEST)
+    check("выгрузка по идентификатору ОТКАЗАВШЕГО сохранения отброшена",
+          not allowed and bool(rejected), str(rejected))
     allowed, rejected = mcp_store.guard_calls([export_call], saved_results, flat,
                                               user_text=DELIVER_REQUEST,
                                               done_keys={mcp_store.call_key(export_call)})
     check("повтор уже выполненного вызова отброшен", not allowed and bool(rejected),
           str(rejected))
+    # ОХРАНА НЕ ДОПИСЫВАЕТ НАБОР «ВЫПОЛНЕННЫХ». Разрешённый вызов может быть ещё
+    # и не отправлен (его отбрасывает гейт записей — см. records_missing), а
+    # «выполнено» — это УСПЕШНЫЙ результат. С прежней мутацией набора по ссылке
+    # вызов, никуда не ушедший, считался выполненным, и его повтор молча
+    # отклонялся как «уже выполнялся» (живой случай 10.10).
+    live = set()
+    mcp_store.guard_calls([export_call], saved_results, flat,
+                          user_text=DELIVER_REQUEST, done_keys=live)
+    check("разрешённый вызов не попадает в набор «выполненных» автоматически",
+          live == set(), str(live))
     kill = [{"server": CHAIN_ID, "tool": "delete_weather_watch",
              "arguments": {"id": "w-1"}}]
     allowed, rejected = mcp_store.guard_calls(kill, saved_results, flat,
@@ -1307,9 +1358,12 @@ async def test_chain():
     # затем ФИНАЛЬНЫЙ ОТЧЁТ, и только под ним — карточка файла.
     reset_calls()
     CHAIN_CALLS.clear()
+    # ОЧЕРЕДЬ НАЧИНАЕТСЯ С ВЫГРУЗКИ, а не с сохранения: сохранение выбрано
+    # диспетчером ДО «ок» и отложено, и теперь автомат выполняет его САМ — из
+    # состояния цепочки, не спрашивая модель заново (иначе судьба сохранения
+    # зависела бы от того, вспомнит ли о нём модель: живой случай 10.10 — набор не
+    # сохранился, выгрузка ушла с выдуманным dataset_id, задача ушла в доработку).
     MCP_DECISIONS[:] = [
-        {"done": False, "reason": "сохраняю прогнозы одним набором",
-         "calls": [save_call]},
         {"done": False, "reason": "выгружаю файл по идентификатору набора",
          "calls": [export_call]},
         {"done": True, "reason": "данные получены, набор сохранён, файл выгружен",
@@ -1317,6 +1371,9 @@ async def test_chain():
     ]
     events = await run_chat("", continue_step=True)
     executed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("отложенное сохранение выполнено САМИМ автоматом (без вопроса модели)",
+          any("выполняю отложенное" in text for text in texts(events, "debug")),
+          str(texts(events, "debug"))[:250])
     check("на последнем шаге выполнены сохранение и выгрузка",
           executed == ["save_weather_summary", "export_weather_summary_excel"],
           str(executed))
@@ -1326,11 +1383,13 @@ async def test_chain():
     check("в чате сказано, что цепочка доиграна после подтверждения",
           any("доигрываю цепочку" in text for text in texts(events, "debug")),
           str(texts(events, "debug"))[-300:])
-    # ОЧЕВИДНАЯ ДОСТРОЙКА: после сохранения остался ровно один инструмент
-    # результата (выгрузка) и его обязательный dataset_id уже известен — он
-    # вызывается БЕЗ диспетчера (экономия целого вызова LLM).
-    check("очевидная выгрузка выполнена без вызова диспетчера",
-          MCP_CHOICE_CALLS == 1, f"вызовов диспетчера в этой фазе: {MCP_CHOICE_CALLS}")
+    # НИ ОДНОГО ВЫЗОВА ДИСПЕТЧЕРА В ЭТОЙ ФАЗЕ: сохранение выбрано до «ок» и
+    # отложено (автомат выполняет его сам из состояния цепочки), а выгрузка —
+    # очевидная достройка с уже известным dataset_id (см. auto_followup). Модель
+    # об этом не спрашивают вовсе: полный промпт диспетчера — самая дорогая часть
+    # задачи, а решение однозначно.
+    check("сохранение и выгрузка выполнены без единого вызова диспетчера",
+          MCP_CHOICE_CALLS == 0, f"вызовов диспетчера в этой фазе: {MCP_CHOICE_CALLS}")
     check("в чате сказано, что шаг выполнен без диспетчера",
           any("остался один очевидный шаг результата" in text
               for text in texts(events, "debug")),
@@ -1648,6 +1707,73 @@ async def test_chain():
           and "countryCode: string" in compact, compact[:200])
     check("подсказка по аргументу сохранена (язык/страна важны диспетчеру)",
           "ISO-код страны" in compact and "Название города" in compact, compact[:250])
+
+    # 7.12а ВЛОЖЕННЫЙ объект: поля массива объектов обязаны быть видны модели.
+    # Живой случай 10.10 (не про погоду, а про форму аргумента): инструмент,
+    # принимающий `rows: array<object>`, отклонял вызов «Nothing to save…», а
+    # модель видела ТОЛЬКО «rows: array<object>» — из чего собирать строку, ей
+    # не сообщалось, поэтому она повторяла тот же негодный вызов, и задача
+    # уходила в цикл. Проверка синтетическая: имена полей берутся из СХЕМЫ.
+    nested_tool = {
+        "server": CHAIN_ID, "server_name": "chain-mcp", "tool": "save_rows",
+        "description": "Сохранить строки.",
+        "schema": {"type": "object",
+                   "properties": {
+                       "rows": {"type": "array",
+                                "description": "Строки таблицы.",
+                                "items": {"type": "object",
+                                          "required": ["code"],
+                                          "properties": {
+                                              "code": {"type": "string",
+                                                       "description": "Код строки."},
+                                              "amount": {"type": ["number", "null"],
+                                                         "description": "Сумма."},
+                                              "note": {"type": "string"}}}},
+                       "tags": {"type": "array", "items": {"type": "string"},
+                                "description": "Метки."}},
+                   "required": ["rows"]}}
+    nested_text = mcp_store.tools_text([nested_tool])
+    check("поля вложенного объекта видны модели (иначе вызов не собрать)",
+          "code" in nested_text and "amount" in nested_text
+          and "array<object>" in nested_text, nested_text)
+    check("типы полей вложенного объекта показаны, включая необязательность",
+          "amount: number|null" in nested_text and "note: string" in nested_text,
+          nested_text)
+    check("обязательные поля вложенного объекта помечены",
+          "code!" in nested_text, nested_text)
+    check("вложенность разворачивается на один уровень, а не в полный дамп",
+          len(nested_text) < len(json.dumps(nested_tool["schema"], ensure_ascii=False)),
+          f"{len(nested_text)} против {len(json.dumps(nested_tool['schema'], ensure_ascii=False))}")
+    check("верхний уровень сжатого списка не сломан вложенностью",
+          "rows!" in nested_text and "tags: array<string>" in nested_text, nested_text)
+    check("инструмент со списком записей опознан (массив объектов)",
+          mcp_store.record_args(nested_tool) == ["rows"],
+          str(mcp_store.record_args(nested_tool)))
+    check("инструмент без списка записей ничем не помечен",
+          mcp_store.record_args(rich_tool) == [], str(mcp_store.record_args(rich_tool)))
+
+    # 7.12б ОТКЛОНЁННЫЙ вызов называется в дайджесте ОТДЕЛЬНО, последним блоком:
+    # модель видела ошибку рядом с результатом, но в длинном дайджесте теряла её
+    # и повторяла тот же вызов чуть изменённым (живой случай 10.10). Текст берётся
+    # из ответа сервера — проверка не про конкретный инструмент.
+    untouched_tool = dict(nested_tool, tool="save_other_rows")
+    rejected = mcp_store.digest([
+        {"server": CHAIN_ID, "tool": "save_rows", "arguments": {"id": "x"},
+         "ok": False, "text": "",
+         "error": "Invalid arguments: nothing to save, pass rows or watch id"},
+        {"server": CHAIN_ID, "tool": "get_forecast", "arguments": {}, "ok": True,
+         "text": "данные", "error": ""},
+    ], tools=[nested_tool, untouched_tool])
+    tail_block = rejected.split("СЕРВЕР ОТКЛОНИЛ")[-1]
+    check("отклонённый вызов назван в конце дайджеста вместе с причиной",
+          "save_rows" in tail_block and "nothing to save" in tail_block,
+          tail_block[-260:])
+    check("принятый вызов в список отклонённых не попадает",
+          "get_forecast" not in tail_block, tail_block[-260:])
+    check("список записей назван у ещё не вызванного инструмента",
+          "принимает ЗАПИСИ" in rejected
+          and "rows" in rejected.split("ЕЩЁ НЕ ВЫЗЫВАЛИСЬ")[-1],
+          rejected.split("ЕЩЁ НЕ ВЫЗЫВАЛИСЬ")[-1][:260])
 
     long_result = [{"server": CHAIN_ID, "tool": "get_forecast", "arguments": {},
                     "ok": True, "text": "данные: " + "7.6 18.3 5.8 0 5.5 3.2 " * 120,
@@ -2021,6 +2147,148 @@ async def test_chain_data_on_step():
     MCP_DECISIONS.clear()
 
 
+async def test_records_gate():
+    """Вызов без ЗАПИСЕЙ отбрасывается ЛОКАЛЬНО, а не сервером.
+
+    Живой случай 10.10 (не про погоду и не про конкретный город): запрос
+    «получи прогноз, сохрани набором и выгрузи в Excel». Обе модели — и
+    удалённая, и локальная — выбирали инструмент сохранения и передавали
+    ТОЛЬКО поля верхнего уровня (имя места, координаты, идентификатор набора),
+    без списка записей: в сжатом списке инструментов поля вложенного объекта не
+    были видны, и собрать записи было не из чего. Сервер отвечал «Nothing to
+    save…», модель повторяла вызов, и задача уходила в доработку по кругу.
+    Здесь проверяется, что такой вызов НЕ доходит до сервера: диспетчер
+    переспрашивается с уточнением про записи и выполняет исправленный вызов.
+    """
+    print("\n[11] Вызов без записей: локальный отказ вместо отказа сервера")
+    # План из ОДНОГО шага: у многошагового плана побочные эффекты выполняются на
+    # последнем шаге (см. 7.4), и проверка ушла бы в другой сценарий.
+    saved_steps = list(PLAN_STEPS)
+    PLAN_STEPS[:] = ["Сохранить прогноз набором и выгрузить в Excel"]
+    use_chain_registry()
+    install_chain_stubs()
+    await chat.task_create(chat.TaskCreate(name="Проект: записи"))
+    await chat.session_create()
+    await chat.mcp_apply(McpApply(enabled=[CHAIN_ID]))
+    reset_calls()
+    CHAIN_CALLS.clear()
+
+    no_records = {"server": CHAIN_ID, "tool": "save_weather_summary",
+                  "arguments": {"dataset_id": DATASET_ID, "location": "Казань"}}
+    fixed = {"server": CHAIN_ID, "tool": "save_weather_summary",
+             "arguments": {"dataset_id": DATASET_ID,
+                           "entries": [{"location": "Казань",
+                                        "date": "2026-09-27"}]}}
+    MCP_DECISIONS[:] = [
+        {"mode": "chain", "reason": "читаю прогноз",
+         "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Казань"}}]},
+        # ДИСПЕТЧЕР ЗАБЫЛ ЗАПИСИ — ровно так и было в живом случае.
+        {"done": False, "reason": "сохраняю набор", "calls": [no_records]},
+        {"done": False, "reason": "сохраняю набор с записями", "calls": [fixed]},
+        {"done": True, "reason": "набор сохранён", "calls": []},
+    ]
+    await run_chat(DELIVER_REQUEST, force_plan=True)
+    first = await run_chat("ок")
+    executed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    sent_without_records = [
+        call for batch in CHAIN_CALLS for call in batch
+        if call["tool"] == "save_weather_summary"
+        and not (call.get("arguments") or {}).get("entries")]
+    check("вызов без записей на сервер НЕ ушёл", not sent_without_records,
+          str(sent_without_records))
+    check("сохранение ушло ровно один раз (отклонённый вызов не повторялся)",
+          executed.count("save_weather_summary") == 1, str(executed))
+    check("локальный отказ объяснён в журнале",
+          any("записей в вызове нет" in text for text in texts(first, "debug")),
+          str(texts(first, "debug"))[-300:])
+    saved = [call for batch in CHAIN_CALLS for call in batch
+             if call["tool"] == "save_weather_summary"]
+    check("исправленный вызов пришёл С ЗАПИСЯМИ (их собрали из результатов)",
+          bool(saved) and len((saved[0].get("arguments") or {}).get("entries") or []) == 1,
+          str(saved))
+    check("в уточнении диспетчеру названы поля записи из схемы",
+          any("список ЗАПИСЕЙ" in str(item) and "date" in str(item)
+              for item in MCP_PAYLOADS),
+          str(MCP_PAYLOADS)[-300:])
+    # УСТАРЕВШИЙ ОТЛОЖЕННЫЙ ВЫЗОВ НЕ РАСХОДУЕТ УГОВОР. В живом случае вызов без
+    # записей приходил ДВАЖДЫ: сперва отложенный (выбранный до «ок», когда
+    # результатов ещё не было), затем — свежий ответ диспетчера. Первая проверка
+    # помечала инструмент «уже сказано», и свежий вызов уходил на сервер без
+    # проверки: отказ, повтор, доработка по кругу. Здесь проверяется, что и
+    # свежий ответ получает свой уговор.
+    MCP_DECISIONS.clear()
+    await chat.task_create(chat.TaskCreate(name="Проект: записи дважды"))
+    await chat.session_create()
+    await chat.mcp_apply(McpApply(enabled=[CHAIN_ID]))
+    reset_calls()
+    CHAIN_CALLS.clear()
+    MCP_DECISIONS[:] = [
+        {"mode": "chain", "reason": "читаю прогноз",
+         "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Казань"}}]},
+        # Вызов выбран ДО результатов — и потому без записей (так и было в живом
+        # случае: модель не могла знать, что вернёт чтение).
+        {"done": False, "reason": "сохраняю набор", "calls": [no_records]},
+    ]
+    await run_chat(DELIVER_REQUEST, force_plan=True)
+    # ОТЛОЖЕННЫЙ ВЫЗОВ БЕЗ ЗАПИСЕЙ кладём в состояние цепочки руками: именно так
+    # оно и выглядит в живом приложении (диспетчер выбрал сохранение в раунде ДО
+    # результатов, и вызов ушёл в отложенные до «ок»). Планировщик проверки
+    # второго раунда не делает — он спрашивает диспетчера ровно один раз.
+    session = chat._current_session()
+    current = workspace_store.dialog_mcp(session["dialog"])
+    workspace_store.set_dialog_mcp(
+        session["dialog"], current.get("signature") or "", current.get("request") or "",
+        current.get("results") or [], calls=current.get("calls") or [],
+        chain={**(current.get("chain") or {}), "deferred": [dict(no_records)],
+               "pending": True})
+    MCP_DECISIONS[:] = [
+        # СВЕЖИЙ ответ диспетчера — тоже без записей.
+        {"done": False, "reason": "сохраняю набор", "calls": [no_records]},
+        {"done": False, "reason": "сохраняю набор с записями", "calls": [fixed]},
+        {"done": True, "reason": "набор сохранён", "calls": []},
+    ]
+    second = await run_chat("ок")
+    warned = [text for text in texts(second, "debug")
+              if "записей в вызове нет" in text]
+    check("и отложенный, и свежий вызов без записей отклонены локально",
+          len(warned) >= 2, str(warned))
+    sent = [call for batch in CHAIN_CALLS for call in batch
+            if call["tool"] == "save_weather_summary"]
+    check("на сервер ушло только сохранение С записями",
+          bool(sent) and all((call.get("arguments") or {}).get("entries") for call in sent)
+          and len(sent) == 1, str(sent))
+    check("уговор дошёл до диспетчера дважды",
+          sum(1 for item in MCP_PAYLOADS if "список ЗАПИСЕЙ" in str(item)) >= 2,
+          str(sum(1 for item in MCP_PAYLOADS if "список ЗАПИСЕЙ" in str(item))))
+    # ОТКАЗ, В КОТОРОМ СЕРВЕР НАЗВАЛ ФЛАГ. Живая ошибка (локальная модель,
+    # реальный сервер): «A dataset with id … already exists … Pass `replace: true`
+    # to overwrite» — модель вместо повтора спросила пользователя про конфликт
+    # идентификаторов, и шаг остался не выполненным. Повтор с флагом выводится из
+    # ответа сервера и СХЕМЫ инструмента, а не из знания предметной области.
+    flat_tools = flat_chain_tools()
+    overwrite_error = ('Invalid arguments for `save_weather_summary`: A dataset with '
+                       'id "ekb-kzn-27-09" already exists ("Прогноз", saved '
+                       '2026-09-27T06:00:00Z). Pass `replace: true` to overwrite it.')
+    blocked = {"server": CHAIN_ID, "tool": "save_weather_summary",
+               "arguments": {"dataset_id": DATASET_ID}}
+    fixed_flag = mcp_store.flag_retry(
+        blocked, {"ok": False, "error": overwrite_error}, flat_tools)
+    check("сервер назвал флаг — вызов повторяется с ним",
+          (fixed_flag or {}).get("arguments", {}).get("replace") is True,
+          str(fixed_flag))
+    check("без указания флага ошибка не переписывается",
+          mcp_store.flag_retry(
+              blocked, {"ok": False, "error": "No saved summary with id \"1\""},
+              flat_tools) is None, "")
+    check("удавшемуся вызову повтор не нужен",
+          mcp_store.flag_retry(blocked, {"ok": True, "error": ""}, flat_tools) is None, "")
+
+    MCP_DECISIONS.clear()
+    PLAN_STEPS[:] = saved_steps
+
+
 def main():
     print("Проверка MCP (внешних инструментов агента) — без сети и ключей")
     _write_fake_servers()
@@ -2037,6 +2305,7 @@ def main():
     test_multi_server()
     loop.run_until_complete(test_two_servers_flow())
     loop.run_until_complete(test_chain_data_on_step())
+    loop.run_until_complete(test_records_gate())
     print("\nИтог: " + (f"ПРОВАЛЕНО проверок: {len(FAILURES)} → {FAILURES}"
                        if FAILURES else "все проверки пройдены"))
     return 1 if FAILURES else 0
