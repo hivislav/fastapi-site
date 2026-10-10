@@ -391,6 +391,10 @@ async def fake_call_llm_async(*args, **kwargs):
         MCP_PAYLOADS.append(user)
         if MCP_DECISIONS:
             decision = MCP_DECISIONS.pop(0)
+            if isinstance(decision, str):
+                # Ответ модели КАК ЕСТЬ: нужен для обрыва по пределу длины (см.
+                # раздел [11] — обрезанный JSON приходит строкой, а не словарём).
+                return decision, _metrics(45, 18)
             return json.dumps(decision, ensure_ascii=False), _metrics(45, 18)
         return (json.dumps({"calls": list(MCP_CALLS)}, ensure_ascii=False),
                 _metrics(45, 18))
@@ -1751,6 +1755,47 @@ async def test_chain():
           str(mcp_store.record_args(nested_tool)))
     check("инструмент без списка записей ничем не помечен",
           mcp_store.record_args(rich_tool) == [], str(mcp_store.record_args(rich_tool)))
+    # ЗНАЧЕНИЕ ИЗ РЕЗУЛЬТАТОВ В НЕИДЕНТИФИКАТОРЕ — НЕ ПОВОД ПРОПУСКАТЬ ПРОВЕРКУ.
+    # Живой случай 10.10: модель перенесла в вызов сохранения координаты из
+    # прогноза, они нашлись в тексте результата, и проверка записей отменялась —
+    # сохранение без записей уходило на сервер (три раза подряд). Второй путь
+    # («по идентификатору») считается только по аргументу-ИДЕНТИФИКАТОРУ.
+    noisy_results = [{"server": CHAIN_ID, "tool": "get_forecast", "ok": True,
+                      "text": "Прогноз для Казани (55.79639, 49.10889) "
+                              "watch_id: w-1", "error": ""}]
+    coord_call = [{"server": CHAIN_ID, "tool": "save_weather_summary",
+                   "arguments": {"dataset_id": "x", "latitude": 55.79639}}]
+    check("координаты из результата не отменяют проверку записей",
+          mcp_store.records_missing(coord_call, flat, noisy_results) == coord_call,
+          str(mcp_store.records_missing(coord_call, flat, noisy_results)))
+    watch_call = [{"server": CHAIN_ID, "tool": "save_weather_summary",
+                   "arguments": {"dataset_id": "x", "watch_id": "w-1"}}]
+    # ПОВТОРНАЯ ВЫДАЧА ТОГО ЖЕ РЕЗУЛЬТАТА. Живой случай 10.10: после удачной
+    # выгрузки диспетчер попросил выгрузить тот же набор с ДРУГИМ именем файла, и
+    # в чате появились два одинаковых файла (проверка «тот же вызов» его не
+    # увидела: аргументы разные). Вид результата и идентификатор — из ответов
+    # сервера и схемы, без имён инструментов.
+    exported = [{"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+                 "arguments": {"dataset_id": DATASET_ID}, "ok": True,
+                 "text": "Файл выгружен", "error": ""}]
+    again = {"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+             "arguments": {"dataset_id": DATASET_ID, "file_name": "другое-имя"}}
+    check("повторная выгрузка того же набора отброшена",
+          bool(mcp_store.repeated_result(again, exported, flat)),
+          mcp_store.repeated_result(again, exported, flat))
+    check("выгрузка ДРУГОГО набора не отброшена",
+          mcp_store.repeated_result(
+              {"server": CHAIN_ID, "tool": "export_weather_summary_excel",
+               "arguments": {"dataset_id": "другой-набор"}}, exported, flat) == "", "")
+    check("повторное СОХРАНЕНИЕ не отбрасывается (обновление набора законно)",
+          mcp_store.repeated_result(
+              {"server": CHAIN_ID, "tool": "save_weather_summary",
+               "arguments": {"dataset_id": DATASET_ID,
+                             "entries": [{"location": "Казань"}]}}, exported, flat) == "",
+          "")
+    check("вызов через идентификатор из результата проверку проходит",
+          mcp_store.records_missing(watch_call, flat, noisy_results) == [],
+          str(mcp_store.records_missing(watch_call, flat, noisy_results)))
 
     # 7.12б ОТКЛОНЁННЫЙ вызов называется в дайджесте ОТДЕЛЬНО, последним блоком:
     # модель видела ошибку рядом с результатом, но в длинном дайджесте теряла её
@@ -2285,6 +2330,55 @@ async def test_records_gate():
     check("удавшемуся вызову повтор не нужен",
           mcp_store.flag_retry(blocked, {"ok": True, "error": ""}, flat_tools) is None, "")
 
+    # ОБРЫВ ОТВЕТА ПО ПРЕДЕЛУ ДЛИНЫ. Живой случай 10.10: ответ диспетчера обрёкся
+    # на середине записи, JSON «починился», и сохранение ушло на сервер с 5
+    # записями вместо 7 — молча, без ошибки, набор получился неполным. Теперь
+    # такой вызов не отправляется: диспетчера просят вернуть его короче, но со
+    # всеми строками.
+    check("обрезанный ответ распознан (JSON пришлось чинить)",
+          mcp_store.parse_decision('{"calls": [{"server": "chain-mcp", "tool": '
+                                   '"save_weather_summary", "arguments": {"entries": '
+                                   '[{"date": "2026-09-27"}, {"date": "2026-',
+                                   flat_tools)["repaired"] is True, "")
+    check("целый ответ обрывом не считается",
+          mcp_store.parse_decision(json.dumps({"calls": [dict(fixed)]}),
+                                   flat_tools)["repaired"] is False, "")
+    check("уточнение про обрыв называет аргумент-записи из схемы",
+          "entries" in mcp_store.truncated_note([dict(no_records)], flat_tools),
+          mcp_store.truncated_note([dict(no_records)], flat_tools)[:200])
+
+    MCP_DECISIONS.clear()
+    await chat.task_create(chat.TaskCreate(name="Проект: обрыв ответа"))
+    await chat.session_create()
+    await chat.mcp_apply(McpApply(enabled=[CHAIN_ID]))
+    reset_calls()
+    CHAIN_CALLS.clear()
+    MCP_DECISIONS[:] = [
+        {"mode": "chain", "reason": "читаю прогноз",
+         "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Казань"}}]},
+        # ОБОРВАННЫЙ вызов сохранения (строка как есть, без закрывающих скобок).
+        '{"mode": "chain", "calls": [{"server": "chain-mcp", "tool": '
+        '"save_weather_summary", "arguments": {"dataset_id": "ekb-kzn-27-09", '
+        '"entries": [{"location": "Казань", "date": "2026-09-27"}, '
+        '{"location": "Казань", "date": "2026-',
+        {"done": False, "reason": "сохраняю набор целиком", "calls": [fixed]},
+        {"done": True, "reason": "набор сохранён", "calls": []},
+    ]
+    await run_chat(DELIVER_REQUEST, force_plan=True)
+    cut_run = await run_chat("ок")
+    check("обрезанный вызов на сервер не ушёл",
+          all((call.get("arguments") or {}).get("entries")
+              for batch in CHAIN_CALLS for call in batch
+              if call["tool"] == "save_weather_summary"),
+          str([call.get("arguments") for batch in CHAIN_CALLS for call in batch
+               if call["tool"] == "save_weather_summary"]))
+    check("обрыв назван в журнале и объяснён",
+          any("обрез" in text and "неполн" in text for text in texts(cut_run, "debug")),
+          str(texts(cut_run, "debug"))[-300:])
+    check("уточнение про обрыв дошло до диспетчера",
+          any("ОБРЕЗАН" in str(item) for item in MCP_PAYLOADS),
+          str(MCP_PAYLOADS)[-200:])
     MCP_DECISIONS.clear()
     PLAN_STEPS[:] = saved_steps
 

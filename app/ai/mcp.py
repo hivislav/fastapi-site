@@ -109,7 +109,14 @@ ARG_LIMIT = 12
 # объекта стоят дороже, чем приносят (список уходит в КАЖДЫЙ вызов диспетчера).
 NESTED_ARG_LIMIT = 24
 TOOLS_TEXT_CHARS = 12000
-TOOLS_MAX_TOKENS = 700
+# Предел ответа диспетчера. 700 токенов хватало вызову «получи прогноз», но НЕ
+# вызову, который НЕСЁТ ДАННЫЕ: у сохранения набора список записей (по объекту на
+# день прогноза, 20+ полей) занимал больше, ответ обрывался на середине строки,
+# JSON «чинился» (см. repair_json), и на сервер уходил НАБОР ИЗ 5 ДНЕЙ вместо 7 —
+# без единой ошибки в журнале (живой случай 10.10, обе модели). Поэтому предел
+# поднят с запасом: он ничего не стоит, пока модель отвечает коротко (предел —
+# только потолок), а обрезанные данные стоят пользователю неверного набора.
+TOOLS_MAX_TOKENS = 4000
 # Предел времени на служебный вызов диспетчера. 45 с хватало удалённой модели, но
 # НЕ локальной: её промпт здесь самый большой (все инструменты проекта + правила),
 # и на маке предзаполнение такого промпта занимает десятки секунд — вызов падал по
@@ -2318,6 +2325,39 @@ def _value_in_text(value: str, text: str) -> bool:
                      str(text or "")) is not None
 
 
+def repeated_result(call: Any, results: Any,
+                    tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Причина отказа, если РЕЗУЛЬТАТ такого вида уже получен ("" — нет).
+
+    Живой случай 10.10: после удачной выгрузки диспетчер спрашивался ещё раз и
+    просил выгрузить тот же набор с другим именем файла — в чате появлялись ДВА
+    одинаковых файла (второй раз выбрал именно `file_name`, поэтому проверка
+    «тот же вызов» его не увидела: аргументы-то разные). Вид результата
+    (`result_kind`) и идентификаторы берутся из схемы и ответов сервера, так что
+    проверка не знает ни одного имени инструмента: повторяется ли выгрузка —
+    решает вид результата, а «по чему» — идентификатор, названный в вызове.
+    """
+    kind = result_kind(call.get("tool") if isinstance(call, dict) else "")
+    if kind != "export":
+        # Второе СОХРАНЕНИЕ — законное дело (обновление набора, повтор задачи),
+        # а второе ВЫДАЧА ФАЙЛА по тому же идентификатору — просто дубль в чате.
+        return ""
+    arguments = call.get("arguments") if isinstance(call, dict) else None
+    arguments = arguments if isinstance(arguments, dict) else {}
+    ids = {str(name): str(value) for name, value in arguments.items()
+           if str(value) and ID_ARG_RE.search(str(name))}
+    if not ids:
+        return ""
+    for item in normalize_results(results):
+        if not item.get("ok") or result_kind(item.get("tool")) != kind:
+            continue
+        other = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        if all(str(other.get(name) or "") == value for name, value in ids.items()):
+            return ("такой результат уже получен по этому идентификатору "
+                    "(файл уже выдан — второй раз выгружать нечего)")
+    return ""
+
+
 def records_missing(calls: Any, tools: Optional[List[Dict[str, Any]]],
                     results: Any, ids: Optional[Dict[str, str]] = None
                     ) -> List[Dict[str, Any]]:
@@ -2354,7 +2394,15 @@ def records_missing(calls: Any, tools: Optional[List[Dict[str, Any]]],
         if any(isinstance(arguments.get(name), list) and arguments.get(name)
                for name in names):
             continue
-        if any(str(value) in known for value in arguments.values() if str(value)):
+        # Второй путь («сохрани то, что сервер собрал по идентификатору») —
+        # только через АРГУМЕНТ-ИДЕНТИФИКАТОР. Проверять это по всем аргументам
+        # нельзя: модель переносит в вызов координаты и прочие значения из
+        # результатов, и «любое совпадение» отменяло проверку — живой случай
+        # 10.10, удалённая модель: сохранение без записей ушло на сервер ТРИЖДЫ
+        # подряд, потому что latitude из прогноза нашлась среди значений.
+        if any(str(value) in known
+               for name, value in arguments.items()
+               if str(value) and ID_ARG_RE.search(str(name))):
             continue
         out.append(call)
     return out
@@ -2487,6 +2535,35 @@ def guard_calls(calls: Any, results: Any, tools: Optional[List[Dict[str, Any]]],
             for arg, value in produced_ids([call]).items():
                 issued.add(value)
     return allowed, rejected
+
+
+def truncated_note(calls: List[Dict[str, Any]],
+                   tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Уточнение диспетчеру: ответ ОБОРВАН — записи пришли неполными.
+
+    Живой случай 10.10: предел ответа обрезал вызов сохранения на середине
+    записи, JSON «починился» (см. repair_json), и на сервер ушёл НАБОР ИЗ 5 ДНЕЙ
+    вместо 7 — молча, без единой ошибки в журнале. Такой вызов не отправляется:
+    сначала нужен полный список записей, пусть и короче по полям.
+    """
+    names: List[str] = []
+    for call in calls:
+        schema = _schema_of(tools or [], call.get("server"), call.get("tool"))
+        for name in record_args({"schema": schema}):
+            if name not in names:
+                names.append(name)
+    return (
+        "ТВОЙ ОТВЕТ БЫЛ ОБРЕЗАН по пределу длины: JSON пришёл незакрытым, значит "
+        "данные в нём НЕПОЛНЫЕ (часть записей потеряна). Передавать такое на "
+        "сервер нельзя — набор сохранится неполным, и ошибки при этом не будет. "
+        "Верни вызов ЗАНОВО и сделай его КОРОЧЕ, но со ВСЕМИ строками: записей "
+        f"({', '.join(names) or 'список записей'}) должно быть столько же, сколько "
+        "строк в результатах. Заполняй только те поля, значения которых есть в "
+        "результатах, не повторяй в каждой записи одинаковые значения (место, "
+        "координаты, страна — они уже заданы аргументами верхнего уровня), а "
+        "длинные пояснения перенеси в один общий аргумент верхнего уровня "
+        "(summary/note), а не в каждую строку."
+    )
 
 
 def flag_retry(call: Any, result: Any,
@@ -2821,8 +2898,15 @@ def build_query(user_message: str, tools: List[Dict[str, Any]],
     return text + "\n\nДОСТУПНЫЕ ИНСТРУМЕНТЫ:\n" + tools_text(tools)
 
 
-def _load_object(content: str) -> Any:
-    """JSON из ответа модели (снимаем ```-ограждение и чиним обрыв)."""
+def _load_object(content: str, meta: Optional[Dict[str, Any]] = None) -> Any:
+    """JSON из ответа модели (снимаем ```-ограждение и чиним обрыв).
+
+    `meta["repaired"]` помечает ответ, который пришлось ЧИНИТЬ: чаще всего это
+    ОБРЫВ по пределу длины ответа, то есть данные в нём неполные (см.
+    parse_decision и записи в цепочке). Разбирать такой ответ можно, а вот
+    передавать из него данные на сервер — нет: набор получится неполным, и
+    сервер об этом не скажет.
+    """
     text = str(content or "").strip()
     if not text:
         return None
@@ -2839,9 +2923,12 @@ def _load_object(content: str) -> Any:
     if not repaired:
         return None
     try:
-        return json.loads(repaired)
+        payload = json.loads(repaired)
     except ValueError:
         return None
+    if isinstance(meta, dict):
+        meta["repaired"] = True
+    return payload
 
 
 def parse_calls(content: str,
@@ -2854,7 +2941,13 @@ def parse_calls(content: str,
     придумать инструмент, которого нет, а «вызвать» его нельзя — иначе агент
     показал бы пользователю данные из ниоткуда. `limit` — сколько вызовов брать
     (у цепочки — по остатку бюджета, см. MAX_TOTAL_CALLS_PER_REQUEST)."""
-    payload = _load_object(content)
+    return _calls_from_payload(_load_object(content), tools, limit)
+
+
+def _calls_from_payload(payload: Any,
+                        tools: Optional[List[Dict[str, Any]]] = None,
+                        limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Вызовы из УЖЕ разобранного ответа модели (см. parse_calls)."""
     if isinstance(payload, list):
         payload = {"calls": payload}
     if not isinstance(payload, dict):
@@ -2897,17 +2990,19 @@ def parse_calls(content: str,
 def parse_decision(content: str,
                    tools: Optional[List[Dict[str, Any]]] = None,
                    limit: Optional[int] = None) -> Dict[str, Any]:
-    """Ответ диспетчера целиком: {"mode", "done", "reason", "calls"}.
+    """Ответ диспетчера целиком: {"mode", "done", "reason", "calls", "repaired"}.
 
     Кроме вызовов модель объявляет РЕЖИМ работы: `single` — запрос закрывается
     этим раундом, `chain` — нужна цепочка (следующий вызов зависит от результата
     предыдущего). Режим решает ГИБРИДНУЮ маршрутизацию: разовые запросы не платят
     за цикл, а многошаговые получают возможность дойти до конца. Непонятный или
     отсутствующий режим — `single` (дешёвый путь по умолчанию). `done` —
-    «цепочка закончена, больше вызовов не нужно».
+    «цепочка закончена, больше вызовов не нужно». `repaired` — ответ пришлось
+    ЧИНИТЬ (обычно он оборван пределом длины), то есть данные в нём неполные.
     """
-    calls = parse_calls(content, tools, limit=limit)
-    payload = _load_object(content)
+    meta: Dict[str, Any] = {}
+    payload = _load_object(content, meta)
+    calls = _calls_from_payload(payload, tools, limit=limit)
     mode, done, reason = "single", False, ""
     if isinstance(payload, dict):
         raw_mode = str(payload.get("mode") or payload.get("режим") or "").strip().lower()
@@ -2919,7 +3014,8 @@ def parse_decision(content: str,
         if isinstance(raw_done, bool):
             done = raw_done
         reason = str(payload.get("reason") or payload.get("причина") or "").strip()[:200]
-    return {"mode": mode, "done": done, "reason": reason, "calls": calls}
+    return {"mode": mode, "done": done, "reason": reason, "calls": calls,
+            "repaired": bool(meta.get("repaired"))}
 
 
 async def decide(user_message: str, tools: List[Dict[str, Any]],

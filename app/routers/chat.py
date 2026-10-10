@@ -2185,6 +2185,9 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
     # итерация обязана спросить диспетчера заново (с уточнением про записи),
     # а не считать цепочку законченной.
     records_pending = False
+    # Инструменты, которым уже сказали «ответ обрезан — верни записи целиком»:
+    # уговариваем один раз на инструмент, иначе это был бы цикл уговоров.
+    truncated_warned: set = set()
     # ОТЛОЖЕННЫЕ ЭФФЕКТЫ: вызовы, которые диспетчер выбрал ДО «ок», а выполнять их
     # до подтверждения нельзя (сохранение, выгрузка). Хранятся в состоянии цепочки
     # целиком — после подтверждения их выполняем САМИ, а не надеемся, что модель
@@ -2199,6 +2202,12 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
     # Очевидная достройка (см. auto_followup): вычисляется после раунда и
     # выполняется следующим раундом БЕЗ вызова диспетчера.
     auto_call: Optional[Dict[str, Any]] = None
+    # Решение диспетчера текущего раунда. Объявлено ЗАРАНЕЕ: раунд может обойтись
+    # без диспетчера вовсе (отложенное по плану, повтор с флагом, достройка), а
+    # проверки ниже читают его поля — без объявления раунд падал с
+    # UnboundLocalError («Внутренняя ошибка агента») ровно на первом шаге
+    # выполнения, где и выполняется отложенное.
+    decision: Optional[Dict[str, Any]] = None
     for round_number in range(1, mcp_store.MAX_CHAIN_ITERATIONS + 1):
         remaining = mcp_store.MAX_TOTAL_CALLS_PER_REQUEST - len(calls)
         if remaining <= 0:
@@ -2224,6 +2233,8 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
             # отправляем: дешевле переспросить диспетчера с точным уточнением,
             # чем тратить раунд и получать отказ (см. records_missing). Записи
             # собираются из уже полученных результатов — они у цепочки есть.
+            allowed = [call for call in allowed
+                       if not _drop_repeated(call, results, tools, lines)]
             missing = [call for call in mcp_store.records_missing(allowed, tools, results)
                        if (call["server"], call["tool"]) not in records_warned]
             if missing:
@@ -2341,6 +2352,8 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
         # сохранять», модель повторит его же, и задача уйдёт в доработку по кругу
         # (живой случай 10.10). Такой вызов не выполняем, а переспрашиваем
         # диспетчера с уточнением про записи — данные для них уже в результатах.
+        allowed = [call for call in allowed
+                   if not _drop_repeated(call, results, tools, lines)]
         missing = [call for call in mcp_store.records_missing(allowed, tools, results)
                    if (call["server"], call["tool"]) not in records_warned]
         if missing:
@@ -2353,6 +2366,24 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
                            "собрать их из результатов.")
             nudge_pending = mcp_store.records_note(missing, tools, results)
             records_pending = True
+        # ОБОРВАННЫЙ ОТВЕТ НЕ ОТПРАВЛЯЕМ. Если JSON пришлось ЧИНИТЬ, данные в нём
+        # неполные (обычно ответ обрезан пределом длины): живой случай 10.10 —
+        # сохранение ушло с 5 записями вместо 7, и сервер принял это молча, без
+        # ошибки. Просим диспетчера вернуть вызов короче, но со ВСЕМИ строками.
+        if (decision or {}).get("repaired"):
+            cut = [call for call in allowed
+                   if mcp_store.record_args({"schema": mcp_store._schema_of(
+                       tools, call["server"], call["tool"])})
+                   and (call["server"], call["tool"]) not in truncated_warned]
+            if cut:
+                allowed = [call for call in allowed if call not in cut]
+                truncated_warned.update((call["server"], call["tool"]) for call in cut)
+                lines.append("MCP: ответ модели обрезан по пределу длины — вызов "
+                             + mcp_store.calls_note(cut)
+                             + " не отправляю: записи в нём неполные. Прошу вернуть "
+                               "вызов короче, но со всеми строками.")
+                nudge_pending = mcp_store.truncated_note(cut, tools)
+                records_pending = True
         allowed = allowed[:remaining]
         if not allowed:
             if approved and records_pending:
@@ -2505,6 +2536,25 @@ async def _mcp_chain(dialog: Dict[str, Any], request_text: str,
                      f"({mcp_store.MAX_CHAIN_ITERATIONS}) — останавливаюсь на "
                      "достигнутом.")
     return results, calls, usage, lines
+
+
+def _drop_repeated(call: Dict[str, Any], results: Any,
+                   tools: Optional[List[Dict[str, Any]]],
+                   lines: List[str]) -> bool:
+    """Убирает вызов, чей РЕЗУЛЬТАТ уже получен (True — вызов отброшен).
+
+    Живой случай 10.10: диспетчер спросили ещё раз после удачной выгрузки, и он
+    попросил выгрузить тот же набор с другим именем файла — в чате появились два
+    одинаковых файла (проверка «тот же вызов» его не увидела: аргументы разные).
+    Вид результата и идентификаторы берутся из ответов сервера и схемы, поэтому
+    имена инструментов коду знать не нужно (см. mcp.repeated_result).
+    """
+    reason = mcp_store.repeated_result(call, results, tools)
+    if not reason:
+        return False
+    lines.append(f"MCP: вызов {call.get('server')} · {call.get('tool')} отброшен — "
+                 f"{reason}.")
+    return True
 
 
 def _looks_like_data_table(text: str) -> bool:
