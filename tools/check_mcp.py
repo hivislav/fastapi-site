@@ -63,7 +63,7 @@ from app.ai import attachments as attach_store  # noqa: E402
 from app.ai import client, mcp as mcp_store  # noqa: E402
 from app.ai import workspace as workspace_store  # noqa: E402
 from app.routers import chat  # noqa: E402
-from app.schemas import ChatMessage, McpApply  # noqa: E402
+from app.schemas import ChatMessage, McpApply, SessionMode  # noqa: E402
 
 FAILURES = []
 
@@ -1048,6 +1048,10 @@ XLSX_BYTES = b"PK\x03\x04check-xlsx-payload"
 DELIVER_REQUEST = ("получи прогноз погоды на завтра в Екатеринбурге, прогноз погоды "
                    "на завтра в Казани, сохрани их и отдай в виде эксель таблицы")
 SIMPLE_REQUEST = "какая сейчас погода в Казани"
+# Живой случай (09.10), обобщённый до синтетических данных: город человека НЕ
+# НАЗВАН, его надо сначала найти, а потом взять по нему данные. Ни «сохрани»,
+# ни «затем» в запросе нет.
+LOOKUP_REQUEST = "погода в городе, где живёт Егор"
 CHAIN_TOOLS = [
     {"name": "get_forecast", "title": "Прогноз",
      "description": "Прогноз погоды по городу на несколько дней",
@@ -1113,7 +1117,11 @@ def install_chain_stubs() -> None:
         for call in calls:
             tool = str(call.get("tool") or "")
             args = call.get("arguments") or {}
-            if tool == "get_forecast":
+            if tool == "list_owners":
+                # Инструмент-ПОИСК (см. раздел 7.11): отдаёт пары «человек — город»,
+                # то есть значения, которых в запросе нет.
+                out.append(result(call, "Владельцы: Егор — Самара; Нина — Тула"))
+            elif tool == "get_forecast":
                 out.append(result(call, f"Прогноз для {args.get('location')}: "
                                         "2026-09-27, минимум 6.9, максимум 17.5"))
             elif tool == "save_weather_summary":
@@ -1433,8 +1441,11 @@ async def test_chain():
           MCP_CHOICE_CALLS == 1, f"вызовов диспетчера: {MCP_CHOICE_CALLS}")
     check("разовый запрос сделал один вызов инструмента",
           len([call for batch in CHAIN_CALLS for call in batch]) == 1, str(CHAIN_CALLS))
-    check("разовый запрос не идёт цепочкой",
-          not any("цепочкой" in text for text in texts(simple_events, "debug")),
+    # КОНТРАКТ С 09.10: разовый запрос теперь ОБЪЯВЛЯЕТ цепочку (вход в неё стал
+    # структурным: остались невызванные инструменты) — и всё равно делает РОВНО
+    # один вызов инструмента: лишние закрывает сам диспетчер ответом «готово».
+    check("разовый запрос объявляет цепочку, но лишних вызовов не делает",
+          any("цепочкой" in text for text in texts(simple_events, "debug")),
           str(texts(simple_events, "debug"))[-200:])
 
     # 7.8 Чистка каталога вложений: срок хранения и предел по числу файлов.
@@ -1683,6 +1694,58 @@ async def test_chain():
 # 8. НЕСКОЛЬКО СЕРВЕРОВ: чужие инструменты не подмешиваются, а цепочки
 #    остаются КРОСС-СЕРВЕРНЫМИ (запрос может читать одним сервером, а
 #    записывать другим).
+    # 7.11 ЦЕПОЧКА БЕЗ СЛОВ-МАРКЕРОВ И БЕЗ ОБЪЯВЛЕНИЯ РЕЖИМА МОДЕЛЬЮ — регрессия
+    # живого случая 09.10 («погода в городе человека»): модель объявила single,
+    # маркеров «сохрани/затем» в запросе нет, а зависимость по данным есть (в
+    # списке людей лежит город, а прогноз берётся ПО ГОРОДУ). До правки цикл на
+    # этом и заканчивался: агент отвечал по списку («погоды в данных нет») и
+    # второго вызова не делал.
+    await chat.task_create(chat.TaskCreate(name="Проект: цепочка без маркеров"))
+    await chat.session_create()
+    # Инструмент-ПОИСК без обязательных аргументов: он возвращает значения (имя
+    # человека и его город), которых в запросе НЕТ, — это и есть зависимость по
+    # данным в общем виде. Добавляем его НА ВРЕМЯ своего раздела: общий набор
+    # инструментов делят другие сценарии (они считают невызванные инструменты).
+    lookup_tool = {"name": "list_owners", "title": "Список владельцев",
+                   "description": "Список людей с их городами",
+                   "schema": {"type": "object", "properties": {}}}
+    CHAIN_TOOLS.append(lookup_tool)
+    use_chain_registry()
+    install_chain_stubs()
+    await chat.mcp_apply(McpApply(enabled=[CHAIN_ID]))
+    # Тип задачи «всегда сразу ответ»: живой случай шёл именно этим путём (автомат
+    # сказал «плана не будет — работа в один шаг»), и цепочка в нём идёт СРАЗУ.
+    await chat.session_mode_set(chat._current_session()["id"],
+                                SessionMode(mode="answer"))
+    reset_calls()
+    CHAIN_CALLS.clear()
+    MCP_DECISIONS[:] = [
+        {"mode": "single", "reason": "сначала список владельцев",
+         "calls": [{"server": CHAIN_ID, "tool": "list_owners", "arguments": {}}]},
+        {"mode": "chain", "reason": "город найден в списке — беру прогноз по нему",
+         "calls": [{"server": CHAIN_ID, "tool": "get_forecast",
+                    "arguments": {"location": "Самара"}}]},
+        {"done": True, "calls": []},
+    ]
+    lookup_events = await run_chat(LOOKUP_REQUEST)
+    lookup_executed = [call["tool"] for batch in CHAIN_CALLS for call in batch]
+    check("цепочка идёт и без слов-маркеров, и без объявления режима моделью",
+          lookup_executed == ["list_owners", "get_forecast"], str(lookup_executed))
+    check("второй вызов получил значение ИЗ РЕЗУЛЬТАТА первого (город из списка)",
+          (CHAIN_CALLS[1][0].get("arguments") or {}).get("location") == "Самара",
+          str(CHAIN_CALLS[1:]))
+    check("диспетчер в раунде цепочки видел результат первого вызова",
+          "Самара" in MCP_PAYLOADS[-1] and "Егор" in MCP_PAYLOADS[-1],
+          str(MCP_PAYLOADS[-1])[-200:])
+    check("в чате названа причина «остались невызванные инструменты»",
+          any("цепочкой" in text and "невызванные инструменты" in text
+              for text in texts(lookup_events, "debug")),
+          str(texts(lookup_events, "debug"))[-200:])
+    if lookup_tool in CHAIN_TOOLS:
+        CHAIN_TOOLS.remove(lookup_tool)
+    install_chain_stubs()
+
+
 # ---------------------------------------------------------------------------
 REGISTRY_ID = "city_registry"
 REGISTRY_REQUEST = "запиши данные о пользователе Иван, живёт в Москве"

@@ -38,7 +38,8 @@ from app import config  # noqa: E402
 from app.ai import client  # noqa: E402
 
 FAILURES = []
-SCRIPT = {"mode": "ok", "payloads": [], "connections": 0, "requests": 0}
+SCRIPT = {"mode": "ok", "payloads": [], "connections": 0, "requests": 0,
+          "active": 0, "max_active": 0, "lock": threading.Lock()}
 
 
 def check(name, condition, detail=""):
@@ -90,6 +91,23 @@ class Handler(BaseHTTPRequestHandler):
                     "usage": {"prompt_tokens": 11, "completion_tokens": 7,
                               "total_tokens": 18},
                 }, ensure_ascii=False))
+        elif mode == "slow":
+            # Замер ОДНОВРЕМЕННОСТИ: сколько запросов обрабатывается в один
+            # момент. Так проверяются ворота локальной модели — она обслуживает
+            # один запрос за раз (иначе у mlx_lm.server умирает поток генерации).
+            with SCRIPT["lock"]:
+                SCRIPT["active"] += 1
+                SCRIPT["max_active"] = max(SCRIPT["max_active"], SCRIPT["active"])
+            try:
+                time.sleep(0.4)
+                self._send(200, json.dumps({
+                    "choices": [{"message": {"content": "Ответ модели"}}],
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 7,
+                              "total_tokens": 18},
+                }, ensure_ascii=False))
+            finally:
+                with SCRIPT["lock"]:
+                    SCRIPT["active"] -= 1
         elif mode == "hang":
             time.sleep(30)
             self._send(200, json.dumps({"choices": [{"message": {"content": "поздно"}}]}))
@@ -270,6 +288,49 @@ def main():
     elapsed = asyncio.run(cancel_check())
     check("отмена завершилась быстро (без ожидания таймаута)", elapsed < 5,
           f"{elapsed:.1f} с")
+
+    # [8] ВОРОТА ЛОКАЛЬНОЙ МОДЕЛИ: к ней — по одному запросу за раз, к облаку —
+    # сколько угодно. Живой случай 09.10: две задачи ушли к локальной модели
+    # одновременно, видеопамять мака кончилась, поток генерации умер, и все
+    # последующие вызовы отвечали HTTP 404 «generation thread died».
+    print("\n[8] Одновременные вызовы: локальная модель — по очереди, облако — параллельно")
+    config.LOCAL_LLM_BASE_URL = f"http://127.0.0.1:{server.server_port}/v1"
+    config.LOCAL_LLM_API_KEY = "local"
+
+    async def two_calls(provider):
+        SCRIPT["mode"] = "slow"
+        SCRIPT["active"] = 0
+        SCRIPT["max_active"] = 0
+        await asyncio.gather(
+            client.call_llm_async("раз", provider=provider,
+                                  model=("mlx-community/Qwen3-8B-4bit"
+                                         if provider == "local" else None)),
+            client.call_llm_async("два", provider=provider,
+                                  model=("mlx-community/Qwen3-8B-4bit"
+                                         if provider == "local" else None)),
+        )
+        return SCRIPT["max_active"]
+
+    local_parallel = asyncio.run(two_calls("local"))
+    check("два вызова к ЛОКАЛЬНОЙ модели идут по очереди (одновременно не более одного)",
+          local_parallel == 1, f"одновременных запросов: {local_parallel}")
+    remote_parallel = asyncio.run(two_calls("deepseek-official"))
+    check("два вызова к ОБЛАКУ идут параллельно (ворота не мешают удалённой модели)",
+          remote_parallel == 2, f"одновременных запросов: {remote_parallel}")
+
+    # [9] ОТМЕТКА «СЕРВЕР ОТВЕЧАЕТ, НО ГЕНЕРИРОВАТЬ НЕ МОЖЕТ»: клиент узнаёт
+    # характерный ответ mlx_lm.server и говорит об этом модулю локальной модели —
+    # иначе сбой выглядел бы как «Ответа от модели нет» без причины.
+    from app.ai import local_llm  # noqa: PLC0415 — нужен только здесь
+    local_llm.clear_broken()
+    client._note_broken_local('{"error": "generation thread died"}')
+    check("характерный ответ сервера отмечен как «генерация сломана»",
+          "поток генерации" in local_llm.broken_reason(), local_llm.broken_reason())
+    local_llm.clear_broken()
+    client._note_broken_local('{"error": "invalid request"}')
+    check("обычная ошибка модели сбоем генерации не считается",
+          local_llm.broken_reason() == "", local_llm.broken_reason())
+    local_llm.clear_broken()
 
     print("\nИтог: " + ("все проверки пройдены" if not FAILURES
                        else "ПРОВАЛЕНО проверок: %d — %s" % (len(FAILURES), FAILURES)))

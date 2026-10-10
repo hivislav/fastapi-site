@@ -738,6 +738,80 @@ _STUB = {}
 # который проверяет [3] и который в живом прогоне 07.10 выглядел как «модель
 # промолчала».
 # ---------------------------------------------------------------------------
+def test_broken_generation(server):
+    """СЕРВЕР ОТВЕЧАЕТ, НО ГЕНЕРИРОВАТЬ НЕ МОЖЕТ — и это лечится перезапуском.
+
+    Живой случай 09.10: две задачи пошли к локальной модели одновременно, Metal
+    не смог выделить буфер команд, поток генерации умер — и дальше КАЖДЫЙ вызов
+    получал HTTP 404 «generation thread died», хотя /v1/models отвечал и модель
+    была объявлена. Снаружи это выглядело как «Ответа от модели нет: вызов не
+    удался». Проверяется: отметка ставится и видна, источник считается НЕГОТОВЫМ,
+    подсказка называет причину, `prepare()` перезапускает сервер САМ, а повторный
+    перезапуск в пределах передышки не делается (иначе был бы цикл).
+    """
+    print("\n[10] Сбой генерации: сервер отвечает, но не может генерировать")
+    config.LOCAL_LLM_HOME = HOME_INSTALLED
+    config.LOCAL_LLM_BASE_URL = f"http://127.0.0.1:{server.server_port}/v1"
+    local_llm.save_source("local")
+    local_llm.clear_broken()
+    state = local_llm.status()
+    check("до сбоя источник готов", state["ready"] is True, state["hint"])
+
+    local_llm.mark_broken("поток генерации локального сервера умер (проверка)")
+    state = local_llm.status()
+    check("сбой виден в состоянии сервера", bool(state["server"].get("broken")),
+          str(state["server"].get("broken")))
+    check("сломанный сервер НЕ считается готовым", state["ready"] is False,
+          str(state["ready"]))
+    check("подсказка называет причину и что делать",
+          "ГЕНЕРИРОВАТЬ" in state["hint"] and "ерезапуск" in state["hint"],
+          state["hint"])
+    check("опрос сервера тоже отдаёт признак сбоя",
+          bool(local_llm.probe().get("broken")), str(local_llm.probe()))
+
+    restarts = {"stop": 0, "start": 0}
+    real_stop, real_start = local_llm.stop, local_llm.start
+
+    def fake_stop():
+        restarts["stop"] += 1
+        local_llm.clear_broken()
+        return {"source": "local", "server": {"running": False}}
+
+    def fake_start(wait=0.0):
+        restarts["start"] += 1
+        return {"source": "local", "server": {"running": True, "loaded": True}}
+
+    local_llm.stop, local_llm.start = fake_stop, fake_start
+    try:
+        state = local_llm.prepare(autostart=True, wait=0)
+        check("источник снова готов после перезапуска", state["ready"] is True,
+              state["hint"])
+        check("перезапуск сделан (останов + запуск)",
+              restarts == {"stop": 1, "start": 1}, str(restarts))
+
+        # Сбой повторился сразу: перезапуска НЕТ — иначе был бы цикл «упал —
+        # перезапустили», каждый по тридцать секунд загрузки весов.
+        local_llm.mark_broken("поток генерации умер снова (проверка)")
+        try:
+            local_llm.prepare(autostart=True, wait=0)
+            check("повторный перезапуск в пределах передышки не делается", False,
+                  "перезапуск случился")
+        except local_llm.LocalLlmError as exc:
+            check("повторный перезапуск в пределах передышки не делается",
+                  restarts == {"stop": 1, "start": 1}, str(restarts))
+            check("отказ называет причину словами", "ГЕНЕРИРОВАТЬ" in str(exc),
+                  str(exc))
+    finally:
+        local_llm.stop, local_llm.start = real_stop, real_start
+        local_llm.clear_broken()
+        # За собой убираем как следует: оставленный адрес заглушки уводил
+        # следующие разделы проверки (они ждут ЗАВЕДОМО ЗАКРЫТЫЙ адрес, чтобы
+        # «сервер не запущен» проверялось без ожидания таймаута).
+        config.LOCAL_LLM_BASE_URL = CLOSED_URL
+        config.LOCAL_LLM_HOME = HOME_EMPTY
+        config.set_llm_source("remote")
+
+
 def test_server_env():
     print("\n[9] Окружение сервера: кэш RAG не уводит веса локальной модели")
     config.LOCAL_LLM_HOME = HOME_INSTALLED
@@ -764,6 +838,40 @@ def test_server_env():
               if os.path.isdir(env["HF_HUB_CACHE"]) else "каталога нет")
         check("сервер модели остаётся офлайн (веса уже скачаны)",
               env["HF_HUB_OFFLINE"] == "1", str(env.get("HF_HUB_OFFLINE")))
+
+        # ПАМЯТЬ КЭША ПРОМПТОВ ОГРАНИЧЕНА (правка 10.10): mlx_lm.server держит
+        # KV-кэши промптов, и на агентских запросах кэш рос до 3,4 ГБ — при шести
+        # гигабайтах весов это кончалось срывом генерации и рвущимся соединением
+        # («вызов не удался» у пользователя). Предел задаётся флагами запуска.
+        original_popen = local_llm.subprocess.Popen
+        captured = {}
+
+        class _FakeProcess:
+            pid = 4242
+
+        def fake_popen(command, *args, **kwargs):
+            captured["command"] = list(command)
+            return _FakeProcess()
+
+        local_llm.subprocess.Popen = fake_popen
+        try:
+            local_llm.start()
+        except Exception:  # noqa: BLE001 — важен только собранный argv
+            pass
+        finally:
+            local_llm.subprocess.Popen = original_popen
+        command = captured.get("command") or []
+        joined = " ".join(command)
+        check("серверу задан предел памяти кэша промптов",
+              "--prompt-cache-bytes" in joined
+              and str(local_llm.PROMPT_CACHE_MB * 1024 * 1024) in joined,
+              joined[-160:])
+        check("серверу задан предел числа кэшей промптов",
+              "--prompt-cache-size" in joined,
+              joined[-120:])
+        check("квантование KV по умолчанию выключено (влияет на качество ответов)",
+              local_llm.KV_BITS == 0 and "--kv-bits" not in joined,
+              f"KV_BITS={local_llm.KV_BITS}")
     finally:
         for key, value in saved.items():
             if value is None:
@@ -786,6 +894,7 @@ def main():
         test_status(_STUB["server"])
         test_source_switch()
         test_auto_stop(_STUB["server"])
+        test_broken_generation(_STUB["server"])
         test_server_env()
         # Цикл событий — ОДИН на оба прогона (блокировки задач привязаны к циклу);
         # создаётся явно: asyncio.get_event_loop() устарел в Python 3.12.

@@ -6,4 +6,12 @@ HTML-интерфейс вынесен в отдельный файл chat.html,
 
 import os
 
-CHAT_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat.html")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+CHAT_HTML_PATH = os.path.join(_HERE, "chat.html")
+
+# Страница входа (гейт доступа из внешней сети, см. app/auth.py): отдельный
+# самодостаточный файл — она отдаётся ДО входа, когда ни один другой ресурс
+# приложения недоступен, поэтому не может опираться ни на chat.html, ни на
+# общие стили.
+LOGIN_HTML_PATH = os.path.join(_HERE, "login.html")

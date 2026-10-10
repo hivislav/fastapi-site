@@ -16,6 +16,13 @@
 Локальный сервер модели приложение само не поднимает — это делает
 переключатель или tools/local_llm.sh, чтобы запуск веб-приложения не ждал
 загрузки весов (гигабайты в память) и не решал за человека.
+
+ДОСТУП ИЗ ВНЕШНЕЙ СЕТИ. Наружу приложение отдаётся пробросом порта на
+роутере (внешний адрес → адрес мака в сети дома, порт 8000), поэтому перед всем
+приложением
+стоит ГЕЙТ ДОСТУПА: вход по паролю из .env (app/auth.py). Запуск «наружу» —
+tools/serve.sh (обычный `uvicorn main:app` слушает только 127.0.0.1 и снаружи
+недоступен). Без заданного пароля гейт не пускает наружу никого.
 """
 
 from contextlib import asynccontextmanager
@@ -25,6 +32,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from app import periodic_runner
 from app.ai import local_llm
+from app.auth import AuthGate
+from app.routers import auth as auth_routes
 from app.routers import chat, pages
 
 # Источник ответа из файла настроек — ДО первого запроса к модели: иначе
@@ -91,5 +100,15 @@ class GZipExceptStreams(GZipMiddleware):
 
 app.add_middleware(GZipExceptStreams, minimum_size=1024)
 
+# ГЕЙТ ДОСТУПА (app/auth.py) — добавляется ПОСЛЕДНИМ, то есть оказывается самым
+# внешним слоем: пока пароль не предъявлен, запрос не доходит ни до gzip, ни до
+# маршрутов. Маршрутов пятьдесят восемь, и защита «в каждом маршруте» рано или
+# поздно забылась бы на новом; здесь она одна и по умолчанию — на всём.
+# Исключения (страница входа и маршруты входа/выхода) перечислены в
+# auth.OPEN_PATHS. Локальный клиент (127.0.0.1) гейт пропускает без пароля —
+# этого требуют живые проверки проекта, которые ходят по HTTP на 127.0.0.1.
+app.add_middleware(AuthGate)
+
 app.include_router(pages.router)
+app.include_router(auth_routes.router)
 app.include_router(chat.router)

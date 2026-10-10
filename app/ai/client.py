@@ -24,7 +24,10 @@ Yandex Cloud AI Studio (модели настройки «Тест моделе�
 """
 
 import asyncio
+import contextlib
+import fcntl
 import json
+import os
 import logging
 import random
 import re
@@ -293,6 +296,98 @@ def _parse_json(text: str) -> Optional[Dict[str, Any]]:
     except (ValueError, TypeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# ПОСЛЕДОВАТЕЛЬНЫЕ ВЫЗОВЫ К ЛОКАЛЬНОЙ МОДЕЛИ (не более одного за раз)
+#
+# mlx_lm.server обслуживает запросы ОДНИМ потоком генерации, а память у него —
+# видеопамять мака. Живой случай 09.10: две задачи пошли к локальной модели
+# одновременно, Metal не смог выделить буфер команд
+# ([METAL] Command buffer execution failed: Insufficient Memory), поток генерации
+# умер — и после этого КАЖДЫЙ следующий вызов получал HTTP 404
+# «generation thread died», хотя /v1/models продолжал отвечать и модель была
+# объявлена. Снаружи это выглядело как «Ответа от модели нет: вызов не удался».
+# Ворота ставят вызовы в очередь: вторая задача ждёт, а не убивает модель.
+# К удалённым провайдерам это не относится — там параллельность только помогает.
+# Обычный threading.Semaphore, а не asyncio.Lock: запрос и так выполняется в
+# отдельном потоке (asyncio.to_thread), и ждать в нём безопасно, а привязки к
+# конкретному циклу событий у семафора нет (проверки создают циклы явно).
+_LOCAL_GATE = threading.Semaphore(1)
+
+# Ворота внутри процесса мало: к тому же серверу модели может обратиться ДРУГОЙ
+# процесс — второй экземпляр приложения, `tools/local_llm.sh ask`, проверка. Тогда
+# «по одному запросу за раз» не выполняется, и видеопамять снова кончается.
+# Поэтому те же ворота ставятся ФАЙЛОВОЙ блокировкой в каталоге локальной модели:
+# её видят все процессы этого проекта на этом маке.
+_LOCAL_FILE_LOCK = os.path.join(config.LOCAL_LLM_HOME, "call.lock")
+LOCAL_LOCK_TIMEOUT = float(os.getenv("LOCAL_LLM_LOCK_TIMEOUT", "900"))
+
+
+@contextlib.contextmanager
+def _local_file_gate():
+    """Файловая очередь к локальной модели (для всех процессов проекта).
+
+    Ждём с пределом: застрявший процесс не должен останавливать приложение
+    навсегда. Не удалось взять — зовём без блокировки (лучше попытаться и
+    получить честную причину, чем не ответить вовсе).
+    """
+    handle = None
+    deadline = time.monotonic() + LOCAL_LOCK_TIMEOUT
+    try:
+        os.makedirs(os.path.dirname(_LOCAL_FILE_LOCK), exist_ok=True)
+        handle = open(_LOCAL_FILE_LOCK, "a+")
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    logger.warning("LLM: очередь к локальной модели не дождалась "
+                                   "свободного места за %.0f с", LOCAL_LOCK_TIMEOUT)
+                    break
+                time.sleep(0.2)
+        yield
+    except OSError as exc:  # noqa: BLE001 — блокировка недоступна, зовём как есть
+        logger.warning("LLM: файловая очередь к локальной модели недоступна: %s", exc)
+        yield
+    finally:
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
+
+# Ответ локального сервера, означающий «поток генерации умер»: сервер отвечает,
+# но генерировать не может до перезапуска.
+_BROKEN_SIGNATURES = ("generation thread died", "Insufficient Memory",
+                      "kIOGPUCommandBufferCallbackErrorOutOfMemory")
+
+
+def is_local_provider(provider: Optional[str] = None,
+                      model: Optional[str] = None) -> bool:
+    """Обслуживает ли вызов локальную модель (см. config.provider_spec)."""
+    try:
+        spec = config.provider_spec(provider or config.provider_for_model(model))
+    except Exception:  # noqa: BLE001 — неизвестный провайдер решается ниже
+        return False
+    return str(spec.get("provider") or "") == "local"
+
+
+def _note_broken_local(error_text: str) -> None:
+    """Запомнить, что локальный сервер жив, но генерировать не может."""
+    body = str(error_text or "")
+    if not any(signature in body for signature in _BROKEN_SIGNATURES):
+        return
+    try:
+        from app.ai import local_llm  # поздний импорт: циклов импорта нет
+        local_llm.mark_broken(
+            "поток генерации локального сервера умер (не хватило видеопамяти — "
+            "скорее всего параллельные задачи). Сервер отвечает, но генерировать "
+            "не может: нужен перезапуск.")
+    except Exception:  # noqa: BLE001 — отметка не должна ломать сам вызов
+        pass
 
 
 def _failed_metrics(model: str, elapsed: float, reason: str) -> Dict[str, Any]:
@@ -619,6 +714,36 @@ def _perform_call(
     data: Optional[Dict[str, Any]] = None
     streamed: Optional[Tuple[str, Optional[Dict[str, Any]]]] = None
 
+    # Локальная модель обслуживает ОДИН запрос за раз (см. _LOCAL_GATE): вторая
+    # задача ждёт своей очереди, а не валит сервер нехваткой видеопамяти.
+    local_call = str(spec.get("provider") or "") == "local"
+    if local_call:
+        _LOCAL_GATE.acquire()
+    try:
+        if local_call:
+            with _local_file_gate():
+                return _perform_http_attempts(
+                    url=url, payload=payload, timeout=timeout, abort=abort,
+                    api_key=api_key, attempts=attempts, spec=spec,
+                    used_model=used_model, local_call=local_call, start=start)
+        return _perform_http_attempts(
+            url=url, payload=payload, timeout=timeout, abort=abort, api_key=api_key,
+            attempts=attempts, spec=spec, used_model=used_model, local_call=local_call,
+            start=start)
+    finally:
+        if local_call:
+            _LOCAL_GATE.release()
+
+
+def _perform_http_attempts(
+    url: str, payload: Dict[str, Any], timeout: float, abort: Any, api_key: str,
+    attempts: int, spec: Dict[str, Any], used_model: str, local_call: bool,
+    start: float,
+) -> tuple:
+    """Запросы с повторами: вынесено ради ворот локальной модели (см. выше)."""
+    timeout_retried = False
+    data: Optional[Dict[str, Any]] = None
+    streamed: Optional[Tuple[str, Optional[Dict[str, Any]]]] = None
     for attempt in range(attempts):
         status = 0
         error_text = ""
@@ -651,6 +776,11 @@ def _perform_call(
                 "LLM: HTTP %s за %.1f с (попытка %d из %d): %s",
                 status, time.perf_counter() - start, attempt + 1, attempts, error_text,
             )
+            if local_call:
+                # Локальный сервер может отвечать и при этом НЕ мочь генерировать
+                # («generation thread died»): запоминаем это состояние, чтобы
+                # источник честно назывался НЕГОТОВЫМ, а не «модель промолчала».
+                _note_broken_local(error_text)
             retry = status in RETRY_STATUSES and attempt + 1 < attempts
             if retry:
                 time.sleep(_retry_delay(attempt, headers))

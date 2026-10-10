@@ -4667,6 +4667,18 @@ async def section_direct_answer():
           bool(bots) and bots[-1].get("sources")
           and rag_dialog.SOURCES_MARK in bots[-1]["text"],
           str(bots[-1].get("sources"))[:160] if bots else "ответа нет")
+    # ОТВЕТ ПОКАЗАН — ВВОД СВОБОДЕН (правка 10.10): после текста ответа идут
+    # СЛУЖЕБНЫЕ события (память задачи отдельным вызовом модели, варианты
+    # продолжения), и на локальной модели это занимает секунды. Событие
+    # `answer_ready` обязано идти СРАЗУ после ответа: интерфейс по нему отпускает
+    # поле ввода, а не держит «AI-агент думает…» до конца служебной работы.
+    check("после ответа идёт событие «ответ показан» (ввод свободен)",
+          "answer_ready" in kinds and kinds.index("answer_ready") > kinds.index("bot"),
+          str(kinds)[-160:])
+    check("служебная память задачи считается ПОСЛЕ этого события",
+          "answer_ready" in kinds and "done" in kinds
+          and kinds.index("answer_ready") < kinds.index("done"),
+          str(kinds)[-160:])
     check("при найденных фрагментах модели уходит промпт ПО ДОКУМЕНТАМ",
           any("называй источники" in context for context in LLM_CONTEXT),
           str([context[:60] for context in LLM_CONTEXT][:2]))

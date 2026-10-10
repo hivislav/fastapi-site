@@ -1038,7 +1038,7 @@
             flex-wrap: wrap;
         }
         [hidden] { display: none !important; }
-        #expert-toggle, #agent-toggle {
+        #expert-toggle, #agent-toggle, #logout-btn {
             padding: 8px 12px;
             border: 1px solid var(--line-strong);
             border-radius: 8px;
@@ -1050,6 +1050,13 @@
             transition: background 0.2s, color 0.2s, border-color 0.2s, box-shadow 0.2s;
         }
         #expert-toggle:hover, #agent-toggle:hover { background: rgba(0, 255, 157, 0.12); }
+        /* «Выйти» — выход из закрытой части: кнопка показывается ТОЛЬКО тем, у
+           кого пароль спрашивают (локально гейт пропускает без него, и кнопка
+           была бы мёртвой). Пунктирная рамка — чтобы выход не читался как
+           ещё один режим рядом с «Экспертным режимом» и «AI-агентом». */
+        #logout-btn { border-style: dashed; color: var(--text-dim); }
+        #logout-btn:hover { background: rgba(255, 107, 129, 0.12); color: var(--danger);
+                            border-color: var(--danger); }
         #expert-toggle.active, #agent-toggle.active {
             background: rgba(0, 255, 157, 0.18);
             color: var(--accent-2);
@@ -2286,21 +2293,277 @@
             color: var(--muted);
             margin-bottom: 6px;
         }
-        @media (max-width: 768px) {
-            .layout { grid-template-columns: 1fr; }
-            .sidebar { display: none; }
-            body.expert-mode .layout { grid-template-columns: 1fr; max-width: none; }
+        /* ==================== МОБИЛЬНАЯ ВЁРСТКА (телефон и планшет) ==========
+           До 1024px по ширине окно чата оставалось в три колонки
+           (390px панель + чат + 520px панель токенов), и на телефоне не влезало
+           ничего, а боковая панель просто получала display: none — вместе с ней
+           исчезали проекты, задачи, профиль, MCP и RAG, то есть с телефона нельзя
+           было даже войти в нужную задачу.
+
+           Теперь обе боковые панели — ВЫДВИЖНЫЕ ЯЩИКИ поверх чата:
+             * слева  «☰»  — проекты, задачи, профиль, источник модели;
+             * справа «📊» — токены задачи и статистика ответов.
+           Место в колонках освобождается окну чата, а содержимое панелей
+           остаётся доступным. Ящики НЕ прячут панели через display:none, а
+           сдвигают их (transform): диаграмма токенов считается по реальной
+           ширине панели и при display:none получила бы нулевую. */
+        .drawer-toggle, .stats-toggle, .settings-toggle { display: none; }
+        .drawer-backdrop { display: none; }
+
+        @media (max-width: 1024px) {
+            html, body { overflow-x: hidden; }
+            .layout {
+                grid-template-columns: 1fr;
+                gap: 8px;
+                padding: 8px;
+                padding-bottom: calc(8px + env(safe-area-inset-bottom));
+                height: 100vh;
+                height: 100dvh;      /* 100vh на телефоне включает адресную строку */
+            }
+            body.expert-mode .layout,
             body.agent-mode .layout { grid-template-columns: 1fr; max-width: none; }
-            .stats { height: auto; max-height: 50vh; }
-            body.agent-mode .stats { max-height: 75vh; }
+
+            /* Кнопки ящиков видны только там, где ящики есть. */
+            .drawer-toggle, .stats-toggle, .settings-toggle {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 40px;
+                min-height: 36px;
+                padding: 6px 10px;
+            }
+            /* ШАПКА В ОДНУ СТРОКУ. Замер на экране 390x844 показал, что шапка
+               занимала 352px из 844 (42% экрана!): кнопки режимов, три кнопки
+               типа задачи и три поля параметров переносились на строки. Теперь в
+               шапке остаются только «☰», название, «⚙» и «📊», а режим, тип
+               задачи и параметры ответа прячутся за «⚙» — по нажатию. */
+            #expert-toggle, #agent-toggle, #logout-btn, .chat-header .session-mode,
+            .chat-header .chat-settings { display: none; }
+            body.settings-open #expert-toggle,
+            body.settings-open #agent-toggle,
+            body.settings-open #logout-btn { display: inline-flex; }
+            body.settings-open .chat-header .session-mode { display: inline-flex; }
+            body.settings-open .chat-header .chat-settings {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            /* Настройки, открытые на телефоне, не должны съедать весь экран:
+               они выше обычной шапки в несколько раз, поэтому им отведён предел
+               и своя прокрутка. */
+            body.settings-open .chat-header {
+                max-height: 78dvh;
+                overflow-y: auto;
+            }
+            .stats-toggle .btn-label { display: none; }
+            /* Шапка уезжает при прокрутке переписки вниз и возвращается при
+               прокрутке вверх: место отдаётся окну чата, а полоса состояния
+               задачи остаётся на виду — она вне прокручиваемой области. */
+            /* ВЫСОТА ШАПКИ МЕНЯЕТСЯ МГНОВЕННО, БЕЗ АНИМАЦИИ. Анимация высоты
+               тянула за собой всё окно чата: текст под пальцем ехал вверх
+               0,22 с — это и читалось как «дёргание» и «моргание» при
+               прокрутке. Мгновенный сдвиг незаметен, потому что скрипт в тот же
+               момент компенсирует прокрутку (см. setHeaderHidden): видимое
+               содержимое остаётся ровно на месте. */
+            .chat-header {
+                max-height: 100dvh;
+                overflow: hidden;
+            }
+            body.header-hidden .chat-header {
+                max-height: 0;
+                padding-top: 0;
+                padding-bottom: 0;
+                opacity: 0;
+                border-bottom-width: 0;
+            }
+            .drawer-backdrop {
+                position: fixed;
+                inset: 0;
+                z-index: 50;
+                background: rgba(2, 4, 6, 0.62);
+                backdrop-filter: blur(2px);
+            }
+            body.drawer-open .drawer-backdrop,
+            body.stats-open .drawer-backdrop { display: block; }
+
+            /* Ящик слева: проекты, задачи, профиль, источник ответа. */
+            .sidebar {
+                position: fixed;
+                top: 0;
+                bottom: 0;
+                left: 0;
+                z-index: 60;
+                width: min(88vw, 360px);
+                border-radius: 0 var(--radius) var(--radius) 0;
+                overflow-y: auto;
+                padding-top: calc(16px + env(safe-area-inset-top));
+                transform: translateX(-102%);
+                transition: transform 0.25s ease;
+            }
+            body.drawer-open .sidebar { transform: none; }
+            /* Внутри ящика список задач своего окна прокрутки не получает: на
+               телефоне прокручивается ящик целиком (два вложенных скролла на
+               маленьком экране — ловушка). */
+            .sidebar .user-history { overflow: visible; flex: none; }
+
+            /* Ящик справа: токены задачи и статистика ответов. */
+            .stats {
+                position: fixed;
+                top: 0;
+                right: 0;
+                bottom: 0;
+                z-index: 70;
+                width: min(94vw, 520px);
+                height: auto;
+                max-height: none;
+                border-radius: var(--radius) 0 0 var(--radius);
+                overflow-y: auto;
+                padding-top: calc(16px + env(safe-area-inset-top));
+                transform: translateX(103%);
+                transition: transform 0.25s ease;
+            }
+            body.agent-mode .stats { height: auto; max-height: none; }
+            body.stats-open .stats:not([hidden]) { transform: none; }
+
+            /* Шапка: заголовок строкой, кнопки переносятся и не распирают экран. */
+            .chat-header { padding: 10px 12px; gap: 8px; }
+            .chat-header-top { gap: 8px; }
+            .chat-header .sub { display: none; }
+            .chat-header h1 { font-size: 1.05rem; }
+            .chat-header .avatar { font-size: 1.35rem; }
+            .chat-header button, .session-mode button, .tm-actions button {
+                padding: 8px 10px;
+                font-size: 0.78rem;
+            }
+            .session-mode { flex-wrap: wrap; }
+            .chat-settings { gap: 8px; }
+            .chat-settings label { width: 100%; justify-content: space-between; gap: 8px; }
+            .chat-settings input,
+            .chat-settings #stop-condition,
+            .chat-settings select { width: 100%; min-width: 0; }
+
+            /* ПОЛОСА ЗАДАЧИ: ЭТАПЫ И КНОПКИ — РАЗНЫМИ СТРОКАМИ (было 191px,
+               и кнопки стояли в одной строке с этапами, наезжая на них).
+               Строка 1 — этапы задачи (прокручиваются вбок), строка 2 — кнопки
+               «Пауза»/«Отменить»/«Подтвердить план» поровну на всю ширину,
+               строка 3 — «шаг … / ожидается: …» одной строкой с многоточием.
+               Подсказка про план скрыта: она дублирует переписку. */
+            .task-machine { padding: 6px 10px; gap: 5px; }
+            .task-machine .tm-row { flex-wrap: wrap; gap: 6px; }
+            .task-machine .tm-track {
+                flex: 1 1 100%;
+                min-width: 0;
+                flex-wrap: nowrap;
+                overflow-x: auto;
+                padding-bottom: 2px;
+            }
+            .task-machine .tm-actions {
+                flex: 1 1 100%;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+            }
+            .task-machine .tm-actions button {
+                flex: 1 1 auto;
+                min-width: 0;
+                padding: 8px 10px;
+                font-size: 0.72rem;
+                white-space: nowrap;
+            }
+            .tm-block { flex: 0 0 auto; min-width: 92px; padding: 6px 8px; font-size: 0.66rem; }
+            .tm-arrow { font-size: 0.7rem; }
+            .task-machine .tm-meta {
+                flex-wrap: nowrap;
+                gap: 8px;
+                font-size: 0.68rem;
+                overflow: hidden;
+                white-space: nowrap;
+            }
+            .task-machine .tm-meta > *:not(button) {
+                flex: 0 1 auto;
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .task-machine .tm-meta .tm-idle { flex: 0 0 auto; }
+            .task-machine .tm-plan { display: none; }
+
+            /* ЯКОРЬ COLLAPSING TOOLBAR — строка этапов. Пока шапка на экране,
+               полоса задачи стоит под ней; когда шапка уехала при прокрутке,
+               полоса этапов остаётся верхней строкой окна и выглядит прилипшей
+               (тень и яркая граница), а подсказки под ней прячутся — якорем
+               должна быть именно строка этапов, а не описание шага. */
+            body.header-hidden .task-machine {
+                box-shadow: 0 8px 18px rgba(0, 0, 0, 0.45);
+                border-bottom-color: var(--line-strong);
+            }
+            body.header-hidden .task-machine .tm-meta { display: none; }
+
+            /* Переписка и поле ввода. */
+            .messages { padding: 12px 10px; gap: 10px; }
+            .bubble { max-width: 92%; overflow-x: auto; }
+            .msg.debug .bubble { max-width: 100%; }
+            /* ПОЛЕ ВВОДА: строка ввода занимает всю ширину, а кнопки уходят под
+               неё поровну. Раньше кнопки стояли в одной строке с полем, сжимались
+               до 64px, и их подписи переносились в три строки — отсюда и «кнопки
+               не влезают»: поле ввода вырастало до 74px, а «🗑 Очистить историю»
+               вылезала за край экрана. */
+            .input-row {
+                flex-wrap: wrap;
+                padding: 10px;
+                padding-bottom: calc(10px + env(safe-area-inset-bottom));
+                gap: 8px;
+            }
+            .input-row input {
+                flex: 1 1 100%;
+                font-size: 16px;   /* 16px: иначе iOS приближает страницу при фокусе */
+                padding: 10px 12px;
+            }
+            .input-row button {
+                flex: 1 1 0;
+                min-width: 0;
+                min-height: 44px;
+                padding: 10px 8px;
+                font-size: 0.8rem;
+                white-space: nowrap;
+            }
+
+            /* Таблицы (расход токенов, судья, статистика) шире телефона: пусть
+               прокручиваются внутри своей панели, а не растягивают страницу. */
+            .stats-table, .agent-table, .judge-table { font-size: 0.7rem; }
+            .stats-table th, .stats-table td { padding: 5px 3px; }
+            .agent-chart { min-height: 160px; }
+
+            /* Модалки: почти весь экран и прокрутка ВНУТРИ себя — иначе поле и
+               кнопки уезжают за край. */
+            .modal-overlay { padding: 10px; align-items: flex-start; }
+            .modal-box,
+            .modal-box.inv-modal,
+            .modal-box.mcp-modal,
+            .modal-box.rag-modal,
+            .modal-box.rag-chunks-modal,
+            .modal-box.periodic-modal {
+                width: 100%;
+                max-width: 100%;
+                max-height: calc(100dvh - 20px);
+                overflow-y: auto;
+                padding: 16px;
+            }
+            .modal-actions { flex-wrap: wrap; }
+            .modal-actions button { flex: 1 1 auto; }
         }
     </style>
 </head>
 <body>
     <div class="layout">
+        <!-- Подложка выдвижных ящиков (телефон и планшет): затемняет чат и
+             закрывает ящик по нажатию. На широком экране не показывается —
+             правила живут внутри медиазапроса мобильной вёрстки. -->
+        <div class="drawer-backdrop" id="drawer-backdrop" aria-hidden="true"></div>
         <!-- Боковая панель. В обычном/экспертном режимах — история введённых
              данных юзером; в режиме «AI-агент» — Workspace: текущий проект,
-             его задачи и кнопка новой задачи. -->
+             его задачи и кнопка новой задачи. На узком экране это выдвижной
+             ящик слева (кнопка «☰» в шапке). -->
         <aside class="sidebar">
             <!-- Иконка профиля и заголовок панели на одном уровне: иконка
                  СЛЕВА от заголовка, клик по ней выдвигает слева меню профиля
@@ -2392,6 +2655,12 @@
         <main class="chat">
             <div class="chat-header">
                 <div class="chat-header-top">
+                    <!-- На узком экране боковая панель — выдвижной ящик, и эта
+                         кнопка его открывает: без неё с телефона не добраться ни
+                         до проектов, ни до задач, ни до профиля. На широком
+                         экране кнопка скрыта (панель и так на месте). -->
+                    <button id="drawer-toggle" class="drawer-toggle" type="button"
+                            aria-label="Проекты и задачи" title="Проекты, задачи, профиль">☰</button>
                     <div class="title-group">
                         <span class="avatar">🤖</span>
                         <div>
@@ -2401,6 +2670,23 @@
                     </div>
                     <button id="expert-toggle" type="button" title="Экспертный режим">Экспертный режим</button>
                     <button id="agent-toggle" type="button" title="AI-агент: агент сам выбирает параметры генерации и ведёт историю диалога">AI-агент</button>
+                    <!-- «⚙» — режим, тип задачи, формат ответа, длина и завершение:
+                         на телефоне они прячутся сюда. Замер экрана 390x844 показал,
+                         что без этого шапка занимала 352px из 844 — 42% экрана. -->
+                    <button id="settings-toggle" class="settings-toggle" type="button"
+                            aria-label="Настройки чата" title="Режим, тип задачи, формат ответа, длина, завершение">⚙</button>
+                    <!-- Токены задачи и статистика ответов: на узком экране эта
+                         панель — выдвижной ящик справа, и кнопка его открывает.
+                         Подпись на телефоне скрывается: там важна каждая полоса
+                         ширины, а «📊» понятно и без слова. -->
+                    <button id="stats-toggle" class="stats-toggle" type="button"
+                            aria-label="Токены и статистика" title="Токены задачи и статистика ответов">📊<span class="btn-label"> Токены</span></button>
+                    <!-- Выход из закрытой части (гейт доступа, app/auth.py): сайт
+                         открыт наружу, поэтому вход спрашивает пароль. Кнопка
+                         показывается только тем, у кого пароль спрашивают, —
+                         признак `required` приходит с сервера. -->
+                    <button id="logout-btn" type="button" hidden
+                            title="Выйти: этот браузер забудет вход, и пароль спросят снова">Выйти</button>
                     <!-- ПЕРЕОПРЕДЕЛЕНИЕ ВЫБОРА «ответ или план» у ЭТОЙ задачи.
                          По умолчанию («по обстоятельствам») решает КОД по признакам
                          запроса (task_state.needs_plan): вопрос — прямой ответ по
@@ -2484,86 +2770,17 @@
                 <div class="tm-plan" id="tm-plan"></div>
             </div>
 
-            <div class="modal-overlay" id="group-modal" hidden>
-                <div class="modal-box">
-                    <h3>Роли экспертов</h3>
-                    <input class="roles-field" placeholder="роль" autocomplete="off">
-                    <input class="roles-field" placeholder="роль" autocomplete="off">
-                    <input class="roles-field" placeholder="роль" autocomplete="off">
-                    <input class="roles-field" placeholder="роль" autocomplete="off">
-                    <input class="roles-field" placeholder="роль" autocomplete="off">
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="roles-clear">очистить</button>
-                        <button type="button" class="accept" id="roles-accept">принять</button>
-                    </div>
-                </div>
-            </div>
+            
 
-            <div class="modal-overlay" id="error-modal" hidden>
-                <div class="modal-box">
-                    <h3>Ошибка</h3>
-                    <p id="error-text"></p>
-                    <div class="modal-actions">
-                        <button type="button" class="accept" id="error-close">закрыть</button>
-                    </div>
-                </div>
-            </div>
+            
 
-            <div class="modal-overlay" id="params-modal" hidden>
-                <div class="modal-box">
-                    <h3>Параметры</h3>
-                    <select id="param-select" class="param-select">
-                        <option value="default" selected>По умолчанию</option>
-                        <option value="temperature">Температура</option>
-                        <option value="models">Тест моделей</option>
-                    </select>
-                    <div class="param-fields" id="param-fields" hidden>
-                        <p class="modal-hint">Числовые значения (целые или с точкой).</p>
-                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
-                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
-                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
-                    </div>
-                    <div class="param-models" id="param-models" hidden>
-                        <p class="modal-hint">Выберите модели — запрос уйдёт в каждую из них.
-                            DeepSeek-V4-Flash — модель по умолчанию; остальные (Yandex) доступны
-                            только при ручном выборе здесь.</p>
-                        <label class="model-check"><input type="checkbox" value="deepseek" checked> DeepSeek-V4-Flash</label>
-                        <label class="model-check"><input type="checkbox" value="deepseek-yandex"> DeepSeek 4 Flash (Yandex)</label>
-                        <label class="model-check"><input type="checkbox" value="alice"> Alice AI LLM</label>
-                        <label class="model-check"><input type="checkbox" value="alice-flash"> Alice AI LLM Flash</label>
-                    </div>
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="params-close">закрыть</button>
-                        <button type="button" class="accept" id="params-apply">применить</button>
-                    </div>
-                </div>
-            </div>
+            
             <!-- Модалка названия: «Новая задача» и переименование задачи/диалога.
                  «закрыть» — ничего не меняется, «ок» — применяет введённое имя. -->
-            <div class="modal-overlay" id="name-modal" hidden>
-                <div class="modal-box">
-                    <h3 id="name-modal-title">Новый проект</h3>
-                    <input class="roles-field" id="name-modal-input" placeholder="Название" autocomplete="off">
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="name-modal-close">закрыть</button>
-                        <button type="button" class="accept" id="name-modal-ok">ок</button>
-                    </div>
-                </div>
-            </div>
+            
 
             <!-- Модалка подтверждения удаления задачи или диалога. -->
-            <div class="modal-overlay" id="plan-modal" hidden>
-                <div class="modal-box">
-                    <h3>План задачи</h3>
-                    <p class="modal-hint">Каждый шаг — с новой строки. После сохранения задача снова ждёт подтверждения плана.</p>
-                    <textarea class="roles-field plan-field" id="plan-input" rows="6"
-                              placeholder="1. Собрать данные&#10;2. Написать код" autocomplete="off"></textarea>
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="plan-modal-close">закрыть</button>
-                        <button type="button" class="accept" id="plan-modal-ok">ок</button>
-                    </div>
-                </div>
-            </div>
+            
 
             <!-- Инварианты (шестерёнка ⚙️ у проекта и у каждой задачи в панели
                  Workspace). Правила, которые агент не имеет права нарушить:
@@ -2576,74 +2793,7 @@
                  проекта видны для справки), а если они противоречат друг другу —
                  выбираешь, чьё правило главнее. Два одинаковых блока разметки:
                  один для проекта, второй для задачи. -->
-            <div class="modal-overlay" id="invariants-modal" hidden>
-                <div class="modal-box inv-modal">
-                    <h3 id="inv-title">Инварианты проекта</h3>
-                    <p class="modal-hint">Инварианты — правила, которые агент не
-                        имеет права нарушить: выбранная архитектура, принятые
-                        технические решения, ограничения по стеку, бизнес-правила.
-                        Агент учитывает их в каждом ответе и не предлагает решения,
-                        которые их нарушают. Одно поле — один инвариант.</p>
-                    <p class="modal-hint inv-reminder" id="inv-reminder" hidden></p>
-                    <div class="inv-cols" id="inv-cols">
-                        <div class="inv-section" id="inv-project-section">
-                            <h4>Инварианты проекта</h4>
-                            <p class="inv-note">Действуют во всех задачах проекта.</p>
-                            <div id="inv-project-list"></div>
-                            <div class="inv-add">
-                                <input class="roles-field" id="inv-project-input" autocomplete="off"
-                                       placeholder="напр. «Только PostgreSQL, без MongoDB»">
-                                <button type="button" id="inv-project-add">добавить</button>
-                            </div>
-                        </div>
-                        <div class="inv-section" id="inv-task-section" hidden>
-                            <h4>Инварианты задачи</h4>
-                            <p class="inv-note" id="inv-task-note">Действуют только в этом диалоге.</p>
-                            <div id="inv-task-list"></div>
-                            <div class="inv-add">
-                                <input class="roles-field" id="inv-task-input" autocomplete="off"
-                                       placeholder="напр. «Ответы только на русском»">
-                                <button type="button" id="inv-task-add">добавить</button>
-                            </div>
-                        </div>
-                    </div>
-                    <!-- ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА: temperature и предел длины
-                         ответа. Это настройка ПРОЕКТА (как MCP и RAG), поэтому
-                         она стоит в модалке шестерёнки ПРОЕКТА — у задачи своих
-                         параметров модели нет. Значения уходят в модель
-                         ДЕЙСТВУЮЩЕГО источника (локальную или удалённую) и
-                         действуют в режиме «AI-агент»: ответ шага плана и прямой
-                         ответ по источникам. ПУСТОЕ ПОЛЕ — «не задано»:
-                         параметр в запрос к API не отправляется вовсе, и
-                         работает значение провайдера (так же было до этой
-                         настройки). Ноль в поле температуры — не «пусто», а
-                         осознанный выбор детерминированного ответа. -->
-                    <div class="inv-section inv-llm" id="inv-llm-section" hidden>
-                        <h4>Параметры модели проекта</h4>
-                        <p class="inv-note">Действуют в режиме «AI-агент» — у ответа шага
-                            плана и у прямого ответа по источникам, — и для локальной модели,
-                            и для удалённой. Служебные вызовы (план, проверка результата,
-                            разбор правил) идут со своими значениями: они возвращают JSON.</p>
-                        <div class="inv-llm-fields">
-                            <label>temperature
-                                <input id="inv-llm-temperature"
-                                       inputmode="decimal" autocomplete="off"
-                                       placeholder="напр. 0.7 · пусто — как у провайдера">
-                            </label>
-                            <label>Предел ответа, токенов
-                                <input id="inv-llm-max-tokens"
-                                       inputmode="numeric" autocomplete="off"
-                                       placeholder="напр. 2000 · пусто — как у провайдера">
-                            </label>
-                            <button type="button" id="inv-llm-save">сохранить</button>
-                        </div>
-                        <p class="inv-llm-state" id="inv-llm-state"></p>
-                    </div>
-                    <div class="modal-actions">
-                        <button type="button" class="accept" id="inv-close">закрыть</button>
-                    </div>
-                </div>
-            </div>
+            
 
             <!-- MCP (кнопка «MCP» рядом с шестерёнкой проекта). MCP — протокол
                  внешних инструментов: сервер объявляет инструменты (погода, курсы
@@ -2652,24 +2802,7 @@
                  уходят в каждый запрос агента («применить» запоминает набор).
                  Серверы бесплатные и работают без ключей; список, описания и
                  инструменты приходят с сервера (GET /api/agent/mcp). -->
-            <div class="modal-overlay" id="mcp-modal" hidden>
-                <div class="modal-box mcp-modal">
-                    <h3>MCP-инструменты проекта</h3>
-                    <p class="modal-hint">MCP (Model Context Protocol) — внешние
-                        источники данных для агента. Включённые серверы агент видит
-                        в каждом запросе: если для ответа не хватает фактов (погода,
-                        курс, цена), он сам вызывает нужный инструмент и отвечает по
-                        полученным данным, а не по догадке. Всё бесплатно и без
-                        ключей — интернет нужен только на время вызова.</p>
-                    <div class="mcp-list" id="mcp-list"></div>
-                    <p class="modal-hint mcp-status" id="mcp-status" hidden></p>
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="mcp-refresh">обновить список</button>
-                        <button type="button" class="clear" id="mcp-close">закрыть</button>
-                        <button type="button" class="accept" id="mcp-apply">применить</button>
-                    </div>
-                </div>
-            </div>
+            
 
             <!-- RAG (кнопка «RAG» рядом с «MCP»). RAG — Retrieval-Augmented
                  Generation: ответы агента по СВОИМ документам. Сегодняшний шаг —
@@ -2680,191 +2813,7 @@
                  хранилище, JSON — выгрузка). Галочка включает базу у ПРОЕКТА — как у MCP сервер.
                  Список баз, метрики и стратегии приходят с сервера
                  (GET /api/agent/rag); модель здесь не загружается. -->
-            <div class="modal-overlay" id="rag-modal" hidden>
-                <div class="modal-box rag-modal">
-                    <h3>Базы знаний проекта</h3>
-                    <p class="modal-hint">RAG (Retrieval-Augmented Generation) —
-                        ответы по вашим документам. Файл разбирается на текст,
-                        режется на чанки, каждый чанк получает вектор (эмбеддинг) и
-                        метаданные: источник, заголовок, раздел и номер чанка. Индекс
-                        лежит ЛОКАЛЬНО, в проекте, и никуда не отправляется.
-                        Галочка включает базу у этого проекта: перед каждым запросом
-                        агент ищет в ней фрагменты по вопросу и отвечает по ним —
-                        под ответом видны источники. Документы не смешиваются с
-                        перепиской: они уходят в модель только на время запроса.
-                        <b>Проверка:</b> введите в чат команду <b>/test_rag</b> —
-                        прогон контрольных вопросов по включённым базам; ответы
-                        сверяются эталонами, выписанными из самой базы. Под каждым
-                        ответом видны те же источники, что и в обычном ответе —
-                        с цитатой фрагмента и переходом к чанку.
-                        <b>Разговор по документам:</b> команды
-                        <b>/test_rag_dialog_1</b> и <b>/test_rag_dialog_2</b> —
-                        два контрольных ДИАЛОГА по 10 реплик: пользователя
-                        имитирует модель, а отвечает мини-чат (кнопка
-                        «💬 RAG-диалог») — проверяется, что агент не теряет цель
-                        задачи и у каждого ответа есть источники.</p>
-                    <div class="rag-list" id="rag-list"></div>
-                    <p class="modal-hint rag-status" id="rag-status" hidden></p>
-
-                    <!-- ПАНЕЛЬ ПОИСКА (два этапа). Настройка ПРОЕКТА, как галочки
-                         баз: запоминается кнопкой «применить» внизу диалога.
-                         Первый этап ищет широкий пул кандидатов по всей базе,
-                         второй (реранкинг) переставляет и отсекает его по фразе,
-                         заголовку и порогу релевантности. Переформулировка
-                         запроса — единственное место, где поиск обращается к
-                         модели (служебный вызов), и её можно выключить. -->
-                    <div class="rag-search">
-                        <h4>Поиск и ответы</h4>
-                        <p class="rag-strategy-hint">Как документы попадают в ответ.
-                            Первый этап ищет кандидатов по смыслу и словам запроса:
-                            его число — <b>первичная релевантность</b> (косинус +
-                            слова, 0…2), оно же видно в карточке источника. Второй
-                            этап (реранкинг) читает пару «вопрос + фрагмент»
-                            моделью-кросс-энкодером и даёт <b>уверенность
-                            модели</b> (0…1). Это ДВЕ РАЗНЫЕ ШКАЛЫ, и порога у
-                            каждой свой: фильтрация отсекает по первичной
-                            релевантности (работает всегда, модели не требует), а
-                            порог уверенности — настройка реранкинга.</p>
-                        <div class="rag-flags">
-                            <label class="rag-flag" for="rag-rewrite">
-                                <input type="checkbox" id="rag-rewrite">
-                                <span><b>Query Rewrite</b> — переформулировать
-                                    запрос перед поиском</span>
-                            </label>
-                            <label class="rag-flag" for="rag-rerank">
-                                <input type="checkbox" id="rag-rerank">
-                                <span><b>Reranking</b> — второй этап: пересчёт и
-                                    перестановка пула кандидатов</span>
-                            </label>
-                            <label class="rag-flag" for="rag-filter">
-                                <input type="checkbox" id="rag-filter">
-                                <span><b>Фильтрация по порогу</b> — не отправлять
-                                    модели фрагменты ниже порога</span>
-                            </label>
-                            <label class="rag-flag" for="rag-ask-empty">
-                                <input type="checkbox" id="rag-ask-empty">
-                                <span><b>Спрашивать, если в документах ничего нет</b>
-                                    — не отвечать по общим знаниям без вашего
-                                    согласия, а предложить варианты</span>
-                            </label>
-                        </div>
-                        <div class="rag-row search">
-                            <div class="rag-field">
-                                <label for="rag-top-before">Пул кандидатов (нужен
-                                    реранкингу)</label>
-                                <select id="rag-top-before"></select>
-                            </div>
-                            <div class="rag-field">
-                                <label for="rag-top-after">Фрагментов в ответ
-                                    (с каждой базы)</label>
-                                <select id="rag-top-after"></select>
-                            </div>
-                        </div>
-                        <!-- ЧЕМ РЕРАНКИТЬ ВЫБИРАТЬ НЕЧЕГО: движок один — модель
-                             cross-encoder (она скачана в кэш проекта и нужна
-                             фильтрации). Здесь показывается СОСТОЯНИЕ: чем
-                             реранкинг работает сейчас и почему не моделью, если
-                             её нет. Ручной переключатель на признаки остался в
-                             окружении (RAG_RERANK_BACKEND) — на случай сбоя. -->
-                        <p class="rag-strategy-hint" id="rag-rerank-note" hidden></p>
-                        <!-- ДВА ПОРОГА, ДВЕ ШКАЛЫ. Верхний — первичная
-                             релевантность (фильтрация): работает всегда, модели не
-                             требует. Нижний — уверенность модели (второй этап):
-                             без реранкинга не применяется. -->
-                        <div class="rag-field rag-range-field">
-                            <label for="rag-min-score">Порог первичной релевантности
-                                (фильтрация, 0…2): <span id="rag-min-score-value">—</span></label>
-                            <input type="range" id="rag-min-score" min="0" max="2" step="0.05">
-                        </div>
-                        <div class="rag-field rag-range-field">
-                            <label for="rag-min-ce">Порог уверенности модели
-                                (реранкинг, 0…1): <span id="rag-min-ce-value">—</span></label>
-                            <input type="range" id="rag-min-ce" min="0" max="1" step="0.05">
-                        </div>
-
-
-                        <p class="rag-strategy-hint rag-search-hint" id="rag-search-hint"></p>
-                        <!-- КНОПКА «ПО УМОЛЧАНИЮ» — ЧАСТЬ ЭТОЙ НАСТРОЙКИ, а не
-                             действие всего диалога: она возвращает к умолчаниям
-                             только «Поиск и ответы» (этапы, выборки, оба порога) и
-                             не трогает ни галочки баз, ни параметры разбиения.
-                             Поэтому стоит она внутри своего блока, а не в нижнем
-                             ряду действий диалога.
-                             Кнопка только ЗАПОЛНЯЕТ поля значениями с сервера
-                             (снимок `search_defaults`): сохраняет их обычное
-                             «применить» — путь записи один, и человек видит, что
-                             уйдёт в проект. -->
-                        <div class="modal-actions rag-search-actions">
-                            <button type="button" class="clear" id="rag-defaults"
-                                    title="Проставить в полях настройки фильтрации по умолчанию (значения считает сервер). Сохранит их кнопка «применить».">по умолчанию</button>
-                        </div>
-                    </div>
-
-                    <div class="rag-upload">
-                        <h4>Загрузить свою базу знаний</h4>
-                        <p class="rag-strategy-hint">Параметры разбиения ниже задают НОВУЮ базу.
-                            У уже собранных баз своя стратегия и свой размер чанка — они
-                            написаны в строке каждой базы.</p>
-                        <div class="rag-row">
-                            <div class="rag-field">
-                                <label for="rag-name">Название базы</label>
-                                <input type="text" id="rag-name" autocomplete="off"
-                                       placeholder="Например: Инструкции оператора">
-                            </div>
-                            <div class="rag-field">
-                                <label for="rag-file">Файлы: PDF (в том числе сканы), DOCX, ODT, текст, Markdown, CSV, JSON, картинки</label>
-                                <input type="file" id="rag-file" multiple>
-                            </div>
-                        </div>
-                        <!-- Ряд настроек разбиения: две числовые колонки РАВНОЙ
-                             ширины (класс rag-row.params), поэтому «размер
-                             чанка» и «перекрытие» стоят симметрично. -->
-                        <div class="rag-row params">
-                            <div class="rag-field">
-                                <label for="rag-strategy">Стратегия разбиения</label>
-                                <select id="rag-strategy"></select>
-                            </div>
-                            <div class="rag-field">
-                                <label for="rag-size">Размер чанка, символов</label>
-                                <input type="number" id="rag-size" min="100" max="8000" step="50">
-                            </div>
-                            <div class="rag-field">
-                                <label for="rag-overlap">Перекрытие, символов</label>
-                                <input type="number" id="rag-overlap" min="0" step="10">
-                            </div>
-                        </div>
-                        <p class="rag-strategy-hint" id="rag-strategy-hint"></p>
-                        <p class="modal-hint" id="rag-upload-status" hidden></p>
-
-                        <!-- Прогресс фоновой индексации. Работа идёт на сервере
-                             и НЕ привязана к этому диалогу: закрыть его можно, а
-                             полоса останется на кнопке «RAG» и в подсказке. -->
-                        <div class="rag-progress" id="rag-progress" hidden>
-                            <div class="rag-progress-head">
-                                <span class="rag-progress-stage" id="rag-progress-stage"></span>
-                                <span class="rag-progress-percent" id="rag-progress-percent"></span>
-                                <button type="button" id="rag-progress-cancel">остановить</button>
-                            </div>
-                            <div class="rag-progress-bar" id="rag-progress-bar">
-                                <span id="rag-progress-fill"></span>
-                            </div>
-                            <p class="rag-progress-detail" id="rag-progress-detail"></p>
-                            <p class="rag-progress-queue" id="rag-progress-queue" hidden></p>
-                        </div>
-
-                        <div class="modal-actions">
-                            <button type="button" class="accept" id="rag-upload">загрузить и проиндексировать</button>
-                        </div>
-                    </div>
-
-                    <p class="rag-embed-note" id="rag-embed-note" hidden></p>
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="rag-refresh">обновить</button>
-                        <button type="button" class="clear" id="rag-close">закрыть</button>
-                        <button type="button" class="accept" id="rag-apply">применить</button>
-                    </div>
-                </div>
-            </div>
+            
 
             <!-- Просмотр чанков базы (кнопка «чанки» в строке базы). Показывает,
                  КАК стратегия порезала документ: текст чанка как есть, его номер
@@ -2872,78 +2821,16 @@
                  и есть способ проверить настройки разбиения своими глазами —
                  видно, не разорван ли раздел и не состоит ли чанк из заголовка.
                  Список постраничный: база на 20 000 чанков в диалог не влезет. -->
-            <div class="modal-overlay" id="rag-chunks-modal" hidden>
-                <div class="modal-box rag-chunks-modal">
-                    <h3>Чанки базы: <span id="rag-chunks-name"></span></h3>
-                    <p class="rag-chunks-meta" id="rag-chunks-meta"></p>
-                    <div class="rag-chunks-filters">
-                        <select id="rag-chunks-source" title="Показать чанки одного документа"></select>
-                        <input type="text" id="rag-chunks-query" autocomplete="off"
-                               placeholder="поиск по тексту чанка (например: резервное копирование)">
-                        <button type="button" class="clear" id="rag-chunks-find">найти</button>
-                    </div>
-                    <p class="rag-chunks-status" id="rag-chunks-status"></p>
-                    <div class="rag-chunks-list" id="rag-chunks-list"></div>
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="rag-chunks-more" hidden>показать ещё</button>
-                        <button type="button" class="accept" id="rag-chunks-close">закрыть</button>
-                    </div>
-                </div>
-            </div>
+            
 
             <!-- Периодическая задача: расписание повторяющегося запроса. Открывается
                  кнопкой 🔁 у задачи в списке задач. Период по умолчанию — сутки;
                  если период назван в тексте запроса («раз в час»), сервер берёт его
                  сам. Автозапуск можно остановить — задача при этом остаётся
                  периодической (метка в списке сохраняется) и повтор не вернётся сам. -->
-            <div class="modal-overlay" id="periodic-modal" hidden>
-                <div class="modal-box periodic-modal">
-                    <h3>Периодическая задача</h3>
-                    <p class="modal-hint">Задача повторяется сама: сервер заново
-                        выполняет её запрос через выбранный период и кладёт ответ в
-                        чат этой задачи — со свежими данными внешних инструментов
-                        проекта (если они включены у проекта: погода, курс, цена —
-                        набор инструментов меняется, повтор берёт то, что доступно).
-                        Период можно назвать и прямо в запросе: «Сводка погоды в
-                        Москве за последние сутки, раз в час». Задача не завершается
-                        и не проходит проверку результата — она повторяется, пока
-                        автозапуск включён; при отмене или удалении задачи (проекта)
-                        её сборы на серверах внешних инструментов останавливаются.</p>
-                    <div class="periodic-status" id="periodic-status"></div>
-                    <div class="periodic-field" id="periodic-period-field">
-                        <label for="periodic-period">Период повтора</label>
-                        <select id="periodic-period">
-                            <option value="300">каждые 5 минут</option>
-                            <option value="900">каждые 15 минут</option>
-                            <option value="1800">каждые 30 минут</option>
-                            <option value="3600">раз в час</option>
-                            <option value="10800">каждые 3 часа</option>
-                            <option value="21600">каждые 6 часов</option>
-                            <option value="43200">каждые 12 часов</option>
-                            <option value="86400">раз в сутки</option>
-                            <option value="604800">раз в неделю</option>
-                            <option value="custom" id="periodic-period-custom">как в запросе</option>
-                        </select>
-                    </div>
-                    <p class="modal-hint" id="periodic-request"></p>
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="periodic-toggle">остановить автозапуск</button>
-                        <button type="button" class="clear" id="periodic-close">закрыть</button>
-                        <button type="button" class="accept" id="periodic-save">сохранить</button>
-                    </div>
-                </div>
-            </div>
+            
 
-            <div class="modal-overlay" id="confirm-modal" hidden>
-                <div class="modal-box">
-                    <h3 id="confirm-modal-title">Удаление</h3>
-                    <p class="modal-hint" id="confirm-modal-text"></p>
-                    <div class="modal-actions">
-                        <button type="button" class="clear" id="confirm-modal-cancel">отмена</button>
-                        <button type="button" class="accept" id="confirm-modal-ok">удалить</button>
-                    </div>
-                </div>
-            </div>
+            
 
             <div id="messages" class="messages">
                 <div class="msg bot">
@@ -3139,7 +3026,464 @@
             </div>
         </div>
 
+<div class="modal-overlay" id="group-modal" hidden>
+                <div class="modal-box">
+                    <h3>Роли экспертов</h3>
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <input class="roles-field" placeholder="роль" autocomplete="off">
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="roles-clear">очистить</button>
+                        <button type="button" class="accept" id="roles-accept">принять</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="error-modal" hidden>
+                <div class="modal-box">
+                    <h3>Ошибка</h3>
+                    <p id="error-text"></p>
+                    <div class="modal-actions">
+                        <button type="button" class="accept" id="error-close">закрыть</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="params-modal" hidden>
+                <div class="modal-box">
+                    <h3>Параметры</h3>
+                    <select id="param-select" class="param-select">
+                        <option value="default" selected>По умолчанию</option>
+                        <option value="temperature">Температура</option>
+                        <option value="models">Тест моделей</option>
+                    </select>
+                    <div class="param-fields" id="param-fields" hidden>
+                        <p class="modal-hint">Числовые значения (целые или с точкой).</p>
+                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
+                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
+                        <input class="param-field" placeholder="temperature" inputmode="decimal" autocomplete="off">
+                    </div>
+                    <div class="param-models" id="param-models" hidden>
+                        <p class="modal-hint">Выберите модели — запрос уйдёт в каждую из них.
+                            DeepSeek-V4-Flash — модель по умолчанию; остальные (Yandex) доступны
+                            только при ручном выборе здесь.</p>
+                        <label class="model-check"><input type="checkbox" value="deepseek" checked> DeepSeek-V4-Flash</label>
+                        <label class="model-check"><input type="checkbox" value="deepseek-yandex"> DeepSeek 4 Flash (Yandex)</label>
+                        <label class="model-check"><input type="checkbox" value="alice"> Alice AI LLM</label>
+                        <label class="model-check"><input type="checkbox" value="alice-flash"> Alice AI LLM Flash</label>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="params-close">закрыть</button>
+                        <button type="button" class="accept" id="params-apply">применить</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="name-modal" hidden>
+                <div class="modal-box">
+                    <h3 id="name-modal-title">Новый проект</h3>
+                    <input class="roles-field" id="name-modal-input" placeholder="Название" autocomplete="off">
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="name-modal-close">закрыть</button>
+                        <button type="button" class="accept" id="name-modal-ok">ок</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="plan-modal" hidden>
+                <div class="modal-box">
+                    <h3>План задачи</h3>
+                    <p class="modal-hint">Каждый шаг — с новой строки. После сохранения задача снова ждёт подтверждения плана.</p>
+                    <textarea class="roles-field plan-field" id="plan-input" rows="6"
+                              placeholder="1. Собрать данные&#10;2. Написать код" autocomplete="off"></textarea>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="plan-modal-close">закрыть</button>
+                        <button type="button" class="accept" id="plan-modal-ok">ок</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="invariants-modal" hidden>
+                <div class="modal-box inv-modal">
+                    <h3 id="inv-title">Инварианты проекта</h3>
+                    <p class="modal-hint">Инварианты — правила, которые агент не
+                        имеет права нарушить: выбранная архитектура, принятые
+                        технические решения, ограничения по стеку, бизнес-правила.
+                        Агент учитывает их в каждом ответе и не предлагает решения,
+                        которые их нарушают. Одно поле — один инвариант.</p>
+                    <p class="modal-hint inv-reminder" id="inv-reminder" hidden></p>
+                    <div class="inv-cols" id="inv-cols">
+                        <div class="inv-section" id="inv-project-section">
+                            <h4>Инварианты проекта</h4>
+                            <p class="inv-note">Действуют во всех задачах проекта.</p>
+                            <div id="inv-project-list"></div>
+                            <div class="inv-add">
+                                <input class="roles-field" id="inv-project-input" autocomplete="off"
+                                       placeholder="напр. «Только PostgreSQL, без MongoDB»">
+                                <button type="button" id="inv-project-add">добавить</button>
+                            </div>
+                        </div>
+                        <div class="inv-section" id="inv-task-section" hidden>
+                            <h4>Инварианты задачи</h4>
+                            <p class="inv-note" id="inv-task-note">Действуют только в этом диалоге.</p>
+                            <div id="inv-task-list"></div>
+                            <div class="inv-add">
+                                <input class="roles-field" id="inv-task-input" autocomplete="off"
+                                       placeholder="напр. «Ответы только на русском»">
+                                <button type="button" id="inv-task-add">добавить</button>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- ПАРАМЕТРЫ МОДЕЛИ ПРОЕКТА: temperature и предел длины
+                         ответа. Это настройка ПРОЕКТА (как MCP и RAG), поэтому
+                         она стоит в модалке шестерёнки ПРОЕКТА — у задачи своих
+                         параметров модели нет. Значения уходят в модель
+                         ДЕЙСТВУЮЩЕГО источника (локальную или удалённую) и
+                         действуют в режиме «AI-агент»: ответ шага плана и прямой
+                         ответ по источникам. ПУСТОЕ ПОЛЕ — «не задано»:
+                         параметр в запрос к API не отправляется вовсе, и
+                         работает значение провайдера (так же было до этой
+                         настройки). Ноль в поле температуры — не «пусто», а
+                         осознанный выбор детерминированного ответа. -->
+                    <div class="inv-section inv-llm" id="inv-llm-section" hidden>
+                        <h4>Параметры модели проекта</h4>
+                        <p class="inv-note">Действуют в режиме «AI-агент» — у ответа шага
+                            плана и у прямого ответа по источникам, — и для локальной модели,
+                            и для удалённой. Служебные вызовы (план, проверка результата,
+                            разбор правил) идут со своими значениями: они возвращают JSON.</p>
+                        <div class="inv-llm-fields">
+                            <label>temperature
+                                <input id="inv-llm-temperature"
+                                       inputmode="decimal" autocomplete="off"
+                                       placeholder="напр. 0.7 · пусто — как у провайдера">
+                            </label>
+                            <label>Предел ответа, токенов
+                                <input id="inv-llm-max-tokens"
+                                       inputmode="numeric" autocomplete="off"
+                                       placeholder="напр. 2000 · пусто — как у провайдера">
+                            </label>
+                            <button type="button" id="inv-llm-save">сохранить</button>
+                        </div>
+                        <p class="inv-llm-state" id="inv-llm-state"></p>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="accept" id="inv-close">закрыть</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="mcp-modal" hidden>
+                <div class="modal-box mcp-modal">
+                    <h3>MCP-инструменты проекта</h3>
+                    <p class="modal-hint">MCP (Model Context Protocol) — внешние
+                        источники данных для агента. Включённые серверы агент видит
+                        в каждом запросе: если для ответа не хватает фактов (погода,
+                        курс, цена), он сам вызывает нужный инструмент и отвечает по
+                        полученным данным, а не по догадке. Всё бесплатно и без
+                        ключей — интернет нужен только на время вызова.</p>
+                    <div class="mcp-list" id="mcp-list"></div>
+                    <p class="modal-hint mcp-status" id="mcp-status" hidden></p>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="mcp-refresh">обновить список</button>
+                        <button type="button" class="clear" id="mcp-close">закрыть</button>
+                        <button type="button" class="accept" id="mcp-apply">применить</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="rag-modal" hidden>
+                <div class="modal-box rag-modal">
+                    <h3>Базы знаний проекта</h3>
+                    <p class="modal-hint">RAG (Retrieval-Augmented Generation) —
+                        ответы по вашим документам. Файл разбирается на текст,
+                        режется на чанки, каждый чанк получает вектор (эмбеддинг) и
+                        метаданные: источник, заголовок, раздел и номер чанка. Индекс
+                        лежит ЛОКАЛЬНО, в проекте, и никуда не отправляется.
+                        Галочка включает базу у этого проекта: перед каждым запросом
+                        агент ищет в ней фрагменты по вопросу и отвечает по ним —
+                        под ответом видны источники. Документы не смешиваются с
+                        перепиской: они уходят в модель только на время запроса.
+                        <b>Проверка:</b> введите в чат команду <b>/test_rag</b> —
+                        прогон контрольных вопросов по включённым базам; ответы
+                        сверяются эталонами, выписанными из самой базы. Под каждым
+                        ответом видны те же источники, что и в обычном ответе —
+                        с цитатой фрагмента и переходом к чанку.
+                        <b>Разговор по документам:</b> команды
+                        <b>/test_rag_dialog_1</b> и <b>/test_rag_dialog_2</b> —
+                        два контрольных ДИАЛОГА по 10 реплик: пользователя
+                        имитирует модель, а отвечает мини-чат (кнопка
+                        «💬 RAG-диалог») — проверяется, что агент не теряет цель
+                        задачи и у каждого ответа есть источники.</p>
+                    <div class="rag-list" id="rag-list"></div>
+                    <p class="modal-hint rag-status" id="rag-status" hidden></p>
+
+                    <!-- ПАНЕЛЬ ПОИСКА (два этапа). Настройка ПРОЕКТА, как галочки
+                         баз: запоминается кнопкой «применить» внизу диалога.
+                         Первый этап ищет широкий пул кандидатов по всей базе,
+                         второй (реранкинг) переставляет и отсекает его по фразе,
+                         заголовку и порогу релевантности. Переформулировка
+                         запроса — единственное место, где поиск обращается к
+                         модели (служебный вызов), и её можно выключить. -->
+                    <div class="rag-search">
+                        <h4>Поиск и ответы</h4>
+                        <p class="rag-strategy-hint">Как документы попадают в ответ.
+                            Первый этап ищет кандидатов по смыслу и словам запроса:
+                            его число — <b>первичная релевантность</b> (косинус +
+                            слова, 0…2), оно же видно в карточке источника. Второй
+                            этап (реранкинг) читает пару «вопрос + фрагмент»
+                            моделью-кросс-энкодером и даёт <b>уверенность
+                            модели</b> (0…1). Это ДВЕ РАЗНЫЕ ШКАЛЫ, и порога у
+                            каждой свой: фильтрация отсекает по первичной
+                            релевантности (работает всегда, модели не требует), а
+                            порог уверенности — настройка реранкинга.</p>
+                        <div class="rag-flags">
+                            <label class="rag-flag" for="rag-rewrite">
+                                <input type="checkbox" id="rag-rewrite">
+                                <span><b>Query Rewrite</b> — переформулировать
+                                    запрос перед поиском</span>
+                            </label>
+                            <label class="rag-flag" for="rag-rerank">
+                                <input type="checkbox" id="rag-rerank">
+                                <span><b>Reranking</b> — второй этап: пересчёт и
+                                    перестановка пула кандидатов</span>
+                            </label>
+                            <label class="rag-flag" for="rag-filter">
+                                <input type="checkbox" id="rag-filter">
+                                <span><b>Фильтрация по порогу</b> — не отправлять
+                                    модели фрагменты ниже порога</span>
+                            </label>
+                            <label class="rag-flag" for="rag-ask-empty">
+                                <input type="checkbox" id="rag-ask-empty">
+                                <span><b>Спрашивать, если в документах ничего нет</b>
+                                    — не отвечать по общим знаниям без вашего
+                                    согласия, а предложить варианты</span>
+                            </label>
+                        </div>
+                        <div class="rag-row search">
+                            <div class="rag-field">
+                                <label for="rag-top-before">Пул кандидатов (нужен
+                                    реранкингу)</label>
+                                <select id="rag-top-before"></select>
+                            </div>
+                            <div class="rag-field">
+                                <label for="rag-top-after">Фрагментов в ответ
+                                    (с каждой базы)</label>
+                                <select id="rag-top-after"></select>
+                            </div>
+                        </div>
+                        <!-- ЧЕМ РЕРАНКИТЬ ВЫБИРАТЬ НЕЧЕГО: движок один — модель
+                             cross-encoder (она скачана в кэш проекта и нужна
+                             фильтрации). Здесь показывается СОСТОЯНИЕ: чем
+                             реранкинг работает сейчас и почему не моделью, если
+                             её нет. Ручной переключатель на признаки остался в
+                             окружении (RAG_RERANK_BACKEND) — на случай сбоя. -->
+                        <p class="rag-strategy-hint" id="rag-rerank-note" hidden></p>
+                        <!-- ДВА ПОРОГА, ДВЕ ШКАЛЫ. Верхний — первичная
+                             релевантность (фильтрация): работает всегда, модели не
+                             требует. Нижний — уверенность модели (второй этап):
+                             без реранкинга не применяется. -->
+                        <div class="rag-field rag-range-field">
+                            <label for="rag-min-score">Порог первичной релевантности
+                                (фильтрация, 0…2): <span id="rag-min-score-value">—</span></label>
+                            <input type="range" id="rag-min-score" min="0" max="2" step="0.05">
+                        </div>
+                        <div class="rag-field rag-range-field">
+                            <label for="rag-min-ce">Порог уверенности модели
+                                (реранкинг, 0…1): <span id="rag-min-ce-value">—</span></label>
+                            <input type="range" id="rag-min-ce" min="0" max="1" step="0.05">
+                        </div>
+
+
+                        <p class="rag-strategy-hint rag-search-hint" id="rag-search-hint"></p>
+                        <!-- КНОПКА «ПО УМОЛЧАНИЮ» — ЧАСТЬ ЭТОЙ НАСТРОЙКИ, а не
+                             действие всего диалога: она возвращает к умолчаниям
+                             только «Поиск и ответы» (этапы, выборки, оба порога) и
+                             не трогает ни галочки баз, ни параметры разбиения.
+                             Поэтому стоит она внутри своего блока, а не в нижнем
+                             ряду действий диалога.
+                             Кнопка только ЗАПОЛНЯЕТ поля значениями с сервера
+                             (снимок `search_defaults`): сохраняет их обычное
+                             «применить» — путь записи один, и человек видит, что
+                             уйдёт в проект. -->
+                        <div class="modal-actions rag-search-actions">
+                            <button type="button" class="clear" id="rag-defaults"
+                                    title="Проставить в полях настройки фильтрации по умолчанию (значения считает сервер). Сохранит их кнопка «применить».">по умолчанию</button>
+                        </div>
+                    </div>
+
+                    <div class="rag-upload">
+                        <h4>Загрузить свою базу знаний</h4>
+                        <p class="rag-strategy-hint">Параметры разбиения ниже задают НОВУЮ базу.
+                            У уже собранных баз своя стратегия и свой размер чанка — они
+                            написаны в строке каждой базы.</p>
+                        <div class="rag-row">
+                            <div class="rag-field">
+                                <label for="rag-name">Название базы</label>
+                                <input type="text" id="rag-name" autocomplete="off"
+                                       placeholder="Например: Инструкции оператора">
+                            </div>
+                            <div class="rag-field">
+                                <label for="rag-file">Файлы: PDF (в том числе сканы), DOCX, ODT, текст, Markdown, CSV, JSON, картинки</label>
+                                <input type="file" id="rag-file" multiple>
+                            </div>
+                        </div>
+                        <!-- Ряд настроек разбиения: две числовые колонки РАВНОЙ
+                             ширины (класс rag-row.params), поэтому «размер
+                             чанка» и «перекрытие» стоят симметрично. -->
+                        <div class="rag-row params">
+                            <div class="rag-field">
+                                <label for="rag-strategy">Стратегия разбиения</label>
+                                <select id="rag-strategy"></select>
+                            </div>
+                            <div class="rag-field">
+                                <label for="rag-size">Размер чанка, символов</label>
+                                <input type="number" id="rag-size" min="100" max="8000" step="50">
+                            </div>
+                            <div class="rag-field">
+                                <label for="rag-overlap">Перекрытие, символов</label>
+                                <input type="number" id="rag-overlap" min="0" step="10">
+                            </div>
+                        </div>
+                        <p class="rag-strategy-hint" id="rag-strategy-hint"></p>
+                        <p class="modal-hint" id="rag-upload-status" hidden></p>
+
+                        <!-- Прогресс фоновой индексации. Работа идёт на сервере
+                             и НЕ привязана к этому диалогу: закрыть его можно, а
+                             полоса останется на кнопке «RAG» и в подсказке. -->
+                        <div class="rag-progress" id="rag-progress" hidden>
+                            <div class="rag-progress-head">
+                                <span class="rag-progress-stage" id="rag-progress-stage"></span>
+                                <span class="rag-progress-percent" id="rag-progress-percent"></span>
+                                <button type="button" id="rag-progress-cancel">остановить</button>
+                            </div>
+                            <div class="rag-progress-bar" id="rag-progress-bar">
+                                <span id="rag-progress-fill"></span>
+                            </div>
+                            <p class="rag-progress-detail" id="rag-progress-detail"></p>
+                            <p class="rag-progress-queue" id="rag-progress-queue" hidden></p>
+                        </div>
+
+                        <div class="modal-actions">
+                            <button type="button" class="accept" id="rag-upload">загрузить и проиндексировать</button>
+                        </div>
+                    </div>
+
+                    <p class="rag-embed-note" id="rag-embed-note" hidden></p>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="rag-refresh">обновить</button>
+                        <button type="button" class="clear" id="rag-close">закрыть</button>
+                        <button type="button" class="accept" id="rag-apply">применить</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="rag-chunks-modal" hidden>
+                <div class="modal-box rag-chunks-modal">
+                    <h3>Чанки базы: <span id="rag-chunks-name"></span></h3>
+                    <p class="rag-chunks-meta" id="rag-chunks-meta"></p>
+                    <div class="rag-chunks-filters">
+                        <select id="rag-chunks-source" title="Показать чанки одного документа"></select>
+                        <input type="text" id="rag-chunks-query" autocomplete="off"
+                               placeholder="поиск по тексту чанка (например: резервное копирование)">
+                        <button type="button" class="clear" id="rag-chunks-find">найти</button>
+                    </div>
+                    <p class="rag-chunks-status" id="rag-chunks-status"></p>
+                    <div class="rag-chunks-list" id="rag-chunks-list"></div>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="rag-chunks-more" hidden>показать ещё</button>
+                        <button type="button" class="accept" id="rag-chunks-close">закрыть</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="periodic-modal" hidden>
+                <div class="modal-box periodic-modal">
+                    <h3>Периодическая задача</h3>
+                    <p class="modal-hint">Задача повторяется сама: сервер заново
+                        выполняет её запрос через выбранный период и кладёт ответ в
+                        чат этой задачи — со свежими данными внешних инструментов
+                        проекта (если они включены у проекта: погода, курс, цена —
+                        набор инструментов меняется, повтор берёт то, что доступно).
+                        Период можно назвать и прямо в запросе: «Сводка погоды в
+                        Москве за последние сутки, раз в час». Задача не завершается
+                        и не проходит проверку результата — она повторяется, пока
+                        автозапуск включён; при отмене или удалении задачи (проекта)
+                        её сборы на серверах внешних инструментов останавливаются.</p>
+                    <div class="periodic-status" id="periodic-status"></div>
+                    <div class="periodic-field" id="periodic-period-field">
+                        <label for="periodic-period">Период повтора</label>
+                        <select id="periodic-period">
+                            <option value="300">каждые 5 минут</option>
+                            <option value="900">каждые 15 минут</option>
+                            <option value="1800">каждые 30 минут</option>
+                            <option value="3600">раз в час</option>
+                            <option value="10800">каждые 3 часа</option>
+                            <option value="21600">каждые 6 часов</option>
+                            <option value="43200">каждые 12 часов</option>
+                            <option value="86400">раз в сутки</option>
+                            <option value="604800">раз в неделю</option>
+                            <option value="custom" id="periodic-period-custom">как в запросе</option>
+                        </select>
+                    </div>
+                    <p class="modal-hint" id="periodic-request"></p>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="periodic-toggle">остановить автозапуск</button>
+                        <button type="button" class="clear" id="periodic-close">закрыть</button>
+                        <button type="button" class="accept" id="periodic-save">сохранить</button>
+                    </div>
+                </div>
+            </div>
+<div class="modal-overlay" id="confirm-modal" hidden>
+                <div class="modal-box">
+                    <h3 id="confirm-modal-title">Удаление</h3>
+                    <p class="modal-hint" id="confirm-modal-text"></p>
+                    <div class="modal-actions">
+                        <button type="button" class="clear" id="confirm-modal-cancel">отмена</button>
+                        <button type="button" class="accept" id="confirm-modal-ok">удалить</button>
+                    </div>
+                </div>
+            </div>
+
     <script>
+        // ---------- Доступ из внешней сети: вход по паролю (app/auth.py) ----------
+        // Срок входа конечен (ACCESS_TTL_HOURS), а приложение перезапускается —
+        // значит открытая страница может «протухнуть» посреди работы. Сервер в
+        // этом случае отвечает 401 (гейт стоит перед всеми маршрутами), и без
+        // этой обёртки человек видел бы «⚠️ Ошибка связи с сервером» на каждое
+        // действие. Обёртка ОДНА на все запросы страницы — и на обычные, и на
+        // потоковые: правки в каждом из десятков вызовов рано или поздно
+        // забылись бы на новом, а ошибка выглядела бы как поломка сервера.
+        // 401 в этом приложении отдаёт только гейт: остальные отказы — 400/404/409.
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = async function (...args) {
+            const response = await nativeFetch(...args);
+            if (response.status === 401 && !window.__accessRedirect) {
+                window.__accessRedirect = true;
+                location.replace('/login');
+            }
+            return response;
+        };
+
+        // Кнопка «Выйти»: сервер один знает, спрашивают ли пароль у ЭТОГО клиента
+        // (локально, с 127.0.0.1, гейт пропускает без пароля, и кнопка была бы
+        // мёртвой — поэтому она скрыта по умолчанию и показывается по `required`).
+        const logoutBtn = document.getElementById('logout-btn');
+
+        async function loadAccessState() {
+            try {
+                const res = await fetch('/api/auth/state');
+                if (!res.ok) return;
+                const state = await res.json();
+                logoutBtn.hidden = !state.required;
+                logoutBtn.title = state.user
+                    ? 'Выйти: браузер забудет вход (' + state.user + '), пароль спросят снова'
+                    : 'Выйти: этот браузер забудет вход, и пароль спросят снова';
+            } catch (e) {
+                // Доступ на работу страницы не влияет: не спросили — и не надо.
+            }
+        }
+
+        logoutBtn.addEventListener('click', async () => {
+            // Даже если маршрут не ответил, уходим на страницу входа: куку в
+            // любом случае надо забыть, а «остаться в чате» после «Выйти» хуже
+            // любой ошибке.
+            try { await fetch('/api/auth/logout', { method: 'POST' }); } catch (e) { /* уходим */ }
+            location.replace('/login');
+        });
+
         const input = document.getElementById('input');
         const sendBtn = document.getElementById('send');
         const agentClearBtn = document.getElementById('agent-clear');
@@ -4001,6 +4345,13 @@
         }
         // Идёт переключение задачи/диалога (мгновенное, но асинхронное).
         let switching = false;
+        // «Ответ уже показан»: сервер после текста ответа доделывает служебное
+        // (память задачи, варианты продолжения) и на локальной модели это занимает
+        // секунды. Пока этот набор непуст, поле ввода считается СВОБОДНЫМ, хотя
+        // поток ещё открыт: человек читает ответ и может писать дальше, а кнопки
+        // памяти дорисуются, когда подоспеют. Очищается вместе с завершением
+        // потока, поэтому счётчик запросов не путается.
+        const answerReady = new Set();
         // Локально отправленная команда остановки ('pause'|'cancel'): нужна, чтобы
         // понять, применилась ли она. Состояние с сервера пометку `pending` может
         // затереть (финальное событие шага приходит уже без неё), поэтому факт
@@ -4464,7 +4815,10 @@
             // Запрос идёт ИМЕННО у открытой задачи (см. requestBusyHere): иначе
             // шаг прогона, запущенный пока задача была открыта, гасил кнопки и
             // поле ввода в ДРУГОЙ задаче — на это и была жалоба.
-            const requestHere = requestBusyHere();
+            // Ответ показан, а служебная работа ещё идёт — ввод не держим (см.
+            // answerReady).
+            const requestHere = requestBusyHere()
+                && !answerReady.has(workspace.active_session);
             const openBusy = requestHere || switching || chainHere;
             input.disabled = needTask || paused || chainHere || switching || requestHere;
             // Задача завершена или отменена: следующее сообщение начнёт новую —
@@ -9312,6 +9666,12 @@
                             // решения. План в этом случае не строится — задача
                             // ждёт выбора пользователя.
                             pushAgentNode('assistant', ev.text, ev.analysis);
+                        } else if (ev.type === 'answer_ready') {
+                            // ОТВЕТ ПОКАЗАН — ВВОД СВОБОДЕН (см. answerReady):
+                            // сервер ещё досчитывает память задачи и варианты,
+                            // но человеку это ждать незачем.
+                            answerReady.add(streamSession);
+                            updateComposerState();
                         } else if (ev.type === 'bot') {
                             // У ответа могут быть ФАЙЛЫ (MCP вернул xlsx): под
                             // сообщением рисуются карточки со ссылкой на скачивание.
@@ -9385,6 +9745,7 @@
                 } else {
                     foregroundRequests.delete(streamSession);
                 }
+                answerReady.delete(streamSession);
                 updateComposerState();
                 if (streamEpoch !== viewEpoch) {
                     // Пока шаг выполнялся, пользователь переключил задачу: события
@@ -9680,6 +10041,165 @@
             }
         }
 
+        // ---------- Выдвижные ящики и «слои» на телефоне ----------
+        // На узком экране боковые панели (проекты и задачи слева, токены справа)
+        // лежат ПОВЕРХ чата: место в колонках отдано окну чата, а панели
+        // открываются кнопками «☰» и «📊». Настройки чата (режим, тип задачи,
+        // формат ответа, длина, завершение) прячутся за «⚙» по той же причине:
+        // замер экрана 390x844 показал, что шапка с ними занимала 352px из 844.
+        // Открыт всегда не больше одного слоя: два одновременно на телефоне
+        // закрыли бы весь экран.
+        // Правила видимости — в CSS (медиазапрос), здесь только переключение
+        // класса на body: страница не спрашивает у браузера ширину окна, поэтому
+        // поведение одинаково и в тестах, и при повороте телефона.
+        const drawerToggle = document.getElementById('drawer-toggle');
+        const statsToggle = document.getElementById('stats-toggle');
+        const settingsToggle = document.getElementById('settings-toggle');
+        const drawerBackdrop = document.getElementById('drawer-backdrop');
+        const DRAWER_CLASSES = ['drawer-open', 'stats-open', 'settings-open'];
+
+        function closeDrawers() {
+            DRAWER_CLASSES.forEach((name) => document.body.classList.remove(name));
+        }
+
+        function toggleDrawer(name) {
+            const wasOpen = document.body.classList.contains(name);
+            closeDrawers();
+            if (!wasOpen) document.body.classList.add(name);
+        }
+
+        // ---------- Кнопка «назад» закрывает слой, а не уходит с сайта ----------
+        // На телефоне «назад» — основной способ закрыть то, что открыл, но для
+        // браузера панели и модалки страницами не являются: без этой связи кнопка
+        // «назад» выбрасывала человека с сайта, а окно оставалось открытым.
+        // Слой кладёт в историю одну запись, и «назад» её снимает.
+        let layerPushed = false;       // наша запись лежит в истории
+        let closingByHistory = false;  // закрываем по «назад», а не по нажатию
+
+        function layerOpen() {
+            if (DRAWER_CLASSES.some((name) => document.body.classList.contains(name))) return true;
+            // Модалок полтора десятка, у каждой свой код открытия: смотрим на
+            // признак «показана», а не на список известных модалок.
+            return Array.from(document.querySelectorAll('.modal-overlay'))
+                .some((overlay) => !overlay.hidden);
+        }
+
+        function syncHistory() {
+            const open = layerOpen();
+            if (open && !layerPushed) {
+                layerPushed = true;
+                history.pushState({ siteLayer: true }, '');
+            } else if (!open && layerPushed) {
+                layerPushed = false;
+                if (!closingByHistory) history.back();
+            }
+        }
+
+        function closeLayers() {
+            closeDrawers();
+            document.querySelectorAll('.modal-overlay').forEach((overlay) => {
+                if (overlay.hidden) return;
+                // Закрываем ТОЙ ЖЕ кнопкой, что и человек: у модалок своя логика
+                // закрытия (сброс полей, отмена ожидания), и «просто hidden = true»
+                // оставило бы её невыполненной.
+                const closer = overlay.querySelector('button[id$="-close"]');
+                if (closer) closer.click();
+                else overlay.hidden = true;
+            });
+        }
+
+        window.addEventListener('popstate', () => {
+            closingByHistory = true;
+            layerPushed = false;
+            closeLayers();
+            closingByHistory = false;
+        });
+
+        // Следим за ПОЯВЛЕНИЕМ слоёв, а не за нажатиями: модалки открываются из
+        // десятка мест, и подписка на каждое рано или поздно забылась бы на новом.
+        const layerWatcher = new MutationObserver(() => syncHistory());
+        layerWatcher.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+        document.querySelectorAll('.modal-overlay').forEach((overlay) => {
+            layerWatcher.observe(overlay, { attributes: true, attributeFilter: ['hidden'] });
+        });
+
+        drawerToggle.addEventListener('click', () => toggleDrawer('drawer-open'));
+        statsToggle.addEventListener('click', () => toggleDrawer('stats-open'));
+        settingsToggle.addEventListener('click', () => toggleDrawer('settings-open'));
+        drawerBackdrop.addEventListener('click', closeDrawers);
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') closeLayers();
+        });
+        // Выбор задачи, проекта или создание нового закрывает слой: иначе человек
+        // остаётся с открытым списком поверх только что открытой задачи.
+        sessionsEl.addEventListener('click', closeDrawers);
+        taskSelect.addEventListener('change', closeDrawers);
+        [taskNewBtn, sessionNewBtn, sessionNewPeriodicBtn].forEach((button) => {
+            button.addEventListener('click', closeDrawers);
+        });
+        // Отправка вопроса прячет настройки: человек уже работает с чатом, а не
+        // настраивает его.
+        sendBtn.addEventListener('click', () => document.body.classList.remove('settings-open'));
+
+        // ---------- Шапка уезжает при прокрутке переписки ----------
+        // Место в окне чата на телефоне дороже шапки, а полоса состояния задачи
+        // остаётся на виду: она вне прокручиваемой области. Прокрутка вверх
+        // возвращает шапку, у самого верха она показана всегда.
+        // Состояние шапки меняет только прокрутка РУКОЙ. Разница принципиальна:
+        // страница перерисовывает диалог часто (ответ шага, смена задачи,
+        // обновление состояния) и при этом сама ставит прокрутку — то в конец
+        // (`scrollTop = scrollHeight`), то в начало. Если слушать только событие
+        // прокрутки, шапка моргала бы посреди работы: уехала на ответе шага,
+        // вернулась на перерисовке. Поэтому запоминаем время последнего ЖЕСТА
+        // (касание, колесо, клавиши навигации) и реагируем, только если событие
+        // пришло сразу после него.
+        let lastScrollTop = 0;
+        let lastGestureAt = 0;
+        let headerToggledAt = 0;
+
+        // Показать/убрать шапку БЕЗ ПРЫЖКА СОДЕРЖИМОГО. Когда шапка уезжает,
+        // окно чата становится выше на её высоту — и весь текст в окне переписки
+        // сместился бы вверх ровно на столько же (это и есть «дёргание» на
+        // телефоне). Поэтому прокрутка сдвигается на ту же величину: строка под
+        // пальцем остаётся на месте, а появившееся место достаётся нижней части
+        // окна. Обратный переход компенсируется так же.
+        function setHeaderHidden(hidden) {
+            const header = document.querySelector('.chat-header');
+            if (!header) return;
+            const already = document.body.classList.contains('header-hidden');
+            if (already === !!hidden) return;
+            const before = messagesEl.getBoundingClientRect().top;
+            document.body.classList.toggle('header-hidden', !!hidden);
+            const after = messagesEl.getBoundingClientRect().top;
+            if (after !== before) messagesEl.scrollTop += (after - before);
+            headerToggledAt = Date.now();
+        }
+        ['touchstart', 'touchmove', 'wheel', 'pointerdown'].forEach((name) => {
+            messagesEl.addEventListener(name, () => { lastGestureAt = Date.now(); },
+                                        { passive: true });
+        });
+        document.addEventListener('keydown', (event) => {
+            if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ']
+                    .indexOf(event.key) !== -1) {
+                lastGestureAt = Date.now();
+            }
+        });
+        messagesEl.addEventListener('scroll', () => {
+            const top = messagesEl.scrollTop;
+            const delta = top - lastScrollTop;
+            lastScrollTop = top;
+            if (document.body.classList.contains('settings-open')) return;
+            if (Date.now() - lastGestureAt > 400) return;    // прокрутка не рукой
+            // Передышка после переключения: без неё мелкие колебания прокрутки на
+            // «инерции» пальца дёргали шапку туда-сюда.
+            if (Date.now() - headerToggledAt < 250) return;
+            if (delta > 12 && top > 60) {
+                setHeaderHidden(true);
+            } else if (delta < -12 || top <= 20) {
+                setHeaderHidden(false);
+            }
+        });
+
         sendBtn.addEventListener('click', send);
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') send();
@@ -9700,9 +10220,35 @@
         // на всё приложение и переживает перезапуск, поэтому состояние берём
         // сразу при открытии страницы, а не при первом переключении.
         loadLlmSource();
+        // Доступ: спрашивают ли пароль у этого клиента — от этого зависит
+        // кнопка «Выйти» в шапке (см. обёртку fetch и loadAccessState выше).
+        loadAccessState();
         setAgentMode(true);
         messagesEl.scrollTop = messagesEl.scrollHeight;
         input.focus();
     </script>
+    <!-- ===================== МОДАЛЬНЫЕ ОКНА =====================
+         Все модалки лежат ПРЯМО В BODY, а не внутри окна чата, и это не
+         вкусовщина. У .chat есть backdrop-filter (и overflow: hidden), а
+         backdrop-filter создаёт НОВЫЙ КОНТЕКСТ НАЛОЖЕНИЯ и новую содержащую
+         рамку для position: fixed. Из-за этого модалка с z-index 1000
+         оказывалась заперта внутри .chat: на телефоне выдвижная панель
+         (z-index 60) рисовалась ПОВЕРХ неё, и окно «открывалось в невидимой
+         зоне» — с ним нельзя было работать. Тем же свойством модалка
+         привязывалась к рамке .chat, а не к экрану.
+         Лежат они в конце body: порядок в разметке здесь ни на что не влияет,
+         все обращения к ним — по id. -->
+
+
+
+
+
+
+
+
+
+
+
+
 </body>
 </html>

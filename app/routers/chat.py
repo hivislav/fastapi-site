@@ -1667,7 +1667,7 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                          analyzer: Agent, state: "task_state.TaskState",
                          machine_step: bool = False, reuse: bool = False,
                          fresh: bool = False, approved: bool = False,
-                         resume_chain: bool = False
+                         resume_chain: bool = False, direct: bool = False
                          ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str], bool]:
     """Данные внешних инструментов MCP по запросу — ДО этапа планирования.
 
@@ -1830,16 +1830,58 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
         request_text, tools, started=started, chain_state=stored.get("chain"))
     usage = dict(analyzer.last_usage or {})
     calls = list(decision.get("calls") or [])
+    # Список вызовов ПОСЛЕ переспроса (см. ниже): None — переспроса ещё не было.
+    # Объявляем заранее: иначе ветка «диспетчер ничего не выбрал» обращалась бы к
+    # неопределённому имени, и запрос падал бы вместо ответа (поймано проверкой
+    # «сбой выбора не ломает ответ»).
+    retry: Optional[List[Dict[str, Any]]] = None
     signals = mcp_store.chain_signals(tools, request_text, expected=len(calls))
-    chain_mode = str(decision.get("mode") or "") == "chain" or bool(signals.get("needed"))
+    # В цикл уходим и по СТРУКТУРНОМУ признаку — «остались невызванные
+    # инструменты» (см. mcp_store.chain_possible). Раньше вход требовал текстовых
+    # маркеров или объявления модели, и цепочки с зависимостью по данным без
+    # слов-подсказок не начинались вовсе: «погода в городе человека» вызывала
+    # только список жителей, а второй вызов (прогноз по найденному городу) не
+    # делался — модель отвечала «погоды в данных нет». Признак общий: он не
+    # знает ни про погоду, ни про города, ни про конкретный сервер.
+    # Цена — один вопрос диспетчеру в первом раунде цикла; он же его и закрывает
+    # ответом «готово», поэтому лишних раундов не будет.
+    declared_chain = str(decision.get("mode") or "") == "chain"
+    # СТРУКТУРНАЯ проверка — для ИНТЕРАКТИВНОГО запроса. У периодических задач
+    # (fresh=True) своя отлаженная механика: повтор доигрывает СОХРАНЁННЫЕ вызовы
+    # без диспетчера, а автономный запуск отдельно просит ЧИТАЮЩИЙ вызов после
+    # запуска сбора. Лишний раунд цепочки там ломал бы и счёт служебных вызовов, и
+    # поведение повторов (проверено check_periodic: он ловит и то, и другое).
+    # ПЕРИОДИЧЕСКАЯ ЗАДАЧА — отдельный случай: у неё своя отлаженная механика
+    # (повтор доигрывает СОХРАНЁННЫЕ вызовы без диспетчера; автономный запуск
+    # отдельно просит читающий вызов после запуска сбора), и лишние раунды ломают
+    # и счёт служебных вызовов, и состав повтора (ловят check_periodic).
+    periodic_task = bool(session.get("periodic"))
+    structural_chain = (mcp_store.chain_possible(tools, calls)
+                        and not fresh and not periodic_task)
+    # ПИШУЩАЯ цепочка (просили сохранить/выгрузить, или так объявила модель) и
+    # ЧИТАЮЩАЯ (возможен следующий вызов-чтение по найденному значению).
+    # ПИШУЩЕЙ считается цепочка, которую просит САМ ЗАПРОС (маркеры «сохрани»,
+    # «выгрузи» + инструменты с обязательным идентификатором). Объявление модели
+    # (`mode: chain`) НЕ признак записи: в живом случае «погода в городе человека»
+    # модель объявила chain потому, что нужен второй ВЫЗОВ-ЧТЕНИЕ, а не запись —
+    # и, отложив такую цепочку до «ок», агент в пути прямого ответа (где
+    # подтверждения нет вовсе) оставался без погоды: город человека найден, а
+    # погоды по нему нет.
+    chain_mode = declared_chain or bool(signals.get("needed")) or structural_chain
     if chain_mode:
+        if mcp_store.chain_reason(signals):
+            why = mcp_store.chain_reason(signals)
+        elif declared_chain:
+            why = ("диспетчер объявил режим chain: следующий вызов зависит "
+                   "от результата предыдущего")
+        else:
+            why = ("остались невызванные инструменты — проверяю по результатам, "
+                   "не нужен ли следующий вызов (могут быть зависимости по "
+                   "данным: значение из результата нужно другому инструменту)")
         lines_pre.append(
-            "MCP: задача многошаговая — работаю цепочкой (до "
+            "MCP: задача может быть многошаговой — работаю цепочкой (до "
             f"{mcp_store.MAX_CHAIN_ITERATIONS} раундов и "
-            f"{mcp_store.MAX_TOTAL_CALLS_PER_REQUEST} вызовов). Причина: "
-            + (mcp_store.chain_reason(signals)
-               or "диспетчер объявил режим chain: следующий вызов зависит "
-                  "от результата предыдущего"))
+            f"{mcp_store.MAX_TOTAL_CALLS_PER_REQUEST} вызовов). Причина: " + why)
     # ВЫБОР ТОЛЬКО ИЗ ДЕЙСТВИЙ — это не данные: агенту нечего сказать по такому
     # ответу. Спрашиваем диспетчера ещё раз, прямо требуя ЧИТАЮЩИЙ вызов: запрос
     # «проверяй погоду раз в минуту» превращался в «зарегистрировать наблюдение»,
@@ -1884,6 +1926,32 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                     + ", ".join(f"{call['server']} · {call['tool']}" for call in calls)
                     + ").")
                 if str(retry.get("mode") or "") == "chain":
+                    chain_mode = True
+        # ВТОРОЙ ШАНС ОБЩЕГО ВИДА: диспетчер не выбрал ни одного вызова, а
+        # инструменты есть. Это не «запрос без данных», а решение, которое
+        # локальная модель принимает по-разному на один и тот же запрос: живой
+        # случай — «погода в городе человека» осталась без данных и без погоды,
+        # хотя для неё есть и список людей, и прогноз. Переспрашиваем ОДИН раз,
+        # объяснив, когда пустой ответ уместен (см. EMPTY_DECISION_NOTE).
+        # ... и только в ПРЯМОМ ОТВЕТЕ. У пути с планом и у периодических задач
+        # свои механизмы переспроса: «уговор» про результат (`deliver_note`,
+        # «ЗАПРОС ВЫПОЛНЕН НЕ ПОЛНОСТЬЮ») и просьба ЧИТАЮЩЕГО вызова после запуска
+        # сбора. Общий переспрос перехватывал у них очередь решений диспетчера и
+        # ломал их поведение (живой отказ check_mcp: «уточнений: 0» там, где
+        # уточнение обязано быть).
+        if not calls and retry is None and not fresh and not periodic_task and direct:
+            again = await analyzer.decide_mcp_tools(
+                request_text, tools, started=started,
+                extra=mcp_store.EMPTY_DECISION_NOTE)
+            usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+            if again.get("calls"):
+                calls = list(again["calls"])
+                lines_pre.append(
+                    "MCP: диспетчер ответил «данные не нужны», но запрос просит "
+                    "внешние данные — переспросил ("
+                    + ", ".join(f"{call['server']} · {call['tool']}" for call in calls)
+                    + ").")
+                if str(again.get("mode") or "") == "chain":
                     chain_mode = True
     if not calls:
         workspace_store.set_dialog_mcp(dialog, signature, request_text, [])
@@ -1980,11 +2048,26 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
                 + ", ".join(f"{call['server']} · {call['tool']}" for call in reads)
                 + ").")
             lines.append(mcp_store.results_note(fresh_results))
-    if chain_mode and not approved:
-        # ДО ПОДТВЕРЖДЕНИЯ ПЛАНА РАУНДЫ ЦЕПОЧКИ НЕ НУЖНЫ: данные для плана уже
-        # прочитаны, а результат (сохранение, выгрузка) всё равно откладывается до
-        # «ок» — значит спрашивать диспетчера не о чем, его предложения были бы
-        # тут же отложены. Каждый такой вопрос — целый вызов LLM с самым дорогим
+    # ГДЕ ЖДАТЬ «ок», А ГДЕ НЕТ. В пути с планом поведение прежнее: цепочка до
+    # подтверждения только ЧИТАЕТ и помечается не доигранной, а зависимые чтения
+    # продолжаются на первом шаге выполнения (проверяется check_mcp, раздел [10]).
+    # А в ПРЯМОМ ОТВЕТЕ плана и подтверждения нет вовсе, поэтому откладывать там
+    # — значит не выполнить никогда: ровно на этом споткнулся живой случай
+    # «погода в городе человека» (агент нашёл город по реестру и на этом закончил).
+    # Исключение — запрос, который ПРОСИТ РЕЗУЛЬТАТ (сохранить, выгрузить): у него
+    # есть своя механика «уговора» и доигрывания, и ломать её нельзя.
+    write_chain = bool(signals.get("needed"))
+    if chain_mode and not approved and not (direct and not write_chain):
+        # ДО ПОДТВЕРЖДЕНИЯ ПЛАНА ПИШУЩИЕ РАУНДЫ ЦЕПОЧКИ НЕ НУЖНЫ: данные для плана
+        # уже прочитаны, а результат (сохранение, выгрузка) всё равно откладывается
+        # до «ок» — значит спрашивать диспетчера не о чем, его предложения были бы
+        # тут же отложены.
+        # А ВОТ ЧИТАЮЩАЯ цепочка (структурный признак: остались невызванные
+        # инструменты) идёт СРАЗУ, в том числе до «ок»: таков путь прямого ответа,
+        # где подтверждения плана нет вовсе. Иначе «погода в городе человека»
+        # отвечала по списку жителей, не сделав второго вызова, — а второго шанса
+        # у неё не было. Побочные эффекты внутри цикла откладываются сами
+        # (`split_calls` при `approved=False`), поэтому читать безопасно. Каждый такой вопрос — целый вызов LLM с самым дорогим
         # промптом (живой замер: 5–8 тыс. входных токенов), и он тратился впустую.
         # Помечаем цепочку не доигранной: после «ок» её продолжит _resume_mcp_chain.
         keep_ids = mcp_store.extract_ids(results)
@@ -4166,6 +4249,10 @@ async def _rag_dialog_turn(question: str, *, memory: Dict[str, Any],
            "honest": rag_dialog.looks_like_no_data(answer)}
     # 4. ПАМЯТЬ ЗАДАЧИ: что пользователь уточнил, что зафиксировано. Сбой этого
     #    служебного вызова ответ не отменяет — память дополнит локальный разбор.
+    #    Перед ним — «ответ показан, ввод свободен» (см. тот же приём в прямом
+    #    ответе агента): мини-чат тоже не должен держать поле ввода, пока
+    #    досчитывается память.
+    yield {"type": "answer_ready"}
     async for event in _rag_memory_update(question, answer, memory, tracker):
         yield event
 
@@ -5092,7 +5179,8 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         mcp_data: List[Dict[str, Any]] = []
         if workspace_store.mcp_enabled(task_now):
             mcp_data, mcp_usage, mcp_lines, _ = await _preflight_mcp(
-                task_now, session_now, text, analyzer, state, approved=False)
+                task_now, session_now, text, analyzer, state, approved=False,
+                direct=True)
             total = merge_usage(total, mcp_usage)
             for line in mcp_lines:
                 yield {"type": "debug", "text": f"{_MACHINE}: {line}"}
@@ -5132,8 +5220,17 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
             hint = (" Повторите запрос." if not offer_plan else
                     (" Повторите запрос или отправьте его как задачу (вариант "
                      "«⚙ Разложить работу на шаги»)."))
+            # ПРИЧИНА ВАЖНЕЕ ФОРМУЛИРОВКИ: у локальной модели сбой вызова имеет
+            # конкретное объяснение (поток генерации умер, веса не нашлись,
+            # сервер не поднялся), и «вызов не удался» без него отправляло бы
+            # человека искать причину в запросе и документах (живой случай 09.10).
+            reason = ""
+            if config.llm_source() == "local":
+                reason = local_llm.broken_reason() or local_llm.status()["hint"]
+            reason_text = f" Причина: {reason}" if reason else ""
             yield {"type": "error",
-                   "text": "⚠ Ответа от модели нет: вызов не удался." + hint}
+                   "text": "⚠ Ответа от модели нет: вызов не удался."
+                           + reason_text + hint}
             yield {"type": "usage",
                    "usage": merge_usage(total, tracker.usage_snapshot())}
             return
@@ -5143,6 +5240,14 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                "sources": rag_search.sources(rag_data), "hits": len(hits),
                "cited": rag_dialog.has_citation(answer),
                "bad_cites": rag_dialog.bad_citations(answer, len(hits))}
+        # ОТВЕТ ПОКАЗАН — ВВОД СВОБОДЕН. Дальше идёт СЛУЖЕБНАЯ работа (память
+        # задачи, варианты продолжения) своим вызовом модели, и на локальной
+        # модели она занимает секунды: поток держал поле ввода занятым до самого
+        # конца, и человек, уже читая ответ, ещё несколько секунд видел «AI-агент
+        # думает…» и не мог писать (живая жалоба 10.10). Интерфейс освобождает
+        # ввод по этому событию, а кнопки памяти и варианты дорисуются, когда
+        # подоспеют.
+        yield {"type": "answer_ready"}
         # 5. ПАМЯТЬ ЗАДАЧИ — как в мини-чате: цель, уточнения, ограничения.
         async for event in _rag_memory_update(text, answer, memory_now, tracker):
             yield event

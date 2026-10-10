@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Вход — Чат-бот</title>
+    <!--
+      Страница входа (гейт доступа из внешней сети, см. app/auth.py).
+
+      Отдельный самодостаточный файл НАМЕРЕННО: она отдаётся до входа, когда
+      не доступен ни один другой ресурс приложения, поэтому не может опираться
+      ни на chat.html, ни на его стили. Палитра — та же, что у чата (тёмный фон,
+      матричный зелёный), чтобы вход не выглядел чужим сайтом.
+
+      Скрипт здесь ровно один и делает одно: отправляет логин и пароль на
+      /api/auth/login и уходит на главную. Пароль не хранится ни в localStorage,
+      ни в адресной строке.
+    -->
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #05070a;
+            --surface: rgba(10, 15, 21, 0.94);
+            --line: rgba(0, 255, 157, 0.20);
+            --line-strong: rgba(0, 255, 157, 0.45);
+            --text: #d9f7ec;
+            --text-dim: #8fb0a8;
+            --accent: #22d3ee;
+            --accent-hover: #67e8f9;
+            --accent-2: #00ff9c;
+            --danger: #ff6b81;
+            --warn: #ffb020;
+            --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            background: radial-gradient(1200px 600px at 50% -10%, rgba(0, 255, 157, 0.08), transparent 60%), var(--bg);
+            color: var(--text);
+            font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        .card {
+            width: 100%;
+            max-width: 380px;
+            padding: 26px 24px 22px;
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            background: var(--surface);
+            box-shadow: 0 0 0 1px var(--line), 0 18px 48px rgba(0, 0, 0, 0.6);
+        }
+        .head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+        .avatar { font-size: 26px; }
+        h1 { margin: 0; font-size: 19px; letter-spacing: 0.02em; color: var(--accent-2); }
+        .sub { margin: 0 0 18px; color: var(--text-dim); font-size: 13px; }
+        label { display: block; margin: 12px 0 6px; color: var(--text-dim); font-size: 12px;
+                text-transform: uppercase; letter-spacing: 0.08em; }
+        input {
+            width: 100%;
+            padding: 11px 12px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: rgba(5, 8, 12, 0.9);
+            color: var(--text);
+            font: inherit;
+        }
+        input:focus { outline: none; border-color: var(--line-strong); box-shadow: 0 0 0 3px rgba(0, 255, 157, 0.10); }
+        .pass-row { display: flex; gap: 8px; align-items: stretch; }
+        .pass-row input { flex: 1; }
+        .reveal {
+            flex: 0 0 auto;
+            width: 46px;
+            margin: 0;
+            padding: 0;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            background: rgba(5, 8, 12, 0.9);
+            color: var(--text-dim);
+            font-size: 17px;
+            cursor: pointer;
+        }
+        .reveal:hover { border-color: var(--line-strong); color: var(--accent-2); }
+        .reveal.on { border-color: var(--accent-2); color: var(--accent-2); }
+        button {
+            width: 100%;
+            margin-top: 20px;
+            padding: 12px 14px;
+            border: 1px solid var(--line-strong);
+            border-radius: 10px;
+            background: rgba(0, 255, 157, 0.12);
+            color: var(--accent-2);
+            font: inherit;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        button:hover:not(:disabled) { background: rgba(0, 255, 157, 0.20); }
+        button:disabled { opacity: 0.6; cursor: default; }
+        .note { margin-top: 16px; font-size: 13px; line-height: 1.5; }
+        .note.error { color: var(--danger); }
+        .note.warn { color: var(--warn); }
+        .note.hint { color: var(--text-dim); }
+        .note a { color: var(--accent); }
+        .mono { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+    </style>
+</head>
+<body>
+    <form class="card" id="login-form" autocomplete="on">
+        <div class="head">
+            <span class="avatar">🤖</span>
+            <h1>Чат-бот</h1>
+        </div>
+        <p class="sub">Вход в закрытую часть: сайт доступен из внешней сети, поэтому спрашивает пароль.</p>
+
+        <label for="user">Логин</label>
+        <input id="user" name="user" type="text" autocomplete="username" autocapitalize="none"
+               autocorrect="off" spellcheck="false" required>
+
+        <label for="password">Пароль</label>
+        <!-- Автозаглавные буквы и автозамена у пароля выключены ЯВНО: пароль
+             регистрозависимый, а телефонная клавиатура умеет незаметно
+             подставить заглавную первую букву или «поправить» слово. Кнопка
+             «показать» нужна затем, чтобы человек увидел, что набрал на самом
+             деле, а не гадал, почему верный пароль не подходит. -->
+        <div class="pass-row">
+            <input id="password" name="password" type="password" autocomplete="current-password"
+                   autocapitalize="none" autocorrect="off" spellcheck="false" required>
+            <button type="button" id="reveal" class="reveal"
+                    title="Показать пароль, чтобы проверить, что набрано" aria-label="Показать пароль">👁</button>
+        </div>
+
+        <button id="submit" type="submit">Войти</button>
+        <div class="note hint" id="note" hidden></div>
+        <div class="note mono">Пароль задаётся в <code>.env</code> (ACCESS_USER / ACCESS_PASSWORD) на самом маке.
+            Пароль — латинские буквы и цифры (кириллица не подойдёт).</div>
+    </form>
+
+    <script>
+        const form = document.getElementById('login-form');
+        const userInput = document.getElementById('user');
+        const passwordInput = document.getElementById('password');
+        const submitBtn = document.getElementById('submit');
+        const revealBtn = document.getElementById('reveal');
+        const note = document.getElementById('note');
+
+        // «Показать пароль»: телефонная клавиатура ошибается незаметно (регистр,
+        // кириллица вместо латиницы, автозамена), и человеку нужен способ
+        // увидеть, что он набрал на самом деле.
+        revealBtn.addEventListener('click', () => {
+            const shown = passwordInput.type === 'text';
+            passwordInput.type = shown ? 'password' : 'text';
+            revealBtn.classList.toggle('on', !shown);
+            revealBtn.title = shown ? 'Показать пароль' : 'Скрыть пароль';
+            passwordInput.focus();
+        });
+
+        function showNote(text, kind) {
+            note.textContent = text;
+            note.className = 'note ' + kind;
+            note.hidden = false;
+        }
+
+        // Состояние доступа: уже вошли — сразу на главную (повторный вход не
+        // нужен), вход не настроен — говорим об этом прямо, а не «неверный
+        // пароль» (иначе владелец искал бы ошибку в пароле вместо .env).
+        async function loadState() {
+            try {
+                const res = await fetch('/api/auth/state', { headers: { 'Accept': 'application/json' } });
+                if (!res.ok) return;
+                const state = await res.json();
+                if (state.authenticated) { location.replace('/'); return; }
+                if (!state.enabled) {
+                    showNote('Вход не настроен на сервере: в .env не задан ACCESS_PASSWORD — '
+                             + 'доступ из внешней сети закрыт.', 'warn');
+                }
+            } catch (e) { /* сервер недоступен — скажет сама попытка входа */ }
+        }
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            submitBtn.disabled = true;
+            note.hidden = true;
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    // Пробелы по краям срезаем на месте: их незаметно добавляет
+                    // копирование из сообщения или заметки, и «верный» пароль
+                    // уходил бы на сервер с лишним символом. Сервер делает то же
+                    // самое (app/auth.py, normalize_secret) — на случай других
+                    // клиентов.
+                    body: JSON.stringify({ user: userInput.value.trim(),
+                                           password: passwordInput.value.trim() })
+                });
+                if (res.ok) {
+                    passwordInput.value = '';
+                    location.replace('/');
+                    return;
+                }
+                let detail = '';
+                try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                if (res.status === 429) {
+                    showNote(detail || 'Слишком много неудачных попыток входа. Подождите.', 'warn');
+                } else {
+                    showNote(detail || 'Не удалось войти.', res.status === 401 ? 'error' : 'warn');
+                }
+            } catch (e) {
+                showNote('Ошибка связи с сервером. Проверьте, что приложение запущено.', 'error');
+            } finally {
+                submitBtn.disabled = false;
+                passwordInput.focus();
+            }
+        });
+
+        userInput.focus();
+        loadState();
+    </script>
+</body>
+</html>

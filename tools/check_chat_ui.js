@@ -741,6 +741,30 @@ function jsonResponse(data, ok) {
   return { ok: ok !== false, status: ok === false ? 400 : 200,
     json: async () => data, text: async () => JSON.stringify(data) };
 }
+
+// ДОСТУП ИЗ ВНЕШНЕЙ СЕТИ (гейт доступа, app/auth.py). Интерфейс спрашивает у
+// сервера, спрашивают ли пароль у ЭТОГО клиента (`required`) — от этого зависит
+// кнопка «Выйти» в шапке: локально пароль не спрашивают, и кнопка была бы
+// мёртвой. Здесь же видно, что «Выйти» действительно снимает вход на сервере.
+const ACCESS_STATE = {
+  enabled: true,
+  authenticated: true,
+  user: 'user',
+  local: false,
+  required: true,
+  states: 0,
+  logouts: 0,
+};
+
+function accessPayload() {
+  return {
+    enabled: ACCESS_STATE.enabled,
+    authenticated: ACCESS_STATE.authenticated,
+    user: ACCESS_STATE.user,
+    local: ACCESS_STATE.local,
+    required: ACCESS_STATE.required,
+  };
+}
 // Поток с ЗАДЕРЖКОЙ между событиями: нужен, чтобы проверить, что интерфейс
 // показывает прогон ПО МЕРЕ ПОЯВЛЕНИЯ, а не всё в конце (живой дефект 03.10:
 // gzip копил куски у Starlette, и прогон «молчал» до конца — см. main.py).
@@ -761,6 +785,9 @@ let dialogTestDelay = 0;   // задержка потока контрольно
 // [S2]/[V] проверяют путь с планом и пустой поиск, и включают его только те
 // проверки, которые проверяют сам гейт («вопрос — прямой ответ»).
 let DIRECT_ANSWER = false;
+// Медленный поток прямого ответа: сервер после текста ответа досчитывает память
+// задачи и варианты, и проверка смотрит на состояние поля ввода В ЭТОТ момент.
+let DIRECT_SLOW = false;
 
 function streamResponse(events) {
   const lines = events.map(e => JSON.stringify(e) + '\n');
@@ -878,6 +905,17 @@ function makeFetch() {
     const body = typeof rawBody === 'string' ? JSON.parse(rawBody) : {};
 
     if (url === '/api/agent/workspace') return jsonResponse(workspacePayload());
+    // Гейт доступа: состояние спрашивается при открытии страницы, выход —
+    // обычный POST, который снимает куку входа на сервере.
+    if (url === '/api/auth/state' && method === 'GET') {
+      ACCESS_STATE.states += 1;
+      return jsonResponse(accessPayload());
+    }
+    if (url === '/api/auth/logout' && method === 'POST') {
+      ACCESS_STATE.logouts += 1;
+      ACCESS_STATE.authenticated = false;
+      return jsonResponse({ ok: true });
+    }
     // Источник ответа (переключатель «локальная / удалённая модель»): состояние
     // отдаёт СЕРВЕР, интерфейс его только рисует. Ответ на переключение — то же
     // состояние, но с запускающимся локальным сервером (веса читаются десятки
@@ -1416,10 +1454,13 @@ function makeFetch() {
             + 'её можно разложить на шаги.',
             options: [{ title: '⚙ Разложить работу на шаги', details: 'план',
               send: requestText + ', разложи на шаги' }] } });
-        return streamResponse([
+        const directEvents = [
           { type: 'state', state: snapshot() },
           { type: 'debug', text: 'Автомат задачи: плана не будет — работа в один шаг.' },
           { type: 'bot', text: directText, sources: RAG_SOURCES || [] },
+          // Как на сервере: ответ показан — ввод свободен, а служебная работа
+          // (память задачи, варианты) идёт ПОСЛЕ этого события.
+          { type: 'answer_ready' },
           { type: 'choices',
             text: 'Если это была работа, а не вопрос, её можно разложить на шаги.',
             options: [{ title: '⚙ Разложить работу на шаги', details: 'план',
@@ -1431,7 +1472,11 @@ function makeFetch() {
           { type: 'usage', usage: usage({ requests: 2, input: 30, output: 12 }) },
           { type: 'done', usage: usage({ requests: 2, input: 30, output: 12 }),
             state: snapshot() },
-        ]);
+        ];
+        // Медленный поток — чтобы проверка успела заглянуть в состояние поля
+        // ввода между ответом и концом служебной работы.
+        return DIRECT_SLOW ? streamResponseSlow(directEvents, 150)
+                           : streamResponse(directEvents);
       }
       if (!body.continue_step && /веб/i.test(requestText)) {
         LAST_ANALYSIS = {
@@ -1611,6 +1656,44 @@ function declaredStyle(el, prop) {
     }
   }
   return best ? best.value : '';
+}
+
+// Правила ВНУТРИ мобильного медиазапроса. Отдельный разбор нужен потому, что
+// declaredStyle() (для обычного каскада) медиаправила пропускает: у CSSMediaRule
+// нет selectorText, и он их не видит — а вся мобильная вёрстка живёт именно там.
+function mobileMediaRules() {
+  const found = [];
+  const sheets = dom.window.document.styleSheets;
+  for (let i = 0; i < sheets.length; i++) {
+    let rules;
+    try { rules = sheets[i].cssRules; } catch (e) { continue; }
+    for (let j = 0; j < rules.length; j++) {
+      const rule = rules[j];
+      const inner = rule.cssRules;
+      if (!inner) continue;
+      const text = (rule.media && rule.media.mediaText) || rule.conditionText || '';
+      if (!/max-width:\s*1024px/.test(text)) continue;
+      for (let k = 0; k < inner.length; k++) found.push(inner[k]);
+    }
+  }
+  return found;
+}
+
+// Значение свойства для селектора внутри мобильного медиазапроса (пусто — такого
+// правила нет). Селекторы в правиле бывают СПИСКОМ (`body.drawer-open .x,
+// body.stats-open .x { … }`), поэтому правило подходит, если искомый селектор
+// совпадает со всем списком или с любой его частью.
+function mobileStyle(selector, prop) {
+  const rules = mobileMediaRules();
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i];
+    if (!rule.style || !rule.selectorText) continue;
+    const parts = rule.selectorText.split(',').map(part => part.trim());
+    if (parts.indexOf(selector) === -1 && rule.selectorText.trim() !== selector) continue;
+    const value = rule.style.getPropertyValue(prop);
+    if (value) return value.trim();
+  }
+  return '';
 }
 
 async function click(el, ms) {
@@ -4529,6 +4612,40 @@ async function run() {
     withSources.length >= 1
     && withSources[withSources.length - 1].textContent.indexOf('📄 Источники:') >= 0,
     'ответов: ' + answerNodes.length + ', с источниками: ' + withSources.length);
+  // ВВОД СВОБОДЕН СРАЗУ ПОСЛЕ ОТВЕТА (правка 10.10). Живая жалоба: человек уже
+  // читает ответ, а поле ввода ещё занято и написано «AI-агент думает…» — потому
+  // что сервер после текста ответа досчитывает память задачи отдельным вызовом
+  // модели, и поток остаётся открытым. Проверяем на МЕДЛЕННОМ потоке: ответ
+  // пришёл, поток ещё открыт, а ввод уже доступен.
+  const callsBeforeReady = chatCalls();
+  // Чистое состояние: у задачи не должно быть идущего прогона шагов (в этом
+  // разделе выше его оставляли), иначе поле ввода занято по другой причине.
+  dom.window.eval('chains.clear()');
+  setState({ stage: 'planning', base_stage: 'planning', steps: [],
+             expected_action: 'составь план и подтверди его у пользователя' });
+  dom.window.eval('applyTaskState(' + JSON.stringify(snapshot()) + ')');
+  DIRECT_ANSWER = true;
+  DIRECT_SLOW = true;
+  $('input').value = 'Как быстро приезжает Trauma Team после вызова?';
+  $('input').dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+  $('send').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  // Поток отдаёт по событию каждые ~150 мс: ответ приходит к 300 мс, «ответ
+  // показан» — к 450, конец потока — к 900. Смотрим в промежуток между ними.
+  await wait(560);
+  check('ответ показан, а поток ещё открыт (проверка началась в нужный момент)',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('Trauma Team') >= 0),
+    'ответов: ' + q('#messages .msg.bot').length);
+  check('ВВОД СВОБОДЕН сразу после ответа (не ждём служебную работу)',
+    $('input').disabled === false, $('input').placeholder);
+  await wait(900);   // ждём конца потока: варианты дорисовались
+  check('после конца потока ввод по-прежнему свободен', $('input').disabled === false,
+    $('input').placeholder);
+  check('служебные варианты дорисовались после освобождения ввода',
+    q('#messages .inv-option').some(el => el.textContent.indexOf('на шаги') >= 0),
+    'вариантов: ' + q('#messages .inv-option').length);
+  DIRECT_SLOW = false;
+  DIRECT_ANSWER = false;
+
   check('в чате сказано, что плана не будет (решение кода видно)',
     q('#messages .msg.debug').some(el => el.textContent.indexOf('плана не будет') >= 0));
   check('под ответом есть вариант «разложить на шаги» (кликабельный)',
@@ -4917,6 +5034,326 @@ async function run() {
   LLM_STATE.ready = true;
   LLM_STATE.error = null;
   dom.window.eval('stopLlmPoll()');
+
+  console.log('\n[A1] Доступ из внешней сети: кнопка «Выйти» появляется по ответу сервера');
+  // Кнопка скрыта В РАЗМЕТКЕ: пока сервер не сказал «пароль спрашивают»,
+  // показывать её нельзя — локально она ничего не значит.
+  const logoutBtn = $('logout-btn');
+  check('кнопка «Выйти» есть в шапке', !!logoutBtn, String(logoutBtn));
+  check('страница спросила состояние доступа у сервера', ACCESS_STATE.states >= 1,
+    String(ACCESS_STATE.states));
+  check('снаружи (required) кнопка «Выйти» показана', logoutBtn.hidden === false,
+    'hidden=' + logoutBtn.hidden);
+  check('в подсказке кнопки назван вошедший пользователь',
+    logoutBtn.title.includes('user'), logoutBtn.title);
+
+  await click(logoutBtn, 40);
+  check('клик по «Выйти» снимает вход на сервере (POST /api/auth/logout)',
+    ACCESS_STATE.logouts === 1, String(ACCESS_STATE.logouts));
+
+  // Локально пароль не спрашивают — кнопка обязана снова спрятаться: иначе она
+  // обещала бы выход, которого нет.
+  ACCESS_STATE.required = false;
+  ACCESS_STATE.local = true;
+  dom.window.eval('loadAccessState()');
+  await wait(40);
+  check('локально (пароль не спрашивают) кнопка «Выйти» скрыта',
+    logoutBtn.hidden === true, 'hidden=' + logoutBtn.hidden);
+  check('повторный опрос состояния не отправил лишний выход',
+    ACCESS_STATE.logouts === 1, String(ACCESS_STATE.logouts));
+  ACCESS_STATE.required = true;
+  ACCESS_STATE.local = false;
+  dom.window.eval('loadAccessState()');
+  await wait(40);
+  check('возврат к внешнему входу снова показывает кнопку',
+    logoutBtn.hidden === false, 'hidden=' + logoutBtn.hidden);
+
+  console.log('\n[H3h] Новая задача во время прогона: поле ввода должно быть свободно');
+  // Живая жалоба с телефона: после «Новая задача» поле ввода надолго оставалось
+  // неактивным, и вторую задачу нельзя было запустить, пока идёт первая.
+  await dom.window.eval("selectSession('s-2')");
+  await wait(80);
+  setState({
+    stage: 'execution', base_stage: 'execution',
+    steps: [{ text: 'X' }, { text: 'Y' }, { text: 'Z' }],
+    steps_total: 3, step_index: 0, step_number: 1, current_step: 'step_1',
+    expected_action: 'выполнить: X',
+  });
+  dom.window.eval('applyTaskState(' + JSON.stringify(snapshot()) + ')');
+  STEP_DELAY = 200;
+  dom.window.eval('noChainFor.clear()');
+  dom.window.eval('runStepChain()');
+  await wait(60);
+  check('прогон в открытой задаче идёт', dom.window.eval('chains.size') >= 1,
+    String(dom.window.eval('chains.size')));
+  check('во время прогона поле ввода занято (так и задумано)',
+    $('input').disabled === true, $('input').placeholder);
+
+  const runningSession = workspace.active_session;
+  await click($('session-new'), 120);
+  check('новая задача создана', workspace.active_session !== runningSession,
+    workspace.active_session);
+  check('ПОСЛЕ создания задачи поле ввода СВОБОДНО (вторую задачу можно запускать)',
+    $('input').disabled === false,
+    `disabled=${$('input').disabled}, switching=${dom.window.eval('switching')}, `
+    + `paused=${dom.window.eval('!!(taskMachineState && taskMachineState.paused)')}, `
+    + `chainHere=${dom.window.eval('chains.has(workspace.active_session)')}, `
+    + `requestHere=${dom.window.eval('requestBusyHere()')}`);
+  check('прогон прежней задачи при этом не остановлен',
+    dom.window.eval('chains.size') >= 1, String(dom.window.eval('chains.size')));
+  STEP_DELAY = 5;
+  for (let i = 0; i < 120 && dom.window.eval('chains.size') > 0; i++) await wait(20);
+  dom.window.eval('noChainFor.clear()');
+
+  console.log('\n[M1] Мобильная вёрстка: боковые панели — выдвижные ящики');
+  // Раньше на узком экране боковая панель получала display:none, и с телефона
+  // пропадали проекты, задачи и профиль. Проверяются и правила (в медиазапросе),
+  // и само поведение кнопок.
+  const mobile = mobileMediaRules();
+  check('мобильный медиазапрос есть (до 1024px)', mobile.length > 0,
+    String(mobile.length));
+  check('в мобильной вёрстке layout — одна колонка',
+    mobileStyle('.layout', 'grid-template-columns') === '1fr',
+    mobileStyle('.layout', 'grid-template-columns'));
+  check('высота мобильного layout считается в dvh (адресная строка телефона)',
+    mobileStyle('.layout', 'height').includes('100dvh'),
+    mobileStyle('.layout', 'height'));
+  check('боковая панель больше НЕ прячется, а сдвигается за край',
+    mobileStyle('.sidebar', 'position') === 'fixed'
+    && mobileStyle('.sidebar', 'transform') === 'translateX(-102%)',
+    mobileStyle('.sidebar', 'position') + ' / ' + mobileStyle('.sidebar', 'transform'));
+  check('открытый ящик возвращает панель на экран',
+    mobileStyle('body.drawer-open .sidebar', 'transform') === 'none',
+    mobileStyle('body.drawer-open .sidebar', 'transform'));
+  check('панель токенов — тоже ящик (справа), и открывается своим классом',
+    mobileStyle('.stats', 'position') === 'fixed'
+    && mobileStyle('.stats', 'transform') === 'translateX(103%)'
+    && mobileStyle('body.stats-open .stats:not([hidden])', 'transform') === 'none',
+    mobileStyle('.stats', 'transform'));
+  check('подложка показывается только при открытом ящике',
+    mobileStyle('body.drawer-open .drawer-backdrop', 'display') === 'block'
+    && mobileStyle('body.stats-open .drawer-backdrop', 'display') === 'block',
+    mobileStyle('body.drawer-open .drawer-backdrop', 'display'));
+  check('кнопки ящиков на широком экране скрыты (панели и так на месте)',
+    declaredStyle($('drawer-toggle'), 'display') === 'none'
+    && declaredStyle($('stats-toggle'), 'display') === 'none',
+    declaredStyle($('drawer-toggle'), 'display'));
+  check('кнопки «☰», «⚙» и «📊» в мобильной вёрстке показаны',
+    mobileStyle('.drawer-toggle', 'display') === 'inline-flex'
+    && mobileStyle('.stats-toggle', 'display') === 'inline-flex'
+    && mobileStyle('.settings-toggle', 'display') === 'inline-flex',
+    mobileStyle('.stats-toggle', 'display'));
+  check('поле ввода 16px — иначе iOS приближает страницу при фокусе',
+    mobileStyle('.input-row input', 'font-size') === '16px',
+    mobileStyle('.input-row input', 'font-size'));
+  check('модалки на телефоне занимают ширину экрана и прокручиваются внутри',
+    mobileStyle('.modal-box', 'width') === '100%'
+    && mobileStyle('.modal-box', 'overflow-y') === 'auto',
+    mobileStyle('.modal-box', 'width'));
+  check('полоса этапов прокручивается вбок, а не сжимается',
+    mobileStyle('.task-machine .tm-track', 'overflow-x') === 'auto'
+    && mobileStyle('.tm-block', 'min-width') === '92px',
+    mobileStyle('.task-machine .tm-track', 'overflow-x'));
+  // Кнопки «Пауза»/«Отменить» стояли в одной строке с этапами и наезжали на них.
+  check('кнопки задачи уходят на СВОЮ строку под этапами',
+    mobileStyle('.task-machine .tm-track', 'flex-basis') === '100%'
+    && mobileStyle('.task-machine .tm-actions', 'flex-basis') === '100%'
+    && mobileStyle('.task-machine .tm-actions', 'display') === 'flex',
+    mobileStyle('.task-machine .tm-actions', 'flex-basis'));
+  check('кнопки задачи делят строку поровну и не переносят подписи',
+    mobileStyle('.task-machine .tm-actions button', 'flex-grow') === '1'
+    && mobileStyle('.task-machine .tm-actions button', 'white-space') === 'nowrap',
+    mobileStyle('.task-machine .tm-actions button', 'flex-grow'));
+  check('строка этапов становится якорем, когда шапка уехала',
+    mobileStyle('body.header-hidden .task-machine', 'box-shadow') !== ''
+    && mobileStyle('body.header-hidden .task-machine .tm-meta', 'display') === 'none',
+    mobileStyle('body.header-hidden .task-machine', 'box-shadow'));
+  check('у полей ввода учтена «домашняя полоса» айфона (safe-area)',
+    mobileStyle('.input-row', 'padding-bottom').includes('safe-area-inset-bottom'),
+    mobileStyle('.input-row', 'padding-bottom'));
+
+  // Шапка на телефоне: замер настоящим движком (WebKit, 390x844) показал, что
+  // кнопки режимов, три кнопки типа задачи и три поля параметров растягивали её
+  // до 352px из 844 — 42% экрана. Теперь это прячется за «⚙».
+  check('режим, тип задачи и параметры спрятаны в шапке по умолчанию',
+    mobileStyle('#expert-toggle', 'display') === 'none'
+    && mobileStyle('#agent-toggle', 'display') === 'none'
+    && mobileStyle('.chat-header .session-mode', 'display') === 'none'
+    && mobileStyle('.chat-header .chat-settings', 'display') === 'none',
+    mobileStyle('.chat-header .chat-settings', 'display'));
+  check('по «⚙» они показываются',
+    mobileStyle('body.settings-open #expert-toggle', 'display') === 'inline-flex'
+    && mobileStyle('body.settings-open .chat-header .chat-settings', 'display') === 'flex',
+    mobileStyle('body.settings-open .chat-header .chat-settings', 'display'));
+  check('подпись «Токены» на телефоне скрыта (важна каждая полоса ширины)',
+    mobileStyle('.stats-toggle .btn-label', 'display') === 'none',
+    mobileStyle('.stats-toggle .btn-label', 'display'));
+  // jsdom нормализует значения (0 -> 0px, 1 1 0 -> 1 1 0px), поэтому сверяем
+  // смысл, а не написание.
+  const zero = (value) => value === '0' || value === '0px';
+  check('шапка уезжает при прокрутке, полоса задачи остаётся на виду',
+    zero(mobileStyle('body.header-hidden .chat-header', 'max-height'))
+    && mobileStyle('.task-machine', 'padding') === '6px 10px',
+    mobileStyle('body.header-hidden .chat-header', 'max-height'));
+  check('подсказка про план в полосе задачи на телефоне скрыта',
+    mobileStyle('.task-machine .tm-plan', 'display') === 'none',
+    mobileStyle('.task-machine .tm-plan', 'display'));
+  check('поле ввода занимает строку целиком, кнопки уходят под него',
+    mobileStyle('.input-row input', 'flex-basis') === '100%'
+    && mobileStyle('.input-row button', 'flex-grow') === '1'
+    && zero(mobileStyle('.input-row button', 'flex-basis'))
+    && mobileStyle('.input-row button', 'white-space') === 'nowrap',
+    mobileStyle('.input-row input', 'flex-basis') + ' / '
+    + mobileStyle('.input-row button', 'flex-basis'));
+
+  // МОДАЛКИ ЛЕЖАТ ПРЯМО В BODY. У .chat есть backdrop-filter, а он создаёт новый
+  // контекст наложения: модалка с z-index 1000 оказывалась заперта внутри .chat,
+  // и выдвижная панель (z-index 60) рисовалась поверх неё — окно «открывалось в
+  // невидимой зоне». Проверяем и структуру, и что выше всех именно модалка.
+  const overlays = Array.from(dom.window.document.querySelectorAll('.modal-overlay'));
+  check('все модальные окна — прямые дети body (иначе их перекрывает панель)',
+    overlays.length > 0
+    && overlays.every((el) => el.parentElement === dom.window.document.body),
+    overlays.filter((el) => el.parentElement !== dom.window.document.body)
+      .map((el) => el.id + '<-' + el.parentElement.className).join(', '));
+  check('у модалок z-index выше выдвижных панелей',
+    mobileStyle('.drawer-backdrop', 'z-index') === '50'
+    && mobileStyle('.sidebar', 'z-index') === '60'
+    && mobileStyle('.stats', 'z-index') === '70'
+    && declaredStyle(overlays[0], 'z-index') === '1000',
+    declaredStyle(overlays[0], 'z-index'));
+
+  check('кнопка «☰» есть в шапке', !!$('drawer-toggle'));
+  check('кнопка «📊 Токены» есть в шапке', !!$('stats-toggle'));
+  check('ящики закрыты при открытии страницы',
+    !dom.window.document.body.classList.contains('drawer-open')
+    && !dom.window.document.body.classList.contains('stats-open'));
+
+  await click($('drawer-toggle'), 20);
+  check('клик по «☰» открывает ящик с задачами',
+    dom.window.document.body.classList.contains('drawer-open'));
+  await click($('stats-toggle'), 20);
+  check('клик по «📊» открывает панель токенов и закрывает первый ящик',
+    dom.window.document.body.classList.contains('stats-open')
+    && !dom.window.document.body.classList.contains('drawer-open'),
+    dom.window.document.body.className);
+  await click($('drawer-backdrop'), 20);
+  check('нажатие на подложку закрывает ящик',
+    !dom.window.document.body.classList.contains('stats-open')
+    && !dom.window.document.body.classList.contains('drawer-open'));
+
+  await click($('drawer-toggle'), 20);
+  dom.window.document.dispatchEvent(new dom.window.KeyboardEvent('keydown', {
+    key: 'Escape', bubbles: true,
+  }));
+  check('Escape закрывает ящик',
+    !dom.window.document.body.classList.contains('drawer-open'));
+
+  await click($('drawer-toggle'), 20);
+  $('sessions').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await wait(20);
+  check('выбор задачи в ящике закрывает ящик',
+    !dom.window.document.body.classList.contains('drawer-open'));
+
+  await click($('drawer-toggle'), 20);
+  await click($('drawer-toggle'), 20);
+  check('повторный клик по «☰» закрывает ящик (кнопка работает как переключатель)',
+    !dom.window.document.body.classList.contains('drawer-open'));
+  dom.window.eval('closeDrawers()');   // страница возвращается в исходное состояние для других проверок
+
+  // Настройки по «⚙»: открываются, повторный клик закрывает.
+  await click($('settings-toggle'), 20);
+  check('клик по «⚙» открывает настройки чата',
+    dom.window.document.body.classList.contains('settings-open'));
+  await click($('settings-toggle'), 20);
+  check('повторный клик по «⚙» закрывает настройки',
+    !dom.window.document.body.classList.contains('settings-open'));
+
+  // Кнопка «назад» телефона: слой кладёт запись в историю, «назад» её снимает.
+  // Без этого «назад» выбрасывал человека с сайта, а окно оставалось открытым.
+  const pushes = [];
+  const realPush = dom.window.history.pushState.bind(dom.window.history);
+  dom.window.history.pushState = function (...args) { pushes.push(args); return realPush(...args); };
+  await click($('drawer-toggle'), 20);
+  check('открытие ящика кладёт запись в историю (для кнопки «назад»)',
+    pushes.length === 1, String(pushes.length));
+  check('повторное открытие другой панели НЕ кладёт вторую запись',
+    (await click($('stats-toggle'), 20), pushes.length === 1), String(pushes.length));
+  dom.window.dispatchEvent(new dom.window.PopStateEvent('popstate'));
+  await wait(20);
+  check('«назад» закрывает открытый слой, а не уводит с сайта',
+    !dom.window.document.body.classList.contains('stats-open')
+    && !dom.window.document.body.classList.contains('drawer-open'));
+  dom.window.history.pushState = realPush;
+
+  // Уход шапки при прокрутке переписки вниз и возврат при прокрутке вверх.
+  const messagesBox = $('messages');
+  const gesture = () => messagesBox.dispatchEvent(new dom.window.Event('wheel'));
+  gesture();
+  messagesBox.scrollTop = 300;
+  messagesBox.dispatchEvent(new dom.window.Event('scroll'));
+  check('прокрутка переписки вниз убирает шапку',
+    dom.window.document.body.classList.contains('header-hidden'));
+  await wait(300);   // передышка после переключения (см. headerToggledAt)
+  gesture();
+  messagesBox.scrollTop = 100;
+  messagesBox.dispatchEvent(new dom.window.Event('scroll'));
+  check('прокрутка вверх возвращает шапку',
+    !dom.window.document.body.classList.contains('header-hidden'));
+  // Перерисовка страницы ставит прокрутку сама (в начало или в конец) и шапку
+  // дёргать не должна: без жеста состояние не меняется. Ждём, пока окно
+  // «после жеста» истечёт (400 мс), иначе прокрутка всё ещё считается рукой.
+  await wait(450);
+  dom.window.document.body.classList.add('header-hidden');
+  messagesBox.scrollTop = 0;
+  messagesBox.dispatchEvent(new dom.window.Event('scroll'));
+  check('программная прокрутка (перерисовка) шапку НЕ возвращает',
+    dom.window.document.body.classList.contains('header-hidden'));
+  gesture();
+  messagesBox.scrollTop = 0;
+  messagesBox.dispatchEvent(new dom.window.Event('scroll'));
+  messagesBox.scrollTop = 300;
+  messagesBox.dispatchEvent(new dom.window.Event('scroll'));
+  gesture();
+  messagesBox.scrollTop = 0;
+  messagesBox.dispatchEvent(new dom.window.Event('scroll'));
+  check('жест к самому верху возвращает шапку',
+    !dom.window.document.body.classList.contains('header-hidden'));
+
+  // КОМПЕНСАЦИЯ ПРОКРУТКИ: уход шапки освобождает её высоту, и без компенсации
+  // весь текст в окне переписки прыгал вверх — это и читалось как «дёргание» на
+  // телефоне. Проверяем сам смысл: прокрутка сдвигается на ту же величину, на
+  // которую сместилось окно переписки.
+  const shiftProbe = { before: 0, after: 0, scroll: 0 };
+  dom.window.eval(`
+    (() => {
+      const box = document.getElementById('messages');
+      const header = document.querySelector('.chat-header');
+      // Подменяем геометрию: в jsdom раскладки нет, а проверить надо именно
+      // компенсацию — на сколько сдвинулось окно, на столько и прокрутка.
+      // Геометрия считается ПО ТЕКУЩЕМУ классу, а не по сохранённой переменной:
+      // компенсация читает положение ДО и ПОСЛЕ переключения в одном тике, и
+      // отложенное (через MutationObserver) значение дало бы «не изменилось».
+      const hiddenNow = () => document.body.classList.contains('header-hidden');
+      Object.defineProperty(header, 'getBoundingClientRect', {
+        configurable: true,
+        value: () => ({ top: 0, height: hiddenNow() ? 0 : 56, bottom: 0, left: 0, right: 0, width: 0 }),
+      });
+      Object.defineProperty(box, 'getBoundingClientRect', {
+        configurable: true,
+        value: () => ({ top: hiddenNow() ? 8 : 64, height: 500, bottom: 0, left: 0, right: 0, width: 0 }),
+      });
+      Object.defineProperty(box, 'scrollTop', {
+        configurable: true, writable: true, value: 300,
+      });
+      window.__shift = () => ({ scrollTop: box.scrollTop,
+                                hidden: hiddenNow() });
+    })()
+  `);
+  const shifted = dom.window.eval('(setHeaderHidden(true), window.__shift())');
+  check('уход шапки компенсирован прокруткой (текст не прыгает)',
+    shifted.scrollTop === 244,
+    JSON.stringify(shifted));
 
   console.log('\nИтог: ' + (failures ? 'ПРОВАЛЕНО проверок: ' + failures : 'все проверки пройдены'));
   dom.window.close();

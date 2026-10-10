@@ -124,6 +124,54 @@ def _fetch_json(url: str, timeout: float = PROBE_TIMEOUT) -> Optional[dict]:
         return None
 
 
+# СЕРВЕР ЖИВ, НО ГЕНЕРИРОВАТЬ НЕ МОЖЕТ. Поток генерации у mlx_lm.server один, а
+# память — видеопамять мака: живой случай 09.10 — две задачи пошли к локальной
+# модели одновременно, Metal не смог выделить буфер команд
+# ([METAL] Insufficient Memory), поток умер, и после этого КАЖДЫЙ вызов отвечал
+# HTTP 404 «generation thread died», хотя /v1/models продолжал отвечать и модель
+# была объявлена. Отличить это состояние от «готов» по HTTP нельзя, поэтому его
+# отмечает клиент, увидев характерный ответ (см. app/ai/client.py), а здесь оно
+# живёт до перезапуска сервера.
+_BROKEN: Dict[str, Any] = {}
+# Когда сервер в последний раз перезапускали ПОСЛЕ такого сбоя. Живёт отдельно от
+# отметки: отметку снимает и перезапуск, и ручная остановка, а передышка нужна
+# именно между ПЕРЕЗАПУСКАМИ — иначе повторный сбой через секунду вызвал бы новый
+# перезапуск, и это превратилось бы в цикл по тридцать секунд загрузки весов.
+_BROKEN_RESTART_AT = 0.0
+# Как часто разрешено ПЕРЕЗАПУСКАТЬ сервер после такого сбоя (секунды): без
+# предела повторные вызовы превратились бы в цикл «упал — перезапустили».
+BROKEN_RESTART_COOLDOWN = float(os.getenv("LOCAL_LLM_BROKEN_COOLDOWN", "120"))
+
+# Предел памяти кэша промптов (МБ) и число хранимых кэшей: см. комментарий у
+# команды запуска. Значения подобраны по замеру: агентский запрос держит три-четыре
+# разных промпта, каждому хватает ~250 МБ.
+PROMPT_CACHE_MB = max(0, int(os.getenv("LOCAL_LLM_PROMPT_CACHE_MB", "1024")))
+PROMPT_CACHE_SEQUENCES = max(1, int(os.getenv("LOCAL_LLM_PROMPT_CACHE_SEQUENCES", "4")))
+KV_BITS = int(os.getenv("LOCAL_LLM_KV_BITS", "0"))
+
+
+def prompt_cache_bytes() -> int:
+    """Предел кэша промптов в байтах (0 — без предела)."""
+    return PROMPT_CACHE_MB * 1024 * 1024
+
+
+def mark_broken(reason: str) -> None:
+    """Запомнить, что сервер отвечает, но генерировать не может."""
+    if not _BROKEN:
+        logger.warning("Локальная модель: %s", reason)
+    _BROKEN.update({"reason": str(reason), "at": time.time()})
+
+
+def clear_broken() -> None:
+    """Снять отметку (сервер перезапущен или выбран другой источник)."""
+    _BROKEN.clear()
+
+
+def broken_reason() -> str:
+    """Почему сервер считается неработоспособным (пусто — не считается)."""
+    return str(_BROKEN.get("reason") or "")
+
+
 def probe(timeout: float = PROBE_TIMEOUT) -> dict:
     """Отвечает ли локальный сервер и какие модели он объявляет.
 
@@ -138,14 +186,16 @@ def probe(timeout: float = PROBE_TIMEOUT) -> dict:
     промолчала» вместо причины.
     """
     data = _fetch_json(_models_url(), timeout)
+    broken = broken_reason()
     if data is None:
-        return {"running": False, "models": [], "loaded": False, "error": None}
+        return {"running": False, "models": [], "loaded": False, "error": None,
+                "broken": broken}
     models: List[str] = []
     for item in data.get("data") or []:
         if isinstance(item, dict) and item.get("id"):
             models.append(str(item["id"]))
     return {"running": True, "models": models, "loaded": bool(models),
-            "error": None}
+            "error": None, "broken": broken}
 
 
 def _models_url() -> str:
@@ -361,7 +411,8 @@ def status(with_probe: bool = True) -> dict:
         "stop_in": (max(0, int(_stop_deadline - time.time()))
                     if _stop_deadline else 0),
     })
-    ready = (server["running"] and bool(server.get("loaded"))) \
+    ready = (server["running"] and bool(server.get("loaded"))
+             and not (server.get("broken") or broken_reason())) \
         or info["source"] == "remote"
     return {
         **info,
@@ -397,6 +448,11 @@ def _hint(info: dict, installed: dict, server: dict) -> str:
             return (text + " Локальный сервер работает, хотя выбран удалённый "
                     "источник: он не используется — остановите кнопкой ниже.")
         return text
+    if server["running"] and (server.get("broken") or broken_reason()):
+        return ("Локальный сервер отвечает, но ГЕНЕРИРОВАТЬ не может: поток "
+                "генерации умер (обычно не хватило видеопамяти при параллельных "
+                "задачах). Перезапускаю его сам при следующем запросе; вручную — "
+                "кнопкой ниже или tools/local_llm.sh restart.")
     if server["running"] and server.get("loaded"):
         loaded = ", ".join(server["models"][:3]) or config.LOCAL_LLM_MODEL
         return f"Локальный сервер отвечает, модель: {loaded}."
@@ -522,6 +578,9 @@ def start(wait: float = 0.0) -> dict:
     cancel_scheduled_stop()
     if probe()["running"]:
         return status()
+    # Поднимаем НОВЫЙ процесс — прежняя отметка «генерация сломана» к нему не
+    # относится (её ставил клиент по ответу умершего сервера).
+    clear_broken()
     installed = _installed()
     if not installed["venv"] or not installed["mlx"]:
         raise LocalLlmError(
@@ -540,7 +599,25 @@ def start(wait: float = 0.0) -> dict:
         "--host", str(config.LOCAL_LLM_HOST),
         "--port", str(int(config.LOCAL_LLM_PORT)),
         "--chat-template-args", CHAT_TEMPLATE_ARGS,
+        # ОГРАНИЧЕНИЕ ПАМЯТИ КЭША ПРОМПТОВ. mlx_lm.server держит KV-кэши
+        # промптов, и на агентских запросах (у каждого свой длинный промпт:
+        # инструменты, правила проекта, фрагменты баз) кэш рос до 3,4 ГБ — при
+        # шести гигабайтах весов на шестнадцати гигабайтах памяти мака это
+        # кончалось срывом генерации: `Insufficient Memory`, «generation thread
+        # died» и рвущееся соединение (живой случай 10.10: пользователь видел
+        # «вызов не удался»). Предел задаётся в мегабайтах настройкой
+        # LOCAL_LLM_PROMPT_CACHE_MB (0 — не ограничивать).
+        "--prompt-cache-bytes", str(prompt_cache_bytes()),
+        # Сколько РАЗНЫХ кэшей держать: агент ходит с несколькими повторяющимися
+        # промптами (диспетчер, планировщик, ответ), и десяток вариантов ничего не
+        # ускоряет, а память занимает.
+        "--prompt-cache-size", str(PROMPT_CACHE_SEQUENCES),
     ]
+    if KV_BITS:
+        # Квантование KV-кэша (например, 8 бит) заметно уменьшает память на
+        # длинных контекстах. Выключено по умолчанию: это влияет на качество
+        # ответов, и включать его должен человек, а не приложение за него.
+        command += ["--kv-bits", str(KV_BITS)]
     # start_new_session — сервер не должен умереть вместе с приложением и не
     # должен получать Ctrl+C, предназначенный ему: остановка только явная.
     with open(log_path(), "a", encoding="utf-8") as log:
@@ -594,6 +671,7 @@ def stop() -> dict:
     """
     global _started_at
     cancel_scheduled_stop()   # остановка состоялась — ждать больше нечего
+    clear_broken()            # отметка «генерация сломана» живёт до перезапуска
     pid = _read_pid()
     if pid and _own_process(pid):
         try:
@@ -631,6 +709,29 @@ def prepare(autostart: bool = True, wait: float = START_TIMEOUT) -> dict:
     state = status()
     if state["source"] == "remote" or _serving(state):
         return state
+    if state["server"]["running"] and (state["server"].get("broken")
+                                       or broken_reason()):
+        # СЕРВЕР ОТВЕЧАЕТ, НО ГЕНЕРИРОВАТЬ НЕ МОЖЕТ (см. mark_broken). Поднимать
+        # нечего — порт занят своим же процессом, — а нужен ПЕРЕЗАПУСК: он и есть
+        # лечение. Делаем его сами, но не чаще, чем раз в BROKEN_RESTART_COOLDOWN
+        # секунд: иначе повторные запросы превратились бы в цикл «упал —
+        # перезапустили», и каждый стоил бы тридцати секунд загрузки весов.
+        global _BROKEN_RESTART_AT
+        waited = time.time() - _BROKEN_RESTART_AT
+        if waited >= BROKEN_RESTART_COOLDOWN:
+            _BROKEN_RESTART_AT = time.time()
+            logger.warning("Локальная модель: перезапускаю сервер после сбоя генерации")
+            try:
+                stop()
+                state = start()
+            except LocalLlmError as exc:  # noqa: PERF203 — причину назовём ниже
+                logger.warning("Локальная модель: перезапуск не удался: %s", exc)
+            if wait > 0:
+                wait_ready(wait)
+            state = status()
+            if _serving(state):
+                return state
+        raise LocalLlmError(state["hint"])
     if state["server"]["running"]:
         # Сервер ОТВЕЧАЕТ, но модель не объявлена: веса не загрузились (см.
         # `probe`). Это не «запускается» — поднимать нечего, порт занят своим же
@@ -660,6 +761,10 @@ def _serving(state: dict) -> bool:
     назвать причину, а не пропустить вызов в пустоту.
     """
     server = state.get("server") or {}
+    if server.get("broken") or broken_reason():
+        # Отвечает и модель объявлена, но генерация сломана (см. mark_broken):
+        # пропустить в него вызов — значит показать «модель промолчала».
+        return False
     return bool(server.get("running")) and bool(server.get("loaded", True))
 
 
