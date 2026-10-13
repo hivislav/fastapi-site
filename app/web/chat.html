@@ -1237,6 +1237,41 @@
         .rag-source.openable .rag-source-num { cursor: pointer; text-decoration: underline dotted; }
         .rag-source.openable:hover .rag-source-name { color: var(--accent); }
         .rag-source.flash { background: var(--surface-2); border-radius: 6px; }
+        /* ИСПОЛЬЗОВАН В ОТВЕТЕ: на этот фрагмент модель сослалась номером, то есть
+           он подкрепляет сказанное, а не просто «попал в подборку». Такие строки
+           видно сразу, остальные (подобранные, но не использованные) сложены под
+           кнопкой — иначе восемь адресов документации под ответом, построенным по
+           данным MCP, читались как «ответ взят отсюда». */
+        .rag-source.used {
+            border-left: 2px solid var(--accent-2);
+            padding-left: 6px;
+            background: color-mix(in srgb, var(--accent-2) 7%, transparent);
+            border-radius: 4px;
+        }
+        .rag-source-badge {
+            order: 9;
+            font-size: 0.7rem;
+            text-transform: lowercase;
+            color: var(--accent-2);
+            border: 1px solid var(--line-strong);
+            border-radius: 999px;
+            padding: 0 6px;
+            white-space: nowrap;
+        }
+        .rag-sources-rest { display: flex; flex-direction: column; gap: 4px; opacity: 0.85; }
+        .rag-sources-toggle {
+            align-self: flex-start;
+            margin-top: 2px;
+            padding: 2px 8px;
+            font-size: 0.76rem;
+            font-family: inherit;
+            color: var(--muted);
+            background: transparent;
+            border: 1px dashed var(--line-strong);
+            border-radius: 999px;
+            cursor: pointer;
+        }
+        .rag-sources-toggle:hover { color: var(--text); border-color: var(--accent-2); }
         /* ЦИТАТА: сам фрагмент, из которого взят ответ. Показана двумя строками и
            разворачивается по клику — иначе десять источников превращались бы в
            простыню текста, которую никто не читает. */
@@ -3176,7 +3211,16 @@
                         в каждом запросе: если для ответа не хватает фактов (погода,
                         курс, цена), он сам вызывает нужный инструмент и отвечает по
                         полученным данным, а не по догадке. Всё бесплатно и без
-                        ключей — интернет нужен только на время вызова.</p>
+                        ключей — интернет нужен только на время вызова.
+                        <b>«Git-репозиторий проекта»</b> — состояние рабочей копии
+                        самого проекта: текущая ветка, последний коммит, список
+                        файлов, изменения (diff) и содержимое названного файла.
+                        Локально и только чтение: сервер ничего не коммитит и не
+                        меняет. С ним работает команда <b>/help</b> в чате —
+                        вопросы о САМОМ проекте («что делает app/ai/mcp.py», «что
+                        я изменил в этой ветке», «как устроен поиск по базам»):
+                        ответ строится по документации проекта и по состоянию
+                        репозитория.</p>
                     <div class="mcp-list" id="mcp-list"></div>
                     <p class="modal-hint mcp-status" id="mcp-status" hidden></p>
                     <div class="modal-actions">
@@ -6643,22 +6687,67 @@
         function drawSourceCards(wrap, sources) {
             const list = (sources || []).filter(item => item && item.source);
             if (!list.length) return;
+            // КТО ИЗ ФРАГМЕНТОВ ДЕЙСТВИТЕЛЬНО ИСПОЛЬЗОВАН. Признак — ссылка
+            // модели номером в тексте ответа («[1]»): это те же ссылки, что уже
+            // нарисованы кликабельными (.msg-cite). Так «использован» — не догадка
+            // интерфейса, а то, что модель сама назвала. Ответ, построенный по
+            // данным MCP и состоянию репозитория, ссылок на документацию не имеет
+            // — и подсвечивать в нём нечего (живое замечание 12.10).
+            const used = new Set();
+            wrap.querySelectorAll('.msg-cite').forEach(node => {
+                const number = Number(node.dataset.n);
+                if (number >= 1 && number <= list.length) used.add(number);
+            });
+            const split = used.size > 0;
             const box = document.createElement('div');
             box.className = 'rag-sources';
             const head = document.createElement('div');
             head.className = 'rag-sources-head';
-            head.textContent = 'Фрагменты баз знаний, подобранные по этому запросу '
-                + '(переданы модели; клик по источнику открывает чанк):';
+            if (split) {
+                const rest = list.length - used.size;
+                head.textContent = 'Фрагменты баз знаний: в ответе использованы '
+                    + [...used].sort((a, b) => a - b).map(n => '[' + n + ']').join(', ')
+                    + (rest > 0
+                        ? '; ещё ' + rest + ' подобраны, но в ответе не использованы'
+                        : '')
+                    + '. Клик по источнику открывает чанк:';
+            } else {
+                // НИ ОДИН ФРАГМЕНТ НЕ ИСПОЛЬЗОВАН: подсвечивать нечего, и блок не
+                // должен выглядеть как список источников ответа. Фрагменты остаются
+                // доступны (что было передано модели — это факт), но свёрнуты.
+                head.textContent = 'Фрагменты баз знаний, подобранные по этому '
+                    + 'запросу: ни один в ответе не использован (' + list.length
+                    + '). Показать — по кнопке.';
+            }
             box.appendChild(head);
             const body = document.createElement('div');
             body.className = 'rag-sources-body';
+            // ПОДОБРАННЫЕ, НО НЕ ИСПОЛЬЗОВАННЫЕ — отдельной группой под кнопкой.
+            // Номера у ВСЕХ карточек исходные (1…N), как в ссылках ответа: деление
+            // на группы нумерацию не сдвигает, иначе «[3]» открывал бы чужой
+            // фрагмент. Карточки остаются в разметке (клик по ссылке находит их),
+            // прячется только группа.
+            // Свёрнутая группа есть всегда, когда есть карточки: «подобрано, но не
+            // использовано» — это не источник ответа, и показывать это как источники
+            // нельзя. Одна кнопка раскрывает всё подобранное.
+            const rest = document.createElement('div');
+            rest.className = 'rag-sources-rest';
+            rest.hidden = true;
             list.forEach((item, index) => {
+                const number = index + 1;
+                const isUsed = used.has(number);
                 const line = document.createElement('div');
-                line.className = 'rag-source';
-                line.dataset.n = String(index + 1);
+                line.className = 'rag-source' + (isUsed ? ' used' : '');
+                line.dataset.n = String(number);
+                if (isUsed) {
+                    const badge = document.createElement('span');
+                    badge.className = 'rag-source-badge';
+                    badge.textContent = 'использован в ответе';
+                    line.appendChild(badge);
+                }
                 const num = document.createElement('span');
                 num.className = 'rag-source-num';
-                num.textContent = (index + 1) + '.';
+                num.textContent = number + '.';
                 line.appendChild(num);
                 const name = document.createElement('span');
                 name.className = 'rag-source-name';
@@ -6743,8 +6832,26 @@
                     line.classList.add('openable');
                     line.addEventListener('click', () => openSourceChunk(item));
                 }
-                body.appendChild(line);
+                // Куда положить карточку: использованные — сразу видны, остальные —
+                // в свёрнутую группу. Не использован ни один — свёрнуто всё.
+                (isUsed ? body : rest).appendChild(line);
             });
+            if (rest.childElementCount) {
+                body.appendChild(rest);
+                const toggle = document.createElement('button');
+                toggle.type = 'button';
+                toggle.className = 'rag-sources-toggle';
+                const label = () => (rest.hidden ? 'Показать' : 'Скрыть')
+                    + (split ? ' подобранные, но не использованные ('
+                             : ' подобранные фрагменты (')
+                    + rest.childElementCount + ')';
+                toggle.textContent = label();
+                toggle.addEventListener('click', () => {
+                    rest.hidden = !rest.hidden;
+                    toggle.textContent = label();
+                });
+                body.appendChild(toggle);
+            }
             box.appendChild(body);
             wrap.appendChild(box);
             // ССЫЛКИ «[1]» В ТЕКСТЕ ОТВЕТА: клик раскрывает цитату источника с
@@ -9519,6 +9626,88 @@
 
 
         // ---------------------------------------------------------------------
+        // АССИСТЕНТ РАЗРАБОТЧИКА (команда /help) — вопросы о САМОМ проекте.
+        //
+        // Источники ответа — документация проекта (тот же поиск по базам, что у
+        // агента) и КОНТЕКСТ РЕПОЗИТОРИЯ, который агент получает через MCP
+        // (сервер «Git-репозиторий проекта»: ветка, изменения, файлы, история,
+        // содержимое названного файла). Пайплайн задачи НЕ участвует — как у
+        // /test_rag: ни плана, ни шагов, ни автомата; ответ приходит потоком и
+        // рисуется теми же карточками источников, что ответ агента.
+        // ---------------------------------------------------------------------
+        async function runDevHelp(question) {
+            if (requestBusyHere()) return;
+            const sessionId = workspace.active_session || null;
+            const streamEpoch = viewEpoch;
+            const streamSession = sessionId;
+            // Команду набирают и без вопроса: тогда ассистент отвечает обзором
+            // проекта — ту же фразу отправляем на сервер, чтобы вопрос в журнале,
+            // в ответе и в истории разговора был один и тот же.
+            const asked = question || ('Что это за проект, из чего он состоит '
+                + 'и что сейчас происходит в рабочей копии?');
+            pushDialogNode('user', '🧭 /help — ' + asked);
+            foregroundRequests.add(streamSession);
+            updateComposerState();
+            updateTyping();
+            try {
+                const res = await fetch('/api/agent/help', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: '/help ' + asked,
+                                           session_id: sessionId })
+                });
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    let text = detail || 'Ассистент не смог ответить — повторите вопрос.';
+                    // 404 у ЭТОГО маршрута значит не «ответа нет», а «сервер его не
+                    // знает»: приложение запущено ДО правки и держит прежний код в
+                    // памяти, а страница берётся с диска и потому свежая — команда
+                    // перехватывается, а маршрута у сервера нет (живой случай
+                    // 12.10: «/help → Not Found»). Причина называется прямо, иначе
+                    // человек ищет её в самой команде. Знак «⚠️» добавляет
+                    // drawAgentNode — второй ставить нельзя.
+                    if (res.status === 404) {
+                        text = 'Маршрут /api/agent/help не найден: приложение '
+                            + 'запущено до этой правки. Перезапустите сервер '
+                            + '(tools/serve.sh restart) и обновите страницу.';
+                    }
+                    pushDialogNode('error', text);
+                    return;
+                }
+                await readNdjsonStream(res, (ev) => {
+                    // События рисуем только в СВОЁМ диалоге: переключились —
+                    // поток дочитываем (сервер всё сохранит в журнал), но в чужое
+                    // окно ничего не пишем.
+                    if (!dialogStreamHere(streamEpoch, streamSession)) return;
+                    if (ev.type === 'help_start') {
+                        const sources = [];
+                        sources.push((ev.bases && ev.bases.length)
+                            ? 'документация проекта: ' + ev.bases.join(', ')
+                            : 'документация проекта не подключена (кнопка «RAG»)');
+                        sources.push(ev.git
+                            ? 'состояние репозитория: получено через MCP'
+                            : 'состояние репозитория: не получено (кнопка «MCP»)');
+                        pushDialogNode('debug', '🧭 Ассистент проекта отвечает по '
+                            + 'источникам — ' + sources.join('; ') + '.');
+                    } else if (ev.type === 'bot') {
+                        pushDialogNode('assistant', ev.text, ev.sources);
+                    } else if (ev.type === 'debug' || ev.type === 'error') {
+                        pushDialogNode(ev.type, ev.text);
+                    }
+                });
+            } catch (err) {
+                pushDialogNode('error', 'Ответ ассистента прерван: '
+                    + (err && err.message ? err.message : err));
+            } finally {
+                foregroundRequests.delete(streamSession);
+                updateComposerState();
+                updateTyping();
+            }
+        }
+
+
+        // ---------------------------------------------------------------------
         // КОНТРОЛЬНЫЙ ДИАЛОГ (команды /test_rag_dialog_1 и /test_rag_dialog_2) —
         // ТЕСТОВЫЙ КЕЙС. Десять реплик: старт задан сценарием, дальше реплики
         // пишет имитация пользователя (служебный вызов LLM), а отвечает тот же
@@ -9808,6 +9997,24 @@
                 return;
             }
 
+            // КОМАНДА /help — АССИСТЕНТ РАЗРАБОТЧИКА: вопросы о САМОМ проекте
+            // (как он устроен, что делает модуль, что изменилось в ветке).
+            // Это команда, а не запрос задачи: пайплайн (план, подтверждение,
+            // шаги, автомат) не участвует, как у /test_rag, а ответ строится по
+            // документации проекта и по состоянию репозитория, которое агент
+            // получает через MCP (сервер «Git-репозиторий проекта»).
+            const helpCommand = content.trim().match(/^\/help(\s+([\s\S]*))?$/i);
+            if (helpCommand) {
+                if (!workspace.active_task) {
+                    addMessage('bot', '⚠️ Ассистент отвечает о проекте — сначала '
+                        + 'создайте проект (кнопка «Новый проект»).', true);
+                    return;
+                }
+                input.value = '';
+                await runDevHelp((helpCommand[2] || '').trim());
+                return;
+            }
+
             // НЕПОЛНАЯ КОМАНДА КОНТРОЛЬНОГО ДИАЛОГА («/test_rag_dialog» без
             // номера, «/test_rag_dialog_3»): подсказываем доступные команды. Иначе
             // такой текст уходил бы в модель обычным вопросом по документам —
@@ -9820,7 +10027,8 @@
                 addMessage('bot', '⚠️ У контрольного диалога нужен номер: '
                     + '**/test_rag_dialog_1** — «Нетраннер к игре», '
                     + '**/test_rag_dialog_2** — «Памятка медика». '
-                    + 'Есть ещё **/test_rag** — прогон контрольных вопросов по базам.', true);
+                    + 'Есть ещё **/test_rag** — прогон контрольных вопросов по '
+                    + 'базам, и **/help** — вопросы о самом проекте.', true);
                 return;
             }
 

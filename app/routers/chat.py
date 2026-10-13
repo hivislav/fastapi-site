@@ -43,6 +43,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from app import config
 from app.ai import attachments as attach_store
 from app.ai import client as llm_client
+from app.ai import dev_help
 from app.ai import service
 from app.ai import invariants as invariants_store
 from app.ai import local_llm
@@ -5029,6 +5030,277 @@ def _decode_upload_files(items: List[Any]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# АССИСТЕНТ РАЗРАБОТЧИКА: команда /help в чате (app/ai/dev_help.py)
+#
+# ЧТО ЭТО. Вопрос о САМОМ проекте: как он устроен, что делает такой-то модуль,
+# что изменилось в текущей ветке, с чего начать правку. Источники — те же, что у
+# всего режима «AI-агент», и оба нужны именно здесь:
+#
+#   * ДОКУМЕНТАЦИЯ проекта — включённые базы знаний проекта и тот же поиск
+#     (`rag_search.search`) с теми же настройками проекта: по вопросу человека в
+#     документации ищутся фрагменты, и под ответом видны те же карточки
+#     источников с цитатой и переходом к чанку;
+#   * КОНТЕКСТ ПРОЕКТА, ПОЛУЧЕННЫЙ ЧЕРЕЗ MCP — состояние репозитория (ветка,
+#     последний коммит, изменённые файлы, diff, история, содержимое файла) от
+#     сервера `git` (mcp_servers/git.mjs, только чтение). Набор вызовов задаёт
+#     КОД (`dev_help.calls`), а не диспетчер: команда всегда спрашивает одно и то
+#     же — «покажи состояние работы», — и лишний служебный вызов модели здесь
+#     ничего не решает.
+#
+# МИМО ПАЙПЛАЙНА ЗАДАЧИ — как контрольный прогон `/test_rag` и мини-чат: ни
+# планировщика, ни подтверждения плана, ни шагов, ни приёмщика, ни переходов
+# автомата. В память диалога (messages) и в автомат (state) команда НЕ пишет:
+# вопросы о проекте не должны становиться «памятью задачи» и подменять запрос, по
+# которому задача работает. В журнал чата (`log`) пишет — человек должен видеть
+# ответ и после переключения задачи, — и ИЗ ЭТОГО ЖЕ журнала берётся история
+# разговора для ассистента (следующий вопрос «а как он выбирает инструменты?»
+# должен понимать, о чём был предыдущий): `dev_help.history_from_log`.
+#
+# РАСХОД команды показывается её собственным событием `usage` и в замер задачи не
+# входит — как у прогона `/test_rag`.
+# ---------------------------------------------------------------------------
+def _dev_help_repo_dir() -> str:
+    """Каталог репозитория, о котором отвечает ассистент.
+
+    Тот же, с которым работает сервер `git`: переменная окружения `GIT_REPO_DIR`,
+    иначе корень проекта. Один и тот же каталог нужен в двух местах — проверить,
+    существует ли файл, о котором спросили (иначе вызов инструмента с чужим путём
+    вернул бы отказ), и показать его содержимое.
+    """
+    return (os.getenv(dev_help.REPO_ENV) or "").strip() or config.PROJECT_ROOT
+
+
+def _dev_help_path(question_text: str) -> Tuple[str, str]:
+    """Файл (или каталог) проекта, названный в вопросе: (путь, вид).
+
+    Вид определяет КОД по файловой системе проекта: файл существует — о нём и
+    спросили; каталог — спрашивают о его содержимом; ничего не нашлось — вопрос
+    общий (тогда ассистент показывает состояние работы, список файлов и коммиты).
+
+    Проверка существования тут обязательна: в вопросе может стоять имя файла,
+    которого в проекте нет («а как устроен rag_helpers.py?»), и вызов инструмента
+    с таким путём был бы заведомым отказом сервера — вместо ответа человек
+    получил бы ошибку инструмента.
+    """
+    return dev_help.kind_of(_dev_help_repo_dir(), question_text)
+
+
+def _dev_help_git_reason(task: Dict[str, Any]) -> str:
+    """Почему контекст репозитория недоступен ("" — доступен).
+
+    Проверяются ДВА условия, и оба видны БЕЗ запуска сервера: он вообще
+    подключён к проекту (кнопка «MCP», `task["mcp"]` — это настройка ПРОЕКТА) и
+    он работоспособен (есть node, файл сервера, MCP SDK). Причина называется
+    словами: иначе «ассистент не видит ветку» выглядело бы как его неумение.
+    """
+    if dev_help.SERVER_ID not in workspace_store.mcp_enabled(task):
+        return "сервер не включён у проекта"
+    entry = mcp_store.find_server(dev_help.SERVER_ID)
+    if entry is None:
+        return "сервер «%s» не найден в реестре серверов проекта" % dev_help.SERVER_ID
+    return mcp_store.availability_error(entry)
+
+
+@router.post("/agent/help")
+async def agent_help(msg: ChatMessage) -> StreamingResponse:
+    """АССИСТЕНТ РАЗРАБОТЧИКА — команда `/help` в чате: вопросы о проекте.
+
+    Поток событий (NDJSON, как у чата агента):
+
+      * `{"type": "help_start", "question": …, "bases": [...], "git": bool}` —
+        команда принята: по каким базам знаний отвечаем и есть ли контекст
+        репозитория;
+      * `{"type": "debug", "text": …}` — что делает ассистент: какие инструменты
+        MCP вызвал и что они вернули, по какому запросу ищет документацию, что
+        нашлось, чем ответил источник;
+      * `{"type": "bot", "text": …, "sources": [...]}` — ответ ВМЕСТЕ С
+        ИСТОЧНИКАМИ (в тексте строка «📄 Источники:», в `sources` — фрагменты для
+        карточек: файл, раздел, релевантность, цитата, переход к чанку);
+      * `{"type": "answer_ready"}` — ответ показан, ввод свободен;
+      * `{"type": "usage", "usage": {...}}` — расход хода целиком (ответ +
+        переформулировка запроса, если она включена);
+      * `{"type": "done", "usage": {...}}` — конец потока.
+
+    Проекта нет — отказ СРАЗУ (400): документация и базы знаний привязаны к
+    проекту. Базы знаний не подключены — команда РАБОТАЕТ: состояние репозитория
+    само по себе отвечает на «что изменилось», и строка источников при этом не
+    выдумывается (см. `rag_dialog.ensure_sources`).
+    """
+    text = str(getattr(msg, "content", "") or "").strip()
+    if not dev_help.is_command(text):
+        raise HTTPException(status_code=400, detail=(
+            "Это не команда %s. Ассистент разработчика отвечает на вопросы о "
+            "проекте: %s <вопрос> — например «%s что делает app/ai/mcp.py»."
+            % (dev_help.COMMAND, dev_help.COMMAND, dev_help.COMMAND)))
+    task, session = _rag_dialog_target(str(getattr(msg, "session_id", "") or ""))
+    if task is None or session is None:
+        raise HTTPException(status_code=400, detail=(
+            "Сначала создайте проект — документация проекта и базы знаний "
+            "привязаны к проекту, и вопросы о проекте задаются в его задаче"))
+    dialog = session["dialog"]
+    question_text = dev_help.question(text)
+    enabled = workspace_store.rag_enabled(task)
+    settings = workspace_store.rag_settings(task)
+    project_llm = workspace_store.llm_settings(task)
+    profile_id = _current_profile_id()
+    profile = _profile_block()
+    path, path_kind = _dev_help_path(question_text)
+    git_reason = _dev_help_git_reason(task)
+    git_calls = ([] if git_reason else dev_help.calls(path, path_kind))
+    # Предел ответа: «Длина» из шапки чата главнее проекта, проект — главнее
+    # константы ассистента (те же правила, что у шага и прямого ответа, §5.10а).
+    answer_max_tokens = (msg.max_tokens if msg.max_tokens is not None
+                         else project_llm["max_tokens"] or dev_help.HELP_MAX_TOKENS)
+    base_names: List[str] = []
+    for base_id in enabled:
+        meta = rag_store.get_base(base_id, profile=profile_id) or {}
+        base_names.append(str(meta.get("name") or base_id))
+
+    # ВОПРОС — В ЖУРНАЛ ЧАТА: он часть разговора и материал истории для
+    # следующего вопроса команды. В память диалога (messages) он не идёт: это
+    # команда, а не запрос задачи.
+    workspace_store.add_log(dialog, workspace_store.LOG_USER,
+                            "🧭 %s — вопрос о проекте: %s"
+                            % (dev_help.COMMAND, question_text))
+
+    def encode(event: Dict[str, Any]) -> str:
+        _log_event(dialog, event)
+        return json.dumps(event, ensure_ascii=False) + "\n"
+
+    async def event_stream() -> AsyncIterator[str]:
+        # 0. ИСТОЧНИК ОТВЕТА: команда зовёт модель, и при выбранной локальной
+        #    модели сервер обязан отвечать ДО вызова — иначе человек прочитал бы
+        #    «ответа нет» вместо причины («сервер не запущен»).
+        notes: List[str] = []
+        reason = await local_source_guard(notes.append)
+        for note in notes:
+            yield encode({"type": "debug", "text": note})
+        if reason:
+            yield encode({"type": "error", "text": LOCAL_SOURCE_NOT_READY % reason})
+            yield encode({"type": "done", "usage": {}})
+            return
+        yield encode({"type": "help_start", "question": question_text,
+                      "bases": base_names, "git": not git_reason,
+                      "path": path, "kind": path_kind})
+        total: Dict[str, Any] = {}
+        tracker = Agent(AgentConfig())
+        # 1. КОНТЕКСТ ПРОЕКТА — через MCP: ветка, изменения, файлы, история или
+        #    содержимое названного файла. Ошибка сервера команду НЕ отменяет:
+        #    документация остаётся, а причина отказа называется словами.
+        context: List[Dict[str, Any]] = []
+        if git_reason:
+            yield encode({"type": "debug", "text": "⚠ " + dev_help.git_hint(git_reason)})
+        else:
+            yield encode({"type": "debug", "text": (
+                "🔧 Беру состояние проекта через MCP (%s): %s."
+                % (dev_help.SERVER_ID,
+                   ", ".join(str(call["tool"]) for call in git_calls)))})
+            context = await mcp_store.async_run_calls(git_calls,
+                                                      limit=dev_help.MAX_CONTEXT_CALLS)
+            for item in context:
+                if item.get("ok"):
+                    continue
+                yield encode({"type": "debug", "text": (
+                    "⚠ %s.%s — источник отказал: %s"
+                    % (item.get("server_name") or dev_help.SERVER_ID,
+                       item.get("tool"), item.get("error") or "без пояснения"))})
+            note = mcp_store.results_note(context)
+            if note:
+                yield encode({"type": "debug", "text": "🔧 " + note})
+        # 2. ДОКУМЕНТАЦИЯ ПРОЕКТА — тем же поиском и с теми же настройками, что
+        #    у агента. Переформулировка запроса (если включена у проекта) — тот же
+        #    служебный вызов, что в пайплайне задачи.
+        rag_data: Dict[str, Any] = {}
+        hits: List[Dict[str, Any]] = []
+        if not enabled:
+            yield encode({"type": "debug", "text": (
+                "📚 Базы знаний у проекта не подключены — отвечаю по состоянию "
+                "репозитория (кнопка «RAG» включает документацию проекта).")})
+        else:
+            query_text = question_text
+            rewrite_info: Dict[str, Any] = {}
+            if settings.get("rewrite"):
+                async def call(**kwargs: Any) -> Any:
+                    content, metrics = await llm_client.call_llm_async(**kwargs)
+                    tracker.note_usage(metrics, Agent.SERVICE_REWRITE)
+                    return content, metrics
+
+                rewrite_info = await rag_query.rewrite(question_text, call)
+                if rewrite_info.get("query"):
+                    query_text = str(rewrite_info["query"])
+                line = rag_query.debug_line(rewrite_info)
+                if line:
+                    yield encode({"type": "debug", "text": line})
+            yield encode({"type": "debug", "text": (
+                "🔎 Ищу в документации проекта по запросу: «%s»" % query_text[:200])})
+            rag_data = await asyncio.to_thread(
+                rag_search.search, enabled, query_text, profile=profile_id,
+                settings=settings, rewrite=rewrite_info or None,
+                also=(question_text if rewrite_info else ""))
+            hits = rag_search.hits_of(rag_data)
+            note = rag_search.results_note(rag_data)
+            if note:
+                yield encode({"type": "debug", "text": note})
+            yield encode({"type": "debug", "text": _rag_hits_line(hits)})
+        # 3. ОДИН ВЫЗОВ МОДЕЛИ: ответ по документации и состоянию репозитория.
+        messages = dev_help.messages(
+            question_text, profile=profile,
+            doc_block=rag_search.block(rag_data),
+            context_block=mcp_store.block(context),
+            history=dev_help.history_from_log(dialog.get("log")))
+        content, metrics = await llm_client.call_llm_async(
+            user_text=question_text, model=config.active_model(),
+            disable_thinking=True, max_tokens=answer_max_tokens,
+            temperature=project_llm["temperature"], messages=messages,
+            timeout=_rag_test_timeout())
+        tracker.note_usage(metrics, None)
+        total = merge_usage(total, tracker.usage_snapshot())
+        if not str(content or "").strip():
+            # ПРИЧИНА ВАЖНЕЕ ФОРМУЛИРОВКИ: у локальной модели сбой вызова назван
+            # словами (веса не нашлись, поток генерации умер), и «ответа нет» без
+            # причины отправляло бы человека искать её в своём вопросе.
+            local_reason = ""
+            if config.llm_source() == "local":
+                local_reason = local_llm.broken_reason() or local_llm.status()["hint"]
+            yield encode({"type": "error", "text": (
+                "⚠ Ассистент не получил ответа от модели: вызов не удался."
+                + (" Причина: %s." % local_reason if local_reason else "")
+                + " Повторите вопрос.")})
+            yield encode({"type": "usage", "usage": total})
+            yield encode({"type": "done", "usage": total})
+            return
+        # ИСТОЧНИКИ — гарантия кода, но ТОЛЬКО там, где поиск был: строка
+        # появляется, если фрагменты есть или поиск выполнялся (см.
+        # rag_dialog.ensure_sources), и ссылки на невыданные фрагменты снимаются.
+        answer = rag_dialog.ensure_sources(content, hits, searched=len(enabled),
+                                           cut=_rag_cut_note(rag_data),
+                                           tools=bool(context))
+        yield encode({"type": "bot", "text": answer,
+                      "sources": rag_search.sources(rag_data), "hits": len(hits)})
+        # ОТВЕТ ПОКАЗАН — ВВОД СВОБОДЕН (служебной работы после ответа у команды
+        # нет, но событие держит интерфейс в одном правиле с остальными путями).
+        yield encode({"type": "answer_ready"})
+        yield encode({"type": "usage", "usage": total})
+        yield encode({"type": "done", "usage": total})
+
+    async def stream() -> AsyncIterator[str]:
+        """Поток ответа + запись журнала на диск (ответ виден и после
+        переключения задачи). Сбой записи ответ не отменяет."""
+        try:
+            async for chunk in event_stream():
+                yield chunk
+        finally:
+            try:
+                async with _workspace_lock:
+                    await _persist()
+            except Exception as exc:            # pragma: no cover - защита
+                logger.warning("Ассистент (%s): журнал не сохранён — %s",
+                               dev_help.COMMAND, str(exc)[:150])
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
 # Профиль пользователя: сведения о юзере уходят в системный промпт сессии
 # ---------------------------------------------------------------------------
 def _profile_fields(payload: ProfileFields) -> Dict[str, Any]:
@@ -5402,11 +5674,18 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
         # 4. ОДИН ВЫЗОВ МОДЕЛИ: ответ по собранным источникам.
         enabled = workspace_store.rag_enabled(task_now)
         hits = rag_search.hits_of(rag_data)
+        # ДАННЫЕ ВНЕШНИХ ИНСТРУМЕНТОВ В КОНТЕКСТЕ — промпт берётся свой
+        # (`tools=True`): ответ по git/MCP приводится ПОЛНО (файлы, строки diff), а
+        # номерами фрагментов документации такие факты не подкрепляются. Без этого
+        # флага вопрос «какие изменения в файле X» получал краткий ответ по
+        # документам со ссылками на разделы, к изменениям не относящиеся (живой
+        # случай 12.10).
+        tools_now = mcp_store.has_data(mcp_data)
         messages = rag_dialog.answer_messages(
             memory_store.block(memory_now), rag_search.block(rag_data),
             rag_dialog.history_text(dialog_now["messages"]), text, profile,
             extra_blocks=[invariants_store.block(invariants_now),
-                          mcp_store.block(mcp_data)])
+                          mcp_store.block(mcp_data)], tools=tools_now)
         content, metrics = await llm_client.call_llm_async(
             user_text=text, model=config.active_model(), disable_thinking=True,
             max_tokens=answer_max_tokens,
@@ -5432,7 +5711,8 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                    "usage": merge_usage(total, tracker.usage_snapshot())}
             return
         answer = rag_dialog.ensure_sources(content, hits, searched=len(enabled),
-                                           cut=_rag_cut_note(rag_data))
+                                           cut=_rag_cut_note(rag_data),
+                                           tools=tools_now)
         yield {"type": "bot", "text": answer,
                "sources": rag_search.sources(rag_data), "hits": len(hits),
                "cited": rag_dialog.has_citation(answer),

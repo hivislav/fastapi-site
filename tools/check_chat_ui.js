@@ -617,6 +617,11 @@ const PERIODIC_LABELS = {
   '43200': 'каждые 12 часов', '86400': 'раз в сутки', '604800': 'раз в неделю',
 };
 const ragTests = [];          // тела POST /api/agent/rag/test
+const helpCalls = [];         // тела POST /api/agent/help (команда /help)
+// Ответ ассистента БЕЗ ссылок на документацию (информация взята из MCP и
+// состояния репозитория): так проверяется, что подобранные фрагменты не
+// выдаются за использованные.
+let HELP_NO_CITES = false;
 const sessionModes = [];      // тела POST /api/agent/sessions/{id}/mode
 // МИНИ-ЧАТ ПО БАЗАМ ЗНАНИЙ и КОНТРОЛЬНЫЕ ДИАЛОГИ (app/ai/rag_dialog.py):
 // тела запросов к своим маршрутам — по ним видно, что команда ушла ИМЕННО туда
@@ -1127,6 +1132,32 @@ function makeFetch() {
         { type: 'test_verdict', text: '🧪 Оценка ответов\nВерных ответов: 1 из 2.\n1. ✅ верно',
           items: [{ n: 1, ok: true, comment: 'сходится' }], summary: 'почти всё верно' },
         { type: 'done', usage: { calls: 3, prompt_tokens: 100, completion_tokens: 20 } },
+      ]);
+    }
+    if (url === '/api/agent/help') {
+      // Ассистент разработчика (команда /help): сервер отвечает потоком тех же
+      // событий, что и в жизни (см. app/routers/chat.py, agent_help) — контекст
+      // репозитория приходит из MCP, ответ — вместе с источниками документации.
+      helpCalls.push(body || {});
+      return streamResponse([
+        { type: 'help_start', question: 'что это за проект?',
+          bases: ['Документация проекта'], git: true, path: '', kind: '' },
+        { type: 'debug', text: '🔧 Беру состояние проекта через MCP (git): '
+          + 'git_status, git_diff, git_files, git_log.' },
+        { type: 'debug', text: '🔧 MCP: Git-репозиторий проекта.git_status — данные получены.' },
+        { type: 'debug', text: '🔎 Ищу в документации проекта по запросу: «проект»' },
+        { type: 'debug', text: 'Найдено фрагментов: 1; лучший — guide.md · чанк № 7' },
+        { type: 'bot', hits: 1, cited: !HELP_NO_CITES,
+          text: HELP_NO_CITES
+            // Ответ ЦЕЛИКОМ по данным репозитория (MCP): ссылок на документацию
+            // в нём нет — и подсвечивать под ним нечего.
+            ? 'Ветка ai-challenge/day31, изменено 9 файлов, добавлено 4 новых.'
+            : 'Проект — приложение на FastAPI с агентом и поиском по базам '
+              + 'знаний [1].\n\n📄 Источники: [1] guide.md · релевантность 1.15 · фрагмент № 7.',
+          sources: RAG_SOURCES || [] },
+        { type: 'answer_ready' },
+        { type: 'usage', usage: { calls: 2, prompt_tokens: 300, completion_tokens: 40 } },
+        { type: 'done', usage: { calls: 2, prompt_tokens: 300, completion_tokens: 40 } },
       ]);
     }
     if (url === '/api/agent/rag/dialog') {
@@ -3827,16 +3858,22 @@ async function run() {
       .indexOf('№ 7') >= 0
       && srcCards[0].querySelector('.rag-source-name').textContent.indexOf('guide.md') >= 0,
     srcCards[0] ? srcCards[0].querySelector('.rag-source-name').textContent : '');
-  check('строки пронумерованы по порядку',
-    srcCards.length > 1 && srcCards[1].querySelector('.rag-source-num').textContent === '2.',
-    srcCards[1] ? srcCards[1].querySelector('.rag-source-num').textContent : '');
+  // НОМЕРА КАРТОЧЕК — ИСХОДНЫЕ, из ссылок ответа: «[1]» в тексте, карточка с
+  // номером 1 и «[1]» в строке источников — один и тот же фрагмент. Порядок в
+  // списке теперь по группам (использованные выше), и нумерация от этого НЕ
+  // сдвигается — на этом держится кликабельность ссылок.
+  check('нумерация карточек исходная, а не по порядку в списке',
+    srcCards.length === RAG_SOURCES.length
+    && srcCards[0].querySelector('.rag-source-num').textContent === '1.'
+    && srcCards.map(el => el.dataset.n).join(',') !== ''
+    && new Set(srcCards.map(el => el.dataset.n)).size === RAG_SOURCES.length,
+    srcCards.map(el => el.dataset.n + ':' + el.querySelector('.rag-source-num').textContent).join(' '));
+  const neighbourCard = srcCards.filter(
+    el => el.querySelector('.rag-source-meta').textContent.indexOf('соседний фрагмент № 42') >= 0)[0];
   check('соседний фрагмент подписан как продолжение, а не релевантностью',
-    srcCards.length > 2
-    && srcCards[2].querySelector('.rag-source-meta').textContent
-      .indexOf('соседний фрагмент № 42') >= 0
-    && srcCards[2].querySelector('.rag-source-meta').textContent
-      .indexOf('релевантность') < 0,
-    srcCards[2] ? srcCards[2].querySelector('.rag-source-meta').textContent : '');
+    !!neighbourCard
+    && neighbourCard.querySelector('.rag-source-meta').textContent.indexOf('релевантность') < 0,
+    neighbourCard ? neighbourCard.querySelector('.rag-source-meta').textContent : '(нет карточки)');
   check('в подписи строки видны ДВА числа: релевантность и оценка модели',
     !!srcCards[0] && srcCards[0].querySelector('.rag-source-meta').textContent
       .indexOf('релевантность 1.15') >= 0
@@ -3853,10 +3890,35 @@ async function run() {
       && srcCards[0].title.indexOf('слова запроса 0.82') >= 0
       && srcCards[0].title.indexOf('релевантность первичного поиска: 1.15') >= 0,
     srcCards[0] ? srcCards[0].title : '');
-  check('подпись блока честная: «подобраны по запросу», а не «использованы в ответе»',
-    !!srcBox[0] && srcBox[0].querySelector('.rag-sources-head').textContent
-      .indexOf('подобранные по этому запросу') >= 0,
-    srcBox[0] ? srcBox[0].querySelector('.rag-sources-head').textContent : '');
+  // ГЛАВНОЕ ПРАВИЛО БЛОКА (правка 12.10): «использован» — это фрагмент, на
+  // который модель СОСЛАЛАСЬ номером. Раньше подсвечивались все подобранные, и
+  // ответ, построенный по данным MCP, прикладывал под собой адреса документации,
+  // которой в нём не было.
+  const srcHead = srcBox[0] ? srcBox[0].querySelector('.rag-sources-head').textContent : '';
+  check('подпись блока различает использованные и подобранные фрагменты',
+    srcHead.indexOf('использованы') >= 0 && srcHead.indexOf('не использованы') >= 0,
+    srcHead);
+  check('использованным фрагментам поставлена пометка в карточке',
+    q('#messages .rag-source.used').length === 2
+    && q('#messages .rag-source .rag-source-badge').length === 2,
+    'использованных карточек: ' + q('#messages .rag-source.used').length);
+  check('использованы именно те, на которые сослался ответ ([1] и [3])',
+    q('#messages .rag-source.used').map(el => el.dataset.n).join(',') === '1,3',
+    q('#messages .rag-source.used').map(el => el.dataset.n).join(','));
+  check('подобранные, но не использованные — свёрнуты под кнопкой',
+    q('#messages .rag-sources-rest').length === 1
+    && q('#messages .rag-sources-rest')[0].hidden === true
+    && !!q('#messages .rag-sources-toggle')[0],
+    'скрытых групп: ' + q('#messages .rag-sources-rest').length);
+  await click(q('#messages .rag-sources-toggle')[0], 30);
+  check('кнопка раскрывает подобранные фрагменты (и прячет обратно)',
+    q('#messages .rag-sources-rest')[0].hidden === false
+    && q('#messages .rag-source').length === RAG_SOURCES.length
+    && q('#messages .rag-sources-toggle')[0].textContent.indexOf('Скрыть') >= 0,
+    q('#messages .rag-sources-toggle')[0].textContent);
+  await click(q('#messages .rag-sources-toggle')[0], 30);
+  check('повторный клик снова сворачивает группу',
+    q('#messages .rag-sources-rest')[0].hidden === true);
   check('под служебными строками источников нет',
     q('#messages .msg.debug .rag-sources').length === 0);
   // ИСТОЧНИКИ ЖИВУТ В ЖУРНАЛЕ: после перечитывания диалога карточки на месте.
@@ -4678,6 +4740,85 @@ async function run() {
     $('agent-view-toggle').textContent);
   dom.window.eval('setAgentPanelView("tokens")');
   await wait(40);
+
+  // ---------------------------------------------------------------------
+  // [V2] КОМАНДА /help: ассистент разработчика — вопросы о САМОМ проекте.
+  //      Идёт МИМО пайплайна задачи (свой потоковый маршрут), ответ приходит
+  //      вместе с источниками документации, а контекст репозитория — из MCP.
+  // ---------------------------------------------------------------------
+  console.log('\n[V2] Команда /help: ассистент разработчика');
+  const helpChatCalls = chatCalls();
+  const helpStepCalls = stepCalls();
+  const helpPlain = helpCalls.length;
+  await sendRequest('/help что это за проект?', 80);
+  await wait(120);
+  check('команда ушла в СВОЙ маршрут, а не в чат агента',
+    helpCalls.length === helpPlain + 1 && chatCalls() === helpChatCalls,
+    'запросов ассистента: ' + (helpCalls.length - helpPlain)
+      + ', вызовов чата: ' + (chatCalls() - helpChatCalls));
+  check('вопрос ушёл целиком, вместе с командой',
+    (helpCalls[helpCalls.length - 1].content || '').indexOf('/help что это за проект?') >= 0,
+    JSON.stringify(helpCalls[helpCalls.length - 1]));
+  check('шагов плана команда не запустила', stepCalls() === helpStepCalls,
+    'шагов: ' + (stepCalls() - helpStepCalls));
+  check('вопрос нарисован репликой пользователя',
+    q('#messages .msg.user').some(el => el.textContent.indexOf('/help') >= 0
+      && el.textContent.indexOf('что это за проект?') >= 0));
+  check('строки о контексте репозитория и документации показаны',
+    q('#messages .msg.debug').some(el => el.textContent.indexOf('состояние репозитория: получено через MCP') >= 0
+      && el.textContent.indexOf('Документация проекта') >= 0));
+  const helpAnswer = q('#messages .msg.bot').filter(
+    el => el.textContent.indexOf('приложение на FastAPI') >= 0);
+  check('ответ ассистента нарисован', helpAnswer.length === 1,
+    'ответов: ' + helpAnswer.length);
+  check('под ответом карточки источников документации (как у агента)',
+    !!helpAnswer[0] && helpAnswer[0].querySelectorAll('.rag-source').length > 0,
+    helpAnswer[0] ? String(helpAnswer[0].querySelectorAll('.rag-source').length) : '');
+  check('разметка ответа разбирается (ссылка «[1]» — кликабельная цитата)',
+    !!helpAnswer[0] && helpAnswer[0].querySelectorAll('.msg-cite').length > 0);
+  // ОТВЕТ ПО ДАННЫМ РЕПОЗИТОРИЯ (без ссылок на документацию): подобрано — да,
+  // использовано — нет. Никаких пометок «использован» и никакой свёрнутой группы
+  // быть не должно, но сами карточки остаются: «что было передано модели» — это
+  // факт, и прятать его нельзя.
+  HELP_NO_CITES = true;
+  await sendRequest('/help что в рабочей копии?', 80);
+  await wait(120);
+  const mcpAnswer = q('#messages .msg.bot').filter(
+    el => el.textContent.indexOf('изменено 9 файлов') >= 0)[0];
+  check('ответ по данным репозитория нарисован', !!mcpAnswer);
+  const mcpBlock = mcpAnswer ? mcpAnswer.querySelector('.rag-sources') : null;
+  check('фрагменты не выданы за использованные (пометок нет, группа свёрнута)',
+    !!mcpBlock && mcpBlock.querySelectorAll('.rag-source.used').length === 0
+    && mcpBlock.querySelectorAll('.rag-source-badge').length === 0
+    && mcpBlock.querySelectorAll('.rag-sources-rest').length === 1
+    && mcpBlock.querySelectorAll('.rag-sources-rest')[0].hidden === true
+    && mcpBlock.querySelectorAll('.rag-sources-toggle').length === 1,
+    mcpBlock ? mcpBlock.textContent.slice(0, 140) : '(нет блока)');
+  check('подпись блока честная: «ни один в ответе не использован»',
+    !!mcpBlock && mcpBlock.querySelector('.rag-sources-head').textContent
+      .indexOf('ни один в ответе не использован') >= 0,
+    mcpBlock ? mcpBlock.querySelector('.rag-sources-head').textContent : '');
+  check('карточки подобранных фрагментов остаются доступны (все в разметке)',
+    !!mcpBlock && mcpBlock.querySelectorAll('.rag-source').length === (RAG_SOURCES || []).length,
+    mcpBlock ? String(mcpBlock.querySelectorAll('.rag-source').length) : '');
+  check('кнопка раскрывает подобранные фрагменты и в этом случае',
+    await (async () => {
+      await click(mcpBlock.querySelector('.rag-sources-toggle'), 30);
+      const open = mcpBlock.querySelectorAll('.rag-sources-rest')[0].hidden === false;
+      await click(mcpBlock.querySelector('.rag-sources-toggle'), 30);
+      return open && mcpBlock.querySelectorAll('.rag-sources-rest')[0].hidden === true;
+    })());
+  HELP_NO_CITES = false;
+
+  check('без вопроса команда тоже работает (обзор проекта)',
+    await (async () => {
+      const before = helpCalls.length;
+      await sendRequest('/help', 80);
+      await wait(120);
+      const body = helpCalls[helpCalls.length - 1] || {};
+      return helpCalls.length === before + 1
+        && (body.content || '').indexOf('Что это за проект') >= 0;
+    })());
 
   // КОМАНДЫ /test_rag_dialog_1|2: контрольный разговор из 10 реплик.
   const dialogTestsBefore = dialogTests.length;

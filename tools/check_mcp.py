@@ -872,26 +872,38 @@ async def test_dialog():
     check("сбой выбора не оставляет блок данных",
           mcp_store.BLOCK_HEADER[:40] not in system_texts(), system_texts()[-200:])
 
-    # 5.6 Реестр проекта: три локальных сервера без ключей и ДВА своих на VPS.
+    # 5.6 Реестр проекта: ЧЕТЫРЕ локальных сервера (три внешних без ключей и git
+    # по рабочей копии проекта) и ДВА своих на VPS.
     restore_registry()
     registry = mcp_store.servers()
-    check("к проекту подключены пять MCP-серверов", len(registry) == 5,
+    check("к проекту подключены шесть MCP-серверов", len(registry) == 6,
           str([entry["id"] for entry in registry]))
     check("у каждого есть название и краткое описание",
           all(entry["name"] and entry["description"] for entry in registry),
           str(registry)[:200])
-    check("id серверов — погода, курсы валют, криптовалюты, свой Open-Meteo и реестр городов",
+    check("id серверов — погода, курсы валют, криптовалюты, git проекта, "
+          "свой Open-Meteo и реестр городов",
           [entry["id"] for entry in registry]
-          == ["weather", "currency", "crypto", "open_meteo", "city_registry"],
+          == ["weather", "currency", "crypto", "git", "open_meteo", "city_registry"],
           str([entry["id"] for entry in registry]))
     local = [entry for entry in registry
              if mcp_store.transport_of(entry) == mcp_store.STDIO_TRANSPORT]
-    check("три сервера проекта — локальные файлы MCP SDK на stdio",
-          len(local) == 3
+    check("четыре сервера проекта — локальные файлы MCP SDK на stdio",
+          len(local) == 4
           and all(str(entry.get("script", "")).endswith(".mjs") for entry in local),
           str([entry.get("script") for entry in local]))
+    git_entry = mcp_store.find_server("git") or {}
+    check("git-сервер проекта — локальный, без сети и без ключей",
+          mcp_store.transport_of(git_entry) == mcp_store.STDIO_TRANSPORT
+          and git_entry.get("script") == "git.mjs" and "url" not in git_entry
+          and "token_env" not in git_entry,
+          str(git_entry)[:200])
+    check("git-сервер обещает ветку, файлы и изменения (описание для диалога)",
+          all(word in str(git_entry.get("description") or "").lower()
+              for word in ("ветк", "файл", "измен")),
+          str(git_entry.get("description")))
     remote = mcp_store.find_server("open_meteo") or {}
-    check("четвёртый сервер — удалённый, транспорт http",
+    check("пятый сервер (погода на VPS) — удалённый, транспорт http",
           mcp_store.transport_of(remote) == mcp_store.HTTP_TRANSPORT,
           str(remote)[:200])
     check("по умолчанию адрес — локальный туннель, а не адрес VPS",
