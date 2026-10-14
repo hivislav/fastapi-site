@@ -179,7 +179,20 @@ jobs:
         # Сервер `git` — тот же, что в чате: он один отвечает за то, ЧТО видит
         # ревью (ветка против базовой, окна diff'а, закрытые пути). Зависимости
         # ставятся по замку из репозитория.
-        run: npm ci --prefix mcp_servers
+        env:
+          # КЭШ NPM — ВНУТРИ РАБОЧЕЙ КОПИИ ЗАДАЧИ, а не в домашнем каталоге
+          # пользователя: у своей машины глобальный кэш бывает попорчен
+          # (root-owned файлы после `sudo npm install`), и тогда `npm ci` падает с
+          # EPERM ещё до установки — живой случай 14.10 на этой машине.
+          npm_config_cache: ${{ github.workspace }}/.npm-cache
+        run: |
+          set -eu
+          if [ -d mcp_servers/node_modules/@modelcontextprotocol ]; then
+            # Кэш задачи уже разложил зависимости — ставить заново нечего.
+            echo "Зависимости MCP-сервера на месте (из кэша задачи)."
+          else
+            npm ci --prefix mcp_servers
+          fi
 
       - name: Чем будут считаться эмбеддинги
         if: ${{ steps.mode.outputs.enabled == 'true' }}
