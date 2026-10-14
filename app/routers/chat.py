@@ -5570,9 +5570,14 @@ async def agent_review(msg: ChatMessage) -> StreamingResponse:
                                                   base=asked_base or None)
             await _persist()
         state = dict(state)
+        # СТРОКА ПРО ПАЙПЛАЙН — ВСЕГДА, и при включении, и при выключении: команды
+        # в чате и есть рубильник ревью на pull request (первый шаг пайплайна
+        # читает эту же настройку проекта). Человек должен видеть, что именно он
+        # переключил, — а не догадываться об этом по следующему PR.
+        root = _ai_review_repo_dir()
+        state["pipeline"] = ai_review.pipeline_note(root, bool(value))
         if not value:
             return state
-        root = _ai_review_repo_dir()
         # ХЕШ КОММИТА СПРАШИВАЕМ У СЕРВЕРА GIT (два вызова) — и кладём его в маркер
         # индекса. Иначе индекс, собранный при включении, окажется «не про тот
         # коммит» для ревью (оно сверяет именно хеш) и соберётся второй раз.

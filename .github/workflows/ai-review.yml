@@ -29,14 +29,16 @@
 #     — НИЧЕГО НЕ НУЖНО — для СВОЕЙ машины: `tools/review_runner.sh start`
 #       передаёт раннеру ключ из `.env` проекта, а задачи наследуют окружение
 #       раннера (секрет в GitHub при этом можно не заводить вовсе);
-#   * переменная AI_REVIEW_ENABLED — рубильник: значение `off` выключает ревью
-#     целиком. Любое другое значение (в том числе пустое — переменной нет) —
-#     ревью работает. ЭТО РЕЗЕРВНЫЙ РУБИЛЬНИК: основной — команды
-#     `/ai_review_enable` и `/ai_review_disable` в чате (настройка ПРОЕКТА).
-#     Облачному раннеру файл проекта не виден, поэтому ему нужна переменная; на
-#     своей машине достаточно задать AI_REVIEW_WORKSPACE — и команды в чате будут
-#     управлять пайплайном, а переменная останется только аварийным тормозом
-#     (остановить ревью, не трогая приложение). Это парная настройка к командам `/ai_review_enable` и
+#   * ПЕРВЫЙ ШАГ ПРОГОНА ЧИТАЕТ РЕЖИМ У ПРОЕКТА. Главный рубильник ревью —
+#     команды `/ai_review_enable` и `/ai_review_disable` в чате (настройка
+#     проекта): выключен режим — прогон завершается за секунды, не ставя
+#     зависимости, не собирая индекс и не тратя вызовы модели. На СВОЕЙ машине
+#     связь настраивать не нужно: `tools/review_runner.sh start` передаёт задачам
+#     путь к файлу проекта (AI_REVIEW_WORKSPACE). Для ОБЛАЧНОГО раннера файл
+#     проекта недоступен, поэтому там команды не действуют и нужна переменная;
+#   * переменная AI_REVIEW_ENABLED — АВАРИЙНЫЙ ТОРМОЗ: значение `off` выключает
+#     ревью целиком, не трогая приложение (например на время заморозки). Любое
+#     другое значение (в том числе пустое — переменной нет) ничего не выключает. Это парная настройка к командам `/ai_review_enable` и
 #     `/ai_review_disable` в чате: там режим живёт у ПРОЕКТА, здесь — у
 #     РЕПОЗИТОРИЯ, потому что у пайплайна нет доступа к локальному проекту.
 #     НА СВОЕЙ МАШИНЕ ЭТО МОЖНО СВЯЗАТЬ: переменная AI_REVIEW_WORKSPACE с путём
@@ -99,16 +101,44 @@ jobs:
             "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
 
       - name: Python 3.12
+        # Ставится ВСЕГДА, до разбора режима: разбор читает настройку проекта
+        # модулями самого проекта, а системный python3 раннера может быть старше
+        # (в коде проекта есть `X | None`, то есть нужен 3.10+).
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      - name: Режим AI-ревью у проекта (рубильник из чата)
+        # ГЛАВНЫЙ РУБИЛЬНИК — КОМАНДЫ `/ai_review_enable` и `/ai_review_disable`:
+        # ревью делает ровно то, что записано в настройке проекта. Файл проекта
+        # приходит задачам из окружения раннера (`tools/review_runner.sh start`
+        # ставит AI_REVIEW_WORKSPACE) или из переменной репозитория. Решение
+        # принимает ТОТ ЖЕ код, что и сам прогон, — спрашиваем его и по ответу
+        # пропускаем тяжёлые шаги: при выключенном режиме не ставятся зависимости,
+        # не собирается индекс и не тратятся вызовы модели.
+        id: mode
+        run: |
+          set -eu
+          python3 tools/ai_review.py --mode-report --repo "$GITHUB_WORKSPACE" \
+            --workspace "${{ vars.AI_REVIEW_WORKSPACE }}" > mode.json
+          cat mode.json
+          ENABLED=$(python3 -c "import json;print('true' if json.load(open('mode.json'))['enabled'] else 'false')")
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 🤖 AI-ревью изменений"
+            echo
+            echo "- режим у проекта: **$ENABLED**"
+            python3 -c "import json;d=json.load(open('mode.json'));print('- ' + d['reason']);print('- файл проекта: \`%s\`' % d['workspace']);print('- проект: %s' % (d['project'] or '—'));print('- ключ модели: %s' % ('есть' if d['key'] else 'нет — ' + d['key_reason']))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Node.js (для MCP-сервера git)
+        if: ${{ steps.mode.outputs.enabled == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Кэш зависимостей MCP-сервера
+        if: ${{ steps.mode.outputs.enabled == 'true' }}
         # На self-hosted раннере выкладка кода обновляется каждый прогон, а
         # `node_modules` от неё не зависит: держим его в кэше по замку версий.
         uses: actions/cache@v4
@@ -117,12 +147,14 @@ jobs:
           key: mcp-node-${{ hashFiles('mcp_servers/package-lock.json') }}
 
       - name: Зависимости MCP-сервера git
+        if: ${{ steps.mode.outputs.enabled == 'true' }}
         # Сервер `git` — тот же, что в чате: он один отвечает за то, ЧТО видит
         # ревью (ветка против базовой, окна diff'а, закрытые пути). Зависимости
         # ставятся по замку из репозитория.
         run: npm ci --prefix mcp_servers
 
       - name: Чем будут считаться эмбеддинги
+        if: ${{ steps.mode.outputs.enabled == 'true' }}
         # ПОКАЗЫВАЕТ, а не обещает: на своей машине с пакетом эмбеддингов и кэшем
         # моделей поиск по коду семантический, в облаке — встроенный офлайн-бэкенд.
         # Раньше этого не видно, и «RAG вроде работал» ничем не подтверждалось.
@@ -142,6 +174,7 @@ jobs:
           PY
 
       - name: Разбор изменений
+        if: ${{ steps.mode.outputs.enabled == 'true' }}
         id: review
         # Сбой шага не роняет прогон сразу: причину надо ещё показать в итоге и
         # в комментарии, а решение «красный или зелёный» принимается ниже.
@@ -180,24 +213,41 @@ jobs:
           if [ -n "${{ vars.AI_REVIEW_INDEX_DIR }}" ]; then
             INDEX_ARGS="--index-dir ${{ vars.AI_REVIEW_INDEX_DIR }}"
           else
+            # Каталог индекса обычно приходит из окружения раннера
+            # (AI_REVIEW_INDEX_DIR у self-hosted: индекс вне рабочей копии).
             INDEX_ARGS=""
           fi
+          # РЕЖИМ RAG. На СВОЕЙ машине он обязателен: там есть пакет эмбеддингов и
+          # кэш моделей, и «ревью без индекса» означало бы, что поиск по коду
+          # молча не работает. В облаке — с откатом на отбор контекста кодом.
+          # Переменная AI_REVIEW_RAG перекрывает умолчание.
+          RAG_MODE="${{ vars.AI_REVIEW_RAG }}"
+          if [ -z "$RAG_MODE" ]; then
+            if [ "${{ runner.environment }}" = "self-hosted" ]; then RAG_MODE=on; else RAG_MODE=auto; fi
+          fi
+          echo "Режим RAG: $RAG_MODE"
           python3 tools/ai_review.py \
             --base "origin/${{ github.base_ref }}" \
             --repo "$GITHUB_WORKSPACE" \
             --workspace "${{ vars.AI_REVIEW_WORKSPACE }}" \
-            --rag "${{ vars.AI_REVIEW_RAG || 'auto' }}" \
+            --rag "$RAG_MODE" \
             $INDEX_ARGS \
             --out review.md \
             --json review.json \
             --quiet \
             2>&1 | tee review.log
 
+      - name: Итог прогона при выключенном режиме
+        if: ${{ steps.mode.outputs.enabled != 'true' }}
+        run: |
+          echo "Режим AI-ревью у проекта выключен — ревью не запускалось." >> "$GITHUB_STEP_SUMMARY"
+          echo "Включить: команда /ai_review_enable в чате проекта." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Итог прогона
         # Итог пишется ВСЕГДА: и когда ревью сделано, и когда оно честно не
         # делалось по настройке (нет ключа, режим выключен), и когда прогон
         # сорвался. В последнем случае причина названа словами.
-        if: always()
+        if: ${{ always() && steps.mode.outputs.enabled == 'true' }}
         run: |
           {
             echo "## 🤖 AI-ревью изменений"
@@ -222,7 +272,7 @@ jobs:
         # Комментарий — ОТДЕЛЬНЫЙ шаг и с правом на ошибку: у pull request из
         # форка токен только на чтение, и падать из-за этого ревью не должно
         # (отчёт всё равно есть в итоге прогона и в артефакте).
-        if: ${{ steps.review.outcome == 'success' && hashFiles('review.md') != '' }}
+        if: ${{ steps.mode.outputs.enabled == 'true' && steps.review.outcome == 'success' && hashFiles('review.md') != '' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -257,7 +307,7 @@ jobs:
       - name: Артефакт с отчётом
         # Артефакт — на случай, когда комментарий поставить не удалось (форк) или
         # когда отчёт хочется посмотреть целиком, вместе с журналом прогона.
-        if: always()
+        if: ${{ always() && steps.mode.outputs.enabled == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ai-review
@@ -273,7 +323,7 @@ jobs:
         # кода: прогон остаётся успешным, причина видна в итоге. А вот сорванное
         # ревью (сервер git недоступен, model не ответила) обязано быть заметным:
         # иначе pipeline молча зеленеет без ревью.
-        if: ${{ steps.review.outcome == 'failure' }}
+        if: ${{ steps.mode.outputs.enabled == 'true' && steps.review.outcome == 'failure' }}
         run: |
           echo "::error::AI-ревью не выполнено — причина в итоге прогона и в артефакте ai-review"
           exit 1

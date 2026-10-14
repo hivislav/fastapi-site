@@ -71,6 +71,15 @@ SERVER_ID = "git"
 STATUS_TOOL = "git_status"
 FILES_TOOL = "git_branch_files"
 DIFF_TOOL = "git_branch_diff"
+# ПЕРЕМЕННЫЕ ПАЙПЛАЙНА. Их ставит окружение раннера (`tools/review_runner.sh
+# start` на своей машине), и они связывают пайплайн с ПРИЛОЖЕНИЕМ: файл проекта
+# ведёт к настройке, которой управляют команды `/ai_review_enable` и
+# `/ai_review_disable`, а каталог индекса — вне рабочей копии, чтобы индекс
+# переживал выкладку кода. Читаются и аргументами (`--workspace`, `--index-dir`),
+# и из окружения: аргумент главнее.
+WORKSPACE_ENV = "AI_REVIEW_WORKSPACE"
+INDEX_ENV = "AI_REVIEW_INDEX_DIR"
+
 # Каталог репозитория — та же переменная, что читает сервер
 # (mcp_servers/git.mjs): контекст кода обязан собираться по ТОМУ ЖЕ репозиторию,
 # изменения которого показывает сервер, иначе «связанные файлы» будут из чужого
@@ -184,6 +193,44 @@ def parse(text: Any) -> Tuple[str, str, str]:
                  or not re.fullmatch(r"[A-Za-z0-9._/@^~-]{1,200}", base)):
         return "", "", ""
     return MODE_REVIEW, base, note[:500]
+
+
+def pipeline_state(root: str) -> Dict[str, Any]:
+    """Состояние пайплайна НА ЭТОЙ МАШИНЕ: есть ли свой раннер.
+
+    Нужно, чтобы ответ на команду включения не обещал наугад: «пайплайн включён»
+    правда только там, где есть раннер, который эту настройку прочитает. Признаки
+    — файлы самого раннера в каталоге данных проекта (`data/review_runner`):
+    распакованный (`config.sh`) и зарегистрированный (`.runner`).
+    """
+    base = os.path.join(str(root or "").rstrip("/"), "data", "review_runner")
+    installed = os.path.isfile(os.path.join(base, "config.sh"))
+    registered = os.path.isfile(os.path.join(base, ".runner"))
+    return {"dir": base, "installed": installed, "registered": registered,
+            "run_script": os.path.join(str(root or "").rstrip("/"), "tools",
+                                       "review_runner.sh")}
+
+
+def pipeline_note(root: str, enabled: bool) -> str:
+    """Строка про ПАЙПЛАЙН для ответа на команды включения и выключения.
+
+    Работа ревью на pull request — это тот же режим, что и в чате, и человек
+    вправе знать, что именно он переключил. Поэтому команда называет состояние
+    раннера на этой машине: со своим раннером настройка управляет и пайплайном,
+    без него — пайплайн либо пойдёт в облако, либо не запустится вовсе.
+    """
+    state = pipeline_state(root)
+    if enabled and state["registered"]:
+        return ("🛠 И пайплайн на pull request: включён — раннер на этой машине "
+                "зарегистрирован и читает эту же настройку (файл проекта). "
+                "Выключение режима остановит и его.")
+    if enabled:
+        return ("ℹ Своего раннера на этой машине нет (%s) — пайплайн на pull "
+                "request идёт в облако, если он там настроен, и командой не "
+                "переключается. На своей машине раннер ставит %s."
+                % (state["dir"], state["run_script"]))
+    return ("🛠 И пайплайн на pull request выключен: следующий PR завершится без "
+            "ревью (причина видна в итоге прогона).")
 
 
 def state_text(enabled: bool, base: str = "") -> str:

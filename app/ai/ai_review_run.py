@@ -217,8 +217,9 @@ async def run(deps: Deps, mode: str = ai_review.MODE_REVIEW, base: str = "",
         # включении режима фоновая задача грузит код репозитория в базу знаний
         # (§5.11г). Молчать об этом нельзя: человек должен знать, что ревью пока
         # идёт по отбору контекста, а индекс ещё собирается.
-        if str(state.get("note") or "").strip():
-            text += "\n\n" + str(state["note"]).strip()
+        for extra in ("note", "pipeline"):
+            if str(state.get(extra) or "").strip():
+                text += "\n\n" + str(state[extra]).strip()
         yield {"type": "bot", "text": text}
         return
 

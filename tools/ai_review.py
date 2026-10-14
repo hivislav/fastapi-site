@@ -109,7 +109,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--enabled", choices=("auto", "on", "off"), default="auto",
                         help="состояние режима: auto — из настройки проекта, если она есть")
     parser.add_argument("--workspace", default="",
-                        help="файл workspace для --enabled auto (по умолчанию рабочий)")
+                        help="файл проекта для --enabled auto (по умолчанию — "
+                             "%s из окружения, иначе рабочий файл проекта)"
+                             % ai_review.WORKSPACE_ENV)
+    parser.add_argument("--mode-report", action="store_true",
+                        help="напечатать JSON о режиме у проекта и выйти: по нему "
+                             "пайплайн решает, запускать ли ревью вообще")
     parser.add_argument("--max-files", type=int, default=0,
                         help="сколько файлов читать diff'ом (по умолчанию %d)"
                              % ai_review.MAX_DIFF_FILES)
@@ -152,12 +157,39 @@ def apply_environment(args: argparse.Namespace) -> Dict[str, str]:
     действуют в приложении. Поэтому аргументы скрипта ВЫСТАВЛЯЮТ переменные, а не
     заводят второй способ настройки.
     """
-    if str(args.index_dir or "").strip():
-        os.environ["RAG_DIR"] = os.path.abspath(str(args.index_dir).strip())
+    index_dir = str(args.index_dir or os.getenv(ai_review.INDEX_ENV) or "").strip()
+    if index_dir:
+        os.environ["RAG_DIR"] = os.path.abspath(index_dir)
     if str(args.embeddings or "").strip():
         os.environ["RAG_EMBED_BACKEND"] = str(args.embeddings).strip()
     return {"index_dir": os.environ.get("RAG_DIR", ""),
             "embeddings": os.environ.get("RAG_EMBED_BACKEND", "auto")}
+
+
+def mode_report(args: argparse.Namespace) -> Dict[str, Any]:
+    """Что пайплайн думает о режиме — одной строкой JSON (для гейта в workflow).
+
+    Пайплайн читает настройку ПРОЕКТА (её меняют команды в чате) и выключается,
+    когда режим выключен. Чтобы не повторять этот разбор в YAML, решение
+    принимает ТОТ ЖЕ код, что и сам прогон: workflow лишь спрашивает и по ответу
+    решает, делать ли остальные шаги.
+    """
+    environment = apply_environment(args)
+    mode = project_mode(args)
+    enabled = mode["enabled"] if args.enabled == "auto" else (args.enabled == "on")
+    has_key, key_reason = model_key_present()
+    return {
+        "enabled": bool(enabled),
+        "reason": mode["reason"],
+        "workspace": mode["path"],
+        "project": str(mode.get("project") or ""),
+        "base": mode["base"],
+        "index_dir": environment["index_dir"],
+        "embeddings": environment["embeddings"],
+        "key": bool(has_key),
+        "key_reason": "" if has_key else key_reason,
+        "runner_label": str(os.getenv("AI_REVIEW_RUNNER") or ""),
+    }
 
 
 def applied_limits(args: argparse.Namespace) -> Dict[str, int]:
@@ -213,10 +245,12 @@ def project_mode(args: argparse.Namespace) -> Dict[str, Any]:
     Поэтому `auto` уважает настройку, КОГДА ОНА ЕСТЬ, и честно говорит, что
     смотрит её, — а не делает вид, что знает.
     """
-    path = str(args.workspace or config.AGENT_WORKSPACE_FILE)
+    path = str(args.workspace or os.getenv(ai_review.WORKSPACE_ENV) or ""
+               or config.AGENT_WORKSPACE_FILE)
     if not os.path.isfile(path):
         return {"found": False, "enabled": True, "base": "", "path": path,
-                "reason": "файла проекта нет — режим считаю включённым"}
+                "project": "",
+                "reason": "файла проекта нет (%s) — режим считаю включённым" % path}
     try:
         workspace = workspace_store.load_workspace(path)
     except Exception as exc:                # pragma: no cover - защита
@@ -229,6 +263,7 @@ def project_mode(args: argparse.Namespace) -> Dict[str, Any]:
     settings = workspace_store.ai_review_settings(task)
     return {"found": True, "enabled": bool(settings.get("enabled")),
             "base": str(settings.get("base") or ""), "path": path,
+            "project": str(task.get("name") or task.get("id") or ""),
             "reason": "настройка проекта «%s»" % str(task.get("name") or task.get("id") or "")}
 
 
@@ -424,6 +459,7 @@ async def run_review(args: argparse.Namespace) -> Dict[str, Any]:
     index = used.get("index") or {}
     meta = {
         "enabled": True, "base": base, "repo": str(args.repo or ""),
+        "project": str(mode.get("project") or ""),
         "model": config.active_model(), "provider": config.llm_source(),
         "seconds": round(time.time() - start, 1), "limits": limits,
         "events": len(events), "dry_run": bool(args.dry_run),
@@ -499,6 +535,11 @@ def dry_run_text(result: Dict[str, Any], args: argparse.Namespace) -> str:
 def main(argv: Optional[List[str]] = None) -> int:
     """Точка входа пайплайна: печатает отчёт, пишет файлы, возвращает код."""
     args = parse_args(argv)
+    if args.mode_report:
+        # Отчёт о режиме — ДО всякой работы и без обращений к модели: workflow
+        # спрашивает его первым шагом и по ответу пропускает остальные.
+        print(json.dumps(mode_report(args), ensure_ascii=False))
+        return 0
     # Каталог репозитория — серверу `git` (он читает ту же переменную): ревью
     # обязано смотреть в ТО ЖЕ дерево, из которого собрано.
     os.environ[ai_review.REPO_ENV] = str(args.repo or "")

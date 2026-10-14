@@ -793,6 +793,8 @@ async def section_route():
     check("включение модели не требует", LLM_CALLS == [])
     check("включение называет загрузку кода в RAG (задача или свежий индекс)",
           "Индекс кода" in enable_note, enable_note[:300])
+    check("включение говорит, что оно делает с ПАЙПЛАЙНОМ на PR",
+          "пайплайн на pull request" in enable_note.lower(), enable_note[:400])
     if chat._review_index_tasks:
         await asyncio.gather(*list(chat._review_index_tasks), return_exceptions=True)
     bases = ai_review_rag.review_bases(profile=profile_id)
@@ -867,9 +869,11 @@ async def section_route():
     # ВЫКЛЮЧЕНИЕ — состояние меняется в обе стороны.
     events = await run_review_route(ai_review.COMMAND_DISABLE,
                                     session_id=str(session["id"]))
-    check("выключение: настройка проекта снята",
+    disable_note = texts(events, "bot")[0]
+    check("выключение: настройка проекта снята и пайплайн назван выключенным",
           workspace_store.ai_review_enabled(task) is False
-          and "выключен" in texts(events, "bot")[0])
+          and "выключен" in disable_note
+          and "пайплайн на pull request выключен" in disable_note, disable_note[:300])
 
     log_kinds = [node.get("kind") for node in session["dialog"].get("log") or []]
     check("отчёт и команда записаны в ЖУРНАЛ чата",
@@ -986,6 +990,36 @@ def section_cli():
     check("auto: выключенный у ПРОЕКТА режим учтён и не считается сбоем",
           result.returncode == 0 and "выключен" in result.stderr
           and ai_review.COMMAND_ENABLE in result.stderr, result.stderr[-400:])
+
+    # ЧТО ПАЙПЛАЙН ДУМАЕТ О РЕЖИМЕ: этим ответом workflow решает, запускать ли
+    # ревью вообще (главный рубильник — команды в чате).
+    result = run_cli("--mode-report", "--repo", REPO,
+                     env_extra={"AI_REVIEW_WORKSPACE":
+                                os.environ["AGENT_WORKSPACE_FILE"]})
+    report = {}
+    try:
+        report = json.loads(result.stdout)
+    except ValueError:
+        report = {}
+    check("отчёт о режиме: JSON с решением, причиной и проектом",
+          result.returncode == 0 and report.get("enabled") is False
+          and "настройка проекта" in str(report.get("reason"))
+          and report.get("key") is True and report.get("workspace"),
+          result.stdout[:300])
+    check("файл проекта пайплайн берёт из окружения раннера (AI_REVIEW_WORKSPACE)",
+          str(report.get("workspace")) == os.environ["AGENT_WORKSPACE_FILE"],
+          repr(report.get("workspace")))
+    # Каталог индекса — тоже из окружения: у своей машины он вынесен ВНЕ рабочей
+    # копии, иначе индекс терялся бы при каждой выкладке кода.
+    env_index = os.path.join(_TMP, "env_index_dir")
+    result = run_cli("--repo", REPO, "--base", BASE, "--enabled", "on", "--rag", "on",
+                     "--out", os.path.join(_TMP, "env_index.md"),
+                     env_extra={"AI_REVIEW_INDEX_DIR": env_index})
+    check("каталог индекса берётся из окружения (AI_REVIEW_INDEX_DIR)",
+          result.returncode == 0 and os.path.isdir(env_index)
+          and any(name.startswith("kb-") for name in os.listdir(env_index)),
+          result.stderr[-300:] + " || " + repr(os.listdir(env_index)
+                                               if os.path.isdir(env_index) else None))
 
     # РЕЖИМЫ RAG: off — индекс не собирается вовсе (контекст отбором кодом),
     # auto — откат с названной причиной, on — требование индекса (сбой без него).
@@ -1231,6 +1265,15 @@ def section_wiring():
               and "--rag" in text and "AI_REVIEW_WORKSPACE" in text)
         check("пайплайн показывает, чем посчитаются эмбеддинги",
               "backend_status" in text and "sentence-transformers" in text)
+        check("ПЕРВЫЙ шаг читает режим у проекта, и при выключенном режиме "
+              "тяжёлые шаги пропускаются",
+              "--mode-report" in text and "steps.mode.outputs.enabled" in text
+              and text.count("steps.mode.outputs.enabled") >= 6)
+        check("на своей машине RAG обязателен, в облаке — с откатом",
+              "runner.environment" in text and "RAG_MODE=on" in text
+              and "RAG_MODE=auto" in text)
+        check("файл проекта и каталог индекса приходят и переменными репозитория",
+              "vars.AI_REVIEW_WORKSPACE" in text and "vars.AI_REVIEW_INDEX_DIR" in text)
     runner = os.path.join(PROJECT_ROOT, "tools", "review_runner.sh")
     check("скрипт своей машины-раннера на месте и запускаемый",
           os.path.isfile(runner) and os.access(runner, os.X_OK), runner)
@@ -1244,6 +1287,12 @@ def section_wiring():
               and "token" in text and "не печатаются" in text)
         check("скрипт проверяет эмбеддинги и версию питона на машине",
               "rag_embedding" in text and "3.12" in text)
+        check("скрипт передаёт раннеру файл проекта и каталог индекса "
+              "(команды в чате управляют пайплайном)",
+              "AI_REVIEW_WORKSPACE" in text and "AI_REVIEW_INDEX_DIR" in text
+              and "export AI_REVIEW_WORKSPACE AI_REVIEW_INDEX_DIR" in text)
+        check("у скрипта есть команда «что сейчас думает пайплайн»",
+              "mode)" in text and "--mode-report" in text)
 
 
 # ---------------------------------------------------------------------------
