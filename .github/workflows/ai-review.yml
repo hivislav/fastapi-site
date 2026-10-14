@@ -313,10 +313,17 @@ jobs:
         # Комментарий — ОТДЕЛЬНЫЙ шаг и с правом на ошибку: у pull request из
         # форка токен только на чтение, и падать из-за этого ревью не должно
         # (отчёт всё равно есть в итоге прогона и в артефакте).
-        if: ${{ steps.mode.outputs.enabled == 'true' && steps.review.outcome == 'success' && hashFiles('review.md') != '' }}
+        #
+        # ПУБЛИКАЦИЯ ЧЕРЕЗ curl, А НЕ ЧЕРЕЗ gh. `gh` есть на облачных раннерах, но
+        # на СВОЕЙ машине его обычно нет: шаг падал внутри («gh: command not
+        # found»), а `continue-on-error` показывал его успешным — комментарий не
+        # появлялся вовсе, и это выглядело как «ревью промолчало» (живой случай
+        # 14.10 на этой машине). curl и python на своей машине проверены скриптом
+        # `tools/review_runner.sh check`.
+        if: ${{ steps.mode.outputs.enabled == 'true' && steps.review.outcome == 'success' }}
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           # Отчёта нет (ревью не делалось по настройке или сорвалось) — и
@@ -326,24 +333,42 @@ jobs:
             echo "Отчёта нет — комментарий не публикуется."
             exit 0
           fi
+          MARK="<!-- ai-review-report -->"
           REPO="${{ github.repository }}"
           PR="${{ github.event.pull_request.number }}"
-          MARK="<!-- ai-review-report -->"
+          API="${{ github.api_url }}/repos/$REPO/issues/$PR/comments"
           # МАРКЕР НУЖЕН, ЧТОБЫ ОБНОВЛЯТЬ СВОЙ КОММЕНТАРИЙ, А НЕ ПЛОДИТЬ НОВЫЕ:
           # каждый push в ветку запускает ревью заново, и десяток отчётов под
           # одним pull request читать невозможно.
           printf '%s\n' "$MARK" > body.md
           cat review.md >> body.md
-          OLD=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" \
-            --jq '.[] | select(.body | contains("<!-- ai-review-report -->")) | .id' \
-            | head -n 1 || true)
+          # Тело запроса собирает python: JSON с многострочным markdown руками не
+          # склеить (кавычки, переводы строк, обратные слэши).
+          "$PYTHON" -c "import json;print(json.dumps({'body': open('body.md', encoding='utf-8').read()}))" > payload.json
+          curl -sS --max-time 30 -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$API?per_page=100" -o comments.json
+          OLD=$("$PYTHON" -c "import json;d=json.load(open('comments.json'));print(next((c['id'] for c in d if str(c.get('body') or '').startswith('<!-- ai-review-report -->')), ''))")
           if [ -n "${OLD:-}" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$OLD" -F body=@body.md > /dev/null
-            echo "Комментарий ревью обновлён (id $OLD)."
+            CODE=$(curl -sS --max-time 30 -o answer.json -w '%{http_code}' -X PATCH \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" --data @payload.json \
+              "${{ github.api_url }}/repos/$REPO/issues/comments/$OLD")
+            echo "Обновление прежнего комментария ($OLD): HTTP $CODE"
           else
-            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@body.md > /dev/null
-            echo "Комментарий ревью добавлен."
+            CODE=$(curl -sS --max-time 30 -o answer.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" --data @payload.json "$API")
+            echo "Публикация комментария: HTTP $CODE"
           fi
+          case "$CODE" in
+            2*) ;;
+            *)  # Права только на чтение (форк) или иная причина — называем её, но
+                # прогон не роняем: отчёт остаётся в итоге и в артефакте.
+                echo "Комментарий не опубликован (HTTP $CODE):"
+                head -c 400 answer.json || true
+                exit 0 ;;
+          esac
+          echo "Комментарий ревью опубликован."
 
       - name: Артефакт с отчётом
         # Артефакт — на случай, когда комментарий поставить не удалось (форк) или
