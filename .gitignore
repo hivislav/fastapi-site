@@ -31,3 +31,6 @@ node_modules/
 
 # Резервные копии данных (tools/cleanup_workspace.py)
 *.bak
+
+# Кэш npm задачи AI-ревью (он ставится внутрь рабочей копии, см. .github/workflows/ai-review.yml)
+.npm-cache/
