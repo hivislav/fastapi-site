@@ -281,9 +281,16 @@ cmd_start() {
     # окружение главнее.
     : "${AI_REVIEW_WORKSPACE:=$PROJECT_ROOT/data/agent_workspace.json}"
     : "${AI_REVIEW_INDEX_DIR:=$PROJECT_ROOT/data/run/review-index}"
-    export AI_REVIEW_WORKSPACE AI_REVIEW_INDEX_DIR
+    # ИНТЕРПРЕТАТОР ПРОЕКТА — ТОЖЕ РАННЕРУ. Это не мелочь: пакет эмбеддингов
+    # (`sentence-transformers`) и кэш моделей живут в venv ПРОЕКТА, а в выкладку
+    # раннера venv не попадает (он в .gitignore). Запусти ревью чужим питоном —
+    # RAG молча сползёт на лексический офлайн-бэкенд, и «на своей машине поиск
+    # семантический» окажется неправдой.
+    : "${AI_REVIEW_PYTHON:=$(python_bin)}"
+    export AI_REVIEW_WORKSPACE AI_REVIEW_INDEX_DIR AI_REVIEW_PYTHON
     say "Файл проекта для пайплайна: ${AI_REVIEW_WORKSPACE}"
     say "Каталог индекса кода:       ${AI_REVIEW_INDEX_DIR}"
+    say "Питон для пайплайна:        ${AI_REVIEW_PYTHON} (в нём пакет эмбеддингов)"
     if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
         say "Ключ модели взят из ${PROJECT_ROOT}/.env — секрет в GitHub не нужен."
     else
