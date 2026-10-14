@@ -123,8 +123,19 @@ jobs:
         run: |
           set -eu
           PY="${AI_REVIEW_PYTHON:-}"
-          if [ -z "$PY" ] || [ ! -x "$PY" ]; then
-            PY="$(command -v python3)"
+          if [ -n "$PY" ] && [ ! -x "$PY" ]; then
+            # Молчаливый откат тут — ЛОЖЬ: интерпретатор проекта выбран именно
+            # потому, что в нём эмбеддинги, и подмена его на системный означала бы
+            # «RAG молча стал лексическим». Говорим об этом громко.
+            echo "::warning::AI_REVIEW_PYTHON=$PY не исполняем — беру системный python3 (поиск по коду может стать лексическим)"
+            PY=""
+          fi
+          if [ -z "$PY" ]; then
+            PY="$(command -v python3 || true)"
+          fi
+          if [ -z "$PY" ]; then
+            echo "::error::В PATH нет python3 — ревью не запустить"
+            exit 1
           fi
           echo "PYTHON=$PY" >> "$GITHUB_ENV"
           echo "Интерпретатор: $PY ($("$PY" --version 2>&1))"

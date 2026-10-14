@@ -32,5 +32,6 @@ node_modules/
 # Резервные копии данных (tools/cleanup_workspace.py)
 *.bak
 
-# Кэш npm задачи AI-ревью (он ставится внутрь рабочей копии, см. .github/workflows/ai-review.yml)
+# Кэш npm задачи AI-ревью: пайплайн ставит его ВНУТРЬ рабочей копии
+# (глобальный кэш машины может быть попорчен), см. .github/workflows/ai-review.yml
 .npm-cache/
