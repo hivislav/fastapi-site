@@ -7,7 +7,11 @@
 // она может только выдумать. Здесь она получает факты: ветку, последний коммит,
 // список файлов, diff и содержимое файла.
 //
-// Инструменты: git_status, git_files, git_diff, git_log, git_show_file.
+// Инструменты: git_status, git_files, git_diff, git_log, git_show_file —
+// состояние рабочей копии и одиночные правки, — а также git_branch_files и
+// git_branch_diff: изменения ВЕТКИ против базовой (то, что проверяет ревью и
+// pull request), причём diff отдаётся ОКНАМИ ПО СТРОКАМ, потому что целиком он в
+// ответ инструмента не влезает (см. app/ai/ai_review.py).
 //
 // ТОЛЬКО ЧТЕНИЕ, и это гарантия кода, а не обещание:
 //   * выполняются исключительно читающие команды (status/ls-files/log/diff/show);
@@ -527,6 +531,159 @@ server.registerTool(
       }
       const cap = Math.max(200, Number(limit) || RESULT_BUDGET);
       return text(clip(head + body, cap, TRUNCATED_NOTE));
+    })
+);
+
+server.registerTool(
+  "git_branch_files",
+  {
+    title: "Изменённые файлы ветки (для ревью)",
+    description:
+      "Список файлов, которые ветка меняет ОТНОСИТЕЛЬНО базовой (не рабочая " +
+      "копия!): статус, добавленные и удалённые строки. Это то, что проверяет " +
+      "ревью и pull request. Строки ответа машинные: «статус<TAB>+<TAB>-<TAB>путь».",
+    inputSchema: {
+      base: z.string().optional()
+        .describe("Базовая ветка для сравнения (по умолчанию upstream, main или master)"),
+      path: z.string().optional().describe("Ограничить одним файлом или каталогом"),
+      limit: z.number().int().min(1).max(300).default(60)
+        .describe("Сколько файлов показать (по умолчанию 60)"),
+    },
+  },
+  async ({ base, path: rawPath, limit }) =>
+    guard(async () => {
+      const root = await repoRoot();
+      const rel = safePath(rawPath, root);
+      const chosen = await baseBranch(base);
+      if (!chosen) {
+        throw new Error("не нашёл базовую ветку для сравнения — назовите её "
+          + "аргументом base (например base=\"main\")");
+      }
+      const mergeBase = await git(["merge-base", chosen, "HEAD"]);
+      const range = (mergeBase.ok ? chosen + "...HEAD" : chosen);
+      const args = ["diff", "--no-color", "--name-status", "-M", range];
+      if (rel) args.push("--", path.join(root, rel));
+      const names = await git(args);
+      if (!names.ok) throw new Error(gitError(names, "git diff --name-status"));
+      const statArgs = ["diff", "--no-color", "--numstat", "-M", range];
+      if (rel) statArgs.push("--", path.join(root, rel));
+      const nums = await git(statArgs);
+      if (!nums.ok) throw new Error(gitError(nums, "git diff --numstat"));
+      // Номера строк по путям: у переименования путь один — новый (`-M`).
+      const sizes = new Map();
+      for (const line of String(nums.stdout).split("\n")) {
+        if (!line) continue;
+        const parts = line.split("\t");
+        if (parts.length < 3) continue;
+        sizes.set(parts.slice(2).join("\t"), [parts[0], parts[1]]);
+      }
+      const rows = [];
+      for (const line of String(names.stdout).split("\n")) {
+        if (!line) continue;
+        const parts = line.split("\t");
+        const status = parts[0] || "?";
+        const file = parts[parts.length - 1] || "";
+        if (!file) continue;
+        const size = sizes.get(file) || ["?", "?"];
+        rows.push(status + "\t+" + size[0] + "\t-" + size[1] + "\t" + file);
+      }
+      const branch = (await git(["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
+      const head = (await git(["rev-parse", "--short", "HEAD"])).stdout.trim();
+      const head_line = "Изменённые файлы ветки " + (branch || "(отсоединённый HEAD)")
+        + " против " + chosen + (head ? " (HEAD " + head + ")" : "")
+        + ": всего " + rows.length + ".";
+      if (!rows.length) {
+        return text(head_line + "\nИзменений нет: ветка не отличается от "
+          + chosen + " (или путь " + (rel || ".") + " в этих изменениях не участвует).");
+      }
+      const cap = Math.max(1, Number(limit) || 60);
+      const body = rows.slice(0, cap).join("\n");
+      const tail = rows.length > cap
+        ? "\n…показаны первые " + cap + " из " + rows.length
+          + " (сузьте path или поднимите limit)" : "";
+      return text(clip(head_line + "\n" + body + tail, RESULT_BUDGET, TRUNCATED_NOTE));
+    })
+);
+
+server.registerTool(
+  "git_branch_diff",
+  {
+    title: "Diff ветки по строкам (для ревью)",
+    description:
+      "Правки ветки относительно базовой — ОКНОМИ ПО СТРОКАМ: вернуть весь diff " +
+      "одним ответом нельзя (клиент берёт не больше 4000 символов), поэтому " +
+      "инструмент отдаёт строки from_line…from_line+lines и говорит, сколько " +
+      "строк всего и с какой продолжать. Так большой pull request читается " +
+      "целиком, без молчаливой обрезки.",
+    inputSchema: {
+      base: z.string().optional()
+        .describe("Базовая ветка для сравнения (по умолчанию upstream, main или master)"),
+      path: z.string().optional()
+        .describe("Ограничить одним файлом (рекомендуется) или каталогом"),
+      from_line: z.number().int().min(1).default(1)
+        .describe("С какой строки diff начать (1 — начало)"),
+      lines: z.number().int().min(10).max(400).default(120)
+        .describe("Сколько строк вернуть (по умолчанию 120)"),
+      context: z.number().int().min(0).max(10).default(3)
+        .describe("Сколько строк контекста вокруг правок (по умолчанию 3)"),
+      stat_only: z.boolean().default(false)
+        .describe("true — вместо diff вернуть сводку «файл: +строки −строки»"),
+    },
+  },
+  async ({ base, path: rawPath, from_line, lines, context, stat_only }) =>
+    guard(async () => {
+      const root = await repoRoot();
+      const rel = safePath(rawPath, root);
+      const chosen = await baseBranch(base);
+      if (!chosen) {
+        throw new Error("не нашёл базовую ветку для сравнения — назовите её "
+          + "аргументом base (например base=\"main\")");
+      }
+      const mergeBase = await git(["merge-base", chosen, "HEAD"]);
+      const range = (mergeBase.ok ? chosen + "...HEAD" : chosen);
+      const args = ["diff", "--no-color", "-M"];
+      if (stat_only) args.push("--stat");
+      else args.push("-U" + Math.max(0, Math.min(10, Number(context) || 0)));
+      args.push(range);
+      if (rel) args.push("--", path.join(root, rel));
+      const result = await git(args);
+      if (!result.ok) throw new Error(gitError(result, "git diff"));
+      const body = String(result.stdout).replace(/\n+$/, "");
+      const what = "ветки против " + chosen;
+      if (!body) {
+        const facts = await pathFacts(rel);
+        return text(emptyDiffNote(what, rel, facts, "branch", []));
+      }
+      if (stat_only) {
+        return text(clip("Сводка изменений " + what + (rel ? ", " + rel : "") + ":\n" + body,
+          RESULT_BUDGET, TRUNCATED_NOTE));
+      }
+      const all = body.split("\n");
+      const start = Math.max(1, Number(from_line) || 1);
+      const count = Math.max(10, Math.min(400, Number(lines) || 120));
+      const want = all.slice(start - 1, start - 1 + count);
+      if (!want.length) {
+        return text("В diff " + what + (rel ? ", " + rel : "") + " всего " + all.length
+          + " строк — строки с " + start + " уже нет. Начните с from_line=1.");
+      }
+      // ОКНО РЕЖЕТСЯ ПО СТРОКАМ И ПО БЮДЖЕТУ СРАЗУ, а не общим clip(): обрезка
+      // посреди окна сказала бы «обрезано, сузьте запрос» вместо честного
+      // «строки такие-то из стольких-то, дальше from_line=…», и продолжение
+      // пришлось бы угадывать.
+      const slice = [];
+      let used = 0;
+      const room = RESULT_BUDGET - 240;          // место под заголовок
+      for (const line of want) {
+        if (slice.length && used + line.length + 1 > room) break;
+        slice.push(line);
+        used += line.length + 1;
+      }
+      const end = start - 1 + slice.length;
+      const more = end < all.length
+        ? "; дальше from_line=" + (end + 1) : "; это КОНЕЦ diff";
+      const head = "Diff " + what + (rel ? ", " + rel : "") + " — строки "
+        + start + "–" + end + " из " + all.length + more + ":";
+      return text(head + "\n" + slice.join("\n"));
     })
 );
 

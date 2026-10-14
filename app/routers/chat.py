@@ -41,6 +41,9 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app import config
+from app.ai import ai_review
+from app.ai import ai_review_rag
+from app.ai import ai_review_run
 from app.ai import attachments as attach_store
 from app.ai import client as llm_client
 from app.ai import dev_help
@@ -5085,13 +5088,17 @@ def _dev_help_path(question_text: str) -> Tuple[str, str]:
     return dev_help.kind_of(_dev_help_repo_dir(), question_text)
 
 
-def _dev_help_git_reason(task: Dict[str, Any]) -> str:
+def _git_mcp_reason(task: Dict[str, Any]) -> str:
     """Почему контекст репозитория недоступен ("" — доступен).
 
     Проверяются ДВА условия, и оба видны БЕЗ запуска сервера: он вообще
     подключён к проекту (кнопка «MCP», `task["mcp"]` — это настройка ПРОЕКТА) и
     он работоспособен (есть node, файл сервера, MCP SDK). Причина называется
     словами: иначе «ассистент не видит ветку» выглядело бы как его неумение.
+
+    Имя — по СЕРВЕРУ, а не по команде: этим ответом пользуются и ассистент
+    проекта (`/help`), и AI-ревью (`/ai_review`) — обоим нужен один и тот же
+    сервер `git`.
     """
     if dev_help.SERVER_ID not in workspace_store.mcp_enabled(task):
         return "сервер не включён у проекта"
@@ -5145,7 +5152,7 @@ async def agent_help(msg: ChatMessage) -> StreamingResponse:
     profile_id = _current_profile_id()
     profile = _profile_block()
     path, path_kind = _dev_help_path(question_text)
-    git_reason = _dev_help_git_reason(task)
+    git_reason = _git_mcp_reason(task)
     git_calls = ([] if git_reason else dev_help.calls(path, path_kind))
     # Предел ответа: «Длина» из шапки чата главнее проекта, проект — главнее
     # константы ассистента (те же правила, что у шага и прямого ответа, §5.10а).
@@ -5296,6 +5303,365 @@ async def agent_help(msg: ChatMessage) -> StreamingResponse:
             except Exception as exc:            # pragma: no cover - защита
                 logger.warning("Ассистент (%s): журнал не сохранён — %s",
                                dev_help.COMMAND, str(exc)[:150])
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# AI-РЕВЬЮ КОДА: команды /ai_review, /ai_review_enable и /ai_review_disable
+# (app/ai/ai_review.py — правила и данные, app/ai/ai_review_run.py — прогон)
+#
+# ЧТО ЭТО. Разбор ИЗМЕНЕНИЙ ВЕТКИ: что ветка меняет относительно базовой, где тут
+# ошибки, что не так с архитектурой и что с этим делать. Источники те же, что у
+# всего режима «AI-агент», и оба нужны:
+#
+#   * ИЗМЕНЕНИЯ — через MCP (сервер `git`, только чтение): `git_status`,
+#     `git_branch_files` (список файлов ветки) и `git_branch_diff` (diff ВЕТКИ
+#     окнами по строкам). Не рабочая копия: у pull request она чистая, и обычный
+#     diff показал бы пустоту;
+#   * ДОКУМЕНТАЦИЯ И КОД — фрагменты включённых баз знаний проекта тем же поиском
+#     (`rag_search.search`), что у агента, плюс контекст кода репозитория, который
+#     отбирает КОД (`ai_review.context_block`): небольшие изменённые файлы целиком
+#     и файлы, где встречаются изменённые имена.
+#
+# ВКЛЮЧЕНИЕ И ВЫКЛЮЧЕНИЕ — ЭТИМ ЖЕ МАРШРУТОМ: команды `/ai_review_enable` и
+# `/ai_review_disable` пишут настройку ПРОЕКТА (`task["ai_review"]`, как кнопки
+# «MCP» и «RAG») и отвечают в чат репликой. Модель при этом не зовётся вовсе.
+# Режим выключен по умолчанию: ревью тратит вызовы модели, и включаться само оно
+# не должно. Выключенный режим на `/ai_review` отвечает ПРИЧИНОЙ и подсказкой, а
+# не молчанием и не «изменений нет».
+#
+# МИМО ПАЙПЛАЙНА ЗАДАЧИ — как `/help` и `/test_rag`: ни планировщика, ни плана,
+# ни шагов, ни приёмщика, ни переходов автомата. В память диалога (messages) и в
+# автомат (state) ревью НЕ пишет: это разбор ветки, а не запрос задачи, и
+# подменять им запрос, по которому задача работает, нельзя. В журнал чата (log)
+# пишет — человек должен видеть отчёт и после переключения задачи. Расход идёт
+# своим событием `usage` и в замер задачи не входит.
+#
+# ТОТ ЖЕ ПРОГОН РАБОТАЕТ В ПАЙПЛАЙНЕ: `tools/ai_review.py` собирает те же `Deps`
+# и печатает тот же отчёт (там его публикует GitHub Action на pull request).
+# ---------------------------------------------------------------------------
+# Фоновые задачи сборки индекса кода для ревью. Ссылки держим ЯВНО: asyncio
+# хранит только слабые ссылки на задачи, и без этого сборщик мусора мог бы снять
+# индексацию на середине. Проверки по этому набору дожидаются её окончания.
+_review_index_tasks: set = set()
+
+
+def _ai_review_repo_dir() -> str:
+    """Каталог репозитория, изменения которого разбирает ревью.
+
+    Тот же, с которым работает сервер `git` (переменная `GIT_REPO_DIR`, иначе
+    корень проекта): контекст кода обязан собираться по тому же дереву, иначе
+    «связанные файлы» приехали бы из чужого репозитория.
+    """
+    return (os.getenv(ai_review.REPO_ENV) or "").strip() or config.PROJECT_ROOT
+
+
+def _ai_review_view(task: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Снимок настройки режима AI-ревью (для маршрута состояния)."""
+    settings = workspace_store.ai_review_settings(task) if task else {}
+    return {
+        "enabled": bool(settings.get("enabled")),
+        "base": str(settings.get("base") or ""),
+        "command": ai_review.COMMAND,
+        "enable_command": ai_review.COMMAND_ENABLE,
+        "disable_command": ai_review.COMMAND_DISABLE,
+    }
+
+
+@router.get("/agent/review")
+async def review_state() -> dict:
+    """Состояние режима AI-ревью у текущего проекта.
+
+    К модели и к git маршрут НЕ обращается: это настройка, а не работа. Нужен
+    интерфейсу и проверкам, чтобы состояние режима можно было спросить, а не
+    угадывать по последнему ответу команды.
+    """
+    return _ai_review_view(_current_task())
+
+
+@router.post("/agent/review")
+async def agent_review(msg: ChatMessage) -> StreamingResponse:
+    """AI-РЕВЬЮ ИЗМЕНЕНИЙ — команды `/ai_review`, `/ai_review_enable`,
+    `/ai_review_disable` в чате.
+
+    Поток событий (NDJSON, как у чата агента):
+
+      * `{"type": "review_start", "mode": …, "enabled": bool, "base": …}` —
+        команда принята: что делаем, включён ли режим и с какой базой сравниваем;
+      * `{"type": "debug", "text": …}` — что делает ревью: какие инструменты MCP
+        вызвал, сколько файлов и символов diff'а прочитал, что нашлось в
+        документации;
+      * `{"type": "bot", "text": …, "sources": [...]}` — ОТЧЁТ (шапка с фактами
+        собрана кодом, дальше ответ модели) вместе с источниками для карточек;
+      * `{"type": "error", "text": …}` — отказ С ПРИЧИНОЙ: режим выключен, сервер
+        git недоступен, изменений нет, модель не ответила;
+      * `{"type": "answer_ready"}` — ответ показан, ввод свободен;
+      * `{"type": "usage", "usage": {...}}` — расход хода;
+      * `{"type": "done", "usage": {...}}` — конец потока.
+
+    Проекта нет — отказ СРАЗУ (400): и базы знаний, и настройка режима, и журнал
+    привязаны к проекту.
+    """
+    text = str(getattr(msg, "content", "") or "").strip()
+    mode, asked_base, note = ai_review.parse(text)
+    if not mode:
+        raise HTTPException(status_code=400, detail=(
+            "Это не команда AI-ревью. Проверить изменения ветки: %s [базовая "
+            "ветка] — например «%s main»; включить и выключить режим: %s и %s."
+            % (ai_review.COMMAND, ai_review.COMMAND, ai_review.COMMAND_ENABLE,
+               ai_review.COMMAND_DISABLE)))
+    task, session = _rag_dialog_target(str(getattr(msg, "session_id", "") or ""))
+    if task is None or session is None:
+        raise HTTPException(status_code=400, detail=(
+            "Сначала создайте проект — настройка режима AI-ревью, базы знаний и "
+            "журнал ответа привязаны к проекту"))
+    dialog = session["dialog"]
+    settings = workspace_store.ai_review_settings(task)
+    base = asked_base or str(settings.get("base") or "")
+    enabled_bases = workspace_store.rag_enabled(task)
+    rag_settings_now = workspace_store.rag_settings(task)
+    project_llm = workspace_store.llm_settings(task)
+    profile_id = _current_profile_id()
+    profile = _profile_block()
+    # Предел ответа: «Длина» из шапки чата главнее проекта, проект — главнее
+    # предела ревью (те же правила, что у шага задачи и у `/help`, §5.10а).
+    answer_max_tokens = (msg.max_tokens if msg.max_tokens is not None
+                         else project_llm["max_tokens"] or ai_review.REVIEW_MAX_TOKENS)
+
+    # КОМАНДА — В ЖУРНАЛ ЧАТА: она часть разговора (человек увидит и отчёт, и то,
+    # чем он был вызван, после переключения задачи). В память диалога не идёт.
+    workspace_store.add_log(dialog, workspace_store.LOG_USER,
+                            "🤖 %s — разбор изменений%s"
+                            % (ai_review.COMMAND,
+                               (" (база: %s)" % base) if base else ""))
+
+    def encode(event: Dict[str, Any]) -> str:
+        _log_event(dialog, event)
+        return json.dumps(event, ensure_ascii=False) + "\n"
+
+    # --- ЧТО ПРОГОНУ НУЖНО ОТ ВНЕШНЕГО МИРА (app/ai/ai_review_run.py: Deps) ----
+    tracker = Agent(AgentConfig())
+    found: Dict[str, Any] = {"hits": [], "sources": [], "searched": 0, "cut": ""}
+
+    async def call_tools(calls: List[Dict[str, Any]],
+                         limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Вызовы MCP git — в отдельном потоке (серверы запускают процессы)."""
+        return await mcp_store.async_run_calls(calls, limit=limit)
+
+    async def ask(message_list: List[Dict[str, str]], max_tokens: int,
+                  temperature: Optional[float],
+                  timeout: Optional[float]) -> Tuple[str, Dict[str, Any]]:
+        """Один вызов модели — с учётом расхода в замере задачи этой команды."""
+        content, metrics = await llm_client.call_llm_async(
+            user_text=(message_list[-1]["content"] if message_list else ""),
+            model=config.active_model(), disable_thinking=True,
+            max_tokens=max_tokens, temperature=temperature,
+            messages=message_list, timeout=timeout or _rag_test_timeout())
+        tracker.note_usage(metrics, None)
+        return content, metrics
+
+    async def documents(query: str) -> Dict[str, Any]:
+        """Фрагменты документации проекта — тем же поиском, что у агента.
+
+        Базы знаний не подключены — это не ошибка: ревью идёт по изменениям и
+        контексту кода, а причина называется строкой диагностики.
+        """
+        if not enabled_bases:
+            return {"block": "", "hits": [], "sources": [], "searched": 0,
+                    "note": ("📚 Базы знаний у проекта не подключены — документация "
+                             "ищется только по репозиторию (кнопка «RAG» включает "
+                             "базы знаний проекта).")}
+        rewrite_info: Dict[str, Any] = {}
+        if rag_settings_now.get("rewrite"):
+            async def call(**kwargs: Any) -> Any:
+                content, metrics = await llm_client.call_llm_async(**kwargs)
+                tracker.note_usage(metrics, Agent.SERVICE_REWRITE)
+                return content, metrics
+
+            rewrite_info = await rag_query.rewrite(query, call)
+        data = await asyncio.to_thread(
+            rag_search.search, enabled_bases, query, profile=profile_id,
+            settings=rag_settings_now, rewrite=rewrite_info or None, also="")
+        hits = rag_search.hits_of(data)
+        found.update({"hits": hits, "sources": rag_search.sources(data),
+                      "searched": len(enabled_bases), "cut": _rag_cut_note(data)})
+        return {"block": rag_search.block(data), "hits": hits,
+                "sources": rag_search.sources(data),
+                "searched": len(enabled_bases),
+                "note": rag_search.results_note(data)}
+
+    async def code_context(files: List[Dict[str, Any]], names: List[str],
+                           changed: List[str],
+                           meta: Dict[str, Any]) -> Dict[str, Any]:
+        """КОНТЕКСТ КОДА ПО ИНДЕКСУ (RAG), а не «весь код в промпт».
+
+        Код и документация репозитория лежат в отдельной базе знаний
+        (`ai_review_rag`, имя «%s»); по правке делается несколько запросов
+        (изменённые имена, модули, пожелание), и модель получает ТОЛЬКО найденные
+        фрагменты. Индекс кэшируется по коммиту, который назвал сервер git.
+
+        Три честных отката, и каждый называет причину: индексация уже идёт в фоне
+        (не запускаем вторую) — ждём её; индекс не собрался (нет пакета
+        эмбеддингов, не пишется каталог) — контекст отбирает код
+        (`ai_review.context_block`); каталог репозитория неизвестен — тоже.
+        """ % ai_review_rag.BASE_NAME
+        root = _ai_review_repo_dir()
+        if not root:
+            info = await asyncio.to_thread(ai_review.context_block, root, files,
+                                           names, changed)
+            info["note"] = ("⚠ Каталог репозитория неизвестен — контекст кода не "
+                            "собран; проверьте GIT_REPO_DIR.")
+            return info
+        running = ai_review_rag.running_job(profile=profile_id)
+        if running:
+            info = await asyncio.to_thread(ai_review.context_block, root, files,
+                                           names, changed)
+            info["note"] = ("📚 Индекс кода ещё собирается (задача %s: %s из %s "
+                            "файлов) — контекст отобран кодом; прогресс виден в "
+                            "диалоге «RAG»."
+                            % (str(running.get("id") or ""),
+                               int(running.get("done") or 0),
+                               int(running.get("total") or 0)))
+            return info
+        settings_now = ai_review_rag.search_settings()
+        index = await asyncio.to_thread(
+            ai_review_rag.ensure, root, profile=profile_id,
+            sha=str((meta or {}).get("head") or ""), settings=settings_now)
+        if index.get("ok"):
+            query_list = ai_review_rag.queries(files, names,
+                                               str((meta or {}).get("note") or ""))
+            data = await asyncio.to_thread(
+                ai_review_rag.search, [index["base_id"]], query_list,
+                profile=profile_id, settings=settings_now)
+            info = ai_review_rag.context_info(index, data)
+            info["note"] = ("📚 Индекс кода: %d %s → %d чанков, бэкенд %s; %s; "
+                            "запросов к индексу: %d."
+                            % (int(index.get("documents") or 0),
+                               ai_review.files_word(int(index.get("documents") or 0)),
+                               int(index.get("chunks") or 0),
+                               str(index.get("backend") or "—"),
+                               "индекс собран за %.1f с" % float(index.get("seconds") or 0.0)
+                               if index.get("built") else "индекс был свежий",
+                               len(query_list)))
+            return info
+        info = await asyncio.to_thread(ai_review.context_block, root, files, names,
+                                       changed)
+        info["note"] = ("⚠ Индекс кода не собран (%s) — контекст отобран кодом: "
+                        "целиком %d, связанных %d, документации %d."
+                        % (str(index.get("reason") or "причина не названа"),
+                           len(info.get("whole") or []),
+                           len(info.get("related") or []),
+                           len(info.get("docs") or [])))
+        return info
+
+    async def set_enabled(value: bool) -> Dict[str, Any]:
+        """Записывает режим у проекта — и, ВКЛЮЧАЯ его, грузит код в RAG.
+
+        Включение режима — это и есть «загрузить кодовую базу автоматически»:
+        фоновая задача складывает документацию и код репозитория в базу знаний
+        (`ai_review_rag`: тот же механизм задач, что у загрузки документов, с
+        прогрессом в диалоге «RAG»), а ревью потом ищет по ней НУЖНЫЕ фрагменты.
+        Индексация крупного проекта — минуты, поэтому она в фоне, а не в этом
+        ответе. Причину «не запустилась» называем словами.
+        """
+        async with _workspace_lock:
+            state = workspace_store.set_ai_review(task, enabled=value,
+                                                  base=asked_base or None)
+            await _persist()
+        state = dict(state)
+        if not value:
+            return state
+        root = _ai_review_repo_dir()
+        # ХЕШ КОММИТА СПРАШИВАЕМ У СЕРВЕРА GIT (два вызова) — и кладём его в маркер
+        # индекса. Иначе индекс, собранный при включении, окажется «не про тот
+        # коммит» для ревью (оно сверяет именно хеш) и соберётся второй раз.
+        # Не ответил — индекс всё равно собираем: ключом свежести станет отпечаток
+        # набора файлов.
+        sha = ""
+        if not _git_mcp_reason(task):
+            results = await mcp_store.async_run_calls(
+                ai_review.discovery_calls(str(state.get("base") or "")), limit=2)
+            where = ai_review.parse_files_header("\n".join(
+                str(item.get("text") or "") for item in results
+                if item.get("ok") and item.get("tool") == ai_review.FILES_TOOL))
+            sha = str(where.get("head") or "")
+        started = await ai_review_rag.start_background(root, profile=profile_id,
+                                                       sha=sha)
+        if started.get("task") is not None:
+            # Ссылку на задачу держим: иначе сборщик мусора может её снять, а
+            # проверки должны уметь её дождаться.
+            _review_index_tasks.add(started["task"])
+            started["task"].add_done_callback(_review_index_tasks.discard)
+        if started.get("started"):
+            state["note"] = ("📚 Индекс кода для ревью собирается в фоне: %d %s, "
+                             "задача `%s` — прогресс виден в диалоге «RAG». "
+                             "Пока он собирается, ревью идёт по отбору контекста "
+                             "кодом."
+                             % (int(started.get("documents") or 0),
+                                ai_review.files_word(int(started.get("documents") or 0)),
+                                str(started.get("job_id") or "")))
+        elif "свежий" in str(started.get("reason") or ""):
+            state["note"] = "📚 Индекс кода для ревью уже свежий — ревью пойдёт по его фрагментам."
+        else:
+            state["note"] = ("⚠ Индекс кода не запущен (%s) — ревью соберёт контекст "
+                             "отбором по коду."
+                             % (str(started.get("reason") or "причина не названа")))
+        return state
+
+    deps = ai_review_run.Deps(
+        call_tools, ask, repo_dir=_ai_review_repo_dir(),
+        enabled=bool(settings.get("enabled")),
+        base=str(settings.get("base") or ""), profile=profile,
+        model=config.active_model(), provider=config.llm_source(),
+        max_tokens=answer_max_tokens, timeout=_rag_test_timeout(),
+        documents=documents, code_context=code_context, set_enabled=set_enabled,
+        server_reason=_git_mcp_reason(task))
+
+    async def event_stream() -> AsyncIterator[str]:
+        # 0. ИСТОЧНИК ОТВЕТА — только для ревью: включение и выключение режима
+        #    модель не зовут, и поднимать ради них локальный сервер незачем.
+        if mode == ai_review.MODE_REVIEW:
+            notes: List[str] = []
+            reason = await local_source_guard(notes.append)
+            for line in notes:
+                yield encode({"type": "debug", "text": line})
+            if reason:
+                yield encode({"type": "error", "text": LOCAL_SOURCE_NOT_READY % reason})
+                yield encode({"type": "done", "usage": {}})
+                return
+        total: Dict[str, Any] = {}
+        async for event in ai_review_run.run(deps, mode=mode, base=base, note=note):
+            if event.get("type") == "bot" and mode == ai_review.MODE_REVIEW:
+                # СТРОКА ИСТОЧНИКОВ — гарантия кода (как у `/help`): ссылки на
+                # невыданные фрагменты убираются, а список документации под
+                # отчётом, построенным по diff'у, не появляется вовсе.
+                event = dict(event)
+                event["text"] = rag_dialog.ensure_sources(
+                    event.get("text"), found["hits"], searched=found["searched"],
+                    cut=found["cut"], tools=True)
+            yield encode(event)
+            if event.get("type") == "bot":
+                # ОТВЕТ ПОКАЗАН — ВВОД СВОБОДЕН (у команды служебной работы после
+                # ответа нет, но событие держит интерфейс в общем правиле).
+                yield encode({"type": "answer_ready"})
+        total = merge_usage(total, tracker.usage_snapshot())
+        yield encode({"type": "usage", "usage": total})
+        yield encode({"type": "done", "usage": total})
+
+    async def stream() -> AsyncIterator[str]:
+        """Поток отчёта + запись журнала на диск (отчёт виден и после
+        переключения задачи). Сбой записи отчёт не отменяет."""
+        try:
+            async for chunk in event_stream():
+                yield chunk
+        finally:
+            try:
+                async with _workspace_lock:
+                    await _persist()
+            except Exception as exc:            # pragma: no cover - защита
+                logger.warning("AI-ревью (%s): журнал не сохранён — %s",
+                               ai_review.COMMAND, str(exc)[:150])
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 

@@ -420,6 +420,22 @@
             color: var(--accent-2);
             box-shadow: inset 0 0 0 1px var(--line-strong);
         }
+        /* ПОДПИСЬ РЕЖИМА AI-РЕВЬЮ у панели проектов: включён он у проекта или
+           выключен, и чем переключается. Это не кнопка (настройку меняют
+           командами в чате), а состояние — поэтому текст, а не значок: у
+           выключенного режима человек должен видеть КОМАНДУ включения. */
+        .review-mark {
+            display: block;
+            margin: 2px 0 0;
+            padding: 0 2px;
+            font-size: 0.62rem;
+            line-height: 1.4;
+            color: var(--muted, #7c8794);
+            letter-spacing: 0.01em;
+        }
+        .review-mark.on {
+            color: var(--accent-2);
+        }
         /* Кнопка «RAG» — соседка «MCP»: та же короткая подпись, но свой цвет
            (зелёный), чтобы кнопки не путались: MCP — внешние источники, RAG —
            локальный индекс своих документов. */
@@ -2642,6 +2658,10 @@
                 </select>
                 <button type="button" class="task-new" id="task-new">Новый проект</button>
             </div>
+            <!-- РЕЖИМ AI-РЕВЬЮ у проекта: подпись состояния (не кнопка —
+                 переключается командами /ai_review_enable и /ai_review_disable в
+                 чате). Показывается только когда проект есть. -->
+            <span class="review-mark" id="review-mark" hidden></span>
             <!-- ИСТОЧНИК ОТВЕТА: локальная модель (MLX на этом же Mac) или
                  удалённая (облако). Источник ОДИН на всё приложение — обычный
                  режим, эксперт, судья, AI-агент и RAG берут модель отсюда,
@@ -3216,11 +3236,20 @@
                         самого проекта: текущая ветка, последний коммит, список
                         файлов, изменения (diff) и содержимое названного файла.
                         Локально и только чтение: сервер ничего не коммитит и не
-                        меняет. С ним работает команда <b>/help</b> в чате —
-                        вопросы о САМОМ проекте («что делает app/ai/mcp.py», «что
-                        я изменил в этой ветке», «как устроен поиск по базам»):
-                        ответ строится по документации проекта и по состоянию
-                        репозитория.</p>
+                        меняет. С ним работают ДВЕ команды в чате.
+                        <b>/help</b> — вопросы о САМОМ проекте («что делает
+                        app/ai/mcp.py», «что я изменил в этой ветке», «как устроен
+                        поиск по базам»): ответ строится по документации проекта и
+                        по состоянию репозитория.
+                        <b>/ai_review</b> [базовая ветка] — AI-РЕВЬЮ ИЗМЕНЕНИЙ
+                        ветки: diff и список файлов берутся у этого же сервера
+                        (ветка против базовой, а не рабочая копия), документация —
+                        поиском по базам проекта, а ответ приходит тремя
+                        разделами: потенциальные баги, архитектурные проблемы и
+                        рекомендации. Режим включается и выключается командами
+                        <b>/ai_review_enable</b> и <b>/ai_review_disable</b> (по
+                        умолчанию выключен). Тот же разбор делает пайплайн на pull
+                        request — файл <b>.github/workflows/ai-review.yml</b>.</p>
                     <div class="mcp-list" id="mcp-list"></div>
                     <p class="modal-hint mcp-status" id="mcp-status" hidden></p>
                     <div class="modal-actions">
@@ -4802,6 +4831,10 @@
                 // Кнопка «MCP» проекта: по последнему снимку помечаем, что
                 // внешние инструменты включены (свежий снимок подтянет loadMcp).
                 renderMcpMarks();
+                // Подпись режима AI-ревью — по последнему снимку, свежий подтянет
+                // loadReviewState (маршрут настройки, к модели не ходит).
+                renderReviewMark();
+                loadReviewState();
                 // Срезы памяти привязаны к задаче, но нужны только виду
                 // «Состояние памяти»: грузить их при каждом обновлении панели
                 // (а это каждый шаг задачи) — лишний запрос вхолостую.
@@ -7613,6 +7646,9 @@
         const mcpStatusEl = document.getElementById('mcp-status');
         // Последний снимок MCP с сервера: серверы, их инструменты и галочки.
         let mcpData = null;
+        // Снимок настройки режима AI-ревью (GET /api/agent/review): подпись у
+        // панели проектов показывает, включён режим или нет.
+        let reviewState = null;
 
         async function mcpRequest(url, options) {
             try {
@@ -9708,6 +9744,120 @@
 
 
         // ---------------------------------------------------------------------
+        // AI-РЕВЬЮ КОДА (команды /ai_review, /ai_review_enable, /ai_review_disable):
+        // разбор ИЗМЕНЕНИЙ ВЕТКИ — потенциальные баги, архитектурные проблемы,
+        // рекомендации. Источники: изменения через MCP (сервер «Git-репозиторий
+        // проекта», только чтение: ветка, список файлов, diff ВЕТКИ окнами по
+        // строкам), документация проекта тем же поиском, что у агента, и контекст
+        // кода репозитория. Пайплайн задачи НЕ участвует — как у /help: ни плана,
+        // ни шагов, ни автомата; отчёт приходит потоком и рисуется теми же
+        // карточками источников. Включение и выключение режима идут СЮДА ЖЕ: это
+        // настройка проекта (`task["ai_review"]`), и ответ на команду человек
+        // должен видеть в чате, а не угадывать по косвенным признакам.
+        // ---------------------------------------------------------------------
+        async function runAiReview(command) {
+            if (requestBusyHere()) return;
+            const sessionId = workspace.active_session || null;
+            const streamEpoch = viewEpoch;
+            const streamSession = sessionId;
+            // Какую команду выполняем: разбор изменений или переключение режима.
+            // Нужна, чтобы после ответа перечитать состояние режима (подпись у
+            // панели проектов) — только у переключения оно меняется.
+            let reviewMode = '';
+            pushDialogNode('user', '🤖 ' + command);
+            foregroundRequests.add(streamSession);
+            updateComposerState();
+            updateTyping();
+            try {
+                const res = await fetch('/api/agent/review', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: command, session_id: sessionId })
+                });
+                if (!res.ok) {
+                    let detail = '';
+                    try { detail = (await res.json()).detail || ''; } catch (e) { detail = ''; }
+                    let text = detail || 'AI-ревью не запустилось — повторите команду.';
+                    // 404 у ЭТОГО маршрута значит не «отчёта нет», а «сервер его не
+                    // знает»: приложение запущено ДО этой правки и держит прежний
+                    // код в памяти, а страница берётся с диска (та же ловушка, что
+                    // была у /help 12.10).
+                    if (res.status === 404) {
+                        text = 'Маршрут /api/agent/review не найден: приложение '
+                            + 'запущено до этой правки. Перезапустите сервер '
+                            + '(tools/serve.sh restart) и обновите страницу.';
+                    }
+                    pushDialogNode('error', text);
+                    return;
+                }
+                await readNdjsonStream(res, (ev) => {
+                    if (!dialogStreamHere(streamEpoch, streamSession)) return;
+                    if (ev.type === 'review_start') {
+                        reviewMode = String(ev.mode || '');
+                        if (ev.mode === 'review') {
+                            pushDialogNode('debug', '🤖 AI-ревью: разбираю изменения'
+                                + (ev.enabled ? '' : ' — режим выключен')
+                                + (ev.base ? ' (база сравнения: ' + ev.base + ')' : '')
+                                + '. Изменения беру через MCP, документацию — '
+                                + 'поиском по базам проекта.');
+                        } else {
+                            pushDialogNode('debug', '🤖 AI-ревью: '
+                                + (ev.mode === 'enable' ? 'включаю' : 'выключаю')
+                                + ' режим у проекта…');
+                        }
+                    } else if (ev.type === 'bot') {
+                        pushDialogNode('assistant', ev.text, ev.sources);
+                        // Состояние режима могло измениться (команды включения и
+                        // выключения) — перечитываем снимок, чтобы подпись у панели
+                        // проектов не расходилась с настройкой.
+                        if (reviewMode === 'enable' || reviewMode === 'disable') {
+                            loadReviewState();
+                        }
+                    } else if (ev.type === 'debug' || ev.type === 'error') {
+                        pushDialogNode(ev.type, ev.text);
+                    }
+                });
+            } catch (err) {
+                pushDialogNode('error', 'AI-ревью прервано: '
+                    + (err && err.message ? err.message : err));
+            } finally {
+                foregroundRequests.delete(streamSession);
+                updateComposerState();
+                updateTyping();
+            }
+        }
+
+        // Снимок настройки режима ревью с сервера: нужен интерфейсу, чтобы
+        // состояние режима было ВИДНО (подпись у кнопки «MCP» и в подсказке), а не
+        // выяснялось попыткой команды.
+        async function loadReviewState() {
+            try {
+                const res = await fetch('/api/agent/review');
+                if (!res.ok) { reviewState = null; renderReviewMark(); return; }
+                reviewState = await res.json();
+            } catch (err) {
+                reviewState = null;
+            }
+            renderReviewMark();
+        }
+
+        // Подпись режима AI-ревью рядом с кнопкой MCP проекта: включён он или нет
+        // и как его переключить. Без неё выключенный режим выглядел бы как
+        // «команда не работает».
+        function renderReviewMark() {
+            const node = document.getElementById('review-mark');
+            if (!node) return;
+            const state = reviewState || {};
+            node.hidden = !workspace.active_task;
+            if (!workspace.active_task) return;
+            node.textContent = state.enabled
+                ? '🤖 AI-ревью включён' + (state.base ? ' (база: ' + state.base + ')' : '')
+                : '🤖 AI-ревью выключен — /ai_review_enable';
+            node.classList.toggle('on', !!state.enabled);
+        }
+
+
+        // ---------------------------------------------------------------------
         // КОНТРОЛЬНЫЙ ДИАЛОГ (команды /test_rag_dialog_1 и /test_rag_dialog_2) —
         // ТЕСТОВЫЙ КЕЙС. Десять реплик: старт задан сценарием, дальше реплики
         // пишет имитация пользователя (служебный вызов LLM), а отвечает тот же
@@ -9981,6 +10131,55 @@
             // ЭТОЙ задачи: чужие задачи не помеха (они на своих блокировках).
             if (requestBusyHere()) return;
             if (chains.has(workspace.active_session)) return;
+
+            // КОМАНДЫ AI-РЕВЬЮ — /ai_review, /ai_review_enable,
+            // /ai_review_disable: разбор ИЗМЕНЕНИЙ ВЕТКИ (потенциальные баги,
+            // архитектурные проблемы, рекомендации). Это команда, а не запрос
+            // задачи: пайплайн (план, подтверждение, шаги, автомат) не
+            // участвует, как у /help и /test_rag, а данные приходят через MCP
+            // (сервер «Git-репозиторий проекта», только чтение). Тот же разбор
+            // умеет делать пайплайн на pull request (.github/workflows/
+            // ai-review.yml, tools/ai_review.py).
+            const rawCommandLower = content.trim().toLowerCase();
+            const reviewCommand = rawCommandLower
+                .match(/^\/ai_review(_enable|_disable)?(?:\s+([\s\S]*))?$/);
+            if (reviewCommand) {
+                // У включения и выключения аргументов НЕТ: молча проглотить их
+                // значило бы не выполнить просьбу человека (то же правило, что у
+                // разбора команды на сервере).
+                if (reviewCommand[1] && (reviewCommand[2] || '').trim()) {
+                    input.value = '';
+                    addMessage('bot', '⚠️ У команды **/ai_review'
+                        + reviewCommand[1] + '** аргументов нет: она только '
+                        + 'включает или выключает режим у проекта. Базовая ветка '
+                        + 'указывается у команды **/ai_review** — например '
+                        + '`/ai_review main`.', true);
+                    return;
+                }
+                if (!workspace.active_task) {
+                    addMessage('bot', '⚠️ AI-ревью идёт по проекту — сначала '
+                        + 'создайте проект (кнопка «Новый проект»).', true);
+                    return;
+                }
+                input.value = '';
+                await runAiReview(content.trim());
+                return;
+            }
+
+            // НЕПОЛНАЯ ИЛИ НЕВЕРНАЯ КОМАНДА РЕВЬЮ («/ai_review_foo»,
+            // «/ai_reviewreport»): подсказываем правильные. Иначе такой текст
+            // ушёл бы в модель обычным вопросом, и человек искал бы причину в
+            // самом ревью (та же ловушка, что у /test_rag_dialog).
+            if (/^\/ai_review[a-z_]*$/.test(rawCommandLower)) {
+                input.value = '';
+                addMessage('bot', '⚠️ У AI-ревью три команды: '
+                    + '**/ai_review** [базовая ветка] — разобрать изменения '
+                    + 'ветки (например `/ai_review main`); '
+                    + '**/ai_review_enable** — включить режим ревью у проекта; '
+                    + '**/ai_review_disable** — выключить. '
+                    + 'Аргументов у включения и выключения нет.', true);
+                return;
+            }
 
             // КОМАНДА /test_rag — контрольный прогон вопросов по базам знаний.
             // Это НЕ запрос к модели, а тестовый кейс (см. app/ai/rag_suite.py),

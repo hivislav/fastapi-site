@@ -243,6 +243,20 @@ LLM_TEMPERATURE_MAX = 2.0
 LLM_MAX_TOKENS_MIN = 1
 LLM_MAX_TOKENS_MAX = 65536
 
+# РЕЖИМ AI-РЕВЬЮ КОДА — настройка ПРОЕКТА, как MCP, RAG и параметры модели: поле
+# "ai_review" задачи-workspace помнит, включён ли у проекта разбор изменений
+# (команды `/ai_review_enable` и `/ai_review_disable` в чате). Настройка живёт
+# ЗДЕСЬ, а не в файле репозитория: приложение не правит рабочую копию, а пайплайн
+# на PR (GitHub Action) включает и выключает себя переменной репозитория
+# AI_REVIEW_ENABLED — локальный workspace ему не виден.
+#
+# Формат: {"enabled": bool, "base": "<базовая ветка>"} — базовая ветка нужна
+# пайплайну и команде, когда её не назвали в самой команде («/ai_review»).
+AI_REVIEW_FIELD = "ai_review"
+# Предел длины имени базовой ветки: имена веток ограничены самим git, здесь —
+# страховка от мусора в файле настроек.
+AI_REVIEW_BASE_MAX = 200
+
 # Заголовок пустой сессии (пока пользователь не отправил ни одного запроса).
 EMPTY_SESSION_TITLE = "Новая задача"
 
@@ -1513,6 +1527,60 @@ def set_llm_params(task: Dict[str, Any], temperature: Any = None,
     return dict(task[LLM_FIELD])
 
 
+def _normalize_ai_review(raw: Any) -> Dict[str, Any]:
+    """Приводит настройку режима AI-ревью к рабочему виду.
+
+    Формат: {"enabled": bool, "base": "<базовая ветка>"}. Значение из файла
+    ЗАЖИМАЕТСЯ, а не отвергается: битая настройка в файле не должна мешать
+    приложению работать (то же правило, что у _normalize_llm). Причина отказа
+    при этом называется там, где значение вводит человек — в маршруте команды.
+
+    По умолчанию режим ВЫКЛЮЧЕН: ревью — это отдельное действие, которое тратит
+    вызовы модели, и включаться само оно не должно.
+    """
+    if isinstance(raw, bool):        # запасной формат: голое «включено/выключено»
+        raw = {"enabled": raw}
+    data = raw if isinstance(raw, dict) else {}
+    base = str(data.get("base") or "").strip()[:AI_REVIEW_BASE_MAX]
+    return {"enabled": bool(data.get("enabled")), "base": base}
+
+
+def ai_review_settings(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Настройка режима AI-ревью у проекта (нормализует поле на месте).
+
+    Как mcp_settings(), rag_settings() и llm_settings(): задача, созданная в
+    памяти и ещё не записанная в файл, не имеет поля — оно появляется при первом
+    обращении, а не падает с KeyError.
+    """
+    if not isinstance(task.get(AI_REVIEW_FIELD), dict):
+        task[AI_REVIEW_FIELD] = _normalize_ai_review(task.get(AI_REVIEW_FIELD))
+    return task[AI_REVIEW_FIELD]
+
+
+def ai_review_enabled(task: Optional[Dict[str, Any]]) -> bool:
+    """Включён ли у проекта режим AI-ревью (неизвестный проект — выключен)."""
+    if not task:
+        return False
+    return bool(ai_review_settings(task)["enabled"])
+
+
+def set_ai_review(task: Dict[str, Any], enabled: Any = None,
+                  base: Any = None) -> Dict[str, Any]:
+    """Записывает настройку режима AI-ревью и возвращает её целиком.
+
+    Приходит ВСЁ состояние сразу (как у set_llm_params): `enabled` — включить или
+    выключить режим, `base` — базовая ветка для сравнения. Пустая база означает
+    «не задана»: тогда пайплайн и команда берут ветку по умолчанию (main или
+    отслеживаемую), и это решает сервер git, а не настройка проекта.
+    """
+    settings = ai_review_settings(task)
+    task[AI_REVIEW_FIELD] = _normalize_ai_review({
+        "enabled": settings["enabled"] if enabled is None else bool(enabled),
+        "base": settings["base"] if base is None else base,
+    })
+    return dict(task[AI_REVIEW_FIELD])
+
+
 def exceptions(dialog: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Решения пользователя по противоречиям правил (нормализует поле на месте).
 
@@ -1859,6 +1927,10 @@ def _normalize_task(raw: Any) -> Optional[Dict[str, Any]]:
         # «AI-агент» (шестерёнка ⚙️ проекта). Строка обязательна по той же
         # причине: без неё настройка исчезала бы при первой записи файла.
         "llm": _normalize_llm(raw.get("llm")),
+        # РЕЖИМ AI-РЕВЬЮ КОДА: включён ли у проекта разбор изменений (команды
+        # `/ai_review_enable` и `/ai_review_disable`). Строка обязательна по той
+        # же причине — иначе включённый режим терялся бы при первой записи файла.
+        "ai_review": _normalize_ai_review(raw.get("ai_review")),
     }
 
 

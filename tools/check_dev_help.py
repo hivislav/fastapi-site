@@ -197,8 +197,10 @@ def section_registry():
     info = mcp_store.discover(dev_help.SERVER_ID, force=True)
     check("сервер отвечает на tools/list", bool(info.get("ok")), str(info.get("error")))
     names = [str(tool.get("name")) for tool in info.get("tools") or []]
-    check("объявлены все пять инструментов",
+    check("объявлены все семь инструментов (порядок объявления: пять прежних "
+          "и два для ревью)",
           names == [dev_help.STATUS_TOOL, dev_help.FILES_TOOL, dev_help.DIFF_TOOL,
+                    "git_branch_files", "git_branch_diff",
                     dev_help.LOG_TOOL, dev_help.SHOW_TOOL], str(names))
 
 

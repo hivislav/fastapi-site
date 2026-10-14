@@ -618,6 +618,30 @@ const PERIODIC_LABELS = {
 };
 const ragTests = [];          // тела POST /api/agent/rag/test
 const helpCalls = [];         // тела POST /api/agent/help (команда /help)
+// AI-РЕВЬЮ (команды /ai_review*): тела запросов и состояние режима, которое
+// подделывает заглушка сервера (как `task["ai_review"]` у проекта).
+const reviewCalls = [];
+const REVIEW = { enabled: false, base: '' };
+const REVIEW_REPORT = [
+  '## 🤖 AI-ревью изменений',
+  '',
+  '**Что проверялось:** ветка `work/review`, против `main`, HEAD `a1b2c3d`.',
+  '**Объём:** Изменено файлов: 2 (+17 −6).',
+  '',
+  'Проверено diff\'ом: 2 из 2 файлов.',
+  '- `M` `app/ai/module.py` +14 −6',
+  '- `A` `app/ai/fresh.py` +3 −0',
+  '**Что смотрел ревьюер:** diff 2 файла, связанных файлов 1.',
+  '',
+  '🐞 Потенциальные баги',
+  '- `app/ai/module.py`: при пустом `result` возможно падение — проверьте вход.',
+  '',
+  '🏛 Архитектурные проблемы',
+  '- Второй путь разбора рядом с прежним: правило проекта — один вход.',
+  '',
+  '💡 Рекомендации',
+  '- Дописать проверку поля `result`.',
+].join('\n');
 // Ответ ассистента БЕЗ ссылок на документацию (информация взята из MCP и
 // состояния репозитория): так проверяется, что подобранные фрагменты не
 // выдаются за использованные.
@@ -1110,6 +1134,58 @@ function makeFetch() {
         MCP.enabled = (body.enabled || []).filter(id => known.indexOf(id) >= 0);
       }
       return jsonResponse(mcpPayload());
+    }
+    if (url === '/api/agent/review') {
+      // AI-РЕВЬЮ КОДА (команды /ai_review, /ai_review_enable,
+      // /ai_review_disable): сервер отвечает потоком тех же событий, что и в
+      // жизни (см. app/routers/chat.py, agent_review). GET — снимок режима:
+      // интерфейс показывает подписью, включён он у проекта или нет.
+      if (method === 'GET') {
+        return jsonResponse({ enabled: !!REVIEW.enabled,
+          base: REVIEW.base, command: '/ai_review',
+          enable_command: '/ai_review_enable',
+          disable_command: '/ai_review_disable' });
+      }
+      reviewCalls.push(body || {});
+      const command = String((body || {}).content || '').toLowerCase();
+      if (command.indexOf('_enable') >= 0) {
+        REVIEW.enabled = true;
+        return streamResponse([
+          { type: 'review_start', mode: 'enable', enabled: true, base: '' },
+          { type: 'bot', text: '**Режим AI-ревью включён.** Команда `/ai_review` '
+            + 'разбирает изменения ветки. Выключить: **/ai_review_disable**.' },
+          { type: 'done', usage: {} },
+        ]);
+      }
+      if (command.indexOf('_disable') >= 0) {
+        REVIEW.enabled = false;
+        return streamResponse([
+          { type: 'review_start', mode: 'disable', enabled: false, base: '' },
+          { type: 'bot', text: '**Режим AI-ревью выключен.** Включить: '
+            + '**/ai_review_enable**.' },
+          { type: 'done', usage: {} },
+        ]);
+      }
+      if (!REVIEW.enabled) {
+        return streamResponse([
+          { type: 'review_start', mode: 'review', enabled: false, base: '' },
+          { type: 'error', text: '⚠ Режим AI-ревью у этого проекта выключен — '
+            + 'разбор изменений не делаю. Включить: **/ai_review_enable**.' },
+          { type: 'done', usage: {} },
+        ]);
+      }
+      return streamResponse([
+        { type: 'review_start', mode: 'review', enabled: true, base: 'main' },
+        { type: 'debug', text: '🔧 Беру изменения через MCP (git): git_status, '
+          + 'git_branch_files.' },
+        { type: 'debug', text: '📄 Изменено файлов: 2 (+17 −6). База: main.' },
+        { type: 'debug', text: '📄 Diff прочитан по 2 файлам (900 символов, вызовов: 2).' },
+        { type: 'debug', text: '🔎 Ищу в документации проекта по запросу: «app/ai»' },
+        { type: 'bot', hits: 1, text: REVIEW_REPORT, sources: RAG_SOURCES || [] },
+        { type: 'answer_ready' },
+        { type: 'usage', usage: { calls: 3, prompt_tokens: 900, completion_tokens: 300 } },
+        { type: 'done', usage: { calls: 3, prompt_tokens: 900, completion_tokens: 300 } },
+      ]);
     }
     if (url === '/api/agent/rag/test') {
       // Заглушка контрольного прогона RAG: сервер отвечает потоком тех же
@@ -4819,6 +4895,99 @@ async function run() {
       return helpCalls.length === before + 1
         && (body.content || '').indexOf('Что это за проект') >= 0;
     })());
+
+  // ---------------------------------------------------------------------
+  // [V3] КОМАНДЫ AI-РЕВЬЮ: /ai_review, /ai_review_enable, /ai_review_disable.
+  //      Идут МИМО пайплайна задачи (свой потоковый маршрут), отчёт приходит
+  //      шапкой с фактами и тремя разделами, а режим включается и выключается
+  //      командами и виден подписью у панели проектов.
+  // ---------------------------------------------------------------------
+  console.log('\n[V3] Команды AI-ревью');
+  REVIEW.enabled = false;
+  const reviewChatCalls = chatCalls();
+  const reviewStepCalls = stepCalls();
+  const reviewPlain = reviewCalls.length;
+  // РЕЖИМ ВЫКЛЮЧЕН: команда разбора обязана назвать причину и как включить.
+  await sendRequest('/ai_review', 80);
+  await wait(120);
+  check('выключенный режим: команда ушла в свой маршрут, а не в чат агента',
+    reviewCalls.length === reviewPlain + 1 && chatCalls() === reviewChatCalls,
+    'запросов ревью: ' + (reviewCalls.length - reviewPlain));
+  check('отказ назван причиной и командой включения',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('AI-ревью') >= 0
+      && el.textContent.indexOf('/ai_review_enable') >= 0));
+  check('шагов плана команда не запустила', stepCalls() === reviewStepCalls,
+    'шагов: ' + (stepCalls() - reviewStepCalls));
+  check('подпись режима у панели проектов видна и говорит «выключен»',
+    !$('review-mark').hidden && $('review-mark').textContent.indexOf('выключен') >= 0,
+    $('review-mark').textContent);
+
+  // ВКЛЮЧЕНИЕ: настройка проекта меняется командой, подпись обновляется.
+  await sendRequest('/ai_review_enable', 80);
+  await wait(160);
+  check('включение подтверждено репликой с командой выключения',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('Режим AI-ревью включён') >= 0
+      && el.textContent.indexOf('/ai_review_disable') >= 0));
+  check('подпись режима обновилась на «включён»',
+    $('review-mark').textContent.indexOf('включён') >= 0
+    && $('review-mark').classList.contains('on'), $('review-mark').textContent);
+
+  // РАЗБОР: отчёт с шапкой, тремя разделами и источниками.
+  const reviewBefore = reviewCalls.length;
+  await sendRequest('/ai_review main', 200);
+  await wait(200);
+  const reviewBody = reviewCalls[reviewCalls.length - 1] || {};
+  check('команда с базовой веткой ушла целиком',
+    reviewCalls.length === reviewBefore + 1
+    && (reviewBody.content || '').indexOf('/ai_review main') >= 0,
+    JSON.stringify(reviewBody));
+  check('команда нарисована репликой пользователя',
+    q('#messages .msg.user').some(el => el.textContent.indexOf('/ai_review main') >= 0));
+  check('в диагностике названы инструменты MCP и объём прочитанного',
+    q('#messages .msg.debug').some(el => el.textContent.indexOf('git_branch_files') >= 0)
+    && q('#messages .msg.debug').some(el => el.textContent.indexOf('Diff прочитан') >= 0));
+  const reviewAnswer = q('#messages .msg.bot').filter(
+    el => el.textContent.indexOf('AI-ревью изменений') >= 0);
+  check('отчёт ревью нарисован', reviewAnswer.length === 1,
+    'отчётов: ' + reviewAnswer.length);
+  check('в отчёте шапка с фактами из git (ветка, база, файлы)',
+    !!reviewAnswer[0] && reviewAnswer[0].textContent.indexOf('work/review') >= 0
+    && reviewAnswer[0].textContent.indexOf('main') >= 0
+    && reviewAnswer[0].textContent.indexOf('app/ai/fresh.py') >= 0);
+  check('в отчёте все три раздела — баги, архитектура, рекомендации',
+    !!reviewAnswer[0]
+    && reviewAnswer[0].textContent.indexOf('Потенциальные баги') >= 0
+    && reviewAnswer[0].textContent.indexOf('Архитектурные проблемы') >= 0
+    && reviewAnswer[0].textContent.indexOf('Рекомендации') >= 0);
+  check('под отчётом карточки источников документации',
+    !!reviewAnswer[0] && reviewAnswer[0].querySelectorAll('.rag-source').length > 0);
+
+  // ВЫКЛЮЧЕНИЕ: подпись возвращается к «выключен».
+  await sendRequest('/ai_review_disable', 80);
+  await wait(160);
+  check('выключение подтверждено репликой',
+    q('#messages .msg.bot').some(el => el.textContent.indexOf('Режим AI-ревью выключен') >= 0));
+  check('подпись режима снова говорит «выключен»',
+    $('review-mark').textContent.indexOf('выключен') >= 0
+    && !$('review-mark').classList.contains('on'), $('review-mark').textContent);
+
+  // НЕВЕРНАЯ ФОРМА КОМАНДЫ: подсказка вместо запроса в маршрут (иначе текст
+  // ушёл бы в модель обычным вопросом, и человек искал бы причину в ревью).
+  const wrongPlain = reviewCalls.length;
+  await sendRequest('/ai_review_foo', 60);
+  await wait(80);
+  check('неизвестная форма команды — подсказка, а не запрос',
+    reviewCalls.length === wrongPlain
+    && q('#messages .msg.bot').some(el => el.textContent.indexOf('/ai_review_enable') >= 0
+      && el.textContent.indexOf('три команды') >= 0));
+  await sendRequest('/ai_review_enable лишнее', 60);
+  await wait(80);
+  check('аргумент у включения — подсказка, а не молчаливое выполнение',
+    reviewCalls.length === wrongPlain
+    && q('#messages .msg.bot').some(el => el.textContent.indexOf('аргументов нет') >= 0));
+  // Режим оставляем включённым, как его вернул бы человек: подпись и состояние
+  // сходятся (проверки ниже смотрят на чат, а не на настройку ревью).
+  REVIEW.enabled = true;
 
   // КОМАНДЫ /test_rag_dialog_1|2: контрольный разговор из 10 реплик.
   const dialogTestsBefore = dialogTests.length;
