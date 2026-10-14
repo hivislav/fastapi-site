@@ -41,6 +41,7 @@
 этом будет сказано и в отчёте, и в диагностике.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -445,6 +446,16 @@ def ensure(root: str, profile: Optional[str] = None, sha: str = "",
 # ---------------------------------------------------------------------------
 # Фоновая сборка: режим включили — индекс кода поехал в базу сам
 # ---------------------------------------------------------------------------
+class _Stopped(BaseException):
+    """Индексацию отменили из интерфейса (`rag_jobs.cancel`).
+
+    Наследуется от BaseException НАМЕРЕННО, как и отмена у самих задач RAG
+    (`rag_jobs._Cancelled`): наблюдатель хода индексации ловит обычные исключения
+    (`rag._progress`), и «отмена» не должна выглядеть как сбой наблюдателя —
+    иначе кнопка «остановить» не останавливала бы ничего.
+    """
+
+
 async def index_in_background(root: str, profile: Optional[str] = None,
                               sha: str = "",
                               settings: Optional[Dict[str, Any]] = None,
@@ -453,116 +464,105 @@ async def index_in_background(root: str, profile: Optional[str] = None,
 
     Так работает команда `/ai_review_enable`: индексация крупного проекта — это
     минуты, и держать на них HTTP-соединение нельзя (штатный механизм проекта:
-    задача + прогресс, см. app/ai/rag_jobs.py). По завершении успешной сборки
-    пишется маркер и убираются прежние индексы ревью.
+    задача + прогресс, см. app/ai/rag_jobs.py).
 
-    Возвращает {"started": bool, "job_id": str, "documents": N, "reason": ""}:
-    «нечего индексировать» и «индекс уже свежий» — не сбой, а причина.
+    ЗАДАЧА ВЕДЁТСЯ ЗДЕСЬ, а не через `rag_jobs.start`, ПО ДВУМ причинам:
+
+      * **партии.** RAG принимает не больше `MAX_FILES_PER_UPLOAD` файлов за одну
+        загрузку, а в репозитории их десятки: `rag_jobs.start` отказал бы («за одну
+        загрузку принимается не больше 20 файлов») — на этом и споткнулся живой
+        прогон 14.10. Партии собирает `build`, а задача лишь показывает прогресс;
+      * **один индекс и один маркер.** Несколько задач подряд дали бы несколько баз
+        и «какая из них настоящая» решалось бы по времени, а не по коммиту.
+
+    Возвращает {"started", "job_id", "documents", "task", "reason"}: `task` —
+    заведённая задача (её видно в проверках), `reason` — почему не запущено
+    («индекс уже свежий», «нечего индексировать», «нет места»).
     """
     from app.ai import rag_jobs
 
     current = state(root, profile=profile, sha=sha)
     if current["fresh"]:
-        return {"started": False, "job_id": "", "documents": 0,
-                "reason": "индекс кода уже свежий (коммит %s)" % (str(sha)[:12] or "—")}
-    info = documents(root)
+        return {"started": False, "job_id": "", "documents": 0, "task": None,
+                "reason": "индекс кода уже свежий (коммит %s)"
+                          % (str(sha)[:12] or "—")}
+    # Чтение файлов — в отдельном потоке: их десятки мегабайт, и цикл событий на
+    # этом стоять не должен.
+    info = await asyncio.to_thread(documents, root)
     if info["reason"]:
-        return {"started": False, "job_id": "", "documents": 0,
+        return {"started": False, "job_id": "", "documents": 0, "task": None,
                 "reason": info["reason"]}
     try:
         rag.ensure_capacity(profile=profile)
-        job = await rag_jobs.start(
-            profile=profile, files=info["documents"], name=BASE_NAME,
-            strategy=(settings or {}).get("strategy"),
-            chunk_size=(settings or {}).get("chunk_size"),
-            overlap=(settings or {}).get("overlap"))
+        job = rag_jobs.create(profile=profile, name=BASE_NAME)
     except rag.RagError as exc:
         return {"started": False, "job_id": "", "documents": info["files"],
-                "reason": "индекс кода не запущен: %s" % str(exc)[:200]}
+                "task": None, "reason": "индекс кода не запущен: %s" % str(exc)[:200]}
     except Exception as exc:                     # pragma: no cover - защита
         logger.exception("AI-ревью: фоновая индексация не запущена")
         return {"started": False, "job_id": "", "documents": info["files"],
-                "reason": "индекс кода не запущен: %s" % str(exc)[:200]}
-    return {"started": True, "job_id": str(job.get("id") or ""),
-            "documents": info["files"], "chunks_estimate": 0,
-            "reason": "", "skipped": info["skipped"]}
+                "task": None, "reason": "индекс кода не запущен: %s" % str(exc)[:200]}
+    job_id = str(job.get("id") or "")
+    task = asyncio.ensure_future(_background_worker(job_id, root, profile, sha,
+                                                    settings))
+    return {"started": True, "job_id": job_id, "documents": info["files"],
+            "skipped": info["skipped"], "task": task, "reason": ""}
 
 
-async def mark_when_done(job_id: str, root: str, profile: Optional[str] = None,
-                         sha: str = "", timeout: float = JOB_WAIT_S) -> Dict[str, Any]:
-    """Дожидается фоновой сборки и помечает базу (маркер + уборка прежних).
+async def _background_worker(job_id: str, root: str, profile: Optional[str],
+                             sha: str, settings: Optional[Dict[str, Any]],
+                             ) -> Dict[str, Any]:
+    """Собирает индекс в фоне и ведёт задачу RAG: прогресс, отмена, итог, маркер.
 
-    Отдельная задача, а не часть маршрута: индексация живёт в `rag_jobs` и
-    переживает ответ чата. Возвращает {"ok", "base_id", "reason"}: причина отказа
-    называется словами (задачу отменили, упала, не дождались) — она уходит в
-    журнал, чтобы «индекс не появился» не осталось без объяснения.
+    Возвращает итог сборки (тот же словарь, что `build`), чтобы вызывающий мог
+    дождаться задачи и увидеть результат: «сколько файлов, сколько чанков, чем
+    считались векторы». Прогресс и отмена идут через `rag_jobs`: `progress`
+    возвращает False, когда задачу отменили, — это и есть проверка отмены.
     """
     from app.ai import rag_jobs
 
-    deadline = time.time() + max(5.0, float(timeout or JOB_WAIT_S))
-    while time.time() < deadline:
-        job = rag_jobs.get(job_id, profile=profile)
-        if job is None:
-            return {"ok": False, "base_id": "", "reason": "задача индексации пропала"}
-        status = str(job.get("state") or "")
-        if status == JOB_DONE:
-            base_id = str(job.get("base_id")
-                          or (job.get("result") or {}).get("id") or "")
-            if not base_id:
-                return {"ok": False, "base_id": "",
-                        "reason": "задача завершилась без базы"}
-            meta = rag_store.get_base(base_id, profile=profile) or {}
-            stats = meta.get("stats") or {}
-            info = documents(root)
-            write_marker(base_id, {
-                "root": os.path.abspath(str(root or "")), "sha": str(sha or ""),
-                "documents": int(stats.get("documents") or info["files"]),
-                "chunks": int(stats.get("chunks") or 0), "chars": info["chars"],
-                "backend": str((meta.get("embedding") or {}).get("backend")
-                               or meta.get("backend") or ""),
-                "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "fingerprint": info["fingerprint"], "files": info["files"]})
-            removed = drop_bases([item for item in review_bases(profile=profile)
-                                  if item["id"] != base_id], profile=profile)
-            return {"ok": True, "base_id": base_id,
-                    "chunks": int(stats.get("chunks") or 0),
-                    "documents": int(stats.get("documents") or 0),
-                    "stale_removed": removed, "reason": ""}
-        if status in (JOB_FAILED, JOB_CANCELLED):
-            return {"ok": False, "base_id": "",
-                    "reason": "индексация %s: %s"
-                              % ("отменена" if status == JOB_CANCELLED else "не удалась",
-                                 str(job.get("error") or "без пояснения")[:200])}
-        await _sleep(JOB_POLL_S)
-    return {"ok": False, "base_id": "",
-            "reason": "индексация не закончилась за %d с" % int(timeout)}
+    def report(stage: str = "", done: float = 0, total: float = 0,
+               detail: str = "", heavy: bool = False) -> None:
+        if not rag_jobs.progress(job_id, str(stage or "index"), done, total,
+                                 str(detail or ""), bool(heavy)):
+            raise _Stopped()
 
-
-async def _sleep(seconds: float) -> None:
-    """Пауза между опросами задачи (отдельной функцией — проверкам её подменить)."""
-    import asyncio
-    await asyncio.sleep(seconds)
+    try:
+        built = await asyncio.to_thread(build, root, profile=profile, sha=sha,
+                                       on_progress=report, settings=settings)
+    except _Stopped:
+        rag_jobs.cancelled(job_id)
+        return {"ok": False, "base_id": "", "chunks": 0, "documents": 0,
+                "reason": "индексация отменена"}
+    except Exception as exc:                     # pragma: no cover - защита
+        logger.exception("AI-ревью: фоновая индексация упала")
+        rag_jobs.fail(job_id, "%s: %s" % (type(exc).__name__, str(exc)[:200]))
+        return {"ok": False, "base_id": "", "chunks": 0, "documents": 0,
+                "reason": "индексация не удалась: %s" % str(exc)[:200]}
+    if not built.get("ok"):
+        rag_jobs.fail(job_id, str(built.get("reason") or "индексация не удалась"))
+        return built
+    # Маркер новой базы уже записан `build`; убираем прежние индексы ревью и
+    # закрываем задачу ИТОГОМ БАЗЫ (по нему интерфейс показывает чанки).
+    built["stale_removed"] = drop_bases(
+        [item for item in review_bases(profile=profile) if item["id"] != built["base_id"]],
+        profile=profile)
+    meta = rag_store.get_base(built["base_id"], profile=profile) or {}
+    rag_jobs.finish(job_id, meta)
+    return built
 
 
 async def start_background(root: str, profile: Optional[str] = None, sha: str = "",
                            settings: Optional[Dict[str, Any]] = None,
                            ) -> Dict[str, Any]:
-    """Запускает фоновую сборку индекса И ждёт её в отдельной задаче.
+    """Запускает фоновую сборку индекса (её задачу возвращает в `task`).
 
-    Возвращает то же, что `index_in_background`, плюс `job_id`: заведённая задача
-    (её можно отменить вместе с приложением). Так команда включения режима
-    отвечает СРАЗУ, а индекс появляется сам.
+    Отдельное имя — потому что этим пользуется команда включения режима: она не
+    ждёт индексацию (она в фоне), но держит ссылку на задачу, чтобы её нельзя было
+    снять сборщиком мусора и чтобы проверки могли дождаться окончания.
     """
-    import asyncio
-
-    started = await index_in_background(root, profile=profile, sha=sha,
-                                        settings=settings)
-    if not started.get("started"):
-        return started
-    task = asyncio.ensure_future(
-        mark_when_done(str(started["job_id"]), root, profile=profile, sha=sha))
-    started["task"] = task
-    return started
+    return await index_in_background(root, profile=profile, sha=sha,
+                                     settings=settings)
 
 
 # ---------------------------------------------------------------------------

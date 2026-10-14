@@ -41,7 +41,11 @@
 #     другое значение (в том числе пустое — переменной нет) ничего не выключает. Это парная настройка к командам `/ai_review_enable` и
 #     `/ai_review_disable` в чате: там режим живёт у ПРОЕКТА, здесь — у
 #     РЕПОЗИТОРИЯ, потому что у пайплайна нет доступа к локальному проекту.
-#     НА СВОЕЙ МАШИНЕ ЭТО МОЖНО СВЯЗАТЬ: переменная AI_REVIEW_WORKSPACE с путём
+#   * НА СВОЕЙ МАШИНЕ ПИТОН НЕ СТАВИТСЯ, БЕРЁТСЯ СВОЙ —
+#     `tools/review_runner.sh start` передаёт задачи интерпретатор проекта
+#     (AI_REVIEW_PYTHON), в котором стоят эмбеддинги; без этого RAG по коду
+#     молча ушёл бы на лексический офлайн-бэкенд;
+#   * НА СВОЕЙ МАШИНЕ ЭТО МОЖНО СВЯЗАТЬ: переменная AI_REVIEW_WORKSPACE с путём
 #     к рабочему файлу проекта (`data/agent_workspace.json` каталога, где стоит
 #     приложение) — тогда команды `/ai_review_enable` и `/ai_review_disable`
 #     управляют и пайплайном;
@@ -100,13 +104,37 @@ jobs:
           git fetch --no-tags origin \
             "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
 
-      - name: Python 3.12
-        # Ставится ВСЕГДА, до разбора режима: разбор читает настройку проекта
-        # модулями самого проекта, а системный python3 раннера может быть старше
-        # (в коде проекта есть `X | None`, то есть нужен 3.10+).
+      - name: Python 3.12 (только в облаке)
+        # НА СВОЕЙ МАШИНЕ ПИТОН НЕ СТАВИТСЯ. Он там уже есть — вместе с пакетом
+        # эмбеддингов и кэшем моделей, — а `actions/setup-python` на macOS падает:
+        # он раскладывает интерпретатор в /Users/runner/hostedtoolcache, куда
+        # писать нельзя (живой прогон 14.10: «mkdir: /Users/runner: Operation not
+        # permitted»). В облаке ставим: там нужен предсказуемый 3.12.
+        if: ${{ runner.environment != 'self-hosted' }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Какой питон работает и есть ли эмбеддинги
+        # ИНТЕРПРЕТАТОР БЕРЁТСЯ ОТ МАШИНЫ (AI_REVIEW_PYTHON из окружения раннера,
+        # его ставит `tools/review_runner.sh start`): в venv проекта лежит
+        # sentence-transformers и кэш моделей, а без них RAG по коду молча уходит
+        # на лексический офлайн-бэкенд. Ищем и говорим прямо, чем считаем.
+        run: |
+          set -eu
+          PY="${AI_REVIEW_PYTHON:-}"
+          if [ -z "$PY" ] || [ ! -x "$PY" ]; then
+            PY="$(command -v python3)"
+          fi
+          echo "PYTHON=$PY" >> "$GITHUB_ENV"
+          echo "Интерпретатор: $PY ($("$PY" --version 2>&1))"
+          "$PY" - <<'PYCODE'
+          try:
+              import sentence_transformers  # noqa: F401
+              print("Эмбеддинги: пакет sentence-transformers доступен — поиск будет семантическим")
+          except Exception as exc:                       # noqa: BLE001
+              print("Эмбеддинги: пакета нет (%s) — индекс посчитается офлайн-бэкендом" % type(exc).__name__)
+          PYCODE
 
       - name: Режим AI-ревью у проекта (рубильник из чата)
         # ГЛАВНЫЙ РУБИЛЬНИК — КОМАНДЫ `/ai_review_enable` и `/ai_review_disable`:
@@ -119,16 +147,16 @@ jobs:
         id: mode
         run: |
           set -eu
-          python3 tools/ai_review.py --mode-report --repo "$GITHUB_WORKSPACE" \
+          "$PYTHON" tools/ai_review.py --mode-report --repo "$GITHUB_WORKSPACE" \
             --workspace "${{ vars.AI_REVIEW_WORKSPACE }}" > mode.json
           cat mode.json
-          ENABLED=$(python3 -c "import json;print('true' if json.load(open('mode.json'))['enabled'] else 'false')")
+          ENABLED=$("$PYTHON" -c "import json;print('true' if json.load(open('mode.json'))['enabled'] else 'false')")
           echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
           {
             echo "## 🤖 AI-ревью изменений"
             echo
             echo "- режим у проекта: **$ENABLED**"
-            python3 -c "import json;d=json.load(open('mode.json'));print('- ' + d['reason']);print('- файл проекта: \`%s\`' % d['workspace']);print('- проект: %s' % (d['project'] or '—'));print('- ключ модели: %s' % ('есть' if d['key'] else 'нет — ' + d['key_reason']))"
+            "$PYTHON" -c "import json;d=json.load(open('mode.json'));print('- ' + d['reason']);print('- файл проекта: \`%s\`' % d['workspace']);print('- проект: %s' % (d['project'] or '—'));print('- ключ модели: %s' % ('есть' if d['key'] else 'нет — ' + d['key_reason']))"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Node.js (для MCP-сервера git)
@@ -164,7 +192,7 @@ jobs:
           if [ -n "${AI_REVIEW_INDEX_DIR}" ]; then
             export RAG_DIR="${AI_REVIEW_INDEX_DIR}"
           fi
-          python3 - <<'PY'
+          "$PYTHON" - <<'PY'
           import json
           from app.ai import rag_embedding
           state = rag_embedding.backend_status()
@@ -226,7 +254,7 @@ jobs:
             if [ "${{ runner.environment }}" = "self-hosted" ]; then RAG_MODE=on; else RAG_MODE=auto; fi
           fi
           echo "Режим RAG: $RAG_MODE"
-          python3 tools/ai_review.py \
+          "$PYTHON" tools/ai_review.py \
             --base "origin/${{ github.base_ref }}" \
             --repo "$GITHUB_WORKSPACE" \
             --workspace "${{ vars.AI_REVIEW_WORKSPACE }}" \
