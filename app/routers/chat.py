@@ -48,6 +48,7 @@ from app.ai import attachments as attach_store
 from app.ai import client as llm_client
 from app.ai import dev_help
 from app.ai import service
+from app.ai import support
 from app.ai import invariants as invariants_store
 from app.ai import local_llm
 from app.ai import mcp as mcp_store
@@ -214,6 +215,84 @@ def _current_profile_id() -> Optional[str]:
     """id текущего профиля — им ограничены задачи, диалоги и память."""
     profile = _current_profile()
     return profile["id"] if profile else None
+
+
+# ---------------------------------------------------------------------------
+# ЗАЯВИТЕЛЬ ОБРАЩЕНИЯ — ИЗ ПРОФИЛЯ, А НЕ ОТ МОДЕЛИ
+#
+# В этом проекте профиль — это клиент (у него свои проекты, диалоги, память и
+# базы), поэтому «кто обратился в поддержку» код знает БЕЗ модели: это поле
+# «Имя» текущего профиля. Модель заявителя не выбирает — как не она ставит флаг
+# перезаписи (`enforce_overwrite`): личность, придуманная моделью, попала бы в
+# чужое обращение, и разбираться в этом пришлось бы человеку.
+#
+# Значение кладётся в contextvar: он свой у каждого запроса и копируется в поток,
+# где исполняются вызовы (`asyncio.to_thread`), поэтому два одновременных запроса
+# не перепутают клиентов.
+#
+# Имя НЕ подставляется, если оно пустое: сервер тогда честно отвечает «заявитель
+# не назван» — это правильнее, чем обращение «от никого» (живой случай: профиль
+# заводят раньше, чем заполняют).
+# ---------------------------------------------------------------------------
+_REQUESTER: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "agent_requester", default="")
+
+# Инструмент сервера `support`, который ЗАВОДИТ обращение, и имя его аргумента.
+# Сопоставление живёт здесь, в веб-слое, а не в клиенте MCP: клиент не знает имён
+# инструментов конкретных серверов (§5.11) — иначе каждое новое имя требовало бы
+# правки в ядре.
+CREATE_TICKET_TOOL = "create_ticket"
+REQUESTER_ARG = "requester"
+
+# Значения аргумента, которые модель ставит «для галочки», когда заявителя не
+# знает: схема помечает поле обязательным, и вместо пустоты приходит заглушка.
+# Такие значения считаются пустыми — иначе подстановка из профиля не сработала бы
+# ровно там, где она нужна.
+_PLACEHOLDER_REQUESTERS = (
+    "", "-", "—", "клиент", "пользователь", "заявитель", "не указан", "не указано",
+    "неизвестно", "unknown", "n/a", "нет данных",
+)
+
+
+def _requester_name() -> str:
+    """Имя клиента-заявителя: поле «Имя» текущего профиля ("" — не заполнено)."""
+    profile = _current_profile() or {}
+    return str(profile.get(profile_store.USER_KEY) or "").strip()
+
+
+def _fill_requester(call: Dict[str, Any], requester: str = "") -> None:
+    """Подставить заявителя в вызов создания обращения (дополнитель MCP).
+
+    Чистая функция: вызов и имя приходят аргументами, ни профилей, ни состояния
+    модуля она не читает, — поэтому проверяется без сервера
+    (tools/check_support_mcp.py, раздел [3]).
+
+    Уже названного заявителя НЕ перебивает: если человек попросил завести
+    обращение за другого клиента («заведи обращение для Дмитрия Ковалёва»), это
+    осознанный выбор человека, и код его не отменяет. Подставляется только
+    пустое значение или заглушка.
+    """
+    if not isinstance(call, dict):
+        return
+    if str(call.get("server") or "").strip() != mcp_store.SUPPORT:
+        return
+    if str(call.get("tool") or "").strip() != CREATE_TICKET_TOOL:
+        return
+    name = str(requester or "").strip() or _REQUESTER.get()
+    if not name:
+        return
+    arguments = call.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+        call["arguments"] = arguments
+    current = str(arguments.get(REQUESTER_ARG) or "").strip()
+    if current.lower() in _PLACEHOLDER_REQUESTERS:
+        arguments[REQUESTER_ARG] = name
+
+
+# Дополнитель регистрируется один раз при импорте веб-слоя: клиент MCP применяет
+# его к каждому вызову перед исполнением (см. mcp.ARG_FILLERS).
+mcp_store.register_arg_filler(_fill_requester)
 
 
 @contextlib.contextmanager
@@ -1707,7 +1786,21 @@ async def _preflight_mcp(task: Dict[str, Any], session: Dict[str, Any], text: st
     выгрузка по-прежнему ждут последнего шага.
     """
     dialog = session["dialog"]
-    enabled = workspace_store.mcp_enabled(task)
+    # ЗАЯВИТЕЛЬ ДЛЯ ВЫЗОВОВ ПОДДЕРЖКИ: имя клиента берётся из профиля ЗДЕСЬ, до
+    # всякой работы с серверами, — дальше оно доедет до вызова создания
+    # обращения через дополнитель аргументов (см. `_fill_requester`). Читаем
+    # именно тут, потому что профиль у запроса может быть переопределён (повтор
+    # периодической задачи идёт в профиле ВЛАДЕЛЬЦА задачи, см.
+    # `_ACTIVE_PROFILE_OVERRIDE`), а contextvar запроса — то место, откуда
+    # значение видно и в потоке исполнения вызовов.
+    _REQUESTER.set(_requester_name())
+    # ТОЛЬКО СЕРВЕРЫ АГЕНТА: командные (у них в реестре есть `command`, сейчас это
+    # `support`) в обычных запросах не участвуют вовсе — ни в каталоге диспетчера,
+    # ни в исполнении. Их открывает своя команда (`/support`), потому что данные
+    # обращений принадлежат конкретному человеку: на вопрос «почему не работает
+    # авторизация?» агент уходил бы в переписку случайного клиента (см.
+    # mcp_store.agent_enabled).
+    enabled = mcp_store.agent_enabled(workspace_store.mcp_enabled(task))
     if not enabled:
         return [], {}, [], False
     # Служебные фразы описывают ПРЕЖНИЙ запрос задачи (state.request), новый текст
@@ -5049,6 +5142,10 @@ def _decode_upload_files(items: List[Any]) -> List[Dict[str, Any]]:
 #     КОД (`dev_help.calls`), а не диспетчер: команда всегда спрашивает одно и то
 #     же — «покажи состояние работы», — и лишний служебный вызов модели здесь
 #     ничего не решает.
+#   * ОБРАЩЕНИЙ КЛИЕНТОВ ЗДЕСЬ НЕТ: поддержка — отдельная команда `/support`
+#     (app/ai/support.py), и сервер `support` помечен в реестре как командный,
+#     поэтому агенту и этой команде его инструменты недоступны вовсе
+#     (`mcp_store.agent_enabled`).
 #
 # МИМО ПАЙПЛАЙНА ЗАДАЧИ — как контрольный прогон `/test_rag` и мини-чат: ни
 # планировщика, ни подтверждения плана, ни шагов, ни приёмщика, ни переходов
@@ -5088,24 +5185,40 @@ def _dev_help_path(question_text: str) -> Tuple[str, str]:
     return dev_help.kind_of(_dev_help_repo_dir(), question_text)
 
 
-def _git_mcp_reason(task: Dict[str, Any]) -> str:
-    """Почему контекст репозитория недоступен ("" — доступен).
+def _mcp_reason(task: Dict[str, Any], server_id: str, what: str) -> str:
+    """Почему данные этого MCP-сервера недоступны ("" — доступны).
 
     Проверяются ДВА условия, и оба видны БЕЗ запуска сервера: он вообще
     подключён к проекту (кнопка «MCP», `task["mcp"]` — это настройка ПРОЕКТА) и
     он работоспособен (есть node, файл сервера, MCP SDK). Причина называется
     словами: иначе «ассистент не видит ветку» выглядело бы как его неумение.
 
+    `what` — что именно нужно от сервера, для текста причины: «контекст
+    репозитория» у сервера `git`, «данные обращений» у сервера `support`. Одна
+    функция на оба сервера: правила отказа у них одинаковые, а разными текстами
+    человек читал бы одно и то же правило дважды.
+    """
+    if server_id not in workspace_store.mcp_enabled(task):
+        return "%s не включён у проекта" % what
+    entry = mcp_store.find_server(server_id)
+    if entry is None:
+        return "сервер «%s» не найден в реестре серверов проекта" % server_id
+    return mcp_store.availability_error(entry)
+
+
+def _git_mcp_reason(task: Dict[str, Any]) -> str:
+    """Почему контекст репозитория недоступен ("" — доступен).
+
     Имя — по СЕРВЕРУ, а не по команде: этим ответом пользуются и ассистент
     проекта (`/help`), и AI-ревью (`/ai_review`) — обоим нужен один и тот же
     сервер `git`.
     """
-    if dev_help.SERVER_ID not in workspace_store.mcp_enabled(task):
-        return "сервер не включён у проекта"
-    entry = mcp_store.find_server(dev_help.SERVER_ID)
-    if entry is None:
-        return "сервер «%s» не найден в реестре серверов проекта" % dev_help.SERVER_ID
-    return mcp_store.availability_error(entry)
+    return _mcp_reason(task, dev_help.SERVER_ID, "сервер репозитория")
+
+
+def _support_mcp_reason(task: Dict[str, Any]) -> str:
+    """Почему данных обращений нет ("" — есть): сервер `support` выключен или сломан."""
+    return _mcp_reason(task, support.SERVER_ID, "сервер обращений")
 
 
 @router.post("/agent/help")
@@ -5114,9 +5227,9 @@ async def agent_help(msg: ChatMessage) -> StreamingResponse:
 
     Поток событий (NDJSON, как у чата агента):
 
-      * `{"type": "help_start", "question": …, "bases": [...], "git": bool}` —
-        команда принята: по каким базам знаний отвечаем и есть ли контекст
-        репозитория;
+      * `{"type": "help_start", "question": …, "bases": [...], "git": bool,
+        "support": bool}` — команда принята: по каким базам знаний отвечаем, есть
+        ли контекст репозитория и запрошены ли данные обращения клиента;
       * `{"type": "debug", "text": …}` — что делает ассистент: какие инструменты
         MCP вызвал и что они вернули, по какому запросу ищет документацию, что
         нашлось, чем ответил источник;
@@ -5194,6 +5307,8 @@ async def agent_help(msg: ChatMessage) -> StreamingResponse:
         # 1. КОНТЕКСТ ПРОЕКТА — через MCP: ветка, изменения, файлы, история или
         #    содержимое названного файла. Ошибка сервера команду НЕ отменяет:
         #    документация остаётся, а причина отказа называется словами.
+        #    Данных обращений здесь НЕТ и быть не должно: поддержка — отдельная
+        #    команда `/support`, и в /help её инструменты не подключаются.
         context: List[Dict[str, Any]] = []
         if git_reason:
             yield encode({"type": "debug", "text": "⚠ " + dev_help.git_hint(git_reason)})
@@ -5209,7 +5324,7 @@ async def agent_help(msg: ChatMessage) -> StreamingResponse:
                     continue
                 yield encode({"type": "debug", "text": (
                     "⚠ %s.%s — источник отказал: %s"
-                    % (item.get("server_name") or dev_help.SERVER_ID,
+                    % (item.get("server_name") or item.get("server"),
                        item.get("tool"), item.get("error") or "без пояснения"))})
             note = mcp_store.results_note(context)
             if note:
@@ -5303,6 +5418,299 @@ async def agent_help(msg: ChatMessage) -> StreamingResponse:
             except Exception as exc:            # pragma: no cover - защита
                 logger.warning("Ассистент (%s): журнал не сохранён — %s",
                                dev_help.COMMAND, str(exc)[:150])
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# РЕЖИМ ТЕХНИЧЕСКОЙ ПОДДЕРЖКИ: команда /support (app/ai/support.py)
+#
+# ЧТО ЭТО. Человек пишет `/support <номер обращения> <вопрос>` — и
+# получает ответ ПОДДЕРЖКИ по выбранному обращению: что случилось у клиента (по
+# переписке), что уже сделали, что делать дальше, плюс механика продукта из
+# документации со ссылками на фрагменты.
+#
+# ПОЧЕМУ ОТДЕЛЬНАЯ КОМАНДА, А НЕ ОБЫЧНЫЙ ЗАПРОС. Данные обращений принадлежат
+# КОНКРЕТНОМУ человеку. Сервер `support` помечен в реестре как командный (`command`
+# в записи SERVERS), поэтому в запросах агента его инструментов нет вовсе (`mcp_store.agent_enabled` отсекает командные серверы в `_preflight_mcp`) —
+# иначе на вопрос «почему не работает авторизация?» агент отвечал бы по переписке
+# случайного клиента. Открывает их только эта команда, и изменения (завести
+# обращение, ответить клиенту) возможны тоже только здесь и только по прямой
+# просьбе человека (`support.writes_allowed`).
+#
+# РЕФЕРЕНС (ff.ai v0.33, день 33 «user-support») задал три правила, и они
+# соблюдены: (1) каждый запрос получает ТОЛЬКО выбранное обращение и связанного
+# клиента; (2) история разговора, профиль и память оператора в контекст НЕ
+# попадают; (3) неизвестный номер обращения и сбой сервера останавливают запрос
+# ДО ВЫЗОВА МОДЕЛИ — платить за ответ по несуществующему тикету незачем.
+#
+# ПОТОК СОБЫТИЙ (NDJSON, как у /help):
+#   * `support_start` — команда принята: номер обращения (если назван), вопрос,
+#     базы знаний, доступен ли сервер поддержки;
+#   * `debug` — что делает режим: какой инструмент вызван, что он вернул, что
+#     отброшено и почему (чужие серверы, изменения без просьбы);
+#   * `bot` (+ `sources`) — ответ поддержки со строкой источников;
+#   * `answer_ready`, `usage`, `done`.
+#
+# МИМО ПАЙПЛАЙНА ЗАДАЧИ — как `/help` и `/test_rag`: ни плана, ни подтверждения,
+# ни шагов, ни приёмщика, ни переходов автомата. Пишет реплику и ответ в ЖУРНАЛ
+# чата (человек видит их и после переключения задачи), НЕ пишет в память диалога
+# (`messages`) и в автомат (`state`): ответ поддержки — про клиента, и прошлые
+# реплики оператора в него попадать не должны.
+# ---------------------------------------------------------------------------
+@router.post("/agent/support")
+async def agent_support(msg: ChatMessage) -> StreamingResponse:
+    """РЕЖИМ ТЕХНИЧЕСКОЙ ПОДДЕРЖКИ — команда `/support` в чате.
+
+    Формы команды: `/support TCK-1041 <вопрос>` (выбранное обращение),
+    `/support TCK-1041` (разбор обращения), `/support <вопрос>` (номер не назван —
+    набор вызовов выбирает диспетчер, но только среди инструментов поддержки).
+    """
+    text = str(getattr(msg, "content", "") or "").strip()
+    if not support.is_command(text):
+        raise HTTPException(status_code=400, detail=(
+            "Это не команда %s. %s" % (support.COMMAND, support.format_hint())))
+    task, session = _rag_dialog_target(str(getattr(msg, "session_id", "") or ""))
+    if task is None or session is None:
+        raise HTTPException(status_code=400, detail=(
+            "Сначала создайте проект — данные обращений и документация продукта "
+            "привязаны к проекту, и режим поддержки работает в его задаче"))
+    dialog = session["dialog"]
+    # ЗАЯВИТЕЛЬ: имя клиента берётся из профиля и доедет до вызова создания
+    # обращения через дополнитель аргументов (`_fill_requester`). Ставим его
+    # здесь, потому что этот маршрут идёт МИМО `_preflight_mcp` — а без значения
+    # сервер честно отказал бы: «заявитель не назван».
+    client = _requester_name()
+    _REQUESTER.set(client)
+    _, ticket, asked = support.parse(text)
+    question_text = support.question(text)
+    allow_writes = support.writes_allowed(text)
+    enabled = workspace_store.rag_enabled(task)
+    settings = workspace_store.rag_settings(task)
+    project_llm = workspace_store.llm_settings(task)
+    profile_id = _current_profile_id()
+    # ПРОФИЛЬ КЛИЕНТА уходит в промпт поддержки: это его собственные сведения о
+    # себе (стиль, формат ответа, ограничения), и в этом проекте профиль — клиент.
+    # Собирается тем же `profiles.profile_block`, что у агента, вместе с
+    # инструкцией «учитывай в каждом ответе».
+    profile = _profile_block()
+    support_reason = _support_mcp_reason(task)
+    # Предел ответа: «Длина» из шапки чата главнее проекта, проект — главнее
+    # константы режима (те же правила, что у шага и прямого ответа, §5.10а).
+    answer_max_tokens = (msg.max_tokens if msg.max_tokens is not None
+                         else project_llm["max_tokens"] or support.ANSWER_MAX_TOKENS)
+    base_names: List[str] = []
+    for base_id in enabled:
+        meta = rag_store.get_base(base_id, profile=profile_id) or {}
+        base_names.append(str(meta.get("name") or base_id))
+
+    workspace_store.add_log(dialog, workspace_store.LOG_USER,
+                            "🎧 %s — %s%s"
+                            % (support.COMMAND,
+                               ("обращение %s: " % ticket) if ticket else "",
+                               question_text))
+
+    def encode(event: Dict[str, Any]) -> str:
+        _log_event(dialog, event)
+        return json.dumps(event, ensure_ascii=False) + "\n"
+
+    async def event_stream() -> AsyncIterator[str]:
+        notes: List[str] = []
+        reason = await local_source_guard(notes.append)
+        for note in notes:
+            yield encode({"type": "debug", "text": note})
+        if reason:
+            yield encode({"type": "error", "text": LOCAL_SOURCE_NOT_READY % reason})
+            yield encode({"type": "done", "usage": {}})
+            return
+        yield encode({"type": "support_start", "question": question_text,
+                      "ticket": ticket, "bases": base_names,
+                      "support": not support_reason, "writes": allow_writes})
+        total: Dict[str, Any] = {}
+        tracker = Agent(AgentConfig())
+        # 1. РЕЖИМ НЕДОСТУПЕН — отвечаем причиной и НЕ зовём модель: без данных
+        #    обращения ответ поддержки был бы общими словами по документации.
+        if support_reason:
+            yield encode({"type": "error", "text": "⚠ " + support.hint(support_reason)})
+            yield encode({"type": "done", "usage": {}})
+            return
+        # 2. ДАННЫЕ: выбранное обращение читает КОД (номер назвал человек), а без
+        #    номера набор вызовов выбирает диспетчер — но только среди инструментов
+        #    поддержки и только на чтение, если про изменения не просили.
+        context: List[Dict[str, Any]] = []
+        if ticket:
+            # Проверка принадлежности — НА СЕРВЕРЕ (аргумент `client`): чужое
+            # обращение он не отдаст, и запрос остановится до вызова модели ровно
+            # так же, как с несуществующим номером.
+            calls = support.fetch_calls(ticket, client)
+            yield encode({"type": "debug", "text": (
+                "🔧 Читаю обращение %s через MCP (%s)%s."
+                % (ticket, support.TICKET_TOOL,
+                   ", клиент: " + client if client else ""))})
+        else:
+            found = await mcp_store.async_discover([support.SERVER_ID])
+            tools = _mcp_tools(found)
+            if not tools:
+                yield encode({"type": "error", "text": (
+                    "⚠ Сервер поддержки не объявил инструменты: %s"
+                    % str((found[0] or {}).get("error") if found else "нет ответа")[:200])})
+                yield encode({"type": "done", "usage": {}})
+                return
+            decision = await tracker.decide_mcp_tools(
+                question_text, tools, started=[], extra="")
+            calls, dropped = support.filter_calls(decision.get("calls") or [],
+                                                  allow_writes=allow_writes)
+            # ОГРАНИЧЕНИЕ ТЕКУЩИМ КЛИЕНТОМ: поиск и списки получают фильтр, а
+            # инструменты «про клиентов вообще» отбрасываются. Без этого в ответ
+            # попадали обращения ДРУГИХ клиентов (живой случай 15.10).
+            calls, scoped = support.scope_calls(calls, client)
+            for note in dropped + scoped:
+                yield encode({"type": "debug", "text": "⚠ " + note})
+            if client and calls:
+                yield encode({"type": "debug", "text": (
+                    "🔒 Показываю только обращения клиента «%s» (из профиля)."
+                    % client)})
+            if calls:
+                yield encode({"type": "debug", "text": (
+                    "🔧 Вопрос без номера — беру данные поддержки через MCP (%s): %s."
+                    % (support.SERVER_ID,
+                       ", ".join(str(call["tool"]) for call in calls)))})
+            else:
+                yield encode({"type": "debug", "text": (
+                    "🔧 Номер обращения не назван и данные не запрошены — отвечаю по "
+                    "документации. Разбор обращения: %s <номер обращения> <вопрос>."
+                    % support.COMMAND)})
+        if calls:
+            context = await mcp_store.async_run_calls(
+                calls, limit=support.MAX_TICKET_CALLS if ticket else support.MAX_MODE_CALLS)
+            failures = [item for item in context if not item.get("ok")]
+            for item in failures:
+                yield encode({"type": "debug", "text": (
+                    "⚠ %s.%s — источник отказал: %s"
+                    % (item.get("server_name") or item.get("server"),
+                       item.get("tool"), item.get("error") or "без пояснения"))})
+            # НЕИЗВЕСТНОЕ ОБРАЩЕНИЕ ОСТАНАВЛИВАЕТ ЗАПРОС ДО МОДЕЛИ (референс):
+            # ответ по несуществующему тикету — это либо выдумка, либо общие слова
+            # документации, и платить за него вызовом модели незачем.
+            if ticket and failures:
+                yield encode({"type": "error", "text": (
+                    "⚠ Обращение %s не прочитано — запрос остановлен до вызова "
+                    "модели. %s"
+                    % (ticket, str(failures[0].get("error") or "")[:400]))})
+                yield encode({"type": "done", "usage": {}})
+                return
+            note = mcp_store.results_note(context)
+            if note:
+                yield encode({"type": "debug", "text": "🔧 " + note})
+            # ЧТО ИМЕННО ИЗМЕНЕНО — отдельной строкой в журнале. В ответ клиенту
+            # служебные подробности не переносятся (правило 8 промпта), но человек
+            # должен ВИДЕТЬ, что обращение заведено и с каким номером: иначе
+            # «заведи обращение» выглядит как ответ в пустоту (живой вопрос 15.10:
+            # «не могу понять, заводится ли обращение»).
+            for item in context:
+                if not support.is_write(item):
+                    continue
+                number = ""
+                found = re.search(r"TCK-\d+", str(item.get("text") or ""))
+                if found:
+                    number = found.group(0)
+                yield encode({"type": "debug", "text": (
+                    "✍️ Изменение %s%s — %s"
+                    % (item.get("tool"), (" → " + number) if number else "",
+                       "выполнено, запись на диске" if item.get("ok")
+                       else "НЕ выполнено"))})
+        # 3. ДОКУМЕНТАЦИЯ ПРОДУКТА — тем же поиском и с теми же настройками, что у
+        #    агента; переформулировка запроса (если включена у проекта) — тот же
+        #    служебный вызов.
+        rag_data: Dict[str, Any] = {}
+        hits: List[Dict[str, Any]] = []
+        if not enabled:
+            yield encode({"type": "debug", "text": (
+                "📚 Базы знаний у проекта не подключены — отвечаю по данным "
+                "обращения (кнопка «RAG» подключает документацию продукта).")})
+        else:
+            query_text = question_text
+            rewrite_info: Dict[str, Any] = {}
+            if settings.get("rewrite"):
+                async def call(**kwargs: Any) -> Any:
+                    content, metrics = await llm_client.call_llm_async(**kwargs)
+                    tracker.note_usage(metrics, Agent.SERVICE_REWRITE)
+                    return content, metrics
+
+                rewrite_info = await rag_query.rewrite(question_text, call)
+                if rewrite_info.get("query"):
+                    query_text = str(rewrite_info["query"])
+                line = rag_query.debug_line(rewrite_info)
+                if line:
+                    yield encode({"type": "debug", "text": line})
+            yield encode({"type": "debug", "text": (
+                "🔎 Ищу в документации продукта по запросу: «%s»" % query_text[:200])})
+            rag_data = await asyncio.to_thread(
+                rag_search.search, enabled, query_text, profile=profile_id,
+                settings=settings, rewrite=rewrite_info or None,
+                also=(question_text if rewrite_info else ""))
+            hits = rag_search.hits_of(rag_data)
+            note = rag_search.results_note(rag_data)
+            if note:
+                yield encode({"type": "debug", "text": note})
+            yield encode({"type": "debug", "text": _rag_hits_line(hits)})
+        # 4. ОДИН ВЫЗОВ МОДЕЛИ: поддержка отвечает по данным обращения и
+        #    документации. Истории, профиля и памяти задачи в сообщениях нет
+        #    (support.messages) — это ответ про клиента, а не про оператора.
+        ticket_block = mcp_store.block(context)
+        doc_block = rag_search.block(rag_data)
+        messages = support.messages(question_text, profile=profile,
+                                    ticket_block=ticket_block,
+                                    doc_block=doc_block)
+        # ЧТО УШЛО В МОДЕЛЬ — отдельной строкой: без неё «считывается ли контекст»
+        # приходится угадывать по ответу (живой вопрос 15.10). Размеры называют
+        # ровно то, что собрано, и отдельно сказано, чего в промпте НЕТ вовсе.
+        yield encode({"type": "debug", "text": (
+            "📥 В модель уходит: промпт %d симв., профиль клиента %d симв., "
+            "данные обращения %d симв., документация %d симв. (%d фрагм.), "
+            "вопрос %d симв.; истории разговора и памяти задачи в промпте нет."
+            % (len(messages[0]["content"]), len(str(profile or "")),
+               len(ticket_block), len(doc_block),
+               len(hits), len(question_text)))})
+        content, metrics = await llm_client.call_llm_async(
+            user_text=question_text, model=config.active_model(),
+            disable_thinking=True, max_tokens=answer_max_tokens,
+            temperature=project_llm["temperature"], messages=messages,
+            timeout=_rag_test_timeout())
+        tracker.note_usage(metrics, None)
+        total = merge_usage(total, tracker.usage_snapshot())
+        if not str(content or "").strip():
+            local_reason = ""
+            if config.llm_source() == "local":
+                local_reason = local_llm.broken_reason() or local_llm.status()["hint"]
+            yield encode({"type": "error", "text": (
+                "⚠ Поддержка не получила ответа от модели: вызов не удался."
+                + (" Причина: %s." % local_reason if local_reason else "")
+                + " Повторите вопрос.")})
+            yield encode({"type": "usage", "usage": total})
+            yield encode({"type": "done", "usage": total})
+            return
+        answer = rag_dialog.ensure_sources(content, hits, searched=len(enabled),
+                                           cut=_rag_cut_note(rag_data),
+                                           tools=bool(context))
+        yield encode({"type": "bot", "text": answer,
+                      "sources": rag_search.sources(rag_data), "hits": len(hits)})
+        yield encode({"type": "answer_ready"})
+        yield encode({"type": "usage", "usage": total})
+        yield encode({"type": "done", "usage": total})
+
+    async def stream() -> AsyncIterator[str]:
+        """Поток ответа + запись журнала на диск. Сбой записи ответ не отменяет."""
+        try:
+            async for chunk in event_stream():
+                yield chunk
+        finally:
+            try:
+                async with _workspace_lock:
+                    await _persist()
+            except Exception as exc:            # pragma: no cover - защита
+                logger.warning("Режим поддержки (%s): журнал не сохранён — %s",
+                               support.COMMAND, str(exc)[:150])
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 

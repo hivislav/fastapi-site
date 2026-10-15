@@ -5665,6 +5665,39 @@ async function run() {
     shifted.scrollTop === 244,
     JSON.stringify(shifted));
 
+  console.log('\n[V4] Enter в поле ввода: отправка, причина вместо молчания');
+  // ЖИВОЙ СЛУЧАЙ 15.10: «при вводе сообщения нажать Enter — сообщение не
+  // отправляется, а открывается окно новой задачи». Причина была в фокусе: он
+  // оставался на кнопке, которая открыла модалку имени, и Enter «нажимал» её
+  // снова. Проверяем оба правила: Enter отправляет запрос, а после закрытия
+  // модалки фокус возвращается в поле ввода.
+  const enterCalls = calls.filter(c => c === 'POST /api/agent/chat').length;
+  $('input').value = 'проверка Enter';
+  $('input').dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+  $('input').dispatchEvent(new dom.window.KeyboardEvent('keydown',
+    { key: 'Enter', bubbles: true, cancelable: true }));
+  await wait(120);
+  check('Enter отправил запрос, а не открыл окно',
+        calls.filter(c => c === 'POST /api/agent/chat').length === enterCalls + 1
+        && $('name-modal').hidden, 'вызовов: '
+        + (calls.filter(c => c === 'POST /api/agent/chat').length - enterCalls)
+        + ', окно имени hidden=' + $('name-modal').hidden);
+  check('после Enter поле ввода очищено', $('input').value === '',
+        JSON.stringify($('input').value));
+
+  click($('task-new'));
+  await wait(40);
+  check('кнопка «Новый проект» открыла модалку имени', !$('name-modal').hidden);
+  $('name-modal-input').value = 'Проект проверки Enter';
+  $('name-modal-input').dispatchEvent(new dom.window.KeyboardEvent('keydown',
+    { key: 'Enter', bubbles: true, cancelable: true }));
+  await wait(120);
+  check('после создания проекта фокус В ПОЛЕ ВВОДА (а не на кнопке)',
+        dom.window.document.activeElement === $('input'),
+        'фокус: ' + (dom.window.document.activeElement
+                     ? dom.window.document.activeElement.id || dom.window.document.activeElement.tagName
+                     : 'нет'));
+
   console.log('\nИтог: ' + (failures ? 'ПРОВАЛЕНО проверок: ' + failures : 'все проверки пройдены'));
   dom.window.close();
   process.exit(failures ? 1 : 0);

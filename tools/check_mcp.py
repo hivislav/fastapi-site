@@ -872,26 +872,38 @@ async def test_dialog():
     check("сбой выбора не оставляет блок данных",
           mcp_store.BLOCK_HEADER[:40] not in system_texts(), system_texts()[-200:])
 
-    # 5.6 Реестр проекта: ЧЕТЫРЕ локальных сервера (три внешних без ключей и git
-    # по рабочей копии проекта) и ДВА своих на VPS.
+    # 5.6 Реестр проекта: ПЯТЬ локальных серверов (три внешних без ключей, git по
+    # рабочей копии проекта и поддержка по локальному JSON обращений) и ДВА
+    # своих на VPS.
     restore_registry()
     registry = mcp_store.servers()
-    check("к проекту подключены шесть MCP-серверов", len(registry) == 6,
+    check("к проекту подключены семь MCP-серверов", len(registry) == 7,
           str([entry["id"] for entry in registry]))
     check("у каждого есть название и краткое описание",
           all(entry["name"] and entry["description"] for entry in registry),
           str(registry)[:200])
     check("id серверов — погода, курсы валют, криптовалюты, git проекта, "
-          "свой Open-Meteo и реестр городов",
+          "поддержка, свой Open-Meteo и реестр городов",
           [entry["id"] for entry in registry]
-          == ["weather", "currency", "crypto", "git", "open_meteo", "city_registry"],
+          == ["weather", "currency", "crypto", "git", "support", "open_meteo",
+              "city_registry"],
           str([entry["id"] for entry in registry]))
     local = [entry for entry in registry
              if mcp_store.transport_of(entry) == mcp_store.STDIO_TRANSPORT]
-    check("четыре сервера проекта — локальные файлы MCP SDK на stdio",
-          len(local) == 4
+    check("пять серверов проекта — локальные файлы MCP SDK на stdio",
+          len(local) == 5
           and all(str(entry.get("script", "")).endswith(".mjs") for entry in local),
           str([entry.get("script") for entry in local]))
+    support_entry = mcp_store.find_server("support") or {}
+    check("сервер поддержки проекта — локальный, без сети и без ключей",
+          mcp_store.transport_of(support_entry) == mcp_store.STDIO_TRANSPORT
+          and support_entry.get("script") == "tickets.mjs"
+          and "url" not in support_entry and "token_env" not in support_entry,
+          str(support_entry)[:200])
+    check("сервер поддержки обещает обращения и клиентов (описание для диалога)",
+          all(word in str(support_entry.get("description") or "").lower()
+              for word in ("обращен", "клиент", "статус")),
+          str(support_entry.get("description")))
     git_entry = mcp_store.find_server("git") or {}
     check("git-сервер проекта — локальный, без сети и без ключей",
           mcp_store.transport_of(git_entry) == mcp_store.STDIO_TRANSPORT
