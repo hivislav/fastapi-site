@@ -33,6 +33,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -47,6 +48,12 @@ os.environ["AGENT_PROFILES_FILE"] = os.path.join(_TMP, "profiles.json")
 os.environ["RAG_DIR"] = os.path.join(_TMP, "rag")
 os.environ["MCP_ATTACH_DIR"] = os.path.join(_TMP, "mcp_files")
 os.environ["PERIODIC_ENABLED"] = "0"
+
+# ЖУРНАЛ ПРИЛОЖЕНИЯ (stderr): без него не видно, ПОЧЕМУ шаг остался без правок —
+# `decide_file_actions` пишет туда причину «вызовов нет» и начало ответа модели.
+logging.basicConfig(level=logging.WARNING, stream=sys.stderr,
+                    format="    [журнал] %(message)s")
+logging.getLogger("app.ai.mcp").setLevel(logging.INFO)
 
 from app import config  # noqa: E402,F401  (импорт читает .env)
 from app.ai import mcp as mcp_store  # noqa: E402
@@ -310,7 +317,14 @@ async def main() -> int:
     print("    файлы изменены на диске: " + (", ".join(files_changed) or "—"))
     print("    до подтверждения плана записей не было: "
           + ("ДА" if not prints_before else "НЕТ"))
-    ok = bool(files_changed) and bool(reads_before)
+    print("    чтений до «ок»: " + str(len(reads_before))
+          + (" (диспетчер решил, что внешние данные не нужны — это не ошибка)"
+             if not reads_before else ""))
+    # ВЕРДИКТ — ПО ГЛАВНОМУ: изменения остались на диске, а до «ок» записей не
+    # было. Прежнее условие требовало ещё и чтений ДО подтверждения, и живой
+    # прогон 16.10, где диспетчер объявил «данные не нужны» и всё равно создал
+    # и связал файлы, получал вердикт «НЕ выполнено» — проверка врала.
+    ok = bool(files_changed) and not prints_before
     print("    вердикт: " + ("агент выполнил задачу с файлами"
                              if ok else "НЕ выполнено — смотрите журнал выше"))
     if keep:

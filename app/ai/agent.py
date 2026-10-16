@@ -117,6 +117,19 @@ LONG_TERM_MEMORY_HEADER = (
     "вручную (верна для всех задач). Это постоянный контекст: учитывай его при "
     "каждом ответе, противоречий с ним не создавай и не пересказывай без просьбы."
 )
+# РЕЗУЛЬТАТ ПРЕДЫДУЩЕГО ШАГА ПЛАНА (см. Agent.step_result). Уходит системным
+# блоком на шагах, начиная со второго: следующий шаг ЧАСТО продолжает сделанное
+# (подключает созданный модуль, дописывает документ), а память диалога подчиняется
+# стратегии контекста и в окне может не дойти. Живой случай 16.10 (задача про
+# команду /commands): шаг «подключить обработку в chat.py» не увидел модуля,
+# созданного шагом 1, и ответил «пришлите файлы» вместо правки.
+STEP_RESULT_HEADER = (
+    "РЕЗУЛЬТАТ ПРЕДЫДУЩЕГО ШАГА ПЛАНА — текст ответа предыдущего шага (что уже "
+    "сделано по плану). Файлы, названные здесь, ЛЕЖАТ НА ДИСКЕ: их содержимое "
+    "читается инструментами, а имена функций и констант берутся ИЗ ФАЙЛА, а не из "
+    "памяти. Этот блок — не задание: выполняется текущий шаг плана из блока "
+    "состояния задачи."
+)
 # Пределы слоёв памяти (защита от разрастания контекста и файла workspace).
 MAX_MEMORY_ENTRIES = 100
 MEMORY_ENTRY_LIMIT = 4000
@@ -128,6 +141,7 @@ MEMORY_ENTRY_LIMIT = 4000
 SERVICE_HISTORY_CHARS = 6000      # хвост истории диалога в служебном промпте
 MEMORY_LAYER_CHARS = 8000         # один слой памяти (рабочая/долговременная)
 MEMORY_TEXT_LIMIT = 20000         # все слои памяти вместе, одной строкой
+STEP_RESULT_CHARS = 6000          # блок «результат предыдущего шага плана»
 SUMMARY_BLOCK_LIMIT = 12000       # блок резюме (стратегия «summary»)
 FACTS_BLOCK_LIMIT = 8000          # блок фактов (стратегия «sticky facts»)
 FACTS_MAX_TOKENS = 1000           # предел вывода обновления фактов
@@ -249,9 +263,27 @@ PLAN_PROMPT = (
     "исполнителю не за что взяться: он уходит изучать код, не находит места и "
     "оставляет шаг невыполненным (живой случай 16.10). Один шаг — один файл "
     "(или одна связанная правка), и НЕ добавляй шаг «сообщить пользователю»: "
-    "итог даёт последний шаг сам.\n\n"
+    "итог даёт последний шаг сам.\n"
+    "13) ЕСЛИ ШАГ ПОДКЛЮЧАЕТ К НОВОМУ КОДУ — НАЗОВИ И ТОЧКУ ПОДКЛЮЧЕНИЯ: где "
+    "именно новое перехватывается («дописать в app/routers/chat.py разбор "
+    "команды в обработчике сообщения», «подключить модуль в точке входа»). Без "
+    "точки вызова правка встаёт рядом, но не работает: живой прогон 16.10 (задача "
+    "про /commands) закончился тем, что обработчик был добавлен в файл и НИ РАЗУ "
+    "не вызван — проверка прошла, команда не работала.\n\n"
     "ОТВЕТ — ТОЛЬКО один JSON-объект, без markdown и пояснений:\n"
     '{"steps": ["шаг 1", "шаг 2"]}'
+)
+# ПОМЕТКА ПЕРЕПЛАНИРОВАНИЯ «ШАГ БЕЗ ФАЙЛА». Правило 12 просит называть файлы, и
+# это ПРОСЬБА: живой прогон 16.10 (двенадцатый заход, задача про /commands) пришёл
+# с планом «Создать модуль со справочником команд» и «Подключить разбор команды в
+# обработчике сообщений» — БЕЗ имён файлов, и ни один шаг не был выполнен: исполнителю
+# не за что взяться. Гарантия — код (см. chat._ensure_plan_files): план, который
+# меняет файлы, но файлов не называет, уходит планировщику ОДИН раз с этой пометкой.
+PLAN_FILE_NOTE = (
+    "ПЛАН НЕ ПРИНЯТ: шаги, которые МЕНЯЮТ проект, обязаны называть ФАЙЛ. Без имени "
+    "файла исполнителю не за что взяться — он уходит изучать код и оставляет шаг "
+    "невыполненным (живой случай 16.10: «Создать модуль со справочником команд» и "
+    "«Подключить разбор команды» закончились без единой правки). Шаги без файла: "
 )
 # Содержательная проверка результата (этап validation): ОДИН служебный вызов на
 # завершённую задачу. Локальная самопроверка (см. _self_check в chat.py) ловит
@@ -593,6 +625,10 @@ class Agent:
         # понимает, какой шаг выполняется сейчас. None — состояния нет (обычные
         # вызовы агента вне автомата), тогда блока тоже нет.
         self.task_state: Optional["task_state.TaskState"] = None
+        # РЕЗУЛЬТАТ ПРЕДЫДУЩЕГО ШАГА ПЛАНА: текст ответа прошлого шага (см.
+        # STEP_RESULT_HEADER). Заполняет веб-слой на шагах со второго — иначе
+        # следующий шаг не знает, что уже сделано и какие файлы лежат на диске.
+        self.step_result: str = ""
         # Последние использованные параметры генерации (для generate()).
         self.last_params: Dict[str, Any] = {}
         # Сколько резюме составлено в ТЕКУЩЕМ запросе (обнуляется в начале
@@ -645,6 +681,7 @@ class Agent:
         mcp: Optional[List[Dict[str, Any]]] = None,
         rag: Optional[Dict[str, Any]] = None,
         task_memory: Optional[Dict[str, Any]] = None,
+        step_result: Optional[str] = None,
     ) -> AgentResult:
         """Обрабатывает сообщение и возвращает результат целиком.
 
@@ -672,6 +709,10 @@ class Agent:
         выдержки из документов пользователя, подобранные поиском по этому
         запросу. Уходят отдельным системным блоком; None — поиска не было,
         используется прежний блок.
+        step_result — текст ответа ПРЕДЫДУЩЕГО шага плана (см.
+        STEP_RESULT_HEADER): уходит системным блоком, чтобы следующий шаг видел,
+        что уже сделано и какие файлы лежат на диске. None — прежнее значение
+        (или пустая строка: шаг первый).
 
         Собирает все debug-события в result.debug — пригодится, когда
         показывать их по одному не нужно (например, в API-ответах).
@@ -684,7 +725,7 @@ class Agent:
         await self._process(
             user_message, history, sink, summary, facts, branches, branch, covered,
             working_memory, long_term_memory, profile, state, invariants, mcp, rag,
-            task_memory,
+            task_memory, step_result,
         )
         # Финальный текст — последний ответ бота; сообщение об ошибке берём
         # только если готового ответа в потоке не было (например, сбой LLM).
@@ -714,6 +755,7 @@ class Agent:
         mcp: Optional[List[Dict[str, Any]]] = None,
         rag: Optional[Dict[str, Any]] = None,
         task_memory: Optional[Dict[str, Any]] = None,
+        step_result: Optional[str] = None,
     ) -> AsyncIterator[Step]:
         """То же, что generate(), но отдаёт события по мере их возникновения.
 
@@ -735,6 +777,9 @@ class Agent:
         state — состояние конечного автомата задачи (см. Agent.task_state): его
         системный блок говорит модели, на каком этапе задача и какой шаг плана
         выполняется сейчас (см. app/ai/task_state.py).
+        step_result — текст ответа предыдущего шага плана (см. Agent.step_result):
+        следующий шаг видит, что уже сделано, и не просит у человека то, что
+        лежит на диске.
         """
         queue: asyncio.Queue = asyncio.Queue()
 
@@ -745,7 +790,7 @@ class Agent:
             self._process(
                 user_message, history, sink, summary, facts, branches, branch, covered,
                 working_memory, long_term_memory, profile, state, invariants, mcp, rag,
-                task_memory,
+                task_memory, step_result,
             )
         )
         try:
@@ -783,6 +828,7 @@ class Agent:
         mcp: Optional[List[Dict[str, Any]]] = None,
         rag: Optional[Dict[str, Any]] = None,
         task_memory: Optional[Dict[str, Any]] = None,
+        step_result: Optional[str] = None,
     ) -> None:
         """Полный цикл обработки одного сообщения (см. docstring класса)."""
         started = time.perf_counter()
@@ -821,6 +867,11 @@ class Agent:
             # (см. _memory_blocks), а переходы ведёт веб-слой.
             if state is not None:
                 self.task_state = state
+            # Результат предыдущего шага плана (см. STEP_RESULT_HEADER): веб-слой
+            # передаёт его на шагах со второго. Пустая строка — шаг первый или
+            # результата нет, блока тоже нет.
+            if step_result is not None:
+                self.step_result = str(step_result).strip()
             # Инварианты проекта/задачи и утверждённые исключения (см.
             # app/ai/invariants.py): уходят в модель отдельным системным блоком.
             if invariants is not None:
@@ -1264,6 +1315,8 @@ class Agent:
         tools: Optional[List[Dict[str, Any]]] = None,
         results: Optional[List[Dict[str, Any]]] = None,
         extra: str = "",
+        request: str = "",
+        plan: str = "",
     ) -> Dict[str, Any]:
         """ПРАВКИ ФАЙЛОВ ПО ШАГУ: ответ шага → вызовы записи (см. decide_file_actions).
 
@@ -1271,13 +1324,38 @@ class Agent:
         модель здесь ПИШЕТ СОДЕРЖИМОЕ файла, а не выбирает инструмент. Расход
         копится в self.last_usage как дельта одного вызова и складывается с
         расходом шага веб-слоем (см. merge_usage).
+
+        request и plan — цель задачи и план целиком: шаг плана короткий, и без
+        общего замысла исполнитель ищет не там, где нужно (см. build_file_query).
         """
         self.last_usage = self._new_usage()
         return await mcp_store.decide_file_actions(
             str(step or ""), str(answer or ""), list(tools or []),
             self._tracked_call(self.SERVICE_FILES),
             results=list(results or []) if results else None,
-            extra=str(extra or ""))
+            extra=str(extra or ""),
+            request=str(request or ""), plan=str(plan or ""))
+
+    async def file_draft(
+        self,
+        step: str,
+        answer: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        results: Optional[List[Dict[str, Any]]] = None,
+        request: str = "",
+        plan: str = "",
+    ) -> Dict[str, Any]:
+        """ВТОРОЙ ЗАХОД АВТОРА: собрать правку по УЖЕ прочитанному (см. decide_file_draft).
+
+        Служебный вид "draft": тот же (больший) предел ответа, что у правок, но
+        набор инструментов ПИШУЩИЙ — читать в этом заходе нечего и нечем.
+        """
+        self.last_usage = self._new_usage()
+        return await mcp_store.decide_file_draft(
+            str(step or ""), str(answer or ""), list(tools or []),
+            self._tracked_call(self.SERVICE_DRAFT),
+            results=list(results or []) if results else None,
+            request=str(request or ""), plan=str(plan or ""))
 
     async def check_invariants(
         self,
@@ -1705,9 +1783,9 @@ class Agent:
         ответ), затем правила проекта (инварианты), затем ДАННЫЕ ВНЕШНИХ
         ИНСТРУМЕНТОВ MCP (факты по текущему запросу: погода, курсы, цены),
         затем состояние задачи (Task State Machine: этап, план и шаг,
-        который выполняется сейчас), затем глобальные знания (долговременная
-        память), затем данные текущей задачи (рабочая память) — она ближе к
-        запросу.
+        который выполняется сейчас), затем результат ПРЕДЫДУЩЕГО шага плана (что
+        уже сделано), затем глобальные знания (долговременная память), затем
+        данные текущей задачи (рабочая память) — она ближе к запросу.
         """
         blocks: List[Dict[str, str]] = []
         if self.profile:
@@ -1735,6 +1813,12 @@ class Agent:
             blocks.append({"role": "system", "content": rag_block})
         if self.task_state is not None:
             blocks.append({"role": "system", "content": task_state.state_block(self.task_state)})
+        # РЕЗУЛЬТАТ ПРЕДЫДУЩЕГО ШАГА — сразу после состояния задачи: состояние
+        # говорит, ЧТО делаем сейчас, а этот блок — что уже сделано до нас.
+        if self.step_result:
+            blocks.append({"role": "system", "content": (
+                STEP_RESULT_HEADER + "\n"
+                + _cap_tail(self.step_result, STEP_RESULT_CHARS))})
         if self.long_term_memory:
             body = _cap_lines(self.long_term_memory, MEMORY_LAYER_CHARS)
             blocks.append({"role": "system", "content": LONG_TERM_MEMORY_HEADER + "\n" + body})
@@ -2371,6 +2455,10 @@ class Agent:
     SERVICE_MCP = "mcp"              # выбор внешних инструментов MCP (app/ai/mcp.py)
     SERVICE_REWRITE = "rewrite"      # переформулировка запроса для поиска (RAG)
     SERVICE_MEMORY = "memory"        # обновление памяти задачи (выжимка диалога)
+    SERVICE_DRAFT = "draft"          # ПРАВКА ПО ПРОЧИТАННОМУ — второй заход
+                                     # автора (app/ai/mcp.py, decide_file_draft):
+                                     # проход правок не дал изменений, и по уже
+                                     # прочитанному тексту собирают правку заново
     SERVICE_FILES = "files"          # ПРАВКИ ФАЙЛОВ по шагу (app/ai/mcp.py,
                                      # decide_file_actions): ответ шага → вызовы
                                      # записи. Отдельный вид, а не "mcp": у него

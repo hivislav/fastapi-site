@@ -688,6 +688,13 @@ server.registerTool(
       query: z.string().describe("Что искать: текст или (при regex=true) выражение"),
       dir: z.string().optional().describe("Ограничить каталогом, например app/ai"),
       glob: z.string().optional().describe("Шаблон файлов: *.py, **/*.md"),
+      // АРГУМЕНТ `path` — НЕ УКРАШЕНИЕ. Модель называет его почти всегда
+      // («поищи в app/routers/chat.py»), и без него она получала совпадения по
+      // ВСЕМУ проекту: живой прогон 16.10 — поиск «/help» с path в chat.py вернул
+      // 97 совпадений и 88 просмотренных файлов, то есть адрес правки был потерян
+      // в чужом шуме, а сервер об этом молчал (неизвестные ключи схема отбрасывает).
+      path: z.string().optional()
+        .describe("Файл или каталог для поиска (вместо dir/glob): искать только в нём"),
       regex: z.boolean().default(false).describe("true — query это регулярное выражение"),
       ignore_case: z.boolean().default(true).describe("Не различать регистр (по умолчанию да)"),
       context_lines: z.number().int().min(0).max(50).default(0)
@@ -698,9 +705,31 @@ server.registerTool(
                   + ", больше " + MATCH_LIMIT_MAX + " не показываю)"),
     },
   },
-  async ({ query, dir, glob, regex, ignore_case, context_lines, limit }) => guard(async () => {
+  async ({ query, dir, glob, regex, ignore_case, context_lines, limit, path: rawPath }) => guard(async () => {
     const needle = String(query || "");
     if (!needle) throw new Error("пустой запрос поиска (query)");
+    // PATH ПРИНИМАЕМ КАК ОБЛАСТЬ ПОИСКА: файл — ищем в нём одном, каталог — в нём.
+    // Так «поищи в app/routers/chat.py» делает то, что просили, а не ищет по всему
+    // проекту (см. схему: без этого аргумент молча отбрасывался).
+    let scopeDir = dir;
+    let scopeGlob = glob;
+    let scopeNote = "";
+    if (rawPath) {
+      const rel = safePath(rawPath, { what: "поиска" });
+      if (!rel) throw new Error("не указан путь для поиска (path)");
+      const full = path.join(ROOT, rel);
+      const stat = fs.existsSync(full) ? fs.statSync(full) : null;
+      if (stat && stat.isDirectory()) {
+        scopeDir = rel;
+      } else {
+        const base = path.basename(rel);
+        const parent = path.dirname(rel);
+        scopeDir = parent && parent !== "." ? parent : "";
+        scopeGlob = base;
+        // Файл мог быть назван без каталога (glob в нижнем регистре не совпадёт).
+        scopeNote = " (область поиска: " + rel + ")";
+      }
+    }
     let re;
     try {
       re = regex
@@ -710,10 +739,10 @@ server.registerTool(
       throw new Error("выражение не разобрано: " + (err && err.message ? err.message : err)
         + ". Упростите запрос или уберите regex=true");
     }
-    const dirRel = safePath(dir);
+    const dirRel = safePath(scopeDir);
     const cap = Math.max(1, Math.min(MATCH_LIMIT_MAX, Number(limit) || MATCH_LIMIT_DEFAULT));
     const context = Math.max(0, Math.min(CONTEXT_LINES_MAX, Number(context_lines) || 0));
-    const files = searchableFiles(dirRel, glob);
+    const files = searchableFiles(dirRel, scopeGlob);
     const found = [];
     let scanned = 0;
     let total = 0;
@@ -743,13 +772,14 @@ server.registerTool(
     if (!total) {
       return text("Совпадений нет: «" + needle + "» не найдено в " + scanned + " файлах"
         + (dirRel ? " каталога " + dirRel : "")
-        + (glob ? " по шаблону " + glob : "")
+        + (scopeGlob ? " по шаблону " + scopeGlob : "")
+        + scopeNote
         + ". Стоит проверить формулировку запроса (другое имя, часть слова) "
         + "или расширить область поиска (dir/glob).");
     }
     const shownCount = found.length;
     const header = "Найдено совпадений: " + total + " (показано " + shownCount
-      + "), просмотрено файлов: " + scanned
+      + "), просмотрено файлов: " + scanned + scopeNote
       + (skipped ? ", не прочитано: " + skipped : "") + "\n";
     const tail = total > shownCount
       ? "\n…показаны не все совпадения: всего " + total
@@ -1070,12 +1100,29 @@ server.registerTool(
     const replacement = String(replace ?? "");
     const after = all ? parts.join(replacement) : before.replace(needle, () => replacement);
     writeAtomic(rel, after);
+    // ПОТЕРЯ ЗАГОЛОВКА — ПРЕДУПРЕЖДЕНИЕ, А НЕ МОЛЧАНИЕ. Живой прогон 16.10
+    // (задача про /commands): правка README заменила строку-заголовок
+    // «## 7. Конфигурация и переменные окружения» новым разделом — заголовок
+    // исчез, а раздел остался без имени, и по структуре файла это уже не
+    // восстанавливается. Отказывать нельзя (переименование заголовка — законная
+    // правка), а сказать об этом надо: иначе потерю видно только глазами.
+    const heading = needle.match(/^#{1,6}[ \t]+(.*)$/m);
+    // Предупреждаем, только если на месте ЗАГОЛОВКА не осталось НИ ОДНОГО
+    // заголовка: переименование («## А» → «## Б») — законная правка, а вот
+    // замена заголовка абзацем оставляет раздел без имени.
+    const lost = Boolean(heading) && !/^#{1,6}[ \t]+\S/m.test(replacement);
     return writeReply({
       rel,
       action: "ИЗМЕНЁН",
       before,
       after,
-      extra: count > 1 ? "Заменено вхождений: " + count : "",
+      extra: [
+        count > 1 ? "Заменено вхождений: " + count : "",
+        lost ? "ВНИМАНИЕ: заменённый фрагмент был ЗАГОЛОВКОМ («"
+          + heading[1].trim().slice(0, 60) + "»), а в тексте замены его нет — "
+          + "раздел остался без заголовка. Если это не переименование, верните "
+          + "заголовок (и проверьте, что раздел на месте)." : "",
+      ].filter(Boolean).join(" "),
     });
   }),
 );
@@ -1131,6 +1178,22 @@ server.registerTool(
         + "единственным");
     }
     const at = hits[0];
+    // ДЕКОРАТОР НАД ЯКОРЕМ — ОТКАЗ. Вставка ПЕРЕД строкой `def`/`class`, у которой
+    // выше стоит `@…`, отрывает декоратор от функции, и файл перестаёт
+    // компилироваться. Живой прогон 16.10 (задача про команду /commands): так в
+    // app/routers/chat.py появилась строка между `@router.post("/chat")` и
+    // `async def chat(...)`, и модуль перестал читаться. Отказ называет выход.
+    if (where === "before" && /^\s*(async\s+def|def|class)\b/.test(lines[at])) {
+      let above = at - 1;
+      while (above >= 0 && !lines[above].trim()) above -= 1;
+      if (above >= 0 && /^\s*@/.test(lines[above])) {
+        throw new Error("якорь стоит под декоратором: выше строки " + (at + 1)
+          + " идёт «" + lines[above].trim().slice(0, 60) + "». Вставка перед `def` "
+          + "оторвёт декоратор от функции и сломает файл — возьмите якорем строку "
+          + "декоратора и вставьте where=before, либо выберите якорь в другом "
+          + "месте файла");
+      }
+    }
     // ОТСТУП БЕРЁМ У ЯКОРЯ: вставляемый код должен встать на своё место в блоке,
     // а не с нулевым отступом (это частая причина «вставил, но файл сломан»).
     const base = indent ? (lines[at].match(/^[ \t]*/) || [""])[0] : "";

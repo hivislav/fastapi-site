@@ -2118,6 +2118,45 @@ async def test_plan_gate():
               for e in events if e.get("type") == "done"),
           str([e.get("usage") for e in events if e.get("type") == "done"])[:160])
 
+    # 9.1б ПЛАН, МЕНЯЮЩИЙ ФАЙЛЫ, ОБЯЗАН НАЗЫВАТЬ ФАЙЛ (правило 12 — просьба,
+    # проверка — код). Живой прогон 16.10: план «Создать модуль со справочником
+    # команд» + «Подключить разбор команды в обработчике сообщений» без имён файлов
+    # закончился тем, что ни один шаг не был выполнен.
+    await fresh_task()
+    await chat.mcp_apply(chat.McpApply(enabled=["files"]))
+    NAMELESS = ["Найти точку входа и обработчик сообщений", "Создать модуль со справочником команд",
+                "Подключить разбор команды /commands в обработчике сообщений"]
+    NAMED = ["Найти точку входа и обработчик сообщений в app/routers/chat.py",
+             "Создать app/ai/commands.py со справочником команд",
+             "Подключить разбор команды /commands в обработчике сообщений app/routers/chat.py"]
+    PLAN_QUEUE[:] = [NAMELESS, NAMED]
+    PLAN_DEFAULT = "clear"
+    LAST_MESSAGES.clear()
+    events = await run_chat("создай команду /commands со справочником команд")
+    steps_now = [s["text"] for s in (stage_of(events) or {}).get("steps", [])]
+    check("план без имён файлов перестроен планировщиком",
+          steps_now == NAMED, str(steps_now))
+    planner_text = "\n".join(m["content"] for m in LAST_MESSAGES
+                             if m.get("role") == "user")
+    check("в переспросе названы шаги без файла и требование пути",
+          "ПЛАН НЕ ПРИНЯТ" in planner_text and NAMELESS[1] in planner_text
+          and "app/ai/commands.py" in planner_text, planner_text[-260:])
+    check("переспрос назван в журнале",
+          any("файлы названы в шагах" in t or "имени файла" in t
+              for t in texts(events, "debug")), str(texts(events, "debug"))[-200:])
+
+    # 9.1в Шаг-исследование файла не требует, чистый план не переспрашивается.
+    await fresh_task()
+    await chat.mcp_apply(chat.McpApply(enabled=["files"]))
+    RESEARCH = ["Изучить, как устроен поиск по базам знаний проекта",
+                "Объяснить устройство поиска по документации"]
+    PLAN_QUEUE[:] = [RESEARCH]
+    events = await run_chat("нужен план: разобраться, как устроен поиск по базам "
+                            "знаний, и объяснить его")
+    check("план без изменения файлов не переспрашивается",
+          [s["text"] for s in (stage_of(events) or {}).get("steps", [])] == RESEARCH,
+          str((stage_of(events) or {}).get("steps")))
+
     # 9.2 План нарушает правило — перепланирование, в пометке запрещённые шаги.
     await fresh_task()
     PLAN_QUEUE[:] = [BAD, GOOD]

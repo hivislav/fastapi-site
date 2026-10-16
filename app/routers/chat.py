@@ -66,7 +66,8 @@ from app.ai import task_memory as memory_store
 from app.ai import task_state
 from app.ai import workspace as workspace_store
 from app.ai.agent import (
-    Agent, AgentConfig, DEFAULT_SUMMARY_SIZE, DEFAULT_WINDOW_SIZE, merge_usage,
+    Agent, AgentConfig, DEFAULT_SUMMARY_SIZE, DEFAULT_WINDOW_SIZE, PLAN_FILE_NOTE,
+    merge_usage,
 )
 from app.schemas import (
     ChatMessage, InvariantCreate, InvariantDelete, InvariantPick, InvariantResolve,
@@ -3300,6 +3301,62 @@ def _plan_is_fresh(dialog: Optional[Dict[str, Any]], signature: Dict[str, str]) 
     return bool(signature.get("request")) and saved == signature
 
 
+async def _ensure_plan_files(steps: List[str], text: str, planner: Agent,
+                             task: Dict[str, Any], planner_kwargs: Dict[str, Any]
+                             ) -> Tuple[List[str], Dict[str, Any], List[str]]:
+    """ШАГ, МЕНЯЮЩИЙ ФАЙЛЫ, ОБЯЗАН НАЗЫВАТЬ ФАЙЛ — гарантия, а не просьба.
+
+    Правило 12 в `PLAN_PROMPT` просит планировщика называть файлы, но это просьба.
+    Живой прогон 16.10 (двенадцатый заход, задача про /commands): план пришёл как
+    «Создать модуль со справочником команд и обработчиком /commands» и «Подключить
+    разбор команды /commands в обработчике сообщений» — БЕЗ имён файлов. Ни один
+    шаг не был выполнен: исполнителю правок не за что взяться, и он переписывал
+    модуль предыдущего шага (см. `_keep_step_writes`).
+
+    Поэтому шаги проверяются кодом: если шаг по своим словам меняет файлы
+    (`file_step_likely`), а файла в нём нет — планировщика спрашивают ЕЩЁ РАЗ, с
+    пометкой (`PLAN_FILE_NOTE`). Новый план берут ТОЛЬКО если он действительно
+    лучше (меньше шагов без файлов); иначе остаётся прежний, и причина названа в
+    журнале — подменять план «на всякий случай» нельзя.
+
+    Возвращает (шаги, расход служебного вызова, строки журнала).
+    """
+    usage: Dict[str, Any] = {}
+    lines: List[str] = []
+    if not steps or mcp_store.FILES not in workspace_store.mcp_enabled(task):
+        return steps, usage, lines
+
+    def nameless(items: List[str]) -> List[str]:
+        return [step for step in items
+                if mcp_store.file_step_likely(step)
+                and not STEP_PATH_RE.search(str(step or ""))]
+
+    missing = nameless(steps)
+    if not missing:
+        return steps, usage, lines
+    lines.append("в плане есть шаги, меняющие файлы, без имени файла: "
+                 + "; ".join(missing[:3])[:200] + " — переспрашиваю планировщика.")
+    note = PLAN_FILE_NOTE + "\n".join(f"- {step}" for step in missing) + (
+        "\nДай план ЗАНОВО: каждый шаг, который создаёт или меняет файл, называет "
+        "его путь внутри проекта (например app/ai/commands.py), а подключающий шаг "
+        "называет ещё и точку подключения.")
+    kwargs = dict(planner_kwargs)
+    kwargs["note"] = note
+    try:
+        fresh = await planner.build_plan(text, **kwargs)
+    except Exception:  # noqa: BLE001 — переспрос не должен ломать планирование
+        logger.warning("План: переспрос про имена файлов не удался", exc_info=True)
+        lines.append("переспрос планировщика не удался — оставляю прежний план.")
+        return steps, usage, lines
+    usage = merge_usage(usage, dict(planner.last_usage or {}))
+    if fresh and len(nameless(fresh)) < len(missing):
+        lines.append("план перестроен: файлы названы в шагах ("
+                     + str(len(fresh)) + " шагов).")
+        return list(fresh), usage, lines
+    lines.append("новый план не лучше прежнего по именам файлов — оставляю прежний.")
+    return steps, usage, lines
+
+
 async def _plan_gate(steps: List[str], analyzer: Agent, snapshot: Dict[str, Any],
                      replan: Any) -> Dict[str, Any]:
     """КОД-ГЕЙТ ПЛАНА: шаги проверяются по правилам, нарушающие не принимаются.
@@ -5823,11 +5880,176 @@ async def profile_select(profile_id: str) -> dict:
         return profile_store.snapshot(_profiles)
 
 
+# Путь файла в тексте шага плана («дописать в app/routers/chat.py обработку…»).
+STEP_PATH_RE = re.compile(
+    r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:py|mjs|js|ts|md|json|html|css|txt|ya?ml|toml|sh)")
+# Сколько файлов, названных в шаге, приложение читает структурой само. Больше не
+# нужно: у шага один-два целевых файла, а каждый лишний вызов — это шум в данных.
+STEP_FILE_PATHS = 2
+# Слэш-команды в тексте шага и цели («/commands»): по ним ищется МЕСТО правки.
+STEP_COMMAND_RE = re.compile(r"(?<![\w/])/[A-Za-zа-яА-Я_][\w-]{2,}")
+# Строка результата поиска сервера файлов: «путь:НОМЕР: текст».
+SEARCH_HIT_RE = re.compile(r"^(.+?):(\d+):")
+# Сколько строк вокруг найденного места читать заранее. Столько, чтобы в окно
+# попал и сам разбор команды, и его окружение (импорт, соседний обработчик).
+STEP_WINDOW_BEFORE = 30
+STEP_WINDOW_AFTER = 50
+
+
+def _first_hit_line(text: Any) -> int:
+    """Номер строки ПЕРВОГО совпадения из ответа `search_files` (0 — нет)."""
+    for line in str(text or "").splitlines():
+        body = line.strip()
+        if not body or body.startswith("Найдено") or body.startswith("Совпадений"):
+            continue
+        match = SEARCH_HIT_RE.match(body)
+        if match:
+            try:
+                return int(match.group(2))
+            except ValueError:
+                continue
+    return 0
+
+
+async def _step_file_context(task: Dict[str, Any], step_text: str,
+                             goal: str = ""
+                             ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """СТРУКТУРА целевых файлов шага — читает ПРИЛОЖЕНИЕ, без вызова модели.
+
+    Зачем. Шаг «дописать в app/routers/chat.py обработку команды» упирается в
+    файл на 7 852 строки: пока структура (имена функций и НОМЕРА строк) не
+    прочитана, исполнитель ищет место правки вслепую. Живые прогоны 16.10
+    (задача про /commands, шесть заходов): четыре из них закончились тем, что
+    исполнитель читал окна и структуру раунд за раундом и не сделал правок.
+
+    Здесь эту работу делает КОД, а не модель: пути берутся ИЗ ТЕКСТА ШАГА
+    (`outline_file` даёт структуру с номерами строк), результат уходит в данные
+    запроса — его видят и автор ответа, и исполнитель правок. Стоит это вызова
+    инструмента, а не вызова модели; шаги, которые файлов не называют, ничего не
+    платят.
+
+    Возвращает (результаты для данных запроса, строки журнала).
+    """
+    if mcp_store.FILES not in workspace_store.mcp_enabled(task):
+        return [], []
+    paths: List[str] = []
+    for match in STEP_PATH_RE.findall(str(step_text or "")):
+        clean = match.strip("./")
+        if clean and clean not in paths:
+            paths.append(clean)
+    if not paths:
+        return [], []
+    found = await mcp_store.async_discover([mcp_store.FILES])
+    payload = next((item for item in found
+                    if str(item.get("id")) == mcp_store.FILES), None) or {}
+    if not payload.get("ok"):
+        return [], []
+    tools = _mcp_tools([payload])
+    if not any(str(item.get("tool")) == "outline_file" for item in tools):
+        return [], []
+    calls = [{"server": mcp_store.FILES, "tool": "outline_file",
+              "arguments": {"path": path}} for path in paths[:STEP_FILE_PATHS]]
+    done = await mcp_store.async_run_calls(calls, limit=STEP_FILE_PATHS)
+    lines: List[str] = []
+    keep: List[Dict[str, Any]] = []
+    for item in done:
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        path = str(arguments.get("path") or "")
+        if item.get("ok"):
+            keep.append(item)
+            lines.append(f"MCP: структура файла шага прочитана заранее — {path} "
+                         f"({(item.get('text') or '').splitlines()[0][:80]}).")
+        else:
+            lines.append(f"MCP: структуру файла шага прочитать не удалось — {path}: "
+                         f"{str(item.get('error') or 'причина не названа')[:120]}")
+    window = await _step_place_window(step_text, goal, paths, lines)
+    keep.extend(window)
+    return keep, lines
+
+
+async def _step_place_window(step_text: str, goal: str, paths: List[str],
+                             lines: List[str]) -> List[Dict[str, Any]]:
+    """ОКНО ВОКРУГ МЕСТА ПРАВКИ — приложение читает его САМО, без модели.
+
+    Зачем это отдельно от структуры. Живые прогоны 16.10 (задача про /commands)
+    показали один и тот же отказ: исполнитель ИЩЕТ место правки (`search_files`
+    находит 7 совпадений `/help` в `app/routers/chat.py` с номерами строк), но
+    ОКНО вокруг найденного не читает — раунды разведки кончаются, а правку он
+    собирает по догадке: `edit_file` с фрагментом `from app.ai.dev_help import`,
+    которого в файле нет (там `from app.ai import dev_help`), и шаг остаётся
+    невыполненным. Поиск без чтения участка не даёт того, что нужно для правки, —
+    поэтому участок читает КОД, сразу после поиска.
+
+    Порядок: ищем слэш-команду из шага и цели в ПЕРВОМ названном файле; если её там
+    нет — ищем ЛИТЕРАЛЫ команд (`/help`, `/ai_review` …) регуляркой: они стоят там
+    же, где разбор команды. По номеру строки читаем окно и отдаём его в данные.
+    Ничего не нашли — молча ничего не читаем (причина уже названа структурой).
+    """
+    primary = next((path for path in paths if path.endswith(".py")), "")
+    if not primary:
+        return []
+    terms: List[str] = []
+    for source in (step_text, goal):
+        for term in STEP_COMMAND_RE.findall(str(source or "")):
+            clean = term.lower()
+            if clean not in terms:
+                terms.append(clean)
+    found: List[Dict[str, Any]] = []
+    line_no = 0
+    for term in terms[:2]:
+        res = await mcp_store.async_run_calls(
+            [{"server": mcp_store.FILES, "tool": "search_files",
+              "arguments": {"query": term, "path": primary, "limit": 5}}], limit=1)
+        found.extend(res)
+        if res and res[0].get("ok"):
+            line_no = _first_hit_line(res[0].get("text"))
+        if line_no:
+            lines.append(f"MCP: место правки найдено поиском заранее — {primary}, "
+                         f"строка {line_no} (запрос «{term}»).")
+            break
+    # ЗАПАСНОЙ ПОИСК ПО «ЛИТЕРАЛАМ КОМАНД» УБРАН: он находил первую косую черту в
+    # файле (в живом прогоне — строку 3, то есть шапку модуля) и читал бесполезное
+    # окно. Искать место по догадке не надо: если команда в файле ещё не упомянута,
+    # участок найдёт исполнитель в разведке — а текст окна он может прочитать и в
+    # раунде правок (WRITE_ROUND_READS).
+    if not line_no:
+        return []
+    read = await mcp_store.async_run_calls(
+        [{"server": mcp_store.FILES, "tool": "read_file",
+          "arguments": {"path": primary,
+                        "from_line": max(1, line_no - STEP_WINDOW_BEFORE),
+                        "to_line": line_no + STEP_WINDOW_AFTER}}], limit=1)
+    if read and read[0].get("ok"):
+        lines.append(f"MCP: окно вокруг места правки прочитано заранее — {primary}, "
+                     f"строки {max(1, line_no - STEP_WINDOW_BEFORE)}–"
+                     f"{line_no + STEP_WINDOW_AFTER}.")
+        return found + list(read)
+    return found
+
+
+def _store_mcp_extra(session: Dict[str, Any], extra: List[Dict[str, Any]]) -> None:
+    """Дописать результаты в данные запроса (`dialog["mcp"]`) без потери прежних.
+
+    Нужно для предварительного чтения (см. `_step_file_context`) и для любых
+    добавок ПОСЛЕ предварительного прохода MCP: исполнитель правок и приёмщик
+    читают именно это хранилище.
+    """
+    if not extra:
+        return
+    dialog = session.get("dialog") or {}
+    stored = workspace_store.dialog_mcp(dialog)
+    results = list(stored.get("results") or []) + list(extra)
+    workspace_store.set_dialog_mcp(
+        dialog, str(stored.get("signature") or ""), str(stored.get("request") or ""),
+        results, calls=list(stored.get("calls") or []), chain=stored.get("chain"))
+
+
 async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
                              step_text: str, answer: str,
-                             analyzer: "Agent") -> Tuple[List[Dict[str, Any]],
-                                                         List[str],
-                                                         Dict[str, Any]]:
+                             analyzer: "Agent", request: str = "",
+                             plan: str = "") -> Tuple[List[Dict[str, Any]],
+                                                      List[str],
+                                                      Dict[str, Any]]:
     """ПРАВКИ ФАЙЛОВ ПО ОТВЕТУ ШАГА — превращает текст ответа в изменения на диске.
 
     Зачем это нужно. MCP-сервер `files` даёт агенту чтение, поиск и запись, но
@@ -5846,9 +6068,15 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
 
     Возвращает (результаты вызовов, строки диагностики, расход служебного вызова).
 
-    Раундов не больше двух: в первом исполнитель МОЖЕТ попросить чтение (точный
-    текст файла для точечной правки), во втором — присылает саму правку. Первый
-    раунд с правкой сразу закрывает вопрос.
+    Раунды: исполнитель читает участок (разведка) или пишет правку; ПОСЛЕДНИЙ
+    раунд — только запись, о чём его предупреждают заранее (`FILES_LAST_READ_NOTE`).
+    Раунд с правкой сразу закрывает вопрос; отказ сервера даёт ещё одну попытку с
+    причиной отказа. Поиск разрешён ТОЛЬКО в первом раунде (`FILES_NO_SEARCH_NOTE`):
+    повторный поиск даёт те же совпадения, а правки не приближает.
+
+    request и plan — цель задачи и план целиком: шаг плана короткий, и без общего
+    замысла исполнитель ищет не там, где нужно (живой случай 16.10: шаг
+    «подключить обработку команды» искал по документации вместо точки вставки).
     """
     enabled = workspace_store.mcp_enabled(task)
     if mcp_store.FILES not in enabled:
@@ -5868,6 +6096,8 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
     tools = _mcp_tools([payload])
     if not mcp_store.file_write_tools(tools):
         return [], [], {}
+    # ФАЙЛЫ, НАЗВАННЫЕ В ШАГЕ: по ним проверяются все правки этого прохода.
+    step_paths = _step_paths(step_text)
     dialog = session["dialog"]
     stored = workspace_store.dialog_mcp(dialog)
     collected = list(stored.get("results") or [])
@@ -5885,40 +6115,99 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
     wrote = False
     seen_reads: set = set()
     reads_done = 0
+    recon_rounds = 0
     nudge = ""
+    # Файлы, которые после правки НЕ компилируются (путь → сообщение): правка
+    # применилась, но код нерабочий (живой случай 16.10: вставка легла между
+    # декоратором и функцией). Такой шаг не выдаётся за выполненный.
+    syntax_bad: Dict[str, str] = {}
+    syntax_fixes = 0
+    # НОВЫЕ ПРИВАТНЫЕ ФУНКЦИИ БЕЗ ВЫЗОВА (см. _note_connect_state): правка добавила
+    # определение, но никто его не вызывает — подключение не сделано.
+    connect_bad: Dict[str, List[str]] = {}
+    snapshots: Dict[str, str] = {}
     for round_number in range(1, mcp_store.FILES_MAX_ROUNDS + 1):
         # ПЕРВЫЕ раунды могут попросить чтение (точный текст для правки), а
-        # ПОСЛЕДНИЙ — только запись: повторное чтение вместо правки означает, что
+        # ДАЛЬШЕ — только запись: повторное чтение вместо правки означает, что
         # шаг не выполнен (живой случай 16.10: исполнитель дважды подряд просил
         # `read_file` одного файла и ни разу не вернул запись).
         last_round = round_number == mcp_store.FILES_MAX_ROUNDS
-        # РАУНД 1 — РАЗВЕДКА, ДАЛЬШЕ ТОЛЬКО ПИСАТЬ. Живой случай 16.10 (шаг
-        # «подключить команду»): исполнитель ИСКАЛ ВСЕ ЧЕТЫРЕ РАУНДА (десяток
-        # `search_files` подряд) и не сделал ни одной правки — поиск дешёвый, и
-        # бюджет чтений его не останавливал. Поэтому право на разведку дано РОВНО
-        # ОДИН раунд, а начиная со второго разрешена только запись.
-        write_only = round_number > 1 or reads_done >= mcp_store.FILES_MAX_READS
+        # РАУНД ПРАВОК — ЭТО ГАРАНТИЯ, А НЕ ПРОСЬБА: в нём исполнителю НЕ
+        # ОБЪЯВЛЯЮТ инструменты чтения (см. `offered` ниже). Живые прогоны 16.10
+        # (четыре захода, задача про /commands) показали, почему иначе нельзя:
+        # пока чтение оставалось в наборе, исполнитель возвращал его раунд за
+        # раундом — «прочитаю ещё немного» — и не сделал ни одной правки, хотя
+        # шаг требовал именно правки. Раундов разведки ровно `FILE_RECON_ROUNDS`,
+        # поиск разрешён ТОЛЬКО в первом из них, повторение того же чтения
+        # отсекается отпечатком, чтений за проход не больше `FILES_MAX_READS`.
+        write_only = (last_round
+                      or recon_rounds >= mcp_store.FILE_RECON_ROUNDS
+                      or reads_done >= mcp_store.FILES_MAX_READS)
         # Уточнение живёт ровно один раунд: пустой ответ («подумал вместо дела»)
         # получает FILES_EMPTY_NOTE, исчерпанные чтения — FILES_WRITE_ONLY_NOTE.
         extra = nudge
         nudge = ""
-        decision = await analyzer.file_actions(step_text, answer, tools,
-                                               results=collected, extra=extra)
+        # ЧТО ОБЪЯВЛЕНО ИСПОЛНИТЕЛЮ в этом раунде: в раунде правок — ТОЛЬКО
+        # запись. Разбираем ответ по ПОЛНОМУ набору (`tools`): иначе просьба о
+        # чтении выглядела бы как выдуманный инструмент, и причина шага без
+        # правок была бы названа неверно.
+        # В РАУНДЕ ПРАВОК ОБЪЯВЛЯЕМ ЗАПИСЬ И ОДНО ЧТЕНИЕ ОКНА: поиск и структуру —
+        # нет (место уже найдено), а текст участка — да: без него якорь берут из
+        # головы, и правка не проходит (живые прогоны 16.10).
+        offered = (mcp_store.file_write_tools(tools) + mcp_store.file_window_tools(tools)
+                   if write_only else tools)
+        decision = await analyzer.file_actions(step_text, answer, offered,
+                                               results=collected, extra=extra,
+                                               request=request, plan=plan)
         usage = merge_usage(usage, dict(analyzer.last_usage or {}))
-        if decision.get("repaired"):
-            # Ответ исполнителя пришлось ЧИНИТЬ — значит он обрезан, а содержимое
-            # файла в нём неполное: создавать такой файл нельзя (на диске остался
-            # бы обрубок). То же правило, что у данных MCP (truncated_note).
+        if decision.get("repaired") or (not decision.get("parsed")
+                                        and _looks_truncated(decision)):
+            # Ответ исполнителя пришлось ЧИНИТЬ (или он оборвался на середине
+            # JSON) — значит содержимое файла в нём неполное: создавать такой файл
+            # нельзя (на диске остался бы обрубок). То же правило, что у данных MCP
+            # (truncated_note). Но шаг на этом НЕ заканчивается: обрезанный ответ —
+            # это повод переделать правку частями, а не отсутствие правки (живой
+            # прогон 16.10, пятнадцатый заход: так и не было записано ничего).
             lines.append("MCP: ответ исполнителя обрезан по пределу длины — правку "
-                         "НЕ применяю: содержимое неполное. Файл надо писать "
-                         "частями (write_file + append_file).")
-            break
+                         "НЕ применяю: содержимое неполное. Прошу переделать: "
+                         "write_file началом и append_file продолжением.")
+            if last_round:
+                break
+            nudge = mcp_store.FILES_TRUNCATED_NOTE
+            continue
         calls = mcp_store.file_any_calls(decision.get("calls"), tools)
         dropped = mcp_store.dropped_file_tools(decision.get("calls"), tools)
-        reads = ([] if write_only
-                 else [call for call in calls
-                       if not mcp_store.is_deferred_call(call)])
+        # ЧТЕНИЯ, которые исполнитель запросил в этом раунде (до отсева по
+        # бюджету): нужны, чтобы НАЗВАТЬ отброшенное чтение, а не проглотить его.
+        asked_reads = [call for call in calls if not mcp_store.is_deferred_call(call)]
+        reads = list(asked_reads)
+        if write_only:
+            # В раунде правок принимаются ТОЛЬКО чтения окна, и не больше
+            # WRITE_ROUND_READS за раунд: поиск здесь — это повторная разведка,
+            # а не работа (её результат уже в данных).
+            searches = [call for call in reads
+                        if str(call.get("tool")) not in ("read_file", "read_files")]
+            if searches:
+                reads = [call for call in reads if call not in searches]
+                nudge = nudge or mcp_store.FILES_NO_SEARCH_NOTE
+                lines.append("MCP: поиск и структуру в раунде правок не исполняю — "
+                             "место правки уже найдено; нужен текст участка "
+                             "(read_file с from_line/to_line) и правка.")
+            window_reads = [call for call in reads
+                            if str(call.get("tool")) in ("read_file", "read_files")]
+            if len(window_reads) > mcp_store.WRITE_ROUND_READS:
+                keep_calls = window_reads[:mcp_store.WRITE_ROUND_READS]
+                dropped_window = window_reads[mcp_store.WRITE_ROUND_READS:]
+                reads = [call for call in reads if call not in dropped_window]
+                lines.append("MCP: в раунде правок читаю ровно один участок — "
+                             "остальные чтения этого раунда не исполняю ("
+                             + str(len(dropped_window)) + ").")
         writes = [call for call in calls if mcp_store.is_deferred_call(call)]
+        # ПОИСК РАЗРЕШЁН В ОБОИХ РАУНДАХ РАЗВЕДКИ: после первого поиска модель
+        # видит совпадения и часто хочет уточнить запрос — это и есть поиск места
+        # правки, а раундов разведки всего два. В раунде правок инструментов
+        # чтения у исполнителя нет вовсе, поэтому ограничивать поиск по счёту
+        # раундов больше не нужно.
         # ПОВТОР ТОГО ЖЕ ЧТЕНИЯ — не прогресс: исполнять его снова нечего, и такой
         # раунд закрывает путь к правке. Дальше спрашиваем только запись.
         fresh_reads = [call for call in reads
@@ -5934,6 +6223,30 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
             fresh_reads = [call for call in fresh_reads
                            if str(call.get("tool")) not in ("read_file", "read_files")
                            or _call_signature(call) in keep]
+        # ЧТЕНИЕ, КОТОРОЕ НЕ ИСПОЛНЯЕТСЯ, НАЗЫВАЕТСЯ ВСЛУХ. Раунд правок (и
+        # исчерпанный бюджет чтений) отсекают чтения — молчаливый отброс выглядел
+        # бы как «модель ничего не предложила», и причина шага без правок
+        # оставалась не названной (живой прогон 16.10, третий заход: исполнитель
+        # просил окно `chat.py` в раунде правок, и об этом в журнале не было ни
+        # слова).
+        fresh_signatures = {_call_signature(call) for call in fresh_reads}
+        blocked_reads = [] if writes else [
+            call for call in asked_reads
+            if _call_signature(call) not in fresh_signatures]
+        if blocked_reads:
+            names = ", ".join(sorted({f"{call.get('tool')}"
+                                      f"({_short_args(call.get('arguments'))})"
+                                      for call in blocked_reads}))
+            lines.append("MCP: чтение в этом раунде не исполняю (" + names[:200]
+                         + ") — раунд правок или бюджет чтений исчерпан; прошу "
+                           "правку по уже прочитанному.")
+            if not last_round:
+                # ПОИСКУ — СВОЯ ПРИЧИНА: он был в раундах разведки, и повторять
+                # его нечего; остальным чтениям — общее «раунд правок».
+                only_search = all(str(call.get("tool")) in ("search_files", "list_files")
+                                  for call in blocked_reads)
+                nudge = nudge or (mcp_store.FILES_NO_SEARCH_NOTE if only_search
+                                  else mcp_store.FILES_WRITE_ONLY_NOTE)
         seen_reads.update(_call_signature(call) for call in reads)
         reads = fresh_reads
         if not reads and not writes and dropped:
@@ -5941,6 +6254,8 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
                          f"({', '.join(dropped)}) — правку не делаю.")
             break
         if reads:
+            if not write_only:
+                recon_rounds += 1
             done = await mcp_store.async_run_calls(reads,
                                                    limit=mcp_store.FILES_MAX_READS)
             # Бюджет считают только ЧТЕНИЯ ФАЙЛОВ: поиск (`search_files`) —
@@ -5953,8 +6268,37 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
             for item in done:
                 lines.append(_file_call_line(item))
             _remember()
+            if write_only:
+                # ПРОЧИТАЛ — ТЕПЕРЬ ПРАВЬ: раунд правок без правки шаг не закрывает.
+                nudge = nudge or mcp_store.FILES_WRITE_ROUND_NOTE
+            elif recon_rounds >= mcp_store.FILE_RECON_ROUNDS:
+                # ПРЕДУПРЕЖДЕНИЕ О ПОСЛЕДНЕМ РАУНДЕ ЧТЕНИЯ: следующий раунд —
+                # только запись, и инструментов чтения в нём не будет. Без этого
+                # исполнитель «читает ещё немного» до конца раундов и оставляет шаг
+                # без правок (живой прогон 16.10).
+                nudge = nudge or mcp_store.FILES_LAST_READ_NOTE
             continue
         if writes:
+            kept, alien = _keep_step_writes(writes, step_paths)
+            if alien:
+                lines.append("MCP: правку по этим файлам не применяю — их нет в шаге "
+                             "(" + ", ".join(sorted(set(alien)))[:160] + "); шаг "
+                             "называет: " + ", ".join(step_paths)[:160] + ".")
+                nudge = nudge or mcp_store.FILES_WRONG_FILE_NOTE
+            writes = kept
+            if not writes:
+                if not last_round:
+                    continue
+                break
+        if writes:
+            # СНИМОК ФАЙЛА ДО ПРАВКИ: по нему видно, какие ОБЪЯВЛЕНИЯ появились
+            # именно сейчас (см. проверку подключения ниже).
+            for call in writes:
+                arguments = (call.get("arguments")
+                             if isinstance(call.get("arguments"), dict) else {})
+                path = str(arguments.get("path") or "").strip()
+                if path.endswith(".py") and path not in snapshots:
+                    snapshots[path] = mcp_store.read_repo_file(path)
             done = await mcp_store.async_run_calls(writes,
                                                    limit=mcp_store.MAX_FILE_ACTIONS)
             collected.extend(done)
@@ -5963,6 +6307,23 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
                 lines.append(_file_call_line(item))
             _remember()
             wrote = any(item.get("ok") for item in done)
+            # ПРОВЕРКА СИНТАКСИСА ПОСЛЕ ПРАВКИ: применённая правка ещё не значит
+            # рабочий файл. Ошибку называем и пробуем исправить ТЕМ ЖЕ проходом.
+            broken = _note_syntax_state(done, syntax_bad, lines)
+            # ПРОВЕРКА ПОДКЛЮЧЕНИЯ: для подключающего шага объявление без вызова —
+            # не результат (см. FILES_CONNECT_MARKERS).
+            # СНИМОК НЕ ОБНОВЛЯЕМ намеренно: он снят ДО первой правки прохода, и
+            # сравнение с ним даёт ПОЛНЫЙ список объявлений, добавленных ЭТИМ шагом,
+            # — иначе доработанная правка выглядела бы как «новых объявлений нет», и
+            # факт «без вызова» не мог бы ни подтвердиться, ни сняться.
+            dead = _note_connect_state(done, snapshots, step_text, connect_bad, lines)
+            if dead and not broken and not last_round:
+                nudge = nudge or mcp_store.FILES_DEAD_CODE_NOTE
+                continue
+            if broken and not last_round and syntax_fixes < mcp_store.FILES_SYNTAX_RETRIES:
+                syntax_fixes += 1
+                nudge = mcp_store.FILES_SYNTAX_NOTE
+                continue
             if wrote or last_round:
                 break
             # ПРАВКА ОТКЛОНЕНА — ДАЁМ ПЕРЕДЕЛАТЬ. Причина отказа уже лежит в
@@ -5981,13 +6342,89 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
             if not last_round and not writes:
                 # ПРОГРЕССА НЕТ, НО РАУНДЫ ЕСТЬ: не молчим и не сдаёмся сразу —
                 # даём уточнение на следующий раунд (как диспетчеру в цепочке).
-                nudge = (mcp_store.FILES_EMPTY_NOTE if not calls
-                         else mcp_store.FILES_WRITE_ONLY_NOTE)
+                # Уточнение НЕ перебивает уже названную причину (например,
+                # «поиск был в первом раунде»): она точнее общей подсказки.
+                nudge = nudge or (mcp_store.FILES_EMPTY_NOTE if not calls
+                                  else mcp_store.FILES_WRITE_ONLY_NOTE)
                 continue
             lines.append("MCP: правок файлов по этому шагу нет"
                          + (f" — {reason}." if reason else ".")
                          + " Изменения на диске не делаю.")
             break
+    # ВТОРОЙ ЗАХОД АВТОРА (см. decide_file_draft): проход закончился БЕЗ правок, но
+    # разведка что-то прочитала. Тогда тот же текст даётся модели ЕЩЁ РАЗ, с
+    # заданием собрать правку и БЕЗ инструментов чтения: живые прогоны 16.10
+    # (задача про /commands, шесть заходов) показали, что четыре из них кончались
+    # чтениями без правок — при том, что нужный участок уже был прочитан.
+    # Лишнего вызова нет: заход идёт ТОЛЬКО если разведка читала (иначе нового
+    # текста нет и повторять нечего) и если правок не случилось.
+    if not wrote and recon_rounds and not syntax_bad:
+        # ДВА РАУНДА ВТОРОГО ЗАХОДА: в первом автор вправе прочитать ОДИН участок
+        # (иначе он честно отвечает пустым списком — живые прогоны 16.10), во втором
+        # инструментов чтения у него уже нет, и ответ — правка или пустой список.
+        lines.append("MCP: правок нет — второй заход автора: собираю правку по "
+                     "прочитанному (в первом раунде можно прочитать ОДИН участок).")
+        for draft_round in range(1, mcp_store.DRAFT_ROUNDS + 1):
+            offered = (mcp_store.file_write_tools(tools) + mcp_store.file_window_tools(tools)
+                       if draft_round < mcp_store.DRAFT_ROUNDS
+                       else mcp_store.file_write_tools(tools))
+            draft = await analyzer.file_draft(step_text, answer, offered,
+                                             results=collected, request=request, plan=plan)
+            usage = merge_usage(usage, dict(analyzer.last_usage or {}))
+            draft_calls = mcp_store.file_any_calls(draft.get("calls"), offered)
+            draft_reads = [call for call in draft_calls
+                           if not mcp_store.is_deferred_call(call)]
+            draft_writes = [call for call in draft_calls
+                            if mcp_store.is_deferred_call(call)]
+            if draft_writes:
+                draft_writes, draft_alien = _keep_step_writes(draft_writes, step_paths)
+                if draft_alien:
+                    lines.append("MCP: второй заход тоже метил в чужие файлы ("
+                                 + ", ".join(sorted(set(draft_alien)))[:160]
+                                 + ") — не применяю; шаг называет: "
+                                 + ", ".join(step_paths)[:160] + ".")
+            if not draft_writes:
+                reason = str(draft.get("reason") or "").strip()
+                if draft_reads and draft_round < mcp_store.DRAFT_ROUNDS:
+                    # ПРОЧИТАЛ — ЗНАЧИТ ПРОСИЛ ТЕКСТ: выполняем чтение и даём
+                    # автору ещё один раунд, уже без инструментов чтения.
+                    got = await mcp_store.async_run_calls(draft_reads, limit=1)
+                    collected.extend(got)
+                    for item in got:
+                        lines.append(_file_call_line(item))
+                    _remember()
+                    lines.append("MCP: второй заход прочитал участок — прошу правку "
+                                 "ещё раз (чтение в этом заходе было одно).")
+                    continue
+                lines.append("MCP: второй заход правок не дал"
+                             + (f" — {reason}." if reason else "."))
+                break
+            done = await mcp_store.async_run_calls(draft_writes,
+                                                   limit=mcp_store.MAX_FILE_ACTIONS)
+            collected.extend(done)
+            fresh.extend(done)
+            for item in done:
+                lines.append(_file_call_line(item))
+            _remember()
+            wrote = any(item.get("ok") for item in done)
+            _note_syntax_state(done, syntax_bad, lines)
+            break
+    if connect_bad:
+        facts = [connect_result(path, names)
+                 for path, names in sorted(connect_bad.items())]
+        fresh.extend(facts)
+        collected.extend(facts)
+        _remember()
+    if syntax_bad:
+        facts = [syntax_result(path, error)
+                 for path, error in sorted(syntax_bad.items())]
+        # ФАКТ О СЛОМАННОМ ФАЙЛЕ — И В ВОЗВРАТ, И В ДАННЫЕ ЗАПРОСА: приёмщик судит
+        # по данным (`dialog["mcp"]`), и без этой записи сломанный файл прошёл бы
+        # как успешная правка. Вызовы записи _remember() идут ВНУТРИ раундов,
+        # поэтому запоминаем ещё раз — уже с фактом поломки.
+        fresh.extend(facts)
+        collected.extend(facts)
+        _remember()
     if not wrote and fresh:
         lines.append("MCP: ни одна правка файла не удалась — проверьте причину "
                      "отказа в строках выше.")
@@ -5996,6 +6433,18 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
         lines.append("MCP: исполнитель шага не вернул ни одной правки файла — "
                      "изменения на диске не сделаны.")
     return fresh, lines, usage
+
+
+def _looks_truncated(decision: Dict[str, Any]) -> bool:
+    """Похож ли НЕРАЗОБРАННЫЙ ответ исполнителя на обрезанный по пределу длины.
+
+    Предел ответа рубит JSON на середине строки: фигурные скобки не сходятся, а
+    текста много (`raw_len`). Причина «не JSON» в этом случае сбивает с толку —
+    и человека, и следующее уточнение, поэтому обрыв называется обрывом.
+    """
+    if not decision.get("raw_len"):
+        return False
+    return int(decision.get("raw_len") or 0) >= mcp_store.FILES_TRUNCATED_CHARS
 
 
 def _call_signature(call: Dict[str, Any]) -> str:
@@ -6007,6 +6456,160 @@ def _call_signature(call: Dict[str, Any]) -> str:
     return f"{call.get('server')}·{call.get('tool')}·{args}"
 
 
+def _step_paths(step_text: str) -> List[str]:
+    """Файлы, НАЗВАННЫЕ в тексте шага плана (пути без точки и кавычек)."""
+    paths: List[str] = []
+    for match in STEP_PATH_RE.findall(str(step_text or "")):
+        clean = match.strip("./").strip(".,;:()«»\"'")
+        if clean and clean not in paths:
+            paths.append(clean)
+    return paths
+
+
+def _keep_step_writes(calls: List[Dict[str, Any]], step_paths: List[str]
+                      ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Оставить правки ТОЛЬКО по файлам, названным в шаге: (принятые, чужие).
+
+    Почему это гарантия, а не придирка. План обязан называть файлы (правило 12), и
+    один шаг — один файл или одна связанная правка. Живой прогон 16.10 (девятый
+    заход, задача про /commands): шаг «дописать в app/routers/chat.py обработку
+    команды» закончился перезаписью app/ai/commands.py — модуля, созданного
+    предыдущим шагом. Итог двойной: связки нет, а готовый файл испорчен.
+    Шаг без имён файлов ничего не ограничивает: там решает исполнитель.
+    """
+    if not step_paths:
+        return list(calls), []
+    keep: List[Dict[str, Any]] = []
+    alien: List[str] = []
+    for call in calls:
+        arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        path = str(arguments.get("path") or "").strip().lstrip("./")
+        if path in step_paths:
+            keep.append(call)
+        else:
+            alien.append(path or "(путь не назван)")
+    return keep, alien
+
+
+def _syntax_state(results: List[Dict[str, Any]]
+                  ) -> Tuple[Dict[str, str], List[str]]:
+    """Что стало с синтаксисом записанных `.py` файлов: (сломанные, целые).
+
+    Читает файлы ЗАНОВО с диска (через `mcp_store.syntax_error`): проверяем
+    результат правки, а не намерение. Файлы других типов (markdown, JSON)
+    компилятором приложения не проверяются — по ним списки пусты.
+    """
+    broken: Dict[str, str] = {}
+    healthy: List[str] = []
+    for item in results:
+        if not item.get("ok"):
+            continue
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        path = str(arguments.get("path") or "").strip()
+        if not path.endswith(".py"):
+            continue
+        error = mcp_store.syntax_error(path)
+        if error:
+            broken[path] = error
+        elif path not in healthy:
+            healthy.append(path)
+    return broken, healthy
+
+
+def _note_connect_state(results: List[Dict[str, Any]], snapshots: Dict[str, str],
+                        step_text: str, connect_bad: Dict[str, List[str]],
+                        lines: List[str]) -> Dict[str, List[str]]:
+    """Записать, какие НОВЫЕ приватные функции остались без вызова (см. mcp.private_defs).
+
+    Проверка включается только для ПОДКЛЮЧАЮЩИХ шагов (`FILES_CONNECT_MARKERS`) и
+    только для ПРИВАТНЫХ имён: живой прогон 16.10 (одиннадцатый заход, задача про
+    /commands) — в `chat.py` добавили `_is_commands_command` и
+    `_commands_help_text`, ни разу их не вызвали, а проверка приняла это за работу
+    («все три шага подтверждены записями файлов»), и команда не работала.
+    """
+    if not mcp_store.file_step_likely(step_text):
+        return {}
+    body = " ".join(str(step_text or "").lower().split())
+    if not any(marker in body for marker in mcp_store.FILE_CONNECT_MARKERS):
+        return {}
+    found: Dict[str, List[str]] = {}
+    for item in results:
+        if not item.get("ok"):
+            continue
+        path = _result_path(item)
+        if not path.endswith(".py") or path not in snapshots:
+            continue
+        after = mcp_store.read_repo_file(path)
+        if not after:
+            continue
+        before_names = mcp_store.private_defs(snapshots[path])
+        added = [name for name in mcp_store.private_defs(after)
+                 if name not in before_names]
+        dead = mcp_store.unreferenced_names(after, added)
+        if dead:
+            found[path] = dead
+            lines.append(f"MCP: в {path} появились функции без вызова ("
+                         + ", ".join(dead)[:120] + ") — подключение НЕ сделано: "
+                           "объявление без вызова не работает. Прошу исполнителя "
+                           "добавить вызов в точке входа.")
+        elif path in connect_bad:
+            # ВЫЗОВ ПОЯВИЛСЯ — факт снимается: иначе исправленная работа навсегда
+            # осталась бы «не подключённой» и приёмщик отклонял бы готовый шаг.
+            connect_bad.pop(path, None)
+    connect_bad.update(found)
+    return found
+
+
+def _note_syntax_state(results: List[Dict[str, Any]], syntax_bad: Dict[str, str],
+                       lines: List[str]) -> Dict[str, str]:
+    """Записать в состояние и журнал, что стало с синтаксисом после правок.
+
+    Возвращает сломанные файлы этого раунда (`{путь: сообщение}`); исправившиеся
+    из состояния убираются — иначе факт поломки остался бы в данных навсегда, хотя
+    файл уже компилируется.
+    """
+    broken, healthy = _syntax_state(results)
+    for path, error in broken.items():
+        syntax_bad[path] = error
+        lines.append(f"MCP: файл {path} НЕ КОМПИЛИРУЕТСЯ после правки "
+                     f"({error}) — прошу исполнителя исправить.")
+    for path in healthy:
+        syntax_bad.pop(path, None)
+    return broken
+
+
+def connect_result(path: str, names: List[str]) -> Dict[str, Any]:
+    """Запись «объявление без вызова» — в том же виде, что ответы инструментов.
+
+    Приёмщик читает данные запроса: без этой записи он видит только удачные правки
+    и принимает добавленную функцию за выполненное подключение (живой прогон 16.10).
+    """
+    return {
+        "server": "app", "server_name": "Проверка приложения", "source": "",
+        "tool": "connect_check", "arguments": {"path": path}, "ok": False,
+        "text": "",
+        "error": (f"подключение не сделано: в {path} объявлены и нигде не вызваны "
+                  + ", ".join(names)),
+        "action": "", "attachments": [],
+    }
+
+
+def syntax_result(path: str, error: str) -> Dict[str, Any]:
+    """Запись о сломанном синтаксисе — в том же виде, что ответы инструментов.
+
+    Приёмщик читает данные запроса (`dialog["mcp"]`), поэтому факт должен лежать
+    там же, где ответы сервера: иначе «файл изменён» перевесит «файл не
+    компилируется», и шаг уйдёт как выполненный.
+    """
+    return {
+        "server": "app", "server_name": "Проверка приложения", "source": "",
+        "tool": "syntax_check", "arguments": {"path": path}, "ok": False,
+        "text": "",
+        "error": f"файл {path} не компилируется после правки: {error}",
+        "action": "", "attachments": [],
+    }
+
+
 def _file_actions_note(results: List[Dict[str, Any]]) -> str:
     """Подпись «что реально изменилось» по ответам файловых инструментов.
 
@@ -6015,13 +6618,43 @@ def _file_actions_note(results: List[Dict[str, Any]]) -> str:
     прошла: тогда подписи нет, и шаг честно остаётся невыполненным.
     """
     done = [item for item in results if item.get("ok")]
-    if not done:
+    # ОТКАЗ ВИДЕН, НО ПЕРЕДЕЛАННАЯ ПОПЫТКА НЕ ПУГАЕТ: если по этому же файлу
+    # правка в итоге прошла, отказ промежуточного раунда в подпись не идёт (в
+    # данных запроса он остаётся — там история вызовов). Сломанный синтаксис
+    # показываем всегда: он не «промежуточный отказ», а состояние файла на диске.
+    ok_paths = {_result_path(item) for item in done}
+    # ФАКТЫ ПРОВЕРОК ПРИЛОЖЕНИЯ показываем ВСЕГДА: «файл не компилируется» и
+    # «объявление без вызова» — это состояние файла на диске, а не промежуточный
+    # отказ вызова, который переделали.
+    failed = [item for item in results if not item.get("ok")
+              and (str(item.get("tool")) in APP_CHECK_TOOLS
+                   or _result_path(item) not in ok_paths)]
+    if not done and not failed:
         return ""
     lines = ["── ИЗМЕНЕНИЯ ФАЙЛОВ ПО ЭТОМУ ШАГУ (факт, по ответам инструментов) ──"]
     for item in done:
         head = (item.get("text") or "").splitlines()
         lines.append("• " + (head[0] if head else str(item.get("tool"))))
+    for item in failed:
+        # НЕУДАЧА — ТОЖЕ ФАКТ: отказ сервера и сломанный синтаксис обязаны быть
+        # видны в ответе шага, иначе проверка читает только удачную половину.
+        reason = str(item.get("error") or "").strip()
+        if not reason:
+            head = (item.get("text") or "").splitlines()
+            reason = head[0] if head else "причина не названа"
+        lines.append("⚠ НЕ ПРИНЯТО: " + reason)
     return "\n".join(lines)
+
+
+# Виды записей, которые ставит САМ приложение о состоянии файла на диске (не
+# ответы сервера): их подпись в шаге показывает всегда — см. `_file_actions_note`.
+APP_CHECK_TOOLS = ("syntax_check", "connect_check")
+
+
+def _result_path(item: Dict[str, Any]) -> str:
+    """Путь файла из аргументов вызова (пусто — вызов без пути)."""
+    arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+    return str(arguments.get("path") or "").strip()
 
 
 def _file_call_line(item: Dict[str, Any]) -> str:
@@ -6044,6 +6677,28 @@ def _short_args(arguments: Any) -> str:
             text = text[:60] + f"… ({len(str(value))} симв.)"
         parts.append(f"{key}={text}")
     return ", ".join(parts)
+
+
+def _previous_step_result(dialog: Dict[str, Any], state: Any) -> str:
+    """Текст ПРЕДЫДУЩЕГО выполненного шага плана (см. Agent.step_result).
+
+    Нужен на шагах со второго: шаг плана часто ПРОДОЛЖАЕТ сделанное (подключает
+    созданный модуль, дописывает документ), а память диалога живёт по стратегии
+    контекста — прошлый ответ в окно может не попасть. Живой случай 16.10 (задача
+    про команду /commands): шаг «подключить обработку в chat.py» не увидел модуля,
+    созданного шагом 1, и вместо правки ответил просьбой прислать файлы. Берём
+    последнюю реплику ассистента: в автомате это и есть ответ прошлого шага (его
+    текст остаётся в памяти диалога, даже когда в чате он скрыт).
+    """
+    if state is None or int(getattr(state, "step_index", 0) or 0) <= 0:
+        return ""
+    for item in reversed(list(dialog.get("messages") or [])):
+        if str(item.get("role")) != "assistant":
+            continue
+        text = str(item.get("content") or "").strip()
+        if text:
+            return text
+    return ""
 
 
 @router.post("/agent/chat")
@@ -7201,6 +7856,26 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         plan_call_usage = dict(planner.last_usage or {})
                         plan_usage = dict(plan_call_usage)
 
+                        # ШАГ, МЕНЯЮЩИЙ ФАЙЛЫ, ОБЯЗАН НАЗЫВАТЬ ФАЙЛ: правило 12 —
+                        # просьба, здесь — проверка кодом с ОДНИМ переспросом (см.
+                        # _ensure_plan_files). Расход переспроса — тот же служебный
+                        # вид «plan», что и построение плана.
+                        steps, files_usage, files_lines = await _ensure_plan_files(
+                            steps, text, planner, task_now, {
+                                "history": dialog_now["messages"],
+                                "working_memory": working_memory,
+                                "long_term_memory": long_term_memory,
+                                "profile": profile,
+                                "invariants": _invariants_snapshot(task_now, session_now),
+                                "mcp": mcp_data,
+                                "rag": rag_data,
+                            })
+                        if files_lines:
+                            for line in files_lines:
+                                yield encode({"type": "debug",
+                                              "text": f"{_MACHINE}: план: {line}"})
+                        plan_usage = merge_usage(plan_usage, files_usage)
+
                         # КОД-ГЕЙТ ПЛАНА. Промпт-блок правил — просьба; гарантию
                         # даёт проверка шагов арбитром: нарушающие шаги в работу
                         # не уходят, при нарушении — одна попытка перепланирования.
@@ -7397,6 +8072,16 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         f"{_MACHINE}: этап execution, {state.step_label()} — «{step_text}». "
                         f"Ожидается: {state.expected_action}."
                     )})
+                    # СТРУКТУРА ЦЕЛЕВЫХ ФАЙЛОВ ШАГА — ЗАРАНЕЕ И БЕЗ МОДЕЛИ (см.
+                    # _step_file_context): автор ответа и исполнитель правок видят
+                    # имена функций и номера строк, а не начинают поиск с нуля.
+                    step_files, step_file_lines = await _step_file_context(
+                        task_now, step_text, state.request or "")
+                    for line in step_file_lines:
+                        yield encode({"type": "debug", "text": f"{_MACHINE}: {line}"})
+                    if step_files:
+                        mcp_data.extend(step_files)
+                        _store_mcp_extra(session_now, step_files)
                     answered = False
                     fallback_answer = False
                     errors = []
@@ -7423,6 +8108,10 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                         # Фрагменты баз знаний по этому запросу: ответ строится по
                         # документам пользователя и ссылается на них.
                         rag=rag_data,
+                        # Результат ПРЕДЫДУЩЕГО шага плана (см. Agent.step_result):
+                        # шаг со второго часто продолжает сделанное — без этого
+                        # блока он просит у пользователя то, что уже лежит на диске.
+                        step_result=_previous_step_result(dialog_now, state),
                     ):
                         # Событие "done" несёт расход токенов текущего запроса.
                         kind = event.get("type")
@@ -7498,7 +8187,8 @@ async def agent_chat(msg: ChatMessage) -> StreamingResponse:
                             and state.stage == "execution" and step_answer
                             and mcp_store.file_step_likely(step_text)):
                         actions, action_lines, action_usage = await _file_actions_step(
-                            task_now, session_now, step_text, step_answer, files_agent)
+                            task_now, session_now, step_text, step_answer, files_agent,
+                            request=state.request, plan=state.plan_text())
                         if action_usage:
                             usage = merge_usage(usage, action_usage)
                         for line in action_lines:
