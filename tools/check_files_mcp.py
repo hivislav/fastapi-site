@@ -1526,6 +1526,59 @@ def section_step_files_only():
     asyncio.run(run())
 
 
+def section_facts_survive():
+    """ФАКТЫ ПРАВОК НЕ ВЫТЕСНЯЮТСЯ ИЗ ДАННЫХ ЗАПРОСА — и устаревший отказ снимается.
+
+    Живой прогон 16.10 (девятнадцатый заход, задача про /commands): предварительный
+    проход MCP занял все восемь мест в данных запроса, а результаты ПРАВОК ФАЙЛОВ,
+    дописанные позже, обрезались. Из-за этого агент на следующем шаге видел старый
+    отказ «файла нет» (чтение шло ДО создания файла) и отвечал «модуль не создан»,
+    а приёмщик отклонял УЖЕ ВЫПОЛНЕННУЮ работу словами «в данных MCP нет записи».
+    """
+    print("\n[15] Факты правок доходят до модели и приёмщика")
+
+    def read(rel, ok=True):
+        return {"server": "files", "tool": "read_file", "ok": ok,
+                "arguments": {"path": rel},
+                "text": ("Файл: " + rel) if ok else "",
+                "error": "" if ok else ("файла нет: " + rel), "source": "",
+                "action": "", "attachments": []}
+
+    def write(rel):
+        return {"server": "files", "tool": "write_file", "ok": True,
+                "arguments": {"path": rel, "content": "x"},
+                "text": "СОЗДАН " + rel, "error": "", "source": "",
+                "action": "", "attachments": []}
+
+    preflight = [read("app/ai/commands.py", ok=False)]
+    preflight += [read(f"docs/read_{index}.md") for index in range(7)]
+    kept = mcp_store.normalize_results(preflight + [write("app/ai/commands.py")])
+    check("запись файла не вытесняется пределом (данных было 9, предел 8)",
+          any(item["tool"] == "write_file" for item in kept), str(len(kept)))
+    check("устаревший отказ чтения снят: файл позже записан",
+          not any(item["tool"] == "read_file" and not item["ok"] for item in kept),
+          str([(i["tool"], i["ok"]) for i in kept]))
+    only_reads = mcp_store.normalize_results(preflight)
+    check("без записи отказы чтения НЕ пропадают (ничего не скрывается)",
+          any(item["tool"] == "read_file" and not item["ok"] for item in only_reads),
+          str(only_reads)[:200])
+    digest = mcp_store.review_digest(preflight + [write("app/ai/commands.py")])
+    check("приёмщик видит факт применения правки",
+          "ИЗМЕНЕНИЯ ПРИМЕНЕНЫ" in digest and "СОЗДАН app/ai/commands.py" in digest,
+          digest[-260:])
+    check("проверки приложения тоже считаются фактами и не теряются",
+          mcp_store.APP_FACT_TOOLS == ("syntax_check", "connect_check"),
+          str(mcp_store.APP_FACT_TOOLS))
+    checks = [{"server": "app", "server_name": "Проверка приложения", "tool": "syntax_check",
+               "ok": False, "arguments": {"path": "app/x.py"}, "text": "",
+               "error": "файл app/x.py не компилируется", "source": "", "action": "",
+               "attachments": []}]
+    kept_checks = mcp_store.normalize_results(preflight + [write("app/x.py")] + checks)
+    check("запись проверки приложения сохраняется при переполнении",
+          any(item["tool"] == "syntax_check" for item in kept_checks),
+          str([i["tool"] for i in kept_checks]))
+
+
 def section_connect_check():
     """ОБЪЯВЛЕНИЕ БЕЗ ВЫЗОВА — НЕ ПОДКЛЮЧЕНИЕ.
 
@@ -1828,6 +1881,7 @@ def main():
     section_author_second_pass()
     section_step_files_only()
     section_connect_check()
+    section_facts_survive()
 
     print("")
     if FAILURES:

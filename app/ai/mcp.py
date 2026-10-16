@@ -785,9 +785,12 @@ FILE_DRAFT_PROMPT = (
     "6) Пустой список допустим ТОЛЬКО тогда, когда шаг действительно ничего не "
     "меняет в файлах.\n"
     "Ответ — ТОЛЬКО JSON, без пояснений и без markdown вокруг:\n"
+    # В примере — ИМЕНА ИЗ САМОГО ПРОЕКТА (импорт, который в файле уже есть):
+    # выдуманный путь в образце подталкивал модель вставлять импорт модуля,
+    # которого нет (живой прогон 16.10).
     '{"calls": [{"server": "files", "tool": "insert_in_file", "arguments": '
     '{"path": "app/routers/chat.py", "anchor": "@router.post(\"/chat\")", '
-    '"text": "from app.ai.commands import render_help", "where": "before"}}]}'
+    '"text": "from app.ai import dev_help", "where": "before"}}]}'
 )
 
 
@@ -805,6 +808,10 @@ def files_repo_root() -> str:
     return os.path.realpath(root)
 
 
+# Записи, которые ставит САМО ПРИЛОЖЕНИЕ о состоянии файлов на диске (проверка
+# синтаксиса и проверка подключения): они считаются ФАКТАМИ работы наравне с
+# записями файлов и в модель/приёмщика попадают всегда (см. normalize_results).
+APP_FACT_TOOLS = ("syntax_check", "connect_check")
 # Признаки шага, который ПОДКЛЮЧАЕТ новое к существующему коду. Для таких шагов
 # приложение проверяет не только синтаксис, но и САМО ПОДКЛЮЧЕНИЕ (см. private_defs
 # и unreferenced_names): живой прогон 16.10 (одиннадцатый заход, задача про
@@ -3948,7 +3955,59 @@ def normalize_results(raw: Any) -> List[Dict[str, Any]]:
             # ссылкой на скачивание (app/ai/attachments.py).
             "attachments": attach_store.normalize(item.get("attachments")),
         })
-    return out[:MAX_TOTAL_CALLS_PER_REQUEST]
+    # ------------------------------------------------------------------
+    # ЧТО ПОПАДАЕТ В МОДЕЛЬ И В ПРИЁМЩИКА (живой случай 16.10, задача про /commands)
+    # ------------------------------------------------------------------
+    # Здесь было `out[:MAX_TOTAL_CALLS_PER_REQUEST]` — то есть ПЕРВЫЕ восемь
+    # результатов. Предварительный проход MCP (до подтверждения плана) нередко
+    # занимает их целиком, и результаты ПРАВОК ФАЙЛОВ, дописанные позже, в модель и
+    # приёмщику НЕ ПОПАДАЛИ. Последствия были тяжёлые и запутанные: агент на шаге 2
+    # видел в данных старый отказ «файла нет» (чтение шло ДО создания файла) и писал
+    # «модуль не создан», а приёмщик отклонял УЖЕ ВЫПОЛНЕННУЮ работу словами «в
+    # данных MCP нет записи о создании», хотя файл лежал на диске.
+    #
+    # Правила отбора:
+    #   1) УСТАРЕВШИЙ ОТКАЗ ЧТЕНИЯ снимается, если тот же файл позже успешно
+    #      ЗАПИСАН: отказ был про состояние ДО правки и как факт о текущем файле
+    #      неверен (это и сбивало модель с толку);
+    #   2) ФАКТЫ РАБОТЫ (записи файлов и проверки приложения) сохраняются ВСЕГДА —
+    #      именно по ним судят, сделана работа или нет;
+    #   3) ОСТАЛЬНОЕ добирается от САМЫХ НОВЫХ к старым: предел
+    #      MAX_TOTAL_CALLS_PER_REQUEST остаётся, но теперь он не вытесняет факты.
+    written: set = set()
+    for entry in out:
+        if entry["ok"] and is_deferred_call({"server": entry["server"],
+                                            "tool": entry["tool"]}):
+            path = (entry["arguments"] or {}).get("path")
+            if path:
+                written.add(str(path).strip())
+    fresh: List[Dict[str, Any]] = []
+    for entry in out:
+        path = str((entry["arguments"] or {}).get("path") or "").strip()
+        if (not entry["ok"] and path and path in written
+                and not is_deferred_call({"server": entry["server"],
+                                          "tool": entry["tool"]})
+                and str(entry["tool"]) not in APP_FACT_TOOLS):
+            # Снимаем ТОЛЬКО устаревший отказ ЧТЕНИЯ (его перекрыла успешная
+            # запись). Проверки приложения («не компилируется», «объявление без
+            # вызова») — это НЕ устаревшее чтение, а состояние файла ПОСЛЕ правки:
+            # они и есть то, ради чего проверка существует.
+            continue
+        fresh.append(entry)
+    order = {id(entry): index for index, entry in enumerate(fresh)}
+
+    def _is_fact(entry: Dict[str, Any]) -> bool:
+        return (is_deferred_call({"server": entry["server"], "tool": entry["tool"]})
+                or str(entry["tool"]) in APP_FACT_TOOLS)
+
+    facts = [entry for entry in fresh if _is_fact(entry)]
+    if len(facts) >= MAX_TOTAL_CALLS_PER_REQUEST:
+        return facts[-MAX_TOTAL_CALLS_PER_REQUEST:]
+    others = [entry for entry in fresh if not _is_fact(entry)]
+    room = MAX_TOTAL_CALLS_PER_REQUEST - len(facts)
+    keep = facts + (others[-room:] if room > 0 else [])
+    keep.sort(key=lambda entry: order[id(entry)])
+    return keep
 
 
 def arguments_text(arguments: Any) -> str:

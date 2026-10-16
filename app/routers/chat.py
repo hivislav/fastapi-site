@@ -6648,7 +6648,7 @@ def _file_actions_note(results: List[Dict[str, Any]]) -> str:
 
 # Виды записей, которые ставит САМ приложение о состоянии файла на диске (не
 # ответы сервера): их подпись в шаге показывает всегда — см. `_file_actions_note`.
-APP_CHECK_TOOLS = ("syntax_check", "connect_check")
+APP_CHECK_TOOLS = mcp_store.APP_FACT_TOOLS
 
 
 def _result_path(item: Dict[str, Any]) -> str:
