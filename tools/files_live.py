@@ -3,7 +3,7 @@
 Запуск (НУЖЕН рабочий источник ответа — ключ в `.env` или поднятая локальная
 модель; скрипт делает настоящие вызовы модели и потому стоит денег):
 
-    ./venv/bin/python tools/files_live.py [--goal "текст цели"] [--keep]
+    ./venv/bin/python tools/files_live.py [--goal "текст цели"] [--repo ПУТЬ] [--keep]
 
 ЧТО ПРОВЕРЯЕТСЯ
 
@@ -20,6 +20,10 @@
   * что записи не выполнялись до подтверждения плана (в гибридной схеме до «ок»
     идут только чтения) — это печатается по журналу вызовов;
   * сколько это стоило (расход вызовов за задачу).
+
+`--repo ПУТЬ` берёт ГОТОВУЮ рабочую копию вместо временной (например копию самого
+проекта, созданную `git worktree add /tmp/project HEAD`): тогда агент правит
+настоящие файлы проекта, а рабочее дерево разработчика остаётся чистым.
 
 Сценарий ВОСПРОИЗВОДИМ: копия каждый раз собирается заново из этого файла, а
 `--keep` оставляет её на диске, чтобы посмотреть руками. Рабочие файлы проекта
@@ -170,19 +174,25 @@ async def main() -> int:
     global REPO
     goal = DEFAULT_GOAL
     keep = False
+    given_repo = ""
     if "--goal" in sys.argv:
         goal = sys.argv[sys.argv.index("--goal") + 1]
+    if "--repo" in sys.argv:
+        given_repo = os.path.abspath(sys.argv[sys.argv.index("--repo") + 1])
     if "--keep" in sys.argv:
         keep = True
     print("Живой сценарий: агент работает с файлами проекта (MCP-сервер files).")
     print("Цель: " + goal)
     print("Временный каталог: " + _TMP)
 
-    REPO = os.path.join(_TMP, "repo")
+    REPO = given_repo or os.path.join(_TMP, "repo")
     os.makedirs(REPO, exist_ok=True)
     os.environ["FILES_REPO_DIR"] = REPO
-    make_repo()
-    print("Рабочая копия: " + REPO + " (файлов: 4, включая docs/guide.md)\n")
+    if given_repo:
+        print("Рабочая копия (готовая, НЕ временная): " + REPO + "\n")
+    else:
+        make_repo()
+        print("Рабочая копия: " + REPO + " (файлов: 4, включая docs/guide.md)\n")
 
     source = config.llm_source()
     spec = config.provider_spec(config.active_provider())
@@ -268,13 +278,14 @@ async def main() -> int:
     print("    git diff --stat:")
     for line in stat.splitlines() or ["(пусто)"]:
         print("      " + line)
-    print("    docs/guide.md — упоминает новое имя: "
-          + ("ДА" if "compute_total" in guide else "НЕТ")
-          + "; упоминает старое `summary_total`: "
-          + ("да" if "summary_total" in guide else "НЕТ"))
-    print("    docs/CHANGELOG.md: "
-          + ("создан, " + str(len(changelog or "")) + " символов" if changelog
-             else "НЕ создан"))
+    if not given_repo:
+        print("    docs/guide.md — упоминает новое имя: "
+              + ("ДА" if "compute_total" in guide else "НЕТ")
+              + "; упоминает старое `summary_total`: "
+              + ("да" if "summary_total" in guide else "НЕТ"))
+        print("    docs/CHANGELOG.md: "
+              + ("создан, " + str(len(changelog or "")) + " символов" if changelog
+                 else "НЕ создан"))
 
     rows = session["dialog"].get("usage") or []
     rows = rows if isinstance(rows, list) else [rows]
@@ -284,8 +295,16 @@ async def main() -> int:
           f"{len(rows)} (вызовов модели ≈ {calls_count})")
 
     print("\nИТОГ:")
-    files_changed = [name for name in ("docs/guide.md", "docs/CHANGELOG.md")
-                     if name in status]
+    # Изменённые и новые файлы — ИЗ GIT STATUS, а не по списку из сценария: при
+    # прогоне на готовой копии (`--repo`) агент работает с настоящими файлами
+    # проекта, и заранее известного перечня у проверки нет.
+    files_changed = []
+    for line in status.splitlines():
+        name = line[2:].strip().strip(chr(34))
+        if " -> " in name:
+            name = name.split(" -> ")[-1]
+        if name and name not in files_changed:
+            files_changed.append(name)
     tools_used = sorted({str(call.get("tool")) for call in calls})
     print("    инструменты: " + (", ".join(tools_used) or "—"))
     print("    файлы изменены на диске: " + (", ".join(files_changed) or "—"))

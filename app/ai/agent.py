@@ -1244,6 +1244,28 @@ class Agent:
             remaining=remaining,
             chain_state=chain_state)
 
+    async def file_actions(
+        self,
+        step: str,
+        answer: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        results: Optional[List[Dict[str, Any]]] = None,
+        extra: str = "",
+    ) -> Dict[str, Any]:
+        """ПРАВКИ ФАЙЛОВ ПО ШАГУ: ответ шага → вызовы записи (см. decide_file_actions).
+
+        Служебный вид "files": у него свой (больший) предел ответа, потому что
+        модель здесь ПИШЕТ СОДЕРЖИМОЕ файла, а не выбирает инструмент. Расход
+        копится в self.last_usage как дельта одного вызова и складывается с
+        расходом шага веб-слоем (см. merge_usage).
+        """
+        self.last_usage = self._new_usage()
+        return await mcp_store.decide_file_actions(
+            str(step or ""), str(answer or ""), list(tools or []),
+            self._tracked_call(self.SERVICE_FILES),
+            results=list(results or []) if results else None,
+            extra=str(extra or ""))
+
     async def check_invariants(
         self,
         user_message: str,
@@ -2336,6 +2358,10 @@ class Agent:
     SERVICE_MCP = "mcp"              # выбор внешних инструментов MCP (app/ai/mcp.py)
     SERVICE_REWRITE = "rewrite"      # переформулировка запроса для поиска (RAG)
     SERVICE_MEMORY = "memory"        # обновление памяти задачи (выжимка диалога)
+    SERVICE_FILES = "files"          # ПРАВКИ ФАЙЛОВ по шагу (app/ai/mcp.py,
+                                     # decide_file_actions): ответ шага → вызовы
+                                     # записи. Отдельный вид, а не "mcp": у него
+                                     # свой предел ответа (пишется содержимое файла)
 
     @staticmethod
     def _new_usage() -> Dict[str, Any]:

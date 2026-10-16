@@ -77,6 +77,9 @@ const LIST_LIMIT_DEFAULT = 60;
 const LIST_LIMIT_MAX = 400;
 const MATCH_LIMIT_DEFAULT = 30;
 const MATCH_LIMIT_MAX = 80;
+// Контекст совпадений: больше двадцати строк на совпадение в бюджет не влезает,
+// но СХЕМА это значение не отвергает — лишнее зажимается здесь (см. ниже).
+const CONTEXT_LINES_MAX = 20;
 const READ_LINES_DEFAULT = 120;
 const READ_LINES_MAX = 400;
 const READ_FILES_MAX = 8;              // сколько файлов за одно чтение
@@ -531,8 +534,9 @@ server.registerTool(
     inputSchema: {
       dir: z.string().optional().describe("Каталог внутри проекта, например app/ai"),
       glob: z.string().optional().describe("Шаблон пути: *.md, **/*.py, tests/test_*"),
-      limit: z.number().int().min(1).max(LIST_LIMIT_MAX).default(LIST_LIMIT_DEFAULT)
-        .describe("Сколько файлов показать (по умолчанию " + LIST_LIMIT_DEFAULT + ")"),
+      limit: z.number().int().min(1).max(5000).default(LIST_LIMIT_DEFAULT)
+        .describe("Сколько файлов показать (по умолчанию " + LIST_LIMIT_DEFAULT
+                  + ", больше " + LIST_LIMIT_MAX + " не показываю)"),
     },
   },
   async ({ dir, glob, limit }) => guard(async () => {
@@ -686,10 +690,12 @@ server.registerTool(
       glob: z.string().optional().describe("Шаблон файлов: *.py, **/*.md"),
       regex: z.boolean().default(false).describe("true — query это регулярное выражение"),
       ignore_case: z.boolean().default(true).describe("Не различать регистр (по умолчанию да)"),
-      context_lines: z.number().int().min(0).max(5).default(0)
-        .describe("Сколько строк контекста показать после совпадения"),
-      limit: z.number().int().min(1).max(MATCH_LIMIT_MAX).default(MATCH_LIMIT_DEFAULT)
-        .describe("Сколько совпадений показать (по умолчанию " + MATCH_LIMIT_DEFAULT + ")"),
+      context_lines: z.number().int().min(0).max(50).default(0)
+        .describe("Сколько строк контекста показать после совпадения (до "
+                  + CONTEXT_LINES_MAX + ")"),
+      limit: z.number().int().min(1).max(500).default(MATCH_LIMIT_DEFAULT)
+        .describe("Сколько совпадений показать (по умолчанию " + MATCH_LIMIT_DEFAULT
+                  + ", больше " + MATCH_LIMIT_MAX + " не показываю)"),
     },
   },
   async ({ query, dir, glob, regex, ignore_case, context_lines, limit }) => guard(async () => {
@@ -706,7 +712,7 @@ server.registerTool(
     }
     const dirRel = safePath(dir);
     const cap = Math.max(1, Math.min(MATCH_LIMIT_MAX, Number(limit) || MATCH_LIMIT_DEFAULT));
-    const context = Math.max(0, Math.min(5, Number(context_lines) || 0));
+    const context = Math.max(0, Math.min(CONTEXT_LINES_MAX, Number(context_lines) || 0));
     const files = searchableFiles(dirRel, glob);
     const found = [];
     let scanned = 0;
@@ -832,14 +838,14 @@ server.registerTool(
     inputSchema: {
       paths: z.array(z.string()).max(DIFF_FILES_MAX).optional()
         .describe("Только эти файлы (до " + DIFF_FILES_MAX + "); пусто — все изменения"),
-      context_lines: z.number().int().min(0).max(10).default(3)
+      context_lines: z.number().int().min(0).max(50).default(3)
         .describe("Сколько строк контекста вокруг правки (по умолчанию 3)"),
     },
   },
   async ({ paths, context_lines }) => guard(async () => {
     const list = (Array.isArray(paths) ? paths : []).slice(0, DIFF_FILES_MAX)
       .map((item) => safePath(item)).filter(Boolean);
-    const context = Math.max(0, Math.min(10, Number(context_lines) || 3));
+    const context = Math.max(0, Math.min(CONTEXT_LINES_MAX, Number(context_lines) || 3));
     const inside = await runGit(["rev-parse", "--is-inside-work-tree"]);
     if (!inside.ok || inside.out.trim() !== "true") {
       return text("Каталог " + ROOT + " не является git-репозиторием, поэтому diff "

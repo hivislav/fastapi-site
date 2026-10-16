@@ -64,7 +64,14 @@ os.environ["RAG_EMBED_BACKEND"] = "hashing"
 os.environ["RAG_RERANK_BACKEND"] = "features"
 os.environ["PERIODIC_ENABLED"] = "0"
 
+import asyncio  # noqa: E402
+
+from app.ai import client as llm_client  # noqa: E402
 from app.ai import mcp as mcp_store  # noqa: E402
+from app.ai import workspace as workspace_store  # noqa: E402
+from app.ai.agent import Agent, AgentConfig  # noqa: E402
+from app.routers import chat  # noqa: E402
+from app.schemas import McpApply, TaskCreate  # noqa: E402
 
 FAILURES = []
 
@@ -526,6 +533,117 @@ def section_scenario():
 
 
 # ---------------------------------------------------------------------------
+# [8] ПРАВКИ ФАЙЛОВ ПО ШАГУ: ответ шага превращается в изменения на диске
+# ---------------------------------------------------------------------------
+def section_step_actions():
+    """Тот самый проход, без которого файлы не появлялись (живой случай 16.10)."""
+    print("\n[8] Правки файлов по шагу (служебный вызов «files» + исполнение)")
+    tools = [
+        {"server": "files", "server_name": "Файлы проекта", "tool": "read_file",
+         "description": "Прочитать файл", "schema": {"type": "object"}},
+        {"server": "files", "server_name": "Файлы проекта", "tool": "write_file",
+         "description": "Создать или переписать файл", "schema": {"type": "object"}},
+        {"server": "files", "server_name": "Файлы проекта", "tool": "edit_file",
+         "description": "Заменить фрагмент", "schema": {"type": "object"}},
+    ]
+    check("инструменты записи отделяются от чтений",
+          [item["tool"] for item in mcp_store.file_write_tools(tools)]
+          == ["write_file", "edit_file"])
+    check("чтения по шагу тоже допустимы (точный текст для правки)",
+          len(mcp_store.file_any_calls([{"server": "files", "tool": "read_file",
+                                         "arguments": {"path": "x"}}], tools)) == 1)
+    # ИМЯ СВЕРЯЕТСЯ МЯГКО: набор у исполнителя из одного сервера, и «без сервера»
+    # или «files.write_file» — тот же вызов. Строгая сверка отбрасывала их молча.
+    soft = [
+        [{"tool": "write_file", "arguments": {"path": "a", "content": "b"}}],
+        [{"server": "Файлы проекта", "tool": "files.write_file",
+          "arguments": {"path": "a", "content": "b"}}],
+    ]
+    check("вызов без имени сервера принимается",
+          [c["tool"] for c in mcp_store.file_any_calls(soft[0], tools)] == ["write_file"])
+    check("имя вида «сервер.инструмент» принимается",
+          [c["server"] for c in mcp_store.file_any_calls(soft[1], tools)] == ["files"])
+    unknown = [{"server": "files", "tool": "create_file", "arguments": {}}]
+    check("выдуманный инструмент не выполняется, но НАЗВАН",
+          not mcp_store.file_any_calls(unknown, tools)
+          and mcp_store.dropped_file_tools(unknown, tools) == ["create_file"])
+    check("шаг с правкой файлов распознаётся по тексту",
+          mcp_store.file_step_likely("Создать модуль app/ai/worktree.py")
+          and mcp_store.file_step_likely("Подключить перехват команды")
+          and not mcp_store.file_step_likely("Изучить dev_help.py"))
+    check("обрезанный ответ шага распознаётся (незакрытый блок кода)",
+          mcp_store.answer_truncated("Вот код:\n```python\nprint(1)\n")
+          and not mcp_store.answer_truncated("Вот код:\n```python\nprint(1)\n```\n"))
+    check("дайджест исполнителя показывает СОДЕРЖИМОЕ, а не пересказ",
+          "строка файла" in mcp_store.file_digest(
+              [{"server": "files", "tool": "read_file", "ok": True,
+                "text": "Файл: app/x.py\n1| строка файла", "arguments": {}}]))
+
+    async def run():
+        # ЗАГЛУШКА МОДЕЛИ: она отвечает вызовом записи — ровно так, как это делал
+        # бы исполнитель шага (проверка идёт без сети и без ключа).
+        calls_seen = {"system": ""}
+
+        async def fake_call_llm_async(**kwargs):
+            messages = kwargs.get("messages") or []
+            calls_seen["system"] = str(messages[0].get("content") or "")[:40]
+            payload = {"calls": [{"server": "files", "tool": "write_file",
+                                  "arguments": {"path": "app/new_module.py",
+                                                "content": "def added():\n    return 1\n"}}]}
+            return (json.dumps(payload),
+                    {"prompt_tokens": 12, "completion_tokens": 12, "total_tokens": 24})
+
+        original = llm_client.call_llm_async
+        llm_client.call_llm_async = fake_call_llm_async
+        try:
+            await chat.task_create(TaskCreate(name="Правки по шагу"))
+            await chat.mcp_apply(McpApply(enabled=["files"]))
+            task = chat._current_task()
+            await chat.session_create()
+            task = chat._current_task()
+            session = workspace_store.active_session(chat._workspace, task)
+            # Подпись запроса в диалоге выставляет предварительный проход MCP:
+            # запись данных БЕЗ подписи не хранится (её нельзя привязать к запросу),
+            # поэтому здесь она нужна так же, как в живой задаче.
+            workspace_store.set_dialog_mcp(session["dialog"], "files\u0000задача",
+                                           "задача", [])
+            agent = Agent(AgentConfig(max_tokens=None, stop=None, temperature=None,
+                                      model=None))
+            actions, lines, usage = await chat._file_actions_step(
+                task, session, "Создать модуль app/new_module.py",
+                "Вот модуль:\n```python\ndef added():\n    return 1\n```\n", agent)
+            check("промпт исполнителя ушёл в модель",
+                  "ИСПОЛНИТЕЛЬ ШАГА" in calls_seen["system"], calls_seen["system"])
+            check("вызов записи выполнен", [a["tool"] for a in actions] == ["write_file"],
+                  str([a["tool"] for a in actions]))
+            check("ФАЙЛ ПОЯВИЛСЯ НА ДИСКЕ",
+                  os.path.isfile(os.path.join(REPO, "app/new_module.py")),
+                  str(os.listdir(os.path.join(REPO, "app"))))
+            check("в журнал ушла строка о создании файла",
+                  any("СОЗДАН" in line for line in lines), str(lines)[:200])
+            check("расход записан служебным видом «files»",
+                  "files" in (usage.get("service") or {}), str(usage.get("service")))
+            stored = workspace_store.dialog_mcp(session["dialog"])
+            check("результат правки записан в данные запроса (его видит приёмщик)",
+                  any("СОЗДАН" in str(item.get("text") or "")
+                      for item in (stored.get("results") or [])),
+                  str(stored.get("results"))[:200])
+            # ПРАВКА СУЩЕСТВУЮЩЕГО ФАЙЛА: точечная замена, а не перезапись.
+            before_edit = read_local("app/new_module.py") or ""
+            edit_actions, edit_lines, _ = await chat._file_actions_step(
+                task, session, "Изменить функцию в app/new_module.py",
+                "Меняю возвращаемое значение.", agent)
+            check("повторный проход отработал без сбоя",
+                  isinstance(edit_actions, list) and isinstance(edit_lines, list))
+            check("файл не потерян повторным проходом",
+                  (read_local("app/new_module.py") or "") == before_edit)
+        finally:
+            llm_client.call_llm_async = original
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
 def main():
     print("Проверка MCP-сервера «Файлы проекта» (рабочие операции с файлами).")
     print("Временный каталог проверки: " + _TMP)
@@ -544,6 +662,7 @@ def main():
     section_budget()
     section_gate()
     section_scenario()
+    section_step_actions()
 
     print("")
     if FAILURES:
