@@ -187,10 +187,13 @@ CHAIN_MARKERS = SAVE_MARKERS + EXPORT_MARKERS + SEQUENCE_MARKERS
 # ВИД РЕЗУЛЬТАТА по имени инструмента. Тот же приём, что у RESULT_RE: схемы MCP
 # описывают только вход, и «что этот инструмент создаёт» из них не видно, поэтому
 # вид берётся из имени. Список префиксов совпадает с RESULT_RE, только разбит на
-# две группы: SAVE создаёт запись/набор (его ключ можно ЗАДАТЬ), EXPORT отдаёт
-# готовый файл/отчёт (его ключ обязан прийти из результата).
+# две группы: SAVE создаёт запись/набор/ФАЙЛ (его ключ можно ЗАДАТЬ), EXPORT
+# отдаёт готовый файл-выгрузку в чат (его ключ обязан прийти из результата).
+# `edit_`/`patch_`/`append_` — тоже запись (правка файла и дописывание в конец):
+# по смыслу это СОХРАНЕНИЕ, а не выгрузка, поэтому они в группе SAVE.
 SAVE_NAME_RE = re.compile(
-    r"^(save|create|add|register|write|store|put|upsert|import|upload|publish)_")
+    r"^(save|create|add|register|write|store|put|upsert|import|upload|publish|"
+    r"edit|patch|append|move|copy|mkdir|touch)_")
 EXPORT_NAME_RE = re.compile(
     r"^(export|download|send|submit|generate|build|render|report|attach)_")
 # Файл в имени — тоже выгрузка, даже если префикс не из списка выше.
@@ -216,7 +219,8 @@ DESTRUCTIVE_MARKERS = (
 # результата. Различаем по имени, как пары start_/stop_ выше: схемы MCP описывают
 # только вход, и «кто создаёт идентификатор» из них не видно.
 PRODUCER_RE = re.compile(
-    r"^(save|create|add|register|write|store|put|upsert|set|new|import|upload|publish|start)_")
+    r"^(save|create|add|register|write|store|put|upsert|set|new|import|upload|publish|"
+    r"start|edit|patch|append|move|copy|mkdir|touch)_")
 # Значение, названное моделью для создающего инструмента: обычный короткий токен
 # (без путей, пробелов и переводов строк) — иначе это не идентификатор.
 TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -248,10 +252,14 @@ OVERWRITE_FLAGS = ("replace", "overwrite", "overwrite_existing", "force",
 # Отложить запуск значило бы оставить запрос о сводке без данных.
 # Отбор — по префиксу имени инструмента (схема MCP описывает только вход, и
 # «этот вызов что-то создаёт» из неё не видно); чтения (`get_*`, `list_*`,
-# `search_*`, `geocode_*`…) под правило не попадают.
+# `search_*`, `geocode_*`, `read_*`, `outline_*`, `diff_*`) под правило не
+# попадают. ПРАВКИ ФАЙЛОВ (`write_file`, `edit_file`, `append_file`) попадают:
+# до «ок» пользователя на диске не меняется ничего, а сама правка доигрывается на
+# шаге выполнения (см. `chain["deferred"]`).
 RESULT_RE = re.compile(
     r"^(save|create|add|register|write|store|put|upsert|export|download|publish|"
-    r"upload|send|submit|generate|build|render|report|attach)_")
+    r"upload|send|submit|generate|build|render|report|attach|"
+    r"edit|patch|append|move|copy|mkdir|touch)_")
 
 
 def is_deferred_call(call: Any, tools: Optional[List[Dict[str, Any]]] = None) -> bool:
@@ -310,6 +318,7 @@ HTTP_TRANSPORT = "http"
 WEATHER = "weather"
 CURRENCY = "currency"
 CRYPTO = "crypto"
+FILES = "files"
 GIT = "git"
 OPEN_METEO = "open_meteo"
 CITY_REGISTRY = "city_registry"
@@ -358,6 +367,21 @@ SERVERS: List[Dict[str, Any]] = [
         ),
         "source": "CoinGecko",
         "script": "crypto.mjs",
+    },
+    {
+        "id": FILES,
+        "name": "Файлы проекта",
+        "description": (
+            "Рабочие операции с файлами рабочей копии проекта: список файлов, "
+            "чтение (с номерами строк), чтение нескольких файлов сразу, поиск по "
+            "файлам, структура файла и diff изменений — и ЗАПИСЬ: создать или "
+            "переписать файл, заменить фрагмент, дописать в конец. Локальные файлы "
+            "проекта, без сети; каталоги data/, venv/, node_modules/, .git/ и файлы "
+            "с секретами закрыты. Запись выполняется ПОСЛЕ подтверждения плана."
+        ),
+        "source": ("локальная рабочая копия проекта (каталог переопределяет "
+                   "переменная FILES_REPO_DIR)"),
+        "script": "files.mjs",
     },
     {
         "id": GIT,
@@ -522,6 +546,20 @@ TOOLS_PROMPT = (
     "справочные сведения) ИЛИ СВЕДЕНИЯ О КОНКРЕТНОМ ЧЕЛОВЕКЕ, ОБЪЕКТЕ ИЛИ МЕСТЕ — "
     "хотя бы ОДИН вызов обязателен. Пустой список — только для разговора, "
     "которому данные не нужны (приветствие, благодарность, общее объяснение).\n"
+    "ТО ЖЕ О ПРОЕКТЕ И ЕГО ФАЙЛАХ. Если запрос касается ФАЙЛОВ САМОГО ПРОЕКТА "
+    "(код, документация, README, CHANGELOG: «где используется…», «что делает "
+    "модуль…», «обнови документацию», «сверь с правилами», «создай файл», "
+    "«подготовь список изменений») — ответ по памяти не годится, нужен хотя бы "
+    "ОДИН вызов. Порядок такой: сначала ЧТЕНИЯ (list_files, read_file, read_files, "
+    "search_files, outline_file, diff_files), а если файлы надо ИЗМЕНИТЬ — ЗАПИСЬ "
+    "(write_file — новый файл или полная замена, edit_file — замена фрагмента, "
+    "append_file — дописать в конец). Содержимое правки собирай ИЗ ПРОЧИТАННОГО: "
+    "если файла ты ещё не видел, верни в этом раунде ЧТЕНИЕ и поставь "
+    "mode=\"chain\" — правку предложишь следующим раундом, по результатам. Для "
+    "правки существующего файла предпочитай edit_file: он меняет только нужный "
+    "фрагмент, и файл не надо переписывать целиком. Вызовы записи выполняются "
+    "ПОСЛЕ подтверждения плана пользователем — это нормально, выбирай их, когда "
+    "правка действительно нужна.\n"
     "Параметры сбора (интервал, срок хранения) задаёт СЕРВЕР инструмента: не "
     "передавай интервал из текста запроса, если такого аргумента нет в схеме.\n"
     "Ответ — ТОЛЬКО JSON без пояснений:\n"

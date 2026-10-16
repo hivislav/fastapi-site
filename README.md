@@ -291,13 +291,15 @@ uvicorn main:app
 | `weather.mjs` | погода: `7timer.info` + геокодер Open-Meteo |
 | `currency.mjs` | курсы валют: `cbr.ru`, XML в `windows-1251` |
 | `crypto.mjs` | криптовалюты: CoinGecko |
+| `files.mjs` | файлы рабочей копии ЭТОГО проекта: список, чтение, поиск по файлам, структура, diff — и ЗАПИСЬ (создать, заменить фрагмент, дописать; после подтверждения плана) |
 | `git.mjs` | рабочая копия ЭТОГО проекта: ветка, файлы, diff, история, содержимое файла (только чтение, без сети) |
 | `lib/` | общий код серверов |
 | `package.json` | `@modelcontextprotocol/sdk` 1.30.0, `zod` |
 
-Три первых — только `GET`, без ключей, с сетью на время вызова; `git` вообще не ходит в сеть: он
-читает рабочую копию проекта и ничего в ней не меняет (подробности — `mcp_servers/README.md`).
-Пятый и шестой серверы проекта (`open_meteo`, `city_registry`) живут на VPS и подключаются по HTTP
+Три первых — только `GET`, без ключей, с сетью на время вызова; `files` и `git` вообще не ходят в
+сеть: они работают с рабочей копией проекта — `git` только читает её, а `files` ещё и меняет
+(подробности — `mcp_servers/README.md`).
+Свои серверы проекта (`open_meteo`, `city_registry`) живут на VPS и подключаются по HTTP
 своим адресом и своим токеном.
 
 ---
@@ -1020,16 +1022,19 @@ yield encode({"type": "bot", "text": _mcp_files_text(files), "files": files})
 
 ### 15.13 Что объявляют встроенные MCP-серверы
 
-Четыре — на официальном SDK `@modelcontextprotocol/sdk` 1.30.0 + `zod`, ESM, транспорт только stdio; общие помощники в `mcp_servers/lib/common.mjs`: `createServer`, `serve`, `text`, `failure` (ответ с `isError=true`, сервер остаётся живым), `guard` (любое исключение → понятный ответ), `fetchText`/`fetchJson` (таймаут `DEFAULT_TIMEOUT_MS` 15 000), `round`, `parseNumber`, `xmlAll`/`xmlValue`, `decodeWindows1251`/`fetchWindows1251`, `lines`. **Диагностика — ТОЛЬКО в stderr**, stdout занят протоколом.
+Пять — на официальном SDK `@modelcontextprotocol/sdk` 1.30.0 + `zod`, ESM, транспорт только stdio; общие помощники в `mcp_servers/lib/common.mjs`: `createServer`, `serve`, `text`, `failure` (ответ с `isError=true`, сервер остаётся живым), `guard` (любое исключение → понятный ответ), `fetchText`/`fetchJson` (таймаут `DEFAULT_TIMEOUT_MS` 15 000), `round`, `parseNumber`, `xmlAll`/`xmlValue`, `decodeWindows1251`/`fetchWindows1251`, `lines`. **Диагностика — ТОЛЬКО в stderr**, stdout занят протоколом.
 
 | Сервер | Источник | Инструменты |
 |---|---|---|
 | `weather.mjs` | `7timer.info` (модель NOAA GFS) + геокодер Open-Meteo | `get_weather` (`city`) — погода сейчас: температура, влажность, ветер с направлением, облачность в баллах, осадки, макс/мин на сегодня, координаты; `get_forecast` (`city`, `days` 1…7, по умолчанию 3) — по дням: дата, погода, днём/ночью, ветер |
 | `currency.mjs` | `cbr.ru` (`XML_daily.asp`, windows-1251, кэш в `Map`) | `get_rate` (`currency`, `date` опционально) — номинал и курс ₽ за единицу; `convert` (`amount`, `from`, `to`, `date`) — перевод по официальному курсу, RUB входит в таблицу; `list_rates` (`limit` 1…60, по умолчанию 15) |
 | `crypto.mjs` | CoinGecko (`api.coingecko.com/api/v3`, `ALIASES` кодов монет) | `get_price` (`coins: string[]`, `currencies: string[]` = `["usd"]`) — цены, изменение за 24 ч, время обновления; `get_market` (`coin`, `currency` = usd) — цена, капитализация, объём 24 ч, макс/мин 24 ч, изменение 24 ч и 7 дней, исторический максимум, монет в обороте |
+| `files.mjs` | файлы рабочей копии ЭТОГО проекта (`FILES_REPO_DIR`) — **сети нет вовсе** | `list_files` (`dir`, `glob`, `limit`) — список файлов; `read_file` (`path`, `from_line`, `to_line`) — содержимое с номерами строк; `read_files` (`paths`, `from_line`, `to_line`) — 2–8 файлов за вызов; `search_files` (`query`, `dir`, `glob`, `regex`, `ignore_case`, `context_lines`, `limit`) — поиск по файлам («где используется…»); `outline_file` (`path`) — структура без содержимого; `diff_files` (`paths`, `context_lines`) — изменения против коммита; **`write_file`** (`path`, `content`) — создать или переписать; **`edit_file`** (`path`, `find`, `replace`, `all`) — замена фрагмента; **`append_file`** (`path`, `content`) — дописать в конец. Жирные — ЗАПИСЬ: приложение откладывает их до подтверждения плана (`RESULT_RE`), пути проверяются и на чтение, и на запись, запись атомарная, резкое сокращение файла оставляет `.bak` |
 | `git.mjs` | рабочая копия ЭТОГО проекта (`git`, `GIT_REPO_DIR`) — **сети нет вовсе** | `git_status` — ветка, последний коммит, upstream (впереди/отстала), изменённые файлы; `git_files` (`path`, `changed_only`, `limit`) — файлы проекта; `git_diff` (`scope` `working`/`staged`/`head`/`branch`, `path`, `stat_only`, `base`, `limit`) — изменения; `git_log` (`limit`, `path`) — коммиты; `git_show_file` (`path`, `from`, `lines`, `ref`) — содержимое файла с номерами строк |
 
-`mcp_servers/README.md`: серверы бесплатные, без ключей и регистрации; нужен Node.js 18+ и однократный `npm install` в `mcp_servers/` (`node_modules` в git не хранится); ручная проверка — printf JSON-RPC (`initialize` → `notifications/initialized` → `tools/list` → `tools/call`) в `node weather.mjs`; автоматическая проверка клиента без сети и Node — `tools/check_mcp.py`, инструментов `git` — `tools/check_dev_help.py`. Пятый и шестой серверы (`open_meteo`, `city_registry`) в каталоге НЕ лежат — они на VPS, подключаются по Streamable HTTP через SSH-туннель.
+`mcp_servers/README.md`: серверы бесплатные, без ключей и регистрации; нужен Node.js 18+ и однократный `npm install` в `mcp_servers/` (`node_modules` в git не хранится); ручная проверка — printf JSON-RPC (`initialize` → `notifications/initialized` → `tools/list` → `tools/call`) в `node weather.mjs`; автоматическая проверка клиента без сети и Node — `tools/check_mcp.py`, инструментов `git` — `tools/check_dev_help.py`, инструментов `files` (чтения, поиск, охрана
+путей, запись, `.bak`, бюджет, сценарий на трёх файлах) — `tools/check_files_mcp.py`;
+живой прогон агента по цели с правкой файлов — `tools/files_live.py`. Свои серверы (`open_meteo`, `city_registry`) в каталоге НЕ лежат — они на VPS, подключаются по Streamable HTTP через SSH-туннель.
 
 **Пустой diff — с разными причинами, и их называет СЕРВЕР** (`pathFacts`/`emptyDiffNote`): у НЕотслеживаемого файла («нового», `??`) diff пуст потому, что сравнивать не с чем — у него нет ни одной версии в истории; у игнорируемого — потому что git его не ведёт; у файла с правками только в индексе — с подсказкой «повтори со `scope=staged`»; у отслеживаемого и чистого — честное «изменений нет». Пустой `git_diff` без пути дополнительно называет НОВЫЕ файлы: их diff не показывается вовсе. Живой случай 12.10: на вопрос «какие изменения в README.md» агент ответил «изменений нет», хотя файл был написан целиком только что и в git его не было.
 
