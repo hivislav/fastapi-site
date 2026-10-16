@@ -894,6 +894,34 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 // Инструменты: ЗАПИСЬ (откладываются приложением до подтверждения плана)
 // ---------------------------------------------------------------------------
+/** Строка без отступов и повторных пробелов — для снисходительного сравнения. */
+function normalizeLine(line) {
+  return String(line || "").trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Где в тексте лежит фрагмент, если сравнивать строки БЕЗ отступов.
+ * Возвращает {at, count} — единственное совпадение, либо null (нет или несколько).
+ * Неоднозначность не угадываем: править не тот участок хуже, чем честно отказать.
+ */
+function fuzzyWindow(text, needle) {
+  const lines = splitLines(text);
+  const wanted = splitLines(needle).map(normalizeLine);
+  if (!wanted.length || wanted.some((line) => !line)) return null;
+  const hits = [];
+  for (let i = 0; i + wanted.length <= lines.length; i += 1) {
+    let ok = true;
+    for (let k = 0; k < wanted.length; k += 1) {
+      if (normalizeLine(lines[i + k]) !== wanted[k]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) hits.push(i);
+  }
+  return hits.length === 1 ? { at: hits[0], count: wanted.length } : null;
+}
+
 /** Общая часть ответов о записи: факт, размеры, diff, предупреждения. */
 function writeReply({ rel, action, before, after, extra = "" }) {
   const beforeRows = before === null ? 0 : splitLines(before).length;
@@ -1008,8 +1036,29 @@ server.registerTool(
     const parts = before.split(needle);
     const count = parts.length - 1;
     if (!count) {
-      throw new Error("фрагмент не найден в " + rel + " — прочитайте файл (read_file) "
-        + "и возьмите точный текст, включая отступы");
+      // ТОЧНЫЙ ФРАГМЕНТ НЕ НАЙДЕН — ПРОБУЕМ ПО СМЫСЛУ СТРОК. Модель часто
+      // воспроизводит текст с другим отступом или лишними пробелами, и правка
+      // отклонялась, хотя нужное место она назвала верно (живой случай 16.10:
+      // шаг «подключить команду» оставался невыполненным). Сравниваем строки БЕЗ
+      // отступов и повторных пробелов, и правим ТОЛЬКО если такое место ОДНО.
+      const fuzzy = fuzzyWindow(before, needle);
+      if (fuzzy === null) {
+        throw new Error("фрагмент не найден в " + rel + " — прочитайте файл (read_file) "
+          + "и возьмите точный текст, включая отступы; для ВСТАВКИ рядом с "
+          + "одной строкой есть insert_in_file (короткий якорь)");
+      }
+      const lines = splitLines(before);
+      const replacementLines = splitLines(String(replace ?? ""));
+      const afterLines = lines.slice(0, fuzzy.at)
+        .concat(replacementLines, lines.slice(fuzzy.at + fuzzy.count));
+      const after = afterLines.join("\n") + (before.endsWith("\n") ? "\n" : "");
+      writeAtomic(rel, after);
+      return writeReply({
+        rel, action: "ИЗМЕНЁН", before, after,
+        extra: "Совпадение найдено ПО НОРМАЛИЗОВАННОМУ тексту (строки "
+          + (fuzzy.at + 1) + "–" + (fuzzy.at + fuzzy.count)
+          + "): отступы или повторные пробелы отличались от указанных в find.",
+      });
     }
     if (count > 1 && !all) {
       throw new Error("фрагмент встречается " + count + " раз — уточните find "
@@ -1027,6 +1076,73 @@ server.registerTool(
       before,
       after,
       extra: count > 1 ? "Заменено вхождений: " + count : "",
+    });
+  }),
+);
+
+server.registerTool(
+  "insert_in_file",
+  {
+    title: "Вставить строки рядом с якорем",
+    description:
+      "Вставить текст в СУЩЕСТВУЮЩИЙ файл рядом с ЯКОРЕМ: `anchor` — короткий "
+      + "фрагмент одной строки (имя функции, команды, маркера), рядом с которой "
+      + "вставляем. Так ПОДКЛЮЧАЮТ новое в готовый код: не нужно переписывать файл "
+      + "и не нужен точный многострочный фрагмент (в отличие от edit_file). Якорь "
+      + "обязан встречаться РОВНО один раз — иначе назову строки, где он есть, и "
+      + "попрошу уточнить. Выполняется ПОСЛЕ подтверждения плана.",
+    inputSchema: {
+      path: z.string().describe("Путь файла внутри проекта"),
+      anchor: z.string().describe("Фрагмент строки-якоря (короткий и уникальный)"),
+      text: z.string().describe("Что вставить (несколько строк — через перевод строки)"),
+      where: z.enum(["after", "before"]).default("after")
+        .describe("after — сразу после строки-якоря, before — перед ней"),
+      indent: z.boolean().default(true)
+        .describe("Повторить отступ строки-якоря у вставляемых строк (по умолчанию да)"),
+    },
+  },
+  async ({ path: rawPath, anchor, text, where, indent }) => guard(async () => {
+    const rel = safePath(rawPath, { what: "записи" });
+    if (!rel) throw new Error("не указан путь файла (path)");
+    if (!fileExists(rel)) {
+      throw new Error("файла нет: " + rel + ". Новый файл создаёт write_file");
+    }
+    const needle = String(anchor ?? "");
+    if (!needle.trim()) throw new Error("пустой якорь (anchor)");
+    const body = String(text ?? "");
+    if (!body.trim()) throw new Error("нечего вставлять (пустой text)");
+    if (BINARY_EXT.has(path.extname(rel).toLowerCase())) {
+      throw new Error("в файл " + rel + " текстом не пишут — это двоичный формат");
+    }
+    const before = readText(rel, { maxBytes: MAX_READ_BYTES });
+    const lines = splitLines(before);
+    const hits = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      if (lines[i].includes(needle)) hits.push(i);
+    }
+    if (!hits.length) {
+      throw new Error("якорь не найден в " + rel + ": «" + needle + "» — возьмите "
+        + "фрагмент строки из файла (search_files → read_file)");
+    }
+    if (hits.length > 1) {
+      throw new Error("якорь встречается " + hits.length + " раз (строки "
+        + hits.slice(0, 6).map((n) => n + 1).join(", ")
+        + ") — уточните его: возьмите больше символов строки, чтобы место стало "
+        + "единственным");
+    }
+    const at = hits[0];
+    // ОТСТУП БЕРЁМ У ЯКОРЯ: вставляемый код должен встать на своё место в блоке,
+    // а не с нулевым отступом (это частая причина «вставил, но файл сломан»).
+    const base = indent ? (lines[at].match(/^[ \t]*/) || [""])[0] : "";
+    const addition = splitLines(body).map((line) => (line.trim() ? base + line : line));
+    const index = where === "before" ? at : at + 1;
+    const afterLines = lines.slice(0, index).concat(addition, lines.slice(index));
+    const after = afterLines.join("\n") + (before.endsWith("\n") ? "\n" : "");
+    writeAtomic(rel, after);
+    return writeReply({
+      rel, action: "ИЗМЕНЁН", before, after,
+      extra: "Вставлено " + addition.length + " " + (addition.length === 1 ? "строка" : "строк")
+        + " после строки " + (at + 1) + " (якорь найден один раз).",
     });
   }),
 );

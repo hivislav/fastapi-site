@@ -5884,12 +5884,24 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
 
     wrote = False
     seen_reads: set = set()
-    for round_number in (1, 2, 3):
+    reads_done = 0
+    nudge = ""
+    for round_number in range(1, mcp_store.FILES_MAX_ROUNDS + 1):
         # ПЕРВЫЕ раунды могут попросить чтение (точный текст для правки), а
         # ПОСЛЕДНИЙ — только запись: повторное чтение вместо правки означает, что
         # шаг не выполнен (живой случай 16.10: исполнитель дважды подряд просил
         # `read_file` одного файла и ни разу не вернул запись).
-        extra = "" if round_number < 3 else mcp_store.FILES_WRITE_ONLY_NOTE
+        last_round = round_number == mcp_store.FILES_MAX_ROUNDS
+        # РАУНД 1 — РАЗВЕДКА, ДАЛЬШЕ ТОЛЬКО ПИСАТЬ. Живой случай 16.10 (шаг
+        # «подключить команду»): исполнитель ИСКАЛ ВСЕ ЧЕТЫРЕ РАУНДА (десяток
+        # `search_files` подряд) и не сделал ни одной правки — поиск дешёвый, и
+        # бюджет чтений его не останавливал. Поэтому право на разведку дано РОВНО
+        # ОДИН раунд, а начиная со второго разрешена только запись.
+        write_only = round_number > 1 or reads_done >= mcp_store.FILES_MAX_READS
+        # Уточнение живёт ровно один раунд: пустой ответ («подумал вместо дела»)
+        # получает FILES_EMPTY_NOTE, исчерпанные чтения — FILES_WRITE_ONLY_NOTE.
+        extra = nudge
+        nudge = ""
         decision = await analyzer.file_actions(step_text, answer, tools,
                                                results=collected, extra=extra)
         usage = merge_usage(usage, dict(analyzer.last_usage or {}))
@@ -5903,12 +5915,25 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
             break
         calls = mcp_store.file_any_calls(decision.get("calls"), tools)
         dropped = mcp_store.dropped_file_tools(decision.get("calls"), tools)
-        reads = [call for call in calls if not mcp_store.is_deferred_call(call)]
+        reads = ([] if write_only
+                 else [call for call in calls
+                       if not mcp_store.is_deferred_call(call)])
         writes = [call for call in calls if mcp_store.is_deferred_call(call)]
         # ПОВТОР ТОГО ЖЕ ЧТЕНИЯ — не прогресс: исполнять его снова нечего, и такой
         # раунд закрывает путь к правке. Дальше спрашиваем только запись.
         fresh_reads = [call for call in reads
                        if _call_signature(call) not in seen_reads]
+        # Чтений за проход не больше FILES_MAX_READS: иначе исполнитель читает
+        # бесконечно и до правки дело не доходит.
+        # Ограничение на ЧТЕНИЯ ФАЙЛОВ (поиски проходят всегда, но не повторяются).
+        file_reads = [call for call in fresh_reads
+                      if str(call.get("tool")) in ("read_file", "read_files")]
+        room = max(0, mcp_store.FILES_MAX_READS - reads_done)
+        if room < len(file_reads):
+            keep = {_call_signature(call) for call in file_reads[:room]}
+            fresh_reads = [call for call in fresh_reads
+                           if str(call.get("tool")) not in ("read_file", "read_files")
+                           or _call_signature(call) in keep]
         seen_reads.update(_call_signature(call) for call in reads)
         reads = fresh_reads
         if not reads and not writes and dropped:
@@ -5916,11 +5941,19 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
                          f"({', '.join(dropped)}) — правку не делаю.")
             break
         if reads:
-            done = await mcp_store.async_run_calls(reads, limit=2)
+            done = await mcp_store.async_run_calls(reads,
+                                                   limit=mcp_store.FILES_MAX_READS)
+            # Бюджет считают только ЧТЕНИЯ ФАЙЛОВ: поиск (`search_files`) —
+            # дешёвый и короткий ответ, и без него исполнитель не находит МЕСТО
+            # правки. В живом прогоне 16.10 два поиска съели весь бюджет, и на
+            # чтение нужного участка места не осталось — шаг остался без правки.
+            reads_done += sum(1 for item in done
+                              if str(item.get("tool")) in ("read_file", "read_files"))
             collected.extend(done)
             for item in done:
                 lines.append(_file_call_line(item))
             _remember()
+            continue
         if writes:
             done = await mcp_store.async_run_calls(writes,
                                                    limit=mcp_store.MAX_FILE_ACTIONS)
@@ -5930,9 +5963,27 @@ async def _file_actions_step(task: Dict[str, Any], session: Dict[str, Any],
                 lines.append(_file_call_line(item))
             _remember()
             wrote = any(item.get("ok") for item in done)
-            break
+            if wrote or last_round:
+                break
+            # ПРАВКА ОТКЛОНЕНА — ДАЁМ ПЕРЕДЕЛАТЬ. Причина отказа уже лежит в
+            # данных (исполнитель её видит), а уточнение говорит, что делать:
+            # взять якорь из файла или воспользоваться `insert_in_file`. Без этого
+            # шаг «подключить команду» заканчивался отказом сервера и оставался
+            # невыполненным (живой случай 16.10).
+            failed = [item for item in done if not item.get("ok")]
+            nudge = mcp_store.FILES_RETRY_NOTE
+            lines.append("MCP: правка отклонена сервером ("
+                         + (str(failed[0].get("error") or "")[:120] if failed else "причина не названа")
+                         + ") — прошу исполнителя переделать вызов.")
+            continue
         if not reads:
             reason = str(decision.get("reason") or "").strip()
+            if not last_round and not writes:
+                # ПРОГРЕССА НЕТ, НО РАУНДЫ ЕСТЬ: не молчим и не сдаёмся сразу —
+                # даём уточнение на следующий раунд (как диспетчеру в цепочке).
+                nudge = (mcp_store.FILES_EMPTY_NOTE if not calls
+                         else mcp_store.FILES_WRITE_ONLY_NOTE)
+                continue
             lines.append("MCP: правок файлов по этому шагу нет"
                          + (f" — {reason}." if reason else ".")
                          + " Изменения на диске не делаю.")

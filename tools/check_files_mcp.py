@@ -78,7 +78,7 @@ FAILURES = []
 SERVER = "files"
 READ_TOOLS = ("list_files", "read_file", "read_files", "search_files",
               "outline_file", "diff_files")
-WRITE_TOOLS = ("write_file", "edit_file", "append_file")
+WRITE_TOOLS = ("write_file", "edit_file", "insert_in_file", "append_file")
 
 # Рабочая копия для инструментов: заполняет main(). Сервер запускается отдельным
 # процессом и НАСЛЕДУЕТ окружение проверки, поэтому FILES_REPO_DIR достаточно
@@ -217,7 +217,7 @@ def section_registry():
     data = mcp_store.discover(SERVER, force=True)
     check("сервер отвечает на tools/list", bool(data.get("ok")), str(data.get("error")))
     names = [item["name"] for item in data.get("tools") or []]
-    check("объявлены все девять инструментов",
+    check("объявлены все десять инструментов",
           sorted(names) == sorted(READ_TOOLS + WRITE_TOOLS), str(names))
     for tool in READ_TOOLS:
         check("чтение %s не откладывается" % tool,
@@ -382,6 +382,40 @@ def section_writes():
                              "replace": "Статус: принято (цена $& руб.)."})
     check("символы «$&» в тексте замены не подменяются",
           res.get("ok") and "цена $& руб." in (read_local("docs/adr-001.md") or ""), body(res)[:200])
+
+    # ВСТАВКА ПО ЯКОРЮ: так ПОДКЛЮЧАЮТ новое к существующему коду — короткий
+    # уникальный фрагмент строки вместо точного многострочного фрагмента.
+    write_file("app/hooks.py", "def first():\n    return 1\n\ndef second():\n    return 2\n")
+    res = call("insert_in_file", {"path": "app/hooks.py", "anchor": "def second():",
+                                  "text": "    connect()\n"})
+    check("insert_in_file вставил строки после якоря", res.get("ok"), body(res)[:200])
+    check("вставка на диске с ОТСТУПОМ строки-якоря",
+          "    connect()" in (read_local("app/hooks.py") or ""),
+          str(read_local("app/hooks.py"))[:120])
+    check("ответ называет место вставки", "после строки" in body(res), body(res)[:200])
+    res = call("insert_in_file", {"path": "app/hooks.py", "anchor": "return",
+                                  "text": "    x = 1\n"})
+    check("неоднозначный якорь отклонён со списком строк",
+          failed(res, "встречается") and "уточните" in body(res), body(res)[:200])
+    res = call("insert_in_file", {"path": "app/hooks.py", "anchor": "нет_такого",
+                                  "text": "x\n"})
+    check("ненайденный якорь — отказ с подсказкой, где взять",
+          failed(res, "не найден") and "search_files" in body(res), body(res)[:200])
+    res = call("insert_in_file", {"path": "app/hooks.py", "anchor": "def first():",
+                                  "text": "before_hook()\n", "where": "before"})
+    check("insert_in_file умеет вставлять ПЕРЕД якорем",
+          res.get("ok") and (read_local("app/hooks.py") or "").index("before_hook")
+          < (read_local("app/hooks.py") or "").index("def first"), body(res)[:120])
+
+    # СНИСХОДИТЕЛЬНЫЙ edit_file: отступы в find могут отличаться от файла.
+    res = call("edit_file", {"path": "app/hooks.py",
+                             "find": "def first():\nreturn 1",
+                             "replace": "def first():\n    return 100"})
+    check("edit_file находит фрагмент с ДРУГИМИ отступами",
+          res.get("ok") and "return 100" in (read_local("app/hooks.py") or ""),
+          body(res)[:200])
+    check("о снисходительном совпадении сказано прямо",
+          "ПО НОРМАЛИЗОВАННОМУ" in body(res), body(res)[:200])
 
     before = read_local("docs/guide.md") or ""
     res = call("append_file", {"path": "docs/CHANGELOG.md", "content": "## 2026-01-01\n- Начало журнала\n"})
@@ -585,8 +619,13 @@ def section_step_actions():
         calls_seen = {"system": ""}
 
         async def fake_call_llm_async(**kwargs):
+            # Промпт исполнителя приходит СИСТЕМНЫМ (`system_prompt`), а не в
+            # сообщениях: так к нему добавляется JSON-оговорка проекта.
             messages = kwargs.get("messages") or []
-            calls_seen["system"] = str(messages[0].get("content") or "")[:40]
+            system = kwargs.get("system_prompt") or (
+                str(messages[0].get("content") or "") if messages else "")
+            calls_seen["system"] = str(system)[:60]
+            calls_seen["json"] = str(kwargs.get("response_format") or "")
             payload = {"calls": [{"server": "files", "tool": "write_file",
                                   "arguments": {"path": "app/new_module.py",
                                                 "content": "def added():\n    return 1\n"}}]}
@@ -612,8 +651,10 @@ def section_step_actions():
             actions, lines, usage = await chat._file_actions_step(
                 task, session, "Создать модуль app/new_module.py",
                 "Вот модуль:\n```python\ndef added():\n    return 1\n```\n", agent)
-            check("промпт исполнителя ушёл в модель",
+            check("промпт исполнителя ушёл в модель системной частью",
                   "ИСПОЛНИТЕЛЬ ШАГА" in calls_seen["system"], calls_seen["system"])
+            check("ответ исполнителя запрошен как JSON",
+                  calls_seen.get("json") == "json", str(calls_seen.get("json")))
             check("вызов записи выполнен", [a["tool"] for a in actions] == ["write_file"],
                   str([a["tool"] for a in actions]))
             check("ФАЙЛ ПОЯВИЛСЯ НА ДИСКЕ",
@@ -628,6 +669,69 @@ def section_step_actions():
                   any("СОЗДАН" in str(item.get("text") or "")
                       for item in (stored.get("results") or [])),
                   str(stored.get("results"))[:200])
+            # ЦИКЛ «ЧТЕНИЕ → ПРАВКА»: исполнитель вправе сначала прочитать файл
+            # (точный текст для замены), а правку вернуть следующим раундом.
+            rounds = {"n": 0}
+
+            async def fake_two_rounds(**kwargs):
+                rounds["n"] += 1
+                if rounds["n"] == 1:
+                    payload = {"calls": [{"server": "files", "tool": "read_file",
+                                          "arguments": {"path": "app/new_module.py"}}]}
+                else:
+                    payload = {"calls": [{"server": "files", "tool": "edit_file",
+                                          "arguments": {"path": "app/new_module.py",
+                                                        "find": "return 1",
+                                                        "replace": "return 2"}}]}
+                return (json.dumps(payload),
+                        {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20})
+
+            llm_client.call_llm_async = fake_two_rounds
+            loop_actions, loop_lines, _ = await chat._file_actions_step(
+                task, session, "Изменить app/new_module.py",
+                "Меняю возвращаемое значение на 2.", agent)
+            check("раунд чтения выполнен, затем правка",
+                  rounds["n"] == 2 and [a["tool"] for a in loop_actions] == ["edit_file"],
+                  str(rounds) + " " + str([a["tool"] for a in loop_actions]))
+            check("правка применилась после чтения",
+                  "return 2" in (read_local("app/new_module.py") or ""),
+                  str(read_local("app/new_module.py"))[:80])
+            check("в журнале видны и чтение, и правка",
+                  any("read_file" in line for line in loop_lines)
+                  and any("ИЗМЕНЁН" in line for line in loop_lines),
+                  str(loop_lines)[:200])
+            llm_client.call_llm_async = fake_call_llm_async
+
+            # ОТКАЗ СЕРВЕРА — НЕ КОНЕЦ ШАГА: первая правка отклоняется (нет такого
+            # якоря), вторая — по причине отказа — проходит через insert_in_file.
+            retry = {"n": 0}
+
+            async def fake_retry(**kwargs):
+                retry["n"] += 1
+                if retry["n"] == 1:
+                    payload = {"calls": [{"server": "files", "tool": "edit_file",
+                                          "arguments": {"path": "app/new_module.py",
+                                                        "find": "нет такого текста",
+                                                        "replace": "x"}}]}
+                else:
+                    payload = {"calls": [{"server": "files", "tool": "insert_in_file",
+                                          "arguments": {"path": "app/new_module.py",
+                                                        "anchor": "def added():",
+                                                        "text": "    connected = True"}}]}
+                return (json.dumps(payload),
+                        {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20})
+
+            llm_client.call_llm_async = fake_retry
+            retry_actions, retry_lines, _ = await chat._file_actions_step(
+                task, session, "Подключить модуль app/new_module.py",
+                "Подключаю модуль к проекту.", agent)
+            check("после отказа сервера исполнитель переделал вызов",
+                  retry["n"] >= 2 and "connected = True" in (read_local("app/new_module.py") or ""),
+                  str(retry) + " " + str(read_local("app/new_module.py"))[:80])
+            check("отказ назван в журнале, а не проглочен",
+                  any("отклонена" in line for line in retry_lines), str(retry_lines)[:200])
+            llm_client.call_llm_async = fake_call_llm_async
+
             # ПРАВКА СУЩЕСТВУЮЩЕГО ФАЙЛА: точечная замена, а не перезапись.
             before_edit = read_local("app/new_module.py") or ""
             edit_actions, edit_lines, _ = await chat._file_actions_step(
@@ -635,8 +739,13 @@ def section_step_actions():
                 "Меняю возвращаемое значение.", agent)
             check("повторный проход отработал без сбоя",
                   isinstance(edit_actions, list) and isinstance(edit_lines, list))
+            # Повторный проход пишет файл заново (в заглушке — тем же вызовом
+            # `write_file`), поэтому проверяем не «байт в байт», а главное: файл
+            # не потерян и не обрезан.
             check("файл не потерян повторным проходом",
-                  (read_local("app/new_module.py") or "") == before_edit)
+                  bool(read_local("app/new_module.py"))
+                  and "def added" in (read_local("app/new_module.py") or ""),
+                  str(read_local("app/new_module.py"))[:80])
         finally:
             llm_client.call_llm_async = original
 
