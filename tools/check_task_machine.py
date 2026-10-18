@@ -64,6 +64,10 @@ REVIEW = {"verdict": "ok", "step": 0, "comment": "результат соотв�
 # Последняя user-часть вызова проверки: по ней видно, что уходит приёмщику
 # (исходный запрос + план + решение модели по шагам).
 REVIEW_PAYLOAD = []
+# ОЧЕРЕДЬ ответов приёмщика: нужна там, где ответ зависит от ПЕРЕСПРОСА
+# (например, противоречивый вердикт → уточнение). Пусто — отвечает REVIEW.
+REVIEW_QUEUE = []
+REVIEW_CALLS = []
 CALLS = []
 # Сами сообщения последнего вызова: по ним проверяем, что в контекст агента
 # уходит системный блок инвариантов (а в диалог они не пишутся).
@@ -148,12 +152,14 @@ async def fake_call_llm_async(*args, **kwargs):
         REVIEW_PAYLOAD.clear()
         if messages:
             REVIEW_PAYLOAD.append(str(messages[-1].get("content") or ""))
-        if REVIEW is None:
+        REVIEW_CALLS.append(str(messages[-1].get("content") or "") if messages else "")
+        preset = REVIEW_QUEUE.pop(0) if REVIEW_QUEUE else REVIEW
+        if preset is None:
             return "", _metrics()
-        if isinstance(REVIEW, str):
+        if isinstance(preset, str):
             # «Сырой» ответ: так проверяется обрезанный лимитом токенов JSON.
-            return REVIEW, _metrics(40, 8)
-        return json.dumps(REVIEW, ensure_ascii=False), _metrics(40, 8)
+            return preset, _metrics(40, 8)
+        return json.dumps(preset, ensure_ascii=False), _metrics(40, 8)
     if system.startswith("Ты — арбитр инвариантов: проверка ШАГОВ ПЛАНА"):
         # КОД-ГЕЙТ ПЛАНА: префикс проверяем ДО общего «Ты — арбитр инвариантов».
         global PLAN_CALLS
@@ -2118,32 +2124,52 @@ async def test_plan_gate():
               for e in events if e.get("type") == "done"),
           str([e.get("usage") for e in events if e.get("type") == "done"])[:160])
 
-    # 9.1б ПЛАН, МЕНЯЮЩИЙ ФАЙЛЫ, ОБЯЗАН НАЗЫВАТЬ ФАЙЛ (правило 12 — просьба,
-    # проверка — код). Живой прогон 16.10: план «Создать модуль со справочником
-    # команд» + «Подключить разбор команды в обработчике сообщений» без имён файлов
-    # закончился тем, что ни один шаг не был выполнен.
+    # 9.1б ПЛАН БЕЗ ЕДИНОГО ШАГА РЕАЛИЗАЦИИ ПЕРЕСТРАИВАЕТСЯ. Живой прогон 16.10
+    # (задача «сделай команду /cat»): план из одной исследовательской ступени
+    # «Найти в проекте место разбора команд чата» — задача закрылась «успешно», на
+    # диске не изменилось НИЧЕГО. Изучение — не результат: нужен шаг, который
+    # создаёт или правит файл.
     await fresh_task()
     await chat.mcp_apply(chat.McpApply(enabled=["files"]))
-    NAMELESS = ["Найти точку входа и обработчик сообщений", "Создать модуль со справочником команд",
-                "Подключить разбор команды /commands в обработчике сообщений"]
-    NAMED = ["Найти точку входа и обработчик сообщений в app/routers/chat.py",
-             "Создать app/ai/commands.py со справочником команд",
-             "Подключить разбор команды /commands в обработчике сообщений app/routers/chat.py"]
-    PLAN_QUEUE[:] = [NAMELESS, NAMED]
+    RESEARCH_ONLY = ["Найти в проекте место разбора команд чата"]
+    WITH_IMPL = ["Найти в проекте место разбора команд чата в app/routers/chat.py",
+                 "Создать app/ai/commands.py со списком команд",
+                 "Дописать в app/routers/chat.py разбор команды /commands"]
+    PLAN_QUEUE[:] = [RESEARCH_ONLY, WITH_IMPL]
     PLAN_DEFAULT = "clear"
     LAST_MESSAGES.clear()
     events = await run_chat("создай команду /commands со справочником команд")
     steps_now = [s["text"] for s in (stage_of(events) or {}).get("steps", [])]
+    check("план без шага реализации перестроен планировщиком",
+          steps_now == WITH_IMPL, str(steps_now))
+    planner_text = "\n".join(m["content"] for m in LAST_MESSAGES
+                             if m.get("role") == "user")
+    check("в переспросе сказано, что нужен ШАГ РЕАЛИЗАЦИИ",
+          "ПЛАН НЕ ПРИНЯТ" in planner_text and "шаг реализации" in planner_text,
+          planner_text[-260:])
+    check("переспрос назван в журнале",
+          any("нет шага реализации" in t or "шаг реализации появился" in t
+              for t in texts(events, "debug")), str(texts(events, "debug"))[-200:])
+
+    # 9.1б2 ШАГ, МЕНЯЮЩИЙ ФАЙЛЫ, ОБЯЗАН НАЗЫВАТЬ ФАЙЛ (правило 12 — просьба,
+    # проверка — код): без имени файла исполнителю не за что взяться.
+    await fresh_task()
+    await chat.mcp_apply(chat.McpApply(enabled=["files"]))
+    NAMELESS = ["Создать app/ai/commands.py со справочником команд",
+                "Подключить разбор команды /commands в обработчике сообщений"]
+    NAMED = ["Создать app/ai/commands.py со справочником команд",
+             "Подключить разбор команды /commands в обработчике сообщений app/routers/chat.py"]
+    PLAN_QUEUE[:] = [NAMELESS, NAMED]
+    LAST_MESSAGES.clear()
+    events = await run_chat("добавь команду /commands со справочником команд")
     check("план без имён файлов перестроен планировщиком",
-          steps_now == NAMED, str(steps_now))
+          [s["text"] for s in (stage_of(events) or {}).get("steps", [])] == NAMED,
+          str((stage_of(events) or {}).get("steps")))
     planner_text = "\n".join(m["content"] for m in LAST_MESSAGES
                              if m.get("role") == "user")
     check("в переспросе названы шаги без файла и требование пути",
           "ПЛАН НЕ ПРИНЯТ" in planner_text and NAMELESS[1] in planner_text
           and "app/ai/commands.py" in planner_text, planner_text[-260:])
-    check("переспрос назван в журнале",
-          any("файлы названы в шагах" in t or "имени файла" in t
-              for t in texts(events, "debug")), str(texts(events, "debug"))[-200:])
 
     # 9.1в Шаг-исследование файла не требует, чистый план не переспрашивается.
     await fresh_task()
@@ -2243,6 +2269,78 @@ def _answer_calls(calls):
     и идут со своими пределами — высокая температура сломала бы их разбор.
     """
     return [c for c in calls if not c["system"].startswith(("Ты —", "Ты проверяешь"))]
+
+
+async def test_review_clarify():
+    """ПРОТИВОРЕЧИВЫЙ ВЕРДИКТ ПРИЁМЩИКА УТОЧНЯЕТСЯ, а не превращается в ошибку без причины.
+
+    Живой прогон 16.10: приёмщик отвечал «verdict: redo», но разбор по шагам был
+    целиком «принят» и шаг для доработки не назван — доработка шла вслепую и
+    повторяла прежний результат, а пользователь видел «ошибку» без объяснения.
+    """
+    print("\n[10а] Противоречивый вердикт приёмщика: переспрос и причина возврата")
+    global PLAN_STEPS, REVIEW_QUEUE, REVIEW, REVIEW_CALLS
+
+    PLAN_STEPS = ["Создать app/ai/commands.py со справочником"]
+
+    async def setup():
+        await chat.task_create(chat.TaskCreate(name="Прогон проверки"))
+        await chat.session_create()
+        task_now = chat._current_task()
+        session_now = chat._current_session()
+        session_now["dialog"]["invariants"] = []
+        task_now["invariants"] = []
+
+    # 10а.1 Противоречие: redo + все шаги приняты. Ожидаем ОДИН переспрос и «принято».
+    await setup()
+    await run_chat("создай app/ai/commands.py со справочником")
+    REVIEW_QUEUE[:] = [
+        {"verdict": "redo", "step": 0,
+         "steps": [{"n": 1, "ok": True, "comment": "файл создан"}],
+         "comment": "всё сделано, но вердикт redo"},
+        {"verdict": "ok", "step": 0,
+         "steps": [{"n": 1, "ok": True, "comment": "файл создан"}],
+         "comment": "проверил ещё раз: шаг выполнен"},
+    ]
+    REVIEW_CALLS.clear()
+    events = await run_chat("ок")
+    check("противоречивый вердикт приводит к переспросу приёмщика",
+          len(REVIEW_CALLS) == 2 and "противоречив" in REVIEW_CALLS[1],
+          str(len(REVIEW_CALLS)) + " " + REVIEW_CALLS[-1][-200:])
+    check("после уточнения проверка принята",
+          any("содержательная проверка пройдена" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[-200:])
+    check("в журнале видно, что это уточнение",
+          any("уточнение приёмщика" in t for t in texts(events, "debug")),
+          str(texts(events, "debug"))[-200:])
+
+    # 10а.2 Противоречие ПОВТОРИЛОСЬ: ложного «принято» нет — вердикт остаётся redo.
+    await setup()
+    await run_chat("создай app/ai/commands.py со справочником")
+    contradictory = {"verdict": "redo", "step": 0,
+                     "steps": [{"n": 1, "ok": True, "comment": "файл создан"}],
+                     "comment": "redo без причины"}
+    REVIEW_QUEUE[:] = [dict(contradictory), dict(contradictory), dict(contradictory),
+                       dict(contradictory)]
+    REVIEW_CALLS.clear()
+    events = await run_chat("ок")
+    check("повторное противоречие НЕ превращается в «принято»",
+          any("Проверка не пройдена" in t or "Проверка не принята" in t
+              for t in texts(events, "error")), str(texts(events, "error"))[-200:])
+
+    # 10а.3 ВЕРДИКТ redo С ПРИЧИНОЙ: причина возврата видна агенту в блоке состояния.
+    from app.ai import task_state as ts
+    state = ts.new_state("t")
+    ts.plan_ready(state, ["Создать app/ai/commands.py"], "план готов")
+    ts.next_step(state, "шаг 1")
+    ts.validation_failed(state, "проверка не пройдена: разбор команды не подключён", 0)
+    ts.next_step(state, "доработка шага 1")
+    block = ts.state_block(state)
+    check("при возврате на доработку агент видит ПРИЧИНУ",
+          "ЭТО ДОРАБОТКА" in block and "разбор команды не подключён" in block,
+          block[-300:])
+    REVIEW_QUEUE[:] = []
+    REVIEW = {"verdict": "ok", "step": 0, "comment": "результат соответствует плану"}
 
 
 async def test_llm_params():
@@ -2438,6 +2536,7 @@ def main():
         loop.run_until_complete(test_chosen_alternative())
         loop.run_until_complete(test_project_ban_wins())
         loop.run_until_complete(test_plan_gate())
+        loop.run_until_complete(test_review_clarify())
         loop.run_until_complete(test_llm_params())
     finally:
         loop.close()

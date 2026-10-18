@@ -49,6 +49,7 @@ loopback сервера, поэтому агент ходит к ним чере
 
 import ast
 import asyncio
+import builtins
 import datetime
 import json
 import logging
@@ -69,6 +70,13 @@ from app.ai import attachments as attach_store
 from app.ai import json_utils
 
 logger = logging.getLogger(__name__)
+
+# Встроенные имена Python плюс служебные для модуля: их не надо объявлять, поэтому
+# проверка неопределённых имён (см. `undefined_names`) их не называет.
+PY_BUILTINS = frozenset(dir(builtins)) | {
+    "__file__", "__name__", "__doc__", "__package__", "__spec__", "__loader__",
+    "__builtins__", "__debug__",
+}
 
 # Формат вызова LLM: async (messages, **kwargs) -> (текст, метрики|None).
 LlmCall = Callable[..., Any]
@@ -164,6 +172,9 @@ DRAFT_ROUNDS = 2
 # прозой), длинный — обрыв по пределу длины, и лечится он не уточнением, а
 # делением записи на части.
 FILES_TRUNCATED_CHARS = 800
+# Сколько раз проход пробует исправить файл, ссылающийся на НЕОПРЕДЕЛЁННЫЕ ИМЕНА
+# (см. FILES_NAMES_NOTE): как и с синтаксисом — две попытки.
+FILES_NAMES_RETRIES = 2
 # Сколько РАУНДОВ даётся на РАЗВЕДКУ (поиск места и чтение участка). Два — потому
 # что у файла в тысячи строк место правки ищется в два шага (поиск даёт НОМЕР
 # строки, окно чтения — текст для якоря). Дальше раунд становится РАУНДОМ ПРАВОК,
@@ -811,7 +822,7 @@ def files_repo_root() -> str:
 # Записи, которые ставит САМО ПРИЛОЖЕНИЕ о состоянии файлов на диске (проверка
 # синтаксиса и проверка подключения): они считаются ФАКТАМИ работы наравне с
 # записями файлов и в модель/приёмщика попадают всегда (см. normalize_results).
-APP_FACT_TOOLS = ("syntax_check", "connect_check")
+APP_FACT_TOOLS = ("syntax_check", "connect_check", "names_check")
 # Признаки шага, который ПОДКЛЮЧАЕТ новое к существующему коду. Для таких шагов
 # приложение проверяет не только синтаксис, но и САМО ПОДКЛЮЧЕНИЕ (см. private_defs
 # и unreferenced_names): живой прогон 16.10 (одиннадцатый заход, задача про
@@ -824,8 +835,8 @@ FILE_CONNECT_MARKERS = (
 # Что говорим исполнителю, когда новая ПРИВАТНАЯ функция (имя с «_») объявлена и
 # нигде в файле не вызвана: подключение не сделано, добавлено определение.
 FILES_DEAD_CODE_NOTE = (
-    "ПОДКЛЮЧЕНИЕ НЕ СДЕЛАНО: правка добавила функцию (или класс), которую в файле "
-    "НИКТО не вызывает. Объявление без вызова ничего не подключает — команда не "
+    "ПОДКЛЮЧЕНИЕ НЕ СДЕЛАНО: правка добавила функцию, класс или ИМПОРТ, который в "
+    "файле НИКТО не использует. Объявление без вызова ничего не подключает — команда не "
     "заработает. Допиши ВЫЗОВ в точке входа (то место файла, которое выполняется "
     "при запросе) или вставь вызов рядом с такой же командой; имя и точку входа "
     "возьми из прочитанного."
@@ -867,6 +878,44 @@ def private_defs(source: str) -> List[str]:
     return names
 
 
+def imported_names(source: str) -> List[str]:
+    """Имена, которые модуль ИМПОРТИРУЕТ (`import x`, `from m import y [as z]`).
+
+    Нужны проверке подключения (см. FILES_CONNECT_MARKERS): подключающая правка
+    часто состоит из импорта и вызова, и добавленный импорт БЕЗ использования —
+    такой же признак несделанной работы, как объявление без вызова. Живой прогон
+    16.10: шаг «дописать разбор команды» закончился тем, что в `app/routers/chat.py`
+    появилась ОДНА строка `from app.ai.commands import is_cat_command, run_cat` без
+    единого вызова, файл компилировался, и проверка приняла это за работу.
+
+    Импорты `__future__` не считаются: они меняют разбор файла, а не подключают
+    имена (иначе «annotations» вечно выглядел бы неиспользованным).
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    names: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("__future__"):
+                    continue
+                name = alias.asname or alias.name.split(".")[0]
+                if name not in names:
+                    names.append(name)
+        elif isinstance(node, ast.ImportFrom):
+            if str(node.module or "").startswith("__future__"):
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                name = alias.asname or alias.name
+                if name not in names:
+                    names.append(name)
+    return names
+
+
 def unreferenced_names(source: str, names: List[str]) -> List[str]:
     """Из имён те, что в тексте только ОБЪЯВЛЕНЫ и больше нигде не упомянуты."""
     out: List[str] = []
@@ -874,6 +923,67 @@ def unreferenced_names(source: str, names: List[str]) -> List[str]:
         if len(re.findall(r"\b" + re.escape(str(name)) + r"\b", source)) <= 1:
             out.append(str(name))
     return out
+
+
+def undefined_names(source: str) -> List[str]:
+    """Имена, которые в модуле ИСПОЛЬЗУЮТСЯ, но нигде не объявлены и не импортированы.
+
+    Зачем это нужно. Сломанный файл бывает не только «не компилируется»: правка
+    может примениться ЧАСТЬЮ — маршрут вставлен, а импорт к нему не применился
+    (живой прогон 16.10: `edit_file` с импортом упал, `insert_in_file` прошёл).
+    Синтаксис при этом целый, а код нерабочий: в файле есть обращения к
+    `commands_help` и `_ndjson_event`, которых никто не объявлял.
+
+    Проверка разбором AST, без запуска кода: собрать ВСЕ связанные имена (импорты,
+    определения, присваивания, аргументы, `except … as`, `global`, цели `for` и
+    включений), затем найти использованные имена вне этого набора и вне встроенных.
+    Проверка ЛЕНИВАЯ: достаточно, чтобы имя где-то связывалось — значит, область
+    видимости не разбирается, и ложных срабатываний нет (проверено на файлах
+    проекта: `chat.py`, `mcp.py`, `agent.py`, `dev_help.py`, `main.py` — ноль).
+
+    Файл со `from x import *` не проверяется: звёздный импорт делает набор имён
+    непредсказуемым, и «не найдено» ничего не значило бы — возвращаем пусто.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    bound: set = set()
+    star = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    star = True
+                else:
+                    bound.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, ast.MatchAs) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchStar) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+    if star:
+        return []
+    loaded: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            loaded.add(node.id)
+    return sorted(name for name in loaded
+                  if name not in bound and name not in PY_BUILTINS)
 
 
 def syntax_error(path: Any) -> str:
@@ -1167,6 +1277,32 @@ FILES_WRONG_FILE_NOTE = (
 # неполное, поэтому такой правкой файл писать нельзя — но и заканчивать шаг рано.
 # Живой прогон 16.10 (пятнадцатый заход): исполнитель собирал `write_file` с
 # большим содержимым, ответ обрывался, и проход останавливался без правки.
+# Что говорим исполнителю, когда файл ССЫЛАЕТСЯ НА НЕОПРЕДЕЛЁННЫЕ ИМЕНА. Это самый
+# коварный вид поломки: синтаксис целый, файл читается, а имя нигде не объявлено —
+# типичный след ПРИМЕНЁННОЙ ПОЛОВИНЫ правки. Живой прогон 16.10: `edit_file` с
+# импортом упал (фрагмент встречался дважды), `insert_in_file` с маршрутом прошёл —
+# и в `app/routers/chat.py` появился код, ссылающийся на `commands_help` и
+# `_ndjson_event`, которых в файле нет (в редакторе это «красный» код).
+FILES_NAMES_NOTE = (
+    "ФАЙЛ ССЫЛАЕТСЯ НА НЕОПРЕДЕЛЁННЫЕ ИМЕНА (список — в данных выше). Скорее всего "
+    "применилась только ЧАСТЬ правки: вставка есть, а импорт или определение к ней — "
+    "нет. Допиши недостающее в ТОМ ЖЕ файле: импорт модуля (`insert_in_file` рядом с "
+    "другими импортами) или определение функции. Проверяй по тексту файла: имя должно "
+    "быть объявлено или импортировано там, где оно используется."
+)
+
+# Что говорим исполнителю, когда ЧАСТЬ вызовов раунда не применилась, а часть
+# прошла: правка и её подключение — одно изменение, и «половина» даёт файл, который
+# на вид целый, а на деле нерабочий. Живой прогон 16.10 (16:58): `edit_file` с
+# импортом упал, `insert_in_file` с маршрутом прошёл — шаг закрылся «успешно».
+FILES_PARTIAL_NOTE = (
+    "ЧАСТЬ ПРАВОК ЭТОГО РАУНДА НЕ ПРИМЕНИЛАСЬ (какие — в данных выше). Правка и её "
+    "подключение должны примениться ВМЕСТЕ: импорт или вызов, который не применился, "
+    "оставляет код нерабочим, даже если вставка прошла. Верни НЕДОСТАЮЩИЕ вызовы: "
+    "исправь отклонённый по причине отказа (якорь или фрагмент — из текста файла), "
+    "и не повторяй то, что уже применилось."
+)
+
 FILES_TRUNCATED_NOTE = (
     "ТВОЙ ОТВЕТ ОБРЕЗАН ПО ПРЕДЕЛУ ДЛИНЫ — в таком виде правку применить нельзя: "
     "содержимое файла неполное (обрубок на диске хуже, чем ничего). Раздели работу "

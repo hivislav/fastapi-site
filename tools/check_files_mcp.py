@@ -815,7 +815,8 @@ def section_step_actions():
                   retry["n"] >= 2 and "connected = True" in (read_local("app/new_module.py") or ""),
                   str(retry) + " " + str(read_local("app/new_module.py"))[:80])
             check("отказ назван в журнале, а не проглочен",
-                  any("отклонена" in line for line in retry_lines), str(retry_lines)[:200])
+                  any("не применилась" in line or "не применена" in line
+                      for line in retry_lines), str(retry_lines)[:300])
             llm_client.call_llm_async = fake_call_llm_async
 
             # ПРАВКА СУЩЕСТВУЮЩЕГО ФАЙЛА: точечная замена, а не перезапись.
@@ -1249,8 +1250,15 @@ def section_step_structure():
               'COMMAND = "/help"' in place_text
               and any("окно вокруг места правки прочитано" in line
                       for line in place_lines), place_text[:200])
-        check("окно читается вокруг НАЙДЕННОЙ строки, а не с начала файла",
-              "line_0 = 0" not in place_text and "line_90 = 90" in place_text
+        check("совпадение в КОММЕНТАРИИ не считается местом правки",
+              chat._first_hit_line('Найдено совпадений: 2\n'
+                                   'app/x.py:10: # упоминание /help в комментарии\n'
+                                   'app/x.py:42: if is_help(text):') == 42,
+              str(chat._first_hit_line('app/x.py:10: # к\napp/x.py:42: if is_help(text):')))
+        check("если кроме комментариев ничего нет — берётся комментарий",
+              chat._first_hit_line('app/x.py:10: # только комментарий') == 10)
+        check("окно места правки — вокруг найденной строки, а не весь файл",
+              "line_90 = 90" in place_text and "COMMAND = \"/help\"" in place_text
               and "tail_199" not in place_text, place_text[:300])
         # Ни команды из шага, ни литералов команд в файле — окна нет, и это не ошибка.
         with open(os.path.join(REPO, "app/plain_probe.py"), "w",
@@ -1258,6 +1266,9 @@ def section_step_structure():
             handle.write("def plain():\n    return 1\n")
         plain, plain_lines = await chat._step_file_context(
             task, "Дописать в app/plain_probe.py разбор команды", "")
+        head_reads = [line for line in place_lines if "шапка файла прочитана" in line]
+        check("для подключающего шага читается ШАПКА файла (там импорты)",
+              bool(head_reads) and "line_0 = 0" in place_text, str(head_reads)[:200])
         check("без находок окно не читается и ничего не выдумывается",
               not any("место правки найдено" in line for line in plain_lines),
               str(plain_lines)[:200])
@@ -1448,6 +1459,89 @@ def section_author_second_pass():
     asyncio.run(run())
 
 
+def section_chain_writes():
+    """ЗАПИСИ ЦЕПОЧКИ ДИСПЕТЧЕРА ПРОВЕРЯЮТСЯ ТАК ЖЕ, КАК ПРАВКИ ШАГА.
+
+    Живой прогон 16.10 (прогон B): запись в `app/routers/chat.py` пришла от цепочки
+    (в обход прохода правок), оставила ссылку на необъявленное имя `commands` — и ни
+    одна проверка не сработала: сломанный код дошёл до приёмщика молча.
+    """
+    print("\n[18] Записи цепочки диспетчера проходят проверки")
+
+    target = "app/chain_target.py"
+    with open(os.path.join(REPO, target), "w", encoding="utf-8") as handle:
+        handle.write("def ok():\n    return 1\n")
+    lines: List[str] = []
+    facts = chat._verify_chain_writes(
+        [{"server": "files", "tool": "write_file", "ok": True,
+          "arguments": {"path": target, "content": "def ok():\n    return 1\n"},
+          "text": "ОБНОВЛЁН " + target, "error": "", "source": "", "action": "",
+          "attachments": []}], lines)
+    check("целая запись цепочки фактов не даёт", facts == [] and lines == [],
+          str(facts) + " " + str(lines))
+    broken = "def ok():\n    return helper()\n"
+    with open(os.path.join(REPO, target), "w", encoding="utf-8") as handle:
+        handle.write(broken)
+    lines = []
+    facts = chat._verify_chain_writes(
+        [{"server": "files", "tool": "write_file", "ok": True,
+          "arguments": {"path": target, "content": broken},
+          "text": "ОБНОВЛЁН " + target, "error": "", "source": "", "action": "",
+          "attachments": []}], lines)
+    check("запись цепочки с неопределённым именем названа и стала фактом",
+          len(facts) == 1 and str(facts[0].get("tool")) == "names_check"
+          and any("НЕОПРЕДЕЛЁННЫЕ имена" in line for line in lines),
+          str(facts)[:200] + " " + str(lines)[:160])
+    with open(os.path.join(REPO, target), "w", encoding="utf-8") as handle:
+        handle.write("def ok(:\n")
+    lines = []
+    facts = chat._verify_chain_writes(
+        [{"server": "files", "tool": "write_file", "ok": True,
+          "arguments": {"path": target, "content": "x"},
+          "text": "ОБНОВЛЁН " + target, "error": "", "source": "", "action": "",
+          "attachments": []}], lines)
+    check("запись цепочки с поломанным синтаксисом тоже названа",
+          len(facts) == 1 and str(facts[0].get("tool")) == "syntax_check",
+          str(facts)[:200])
+
+
+def section_stale_deferred():
+    """ОТЛОЖЕННАЯ ПРАВКА НЕ ПЕРЕЗАПИСЫВАЕТ ТО, ЧТО УЖЕ СДЕЛАЛ ШАГ.
+
+    Живой прогон 16.10 (16:58): отложенный `write_file(app/ai/commands.py)` из
+    предварительного прохода выполнился ПОСЛЕ правок шага 1 и переписал модуль
+    содержимым, собранным до чтения файлов.
+    """
+    print("\n[17] Отложенная правка не портит работу шага")
+
+    def result(path, by_step=True, ok=True):
+        return {"server": "files", "tool": "write_file", "ok": ok, "by_step": by_step,
+                "arguments": {"path": path, "content": "x"}, "text": "СОЗДАН " + path,
+                "error": "", "source": "", "action": "", "attachments": []}
+
+    def call(path):
+        return {"server": "files", "tool": "write_file",
+                "arguments": {"path": path, "content": "y"}}
+
+    lines = []
+    kept = chat._drop_stale_deferred([call("app/ai/commands.py"), call("docs/x.md")],
+                                     [result("app/ai/commands.py")], lines)
+    check("отложенная правка по уже записанному шагом файлу не выполняется",
+          [item["arguments"]["path"] for item in kept] == ["docs/x.md"], str(kept))
+    check("причина названа в журнале",
+          any("уже записаны ПО ШАГУ" in line for line in lines), str(lines)[:200])
+    lines2 = []
+    kept2 = chat._drop_stale_deferred([call("app/ai/commands.py")],
+                                      [result("app/ai/commands.py", by_step=False)],
+                                      lines2)
+    check("запись ДИСПЕТЧЕРА (не шага) отложенную правку не отменяет",
+          len(kept2) == 1 and not lines2, str(kept2) + " " + str(lines2))
+    lines3 = []
+    kept3 = chat._drop_stale_deferred([call("app/ai/commands.py")], [], lines3)
+    check("без правок шага отложенная правка выполняется как раньше",
+          len(kept3) == 1 and not lines3, str(kept3) + " " + str(lines3))
+
+
 def section_step_files_only():
     """ПРАВКА ТОЛЬКО ПО ФАЙЛАМ ШАГА.
 
@@ -1526,6 +1620,173 @@ def section_step_files_only():
     asyncio.run(run())
 
 
+def section_names_check():
+    """ПОЛОВИНА ПРАВКИ НЕ СЧИТАЕТСЯ ВЫПОЛНЕННЫМ ШАГОМ.
+
+    Живой прогон 16.10 (задача про /commands, 16:58): `edit_file` с импортом упал
+    («фрагмент встречается 2 раз»), `insert_in_file` с маршрутом прошёл — и в
+    `app/routers/chat.py` появился код, ссылающийся на `commands_help` и
+    `_ndjson_event`, которых в файле нет. Синтаксис целый, шаг «выполнен», код
+    нерабочий (в редакторе — красный).
+    """
+    print("\n[16] Половина правки: файл ссылается на неопределённые имена")
+
+    check("неопределённые имена находятся разбором AST",
+          mcp_store.undefined_names("def f():\n    return missing_name()\n")
+          == ["missing_name"], str(mcp_store.undefined_names("def f():\n    return x\n")))
+    check("объявленные и импортированные имена не считаются",
+          mcp_store.undefined_names(
+              "import os\nfrom app import x\n\n\ndef f(арг):\n    y = 1\n"
+              "    return os.path.join(x.путь, str(арг), y)\n") == [],
+          str(mcp_store.undefined_names("import os\n\n\ndef f():\n    return os\n")))
+    check("встроенные имена не считаются неопределёнными",
+          mcp_store.undefined_names("def f(v):\n    return len(str(v))\n") == [])
+    check("звёздный импорт отключает проверку (иначе были бы ложные срабатывания)",
+          mcp_store.undefined_names("from x import *\n\ndef f():\n    return чужое\n")
+          == [])
+    check("файлы проекта чисты (нет ложных срабатываний)",
+          mcp_store.undefined_names(open("app/routers/chat.py", encoding="utf-8").read())
+          == [] and mcp_store.undefined_names(
+              open("app/ai/mcp.py", encoding="utf-8").read()) == [])
+    check("подсказка называет причину и что делать",
+          "НЕОПРЕДЕЛЁННЫЕ ИМЕНА" in mcp_store.FILES_NAMES_NOTE
+          and "ЧАСТЬ правки" in mcp_store.FILES_NAMES_NOTE, "")
+    check("вид записи проверки имён входит в факты приложения",
+          "names_check" in mcp_store.APP_FACT_TOOLS, str(mcp_store.APP_FACT_TOOLS))
+
+    async def run():
+        target = "app/half_edit.py"
+        with open(os.path.join(REPO, target), "w", encoding="utf-8") as handle:
+            handle.write("import os\n\n\ndef helper():\n    return os.getcwd()\n")
+        # Заготовка пишется ЗАНОВО перед каждым случаем: предыдущий мог её изменить.
+        def reset():
+            with open(os.path.join(REPO, target), "w", encoding="utf-8") as handle:
+                handle.write("import os\n\n\ndef helper():\n    return os.getcwd()\n")
+
+        # РАУНД 1: вставка маршрута, который пользуется НЕимпортированным модулем и
+        # НЕсуществующей функцией; РАУНД 2: исполнитель дописывает импорт.
+        rounds = {"n": 0, "notes": []}
+
+        async def fake_half_then_full(**kwargs):
+            rounds["n"] += 1
+            rounds["notes"].append(str(kwargs.get("user_text") or ""))
+            if rounds["n"] == 1:
+                payload = {"calls": [{"server": "files", "tool": "insert_in_file",
+                                      "arguments": {
+                                          "path": target,
+                                          "anchor": "def helper():",
+                                          "where": "before",
+                                          "text": "def route():\n"
+                                                  "    return commands_help.render()\n"}}]}
+            else:
+                payload = {"calls": [{"server": "files", "tool": "insert_in_file",
+                                      "arguments": {
+                                          "path": target,
+                                          "anchor": "import os",
+                                          "text": "import commands_help"}}]}
+            return (json.dumps(payload),
+                    {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20})
+
+        original = llm_client.call_llm_async
+        llm_client.call_llm_async = fake_half_then_full
+        try:
+            reset()
+            task, session = await _fresh_task("Половина правки")
+            actions, lines, _ = await chat._file_actions_step(
+                task, session, "Дописать разбор команды в " + target,
+                "Ответ шага.", _agent())
+            check("неопределённое имя распознано и названо",
+                  any("НЕОПРЕДЕЛЁННЫЕ имена" in line for line in lines), str(lines)[:300])
+            check("исполнителя просят дописать недостающее",
+                  "НЕОПРЕДЕЛЁННЫЕ ИМЕНА" in rounds["notes"][1],
+                  rounds["notes"][1][-260:])
+            check("после доработки файл полон (неопределённых имён нет)",
+                  mcp_store.undefined_names(read_local(target) or "") == []
+                  and "import commands_help" in (read_local(target) or ""),
+                  str(read_local(target))[:200])
+            check("в данных шага факта «неопределённые имена» НЕТ (исправлено)",
+                  not any(str(item.get("tool")) == "names_check" for item in actions),
+                  str(actions)[:200])
+        finally:
+            llm_client.call_llm_async = original
+
+        # НЕИСПРАВИМЫЙ СЛУЧАЙ: исполнитель вставляет код с несуществующим именем и
+        # больше ничего не делает — факт обязан дойти до приёмщика.
+        stuck = {"n": 0}
+
+        async def fake_always_half(**kwargs):
+            stuck["n"] += 1
+            payload = {"calls": [{"server": "files", "tool": "edit_file",
+                                  "arguments": {
+                                      "path": target,
+                                      "find": "    return os.getcwd()",
+                                      "replace": "    return os.getcwd() + missing"}}]}
+            return (json.dumps(payload),
+                    {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20})
+
+        llm_client.call_llm_async = fake_always_half
+        try:
+            reset()
+            task, session = await _fresh_task("Половина правки (не исправлено)")
+            actions, lines, _ = await chat._file_actions_step(
+                task, session, "Дописать разбор команды в " + target,
+                "Ответ шага.", _agent())
+            facts = [item for item in actions
+                     if str(item.get("tool")) == "names_check"]
+            check("факт «неопределённые имена» дошёл до данных шага",
+                  len(facts) == 1 and "missing" in str(facts[0].get("error")),
+                  str(facts)[:200])
+            note = chat._file_actions_note(actions)
+            check("в подписи шага это названо",
+                  "НЕ ПРИНЯТО" in note and "неопределённые имена" in note, note[:300])
+        finally:
+            llm_client.call_llm_async = original
+
+        # ЧАСТЬ ВЫЗОВОВ НЕ ПРИМЕНИЛАСЬ — раунд не закрыт, исполнителя просят доработать.
+        partial = {"n": 0, "notes": []}
+
+        async def fake_partial(**kwargs):
+            partial["n"] += 1
+            partial["notes"].append(str(kwargs.get("user_text") or ""))
+            if partial["n"] == 1:
+                payload = {"calls": [
+                    {"server": "files", "tool": "edit_file",
+                     "arguments": {"path": target, "find": "нет такого текста",
+                                   "replace": "x"}},
+                    {"server": "files", "tool": "insert_in_file",
+                     "arguments": {"path": target, "anchor": "def helper():",
+                                   "where": "before",
+                                   "text": "def typed() -> int:\n    return 42\n"}},
+                ]}
+            else:
+                payload = {"calls": [{"server": "files", "tool": "insert_in_file",
+                                      "arguments": {
+                                          "path": target, "anchor": "def helper():",
+                                          "where": "before",
+                                          "text": "def fixed_part() -> int:\n    return 7\n"}}]}
+            return (json.dumps(payload),
+                    {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20})
+
+        llm_client.call_llm_async = fake_partial
+        try:
+            reset()
+            task, session = await _fresh_task("Часть вызовов не применилась")
+            actions, lines, _ = await chat._file_actions_step(
+                task, session, "Дописать разбор команды в " + target,
+                "Ответ шага.", _agent())
+            check("раунд с частичным применением не закрыл шаг",
+                  partial["n"] >= 2, str(partial["n"]))
+            check("в журнале названо, что часть вызовов не применилась",
+                  any("часть вызовов" in line for line in lines), str(lines)[:300])
+            check("исполнителю сказано доработать вместе",
+                  "ЧАСТЬ ПРАВОК" in partial["notes"][1]
+                  and "ВМЕСТЕ" in partial["notes"][1], partial["notes"][1][-260:])
+        finally:
+            llm_client.call_llm_async = original
+
+    asyncio.run(run())
+
+
 def section_facts_survive():
     """ФАКТЫ ПРАВОК НЕ ВЫТЕСНЯЮТСЯ ИЗ ДАННЫХ ЗАПРОСА — и устаревший отказ снимается.
 
@@ -1567,7 +1828,7 @@ def section_facts_survive():
           "ИЗМЕНЕНИЯ ПРИМЕНЕНЫ" in digest and "СОЗДАН app/ai/commands.py" in digest,
           digest[-260:])
     check("проверки приложения тоже считаются фактами и не теряются",
-          mcp_store.APP_FACT_TOOLS == ("syntax_check", "connect_check"),
+          set(mcp_store.APP_FACT_TOOLS) == {"syntax_check", "connect_check", "names_check"},
           str(mcp_store.APP_FACT_TOOLS))
     checks = [{"server": "app", "server_name": "Проверка приложения", "tool": "syntax_check",
                "ok": False, "arguments": {"path": "app/x.py"}, "text": "",
@@ -1597,6 +1858,17 @@ def section_connect_check():
     check("объявленное и не вызванное — считается",
           mcp_store.unreferenced_names('def _a():\n    pass\n\n\ndef b():\n    pass\n',
                                        ["_a"]) == ["_a"])
+    check("импортированные имена видны (кроме __future__)",
+          mcp_store.imported_names("from __future__ import annotations\n"
+                                   "import os\nfrom app.ai import commands as c\n")
+          == ["os", "c"],
+          str(mcp_store.imported_names("from __future__ import annotations\nimport os\n")))
+    check("импорт без использования считается несделанной работой",
+          mcp_store.unreferenced_names("from app.ai import commands\n\n\ndef f():\n"
+                                       "    return 1\n", ["commands"]) == ["commands"])
+    check("использованный импорт не считается",
+          mcp_store.unreferenced_names("from app.ai import commands\n\n\ndef f():\n"
+                                       "    return commands.run()\n", ["commands"]) == [])
     check("публичные имена так не проверяются (их может звать другой модуль)",
           mcp_store.private_defs('def public():\n    pass\n') == [])
     check("подсказка говорит, что делать",
@@ -1678,6 +1950,46 @@ def section_connect_check():
             note = chat._file_actions_note(actions)
             check("в подписи шага это названо, а не спрятано",
                   "НЕ ПРИНЯТО" in note and "не сделано" in note, note[:300])
+        finally:
+            llm_client.call_llm_async = original
+
+        # ИМПОРТ БЕЗ ВЫЗОВА: «подключили» одной строкой импорта — это не подключение.
+        only_import = {"n": 0, "notes": []}
+
+        async def fake_import_only(**kwargs):
+            only_import["n"] += 1
+            only_import["notes"].append(str(kwargs.get("user_text") or ""))
+            if only_import["n"] == 1:
+                payload = {"calls": [{"server": "files", "tool": "insert_in_file",
+                                      "arguments": {
+                                          "path": target, "anchor": "def entry(text):",
+                                          "where": "before",
+                                          "text": "from app.ai import commands\n"}}]}
+            else:
+                payload = {"calls": [{"server": "files", "tool": "insert_in_file",
+                                      "arguments": {
+                                          "path": target, "anchor": "def entry(text):",
+                                          "where": "before",
+                                          "text": "def _use(text):\n"
+                                                  "    return commands.run(text)\n"}}]}
+            return (json.dumps(payload),
+                    {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20})
+
+        original = llm_client.call_llm_async
+        llm_client.call_llm_async = fake_import_only
+        try:
+            task, session = await _fresh_task("Импорт без вызова")
+            actions, lines, _ = await chat._file_actions_step(
+                task, session, "Подключить разбор команды /commands в " + target,
+                "Ответ шага.", _agent())
+            check("импорт без использования назван несделанной работой",
+                  any("объявления без использования" in line for line in lines),
+                  str(lines)[:300])
+            check("исполнителя просят добавить вызов",
+                  "ВЫЗОВ" in only_import["notes"][1], only_import["notes"][1][-200:])
+            check("после доработки факта «без использования» НЕТ",
+                  not any(str(item.get("tool")) == "connect_check" for item in actions),
+                  str(actions)[:200])
         finally:
             llm_client.call_llm_async = original
 
@@ -1882,6 +2194,9 @@ def main():
     section_step_files_only()
     section_connect_check()
     section_facts_survive()
+    section_names_check()
+    section_stale_deferred()
+    section_chain_writes()
 
     print("")
     if FAILURES:
